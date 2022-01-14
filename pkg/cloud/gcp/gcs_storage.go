@@ -41,7 +41,8 @@ const (
 	GoogleBillingProjectParam = "GOOGLE_BILLING_PROJECT"
 	// CredentialsParam is the query parameter for the base64-encoded contents of
 	// the Google Application Credentials JSON file.
-	CredentialsParam = "CREDENTIALS"
+	CredentialsParam                  = "CREDENTIALS"
+	GoogleApplicationCredentialsParam = "GOOGLE_APPLICATION_CREDENTIALS"
 )
 
 // gcsChunkingEnabled is used to enable and disable chunking of file upload to

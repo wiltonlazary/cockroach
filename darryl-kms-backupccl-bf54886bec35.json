@@ -1,0 +1,12 @@
+{
+  "type": "service_account",
+  "project_id": "darryl-kms-backupccl",
+  "private_key_id": "bf54886bec35078cace73cea8741e9a407386c66",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDYQAwHJfgeTRlq\ndRzw1ddtUHIEKdIyA+spGVhMPGcCeLCBIS/mSC+9gQ7JIvqkBGLv7K2Zobq/8ht9\nz94ntHbCT4y2GDpovo6HZRZBuCNWmjGZDeJyzD3bGxMi6EValkcqd9YjQ/zFzJw5\nDsFYFdQENo4RsYt9QKB5Qfgx0NTrecJ5y8c23DhXg3WHKpY2/mNEarP63uw5WsaZ\nn8ZXDvBCMsTxNXYwHKMhxSJs84uRJP7cFW2Rbcb12RiTz32kbvIZGl1oVQk7PNXp\n2+hN6C1nk7zFgBpZ5AXQSfUqJU3Zo1vzPcs3l3qDPMO8odjisSS0pSLtJMYovAwR\nKODl3VbTAgMBAAECggEASrTBkvyefVVUSO9Ber/dRuHqKZ8LAwVQiae8VcXuLi/k\nhg+hfRQGDhkWMw02+k+boFgq1u7E1ce9kJatoBjbiCA0M7ol/4aJNaQJ7tU+vA3T\nwZTG3LLLUbTGRSJpxzQwTK8OlqtHmUuo0ptS1uvfjT8NkHY+Apy/c3SDWi5TSC9q\n71zXF0K663Utu9Uo+M0vzwgw3V2wwZZDWorarIGZtQkk9Xum71Wtd88VFicBUZzu\n/RNj9/EiJkRz6O9Of19thQxItUeksAwf1sEHeywSXbCT1t3H6vniI2PLvDw9o/QT\nfIkAdMT/+L+Vn9fyWLJICrr40c+yO/cfyRYPQZERNQKBgQD2UkZXrdzZNqTAPxaa\nrQe3TPflEG8ZbWAshVoaW7V9Cr/tzxAxL1PKI4Nl8/ww/6vKmouRShT/ZsJAF4Sk\n9YQGNU+/fcmBDcq0L3EaqZ9sLuLJfMVmJlYQhlr5jEKLSo8TgOlOAk5nqJCrPk4p\ndjJOPy+6XrQnB2ejSkC3RLgLjQKBgQDgv0njEhfmhLG2+Msauu1uuupgikkg/+yA\no+egq6ubBZ6cSKUuzqcnjMcGvbOUNIl2crWIrle4pVoWXvWI2kUrvGwQOyCVXAoF\nsveewRgiLW+BDGMh31RkXgtIhxuV6QxFxW0zda+ZQ++LXSO5RsGe71DbgHyYauVR\ns8s6tpMj3wKBgQCH9dXZ45+5TY4Whzwk2EkgBh32k+Ge+V5SdLDNR72fbWWPD/Hy\nFBt9wahviAK10Qmz5SYQZgG9D608zz5qBxJ+ksKYAghNcZ1nY6BchS/3+NE5QeN7\nhMGQkXh5sc+xLtBWhZtBcchxMvvXaaafABy4T+w6RLfPqyirWvrprcagqQKBgBMM\nw8OGfhYg+ztKHVUXsRZoq4MhVY+BgddpjTGWO4Z5VHdkxPORuqNkkF4m6DjQtzIe\nCPsb4/2XrmolBGTkM2bAotxBVsKyOXtALzL6pQQIm+HxXdm6J1oWiphMM29igJLN\naDMrb4XrNzu12lhTAghpuo3Qdz8oGGXzem9wmEo7AoGBALD2Vh6ddSnoFZC1ZmYj\nLqctjEmNO0oCkAWAd4plmf5uCNkVjq0/DJN+OCXNW02KyiAbROZbfRp/XLi744HY\n5u4iTh4ylEaRroMIyQqm2NQzB3tbCJU1ROP367i0D0QK5+Q3E2BxhKnsTbijcuGP\nSgmeu19q/OEQJYnQMFImnY8o\n-----END PRIVATE KEY-----\n",
+  "client_email": "kms-backup-service@darryl-kms-backupccl.iam.gserviceaccount.com",
+  "client_id": "109889576814801502796",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/kms-backup-service%40darryl-kms-backupccl.iam.gserviceaccount.com"
+}
