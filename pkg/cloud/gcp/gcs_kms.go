@@ -57,7 +57,7 @@ func MakeGCSKMS(uri string, env cloud.KMSEnv) (cloud.KMS, error) {
 	kmsURIParams := resolveKMSURIParams(*kmsURI)
 
 	// Client options to authenticate and start a GCS KMS session.
-	// Currently only accepting json of service account env data.
+	// Currently only accepting json of service account
 	var credentialsOpt []option.ClientOption
 
 	switch kmsURIParams.auth {
@@ -71,6 +71,7 @@ func MakeGCSKMS(uri string, env cloud.KMSEnv) (cloud.KMS, error) {
 			)
 		}
 
+		// Credentials are passed in base64 encoded, so decode the credentials first
 		credentialsJson, err := base64.StdEncoding.DecodeString(kmsURIParams.credentials)
 		if err != nil {
 			return nil, err
@@ -83,11 +84,11 @@ func MakeGCSKMS(uri string, env cloud.KMSEnv) (cloud.KMS, error) {
 				"implicit credentials disallowed for gcs due to --external-io-implicit-credentials flag")
 		}
 		// If implicit credentials used, no client options needed, just context
+		// So credentialsOpt is empty
 	default:
 		return nil, errors.Errorf("unsupported value %s for %s", kmsURIParams.auth, cloud.AuthParam)
 	}
 
-	// Credentials are passed in base64 encoded, so decode the credentials first
 	ctx := context.Background()
 
 	kmc, err := kms.NewKeyManagementClient(ctx, credentialsOpt...)
