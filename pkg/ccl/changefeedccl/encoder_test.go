@@ -12,20 +12,26 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/workload/ledger"
 	"github.com/cockroachdb/cockroach/pkg/workload/workloadsql"
 	"github.com/stretchr/testify/require"
@@ -43,16 +49,16 @@ func TestEncoders(t *testing.T) {
 	}
 	ts := hlc.Timestamp{WallTime: 1, Logical: 2}
 
-	var opts []map[string]string
-	for _, f := range []string{string(changefeedbase.OptFormatJSON), string(changefeedbase.OptFormatAvro)} {
-		for _, e := range []string{
-			string(changefeedbase.OptEnvelopeKeyOnly), string(changefeedbase.OptEnvelopeRow), string(changefeedbase.OptEnvelopeWrapped),
+	var opts []changefeedbase.EncodingOptions
+	for _, f := range []changefeedbase.FormatType{changefeedbase.OptFormatJSON, changefeedbase.OptFormatAvro} {
+		for _, e := range []changefeedbase.EnvelopeType{
+			changefeedbase.OptEnvelopeKeyOnly, changefeedbase.OptEnvelopeRow, changefeedbase.OptEnvelopeWrapped,
 		} {
 			opts = append(opts,
-				map[string]string{changefeedbase.OptFormat: f, changefeedbase.OptEnvelope: e},
-				map[string]string{changefeedbase.OptFormat: f, changefeedbase.OptEnvelope: e, changefeedbase.OptDiff: ``},
-				map[string]string{changefeedbase.OptFormat: f, changefeedbase.OptEnvelope: e, changefeedbase.OptUpdatedTimestamps: ``},
-				map[string]string{changefeedbase.OptFormat: f, changefeedbase.OptEnvelope: e, changefeedbase.OptUpdatedTimestamps: ``, changefeedbase.OptDiff: ``},
+				changefeedbase.EncodingOptions{Format: f, Envelope: e, UpdatedTimestamps: false, Diff: false},
+				changefeedbase.EncodingOptions{Format: f, Envelope: e, UpdatedTimestamps: false, Diff: true},
+				changefeedbase.EncodingOptions{Format: f, Envelope: e, UpdatedTimestamps: true, Diff: false},
+				changefeedbase.EncodingOptions{Format: f, Envelope: e, UpdatedTimestamps: true, Diff: true},
 			)
 		}
 	}
@@ -75,10 +81,14 @@ func TestEncoders(t *testing.T) {
 			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=key_only,diff`: {
-			err: `diff is only usable with envelope=wrapped`,
+			insert:   `[1]->`,
+			delete:   `[1]->`,
+			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=key_only,updated,diff`: {
-			err: `diff is only usable with envelope=wrapped`,
+			insert:   `[1]->`,
+			delete:   `[1]->`,
+			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=row`: {
 			insert:   `[1]->{"a": 1, "b": "bar"}`,
@@ -91,10 +101,14 @@ func TestEncoders(t *testing.T) {
 			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=row,diff`: {
-			err: `diff is only usable with envelope=wrapped`,
+			insert:   `[1]->{"a": 1, "b": "bar"}`,
+			delete:   `[1]->`,
+			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=row,updated,diff`: {
-			err: `diff is only usable with envelope=wrapped`,
+			insert:   `[1]->{"__crdb__": {"updated": "1.0000000002"}, "a": 1, "b": "bar"}`,
+			delete:   `[1]->`,
+			resolved: `{"__crdb__":{"resolved":"1.0000000002"}}`,
 		},
 		`format=json,envelope=wrapped`: {
 			insert:   `[1]->{"after": {"a": 1, "b": "bar"}}`,
@@ -178,11 +192,11 @@ func TestEncoders(t *testing.T) {
 	}
 
 	for _, o := range opts {
-		name := fmt.Sprintf("format=%s,envelope=%s", o[changefeedbase.OptFormat], o[changefeedbase.OptEnvelope])
-		if _, ok := o[changefeedbase.OptUpdatedTimestamps]; ok {
+		name := fmt.Sprintf("format=%s,envelope=%s", o.Format, o.Envelope)
+		if o.UpdatedTimestamps {
 			name += `,updated`
 		}
-		if _, ok := o[changefeedbase.OptDiff]; ok {
+		if o.Diff {
 			name += `,diff`
 		}
 		t.Run(name, func(t *testing.T) {
@@ -190,14 +204,14 @@ func TestEncoders(t *testing.T) {
 
 			var rowStringFn func([]byte, []byte) string
 			var resolvedStringFn func([]byte) string
-			switch o[changefeedbase.OptFormat] {
-			case string(changefeedbase.OptFormatJSON):
+			switch o.Format {
+			case changefeedbase.OptFormatJSON:
 				rowStringFn = func(k, v []byte) string { return fmt.Sprintf(`%s->%s`, k, v) }
 				resolvedStringFn = func(r []byte) string { return string(r) }
-			case string(changefeedbase.OptFormatAvro), string(changefeedbase.DeprecatedOptFormatAvro):
+			case changefeedbase.OptFormatAvro, changefeedbase.DeprecatedOptFormatAvro:
 				reg := cdctest.StartTestSchemaRegistry()
 				defer reg.Close()
-				o[changefeedbase.OptConfluentSchemaRegistry] = reg.URL()
+				o.SchemaRegistryURI = reg.URL()
 				rowStringFn = func(k, v []byte) string {
 					key, value := avroToJSON(t, reg, k), avroToJSON(t, reg, v)
 					return fmt.Sprintf(`%s->%s`, key, value)
@@ -206,48 +220,42 @@ func TestEncoders(t *testing.T) {
 					return string(avroToJSON(t, reg, r))
 				}
 			default:
-				t.Fatalf(`unknown format: %s`, o[changefeedbase.OptFormat])
+				t.Fatalf(`unknown format: %s`, o.Format)
 			}
 
-			target := jobspb.ChangefeedTarget{
-				StatementTimeName: tableDesc.GetName(),
-			}
-			targets := jobspb.ChangefeedTargets{}
-			targets[tableDesc.GetID()] = target
+			targets := changefeedbase.Targets{}
+			targets.Add(changefeedbase.Target{
+				Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
+				TableID:           tableDesc.GetID(),
+				StatementTimeName: changefeedbase.StatementTimeName(tableDesc.GetName()),
+			})
 
-			e, err := getEncoder(o, targets)
 			if len(expected.err) > 0 {
-				require.EqualError(t, err, expected.err)
+				require.EqualError(t, o.Validate(), expected.err)
 				return
 			}
+			require.NoError(t, o.Validate())
+			e, err := getEncoder(o, targets)
 			require.NoError(t, err)
 
-			rowInsert := encodeRow{
-				datums:        row,
-				updated:       ts,
-				tableDesc:     tableDesc,
-				prevDatums:    nil,
-				prevTableDesc: tableDesc,
-			}
+			rowInsert := cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
+			prevRow := cdcevent.TestingMakeEventRow(tableDesc, 0, nil, false)
+			evCtx := eventContext{updated: ts}
+
 			keyInsert, err := e.EncodeKey(context.Background(), rowInsert)
 			require.NoError(t, err)
 			keyInsert = append([]byte(nil), keyInsert...)
-			valueInsert, err := e.EncodeValue(context.Background(), rowInsert)
+			valueInsert, err := e.EncodeValue(context.Background(), evCtx, rowInsert, prevRow)
 			require.NoError(t, err)
 			require.Equal(t, expected.insert, rowStringFn(keyInsert, valueInsert))
 
-			rowDelete := encodeRow{
-				datums:        row,
-				deleted:       true,
-				prevDatums:    row,
-				updated:       ts,
-				tableDesc:     tableDesc,
-				prevTableDesc: tableDesc,
-			}
+			rowDelete := cdcevent.TestingMakeEventRow(tableDesc, 0, row, true)
+			prevRow = cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
+
 			keyDelete, err := e.EncodeKey(context.Background(), rowDelete)
 			require.NoError(t, err)
 			keyDelete = append([]byte(nil), keyDelete...)
-			valueDelete, err := e.EncodeValue(context.Background(), rowDelete)
+			valueDelete, err := e.EncodeValue(context.Background(), evCtx, rowDelete, prevRow)
 			require.NoError(t, err)
 			require.Equal(t, expected.delete, rowStringFn(keyDelete, valueDelete))
 
@@ -262,10 +270,10 @@ func TestAvroEncoder(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		ctx := context.Background()
 
-		sqlDB := sqlutils.MakeSQLRunner(db)
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
 		var ts1 string
 		sqlDB.QueryRow(t,
@@ -294,7 +302,7 @@ func TestAvroEncoder(t *testing.T) {
 		require.NoError(t, err)
 
 		var ts2 string
-		require.NoError(t, crdb.ExecuteTx(ctx, db, nil /* txopts */, func(tx *gosql.Tx) error {
+		require.NoError(t, crdb.ExecuteTx(ctx, s.DB, nil /* txopts */, func(tx *gosql.Tx) error {
 			return tx.QueryRow(
 				`INSERT INTO foo VALUES (3, 'baz') RETURNING cluster_logical_timestamp()`,
 			).Scan(&ts2)
@@ -306,7 +314,7 @@ func TestAvroEncoder(t *testing.T) {
 		})
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroEncoderWithTLS(t *testing.T) {
@@ -321,9 +329,9 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 	}
 	ts := hlc.Timestamp{WallTime: 1, Logical: 2}
 
-	opts := map[string]string{
-		changefeedbase.OptFormat:   "avro",
-		changefeedbase.OptEnvelope: "key_only",
+	opts := changefeedbase.EncodingOptions{
+		Format:   changefeedbase.OptFormatAvro,
+		Envelope: changefeedbase.OptEnvelopeKeyOnly,
 	}
 	expected := struct {
 		insert   string
@@ -350,7 +358,7 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 		regURL, err := url.Parse(reg.URL())
 		require.NoError(t, err)
 		regURL.RawQuery = params.Encode()
-		opts[changefeedbase.OptConfluentSchemaRegistry] = regURL.String()
+		opts.SchemaRegistryURI = regURL.String()
 
 		rowStringFn = func(k, v []byte) string {
 			key, value := avroToJSON(t, reg, k), avroToJSON(t, reg, v)
@@ -360,41 +368,33 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 			return string(avroToJSON(t, reg, r))
 		}
 
-		target := jobspb.ChangefeedTarget{
-			StatementTimeName: tableDesc.GetName(),
-		}
-		targets := jobspb.ChangefeedTargets{}
-		targets[tableDesc.GetID()] = target
+		targets := changefeedbase.Targets{}
+		targets.Add(changefeedbase.Target{
+			Type:              jobspb.ChangefeedTargetSpecification_PRIMARY_FAMILY_ONLY,
+			TableID:           tableDesc.GetID(),
+			StatementTimeName: changefeedbase.StatementTimeName(tableDesc.GetName()),
+		})
 
 		e, err := getEncoder(opts, targets)
 		require.NoError(t, err)
 
-		rowInsert := encodeRow{
-			datums:        row,
-			updated:       ts,
-			tableDesc:     tableDesc,
-			prevDatums:    nil,
-			prevTableDesc: tableDesc,
-		}
+		rowInsert := cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
+		var prevRow cdcevent.Row
+		evCtx := eventContext{updated: ts}
 		keyInsert, err := e.EncodeKey(context.Background(), rowInsert)
 		require.NoError(t, err)
 		keyInsert = append([]byte(nil), keyInsert...)
-		valueInsert, err := e.EncodeValue(context.Background(), rowInsert)
+		valueInsert, err := e.EncodeValue(context.Background(), evCtx, rowInsert, prevRow)
 		require.NoError(t, err)
 		require.Equal(t, expected.insert, rowStringFn(keyInsert, valueInsert))
 
-		rowDelete := encodeRow{
-			datums:        row,
-			deleted:       true,
-			prevDatums:    row,
-			updated:       ts,
-			tableDesc:     tableDesc,
-			prevTableDesc: tableDesc,
-		}
+		rowDelete := cdcevent.TestingMakeEventRow(tableDesc, 0, row, true)
+		prevRow = cdcevent.TestingMakeEventRow(tableDesc, 0, row, false)
+
 		keyDelete, err := e.EncodeKey(context.Background(), rowDelete)
 		require.NoError(t, err)
 		keyDelete = append([]byte(nil), keyDelete...)
-		valueDelete, err := e.EncodeValue(context.Background(), rowDelete)
+		valueDelete, err := e.EncodeValue(context.Background(), evCtx, rowDelete, prevRow)
 		require.NoError(t, err)
 		require.Equal(t, expected.delete, rowStringFn(keyDelete, valueDelete))
 
@@ -405,14 +405,14 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 		noCertReg, err := cdctest.StartTestSchemaRegistryWithTLS(nil)
 		require.NoError(t, err)
 		defer noCertReg.Close()
-		opts[changefeedbase.OptConfluentSchemaRegistry] = noCertReg.URL()
+		opts.SchemaRegistryURI = noCertReg.URL()
 
 		enc, err := getEncoder(opts, targets)
 		require.NoError(t, err)
 		_, err = enc.EncodeKey(context.Background(), rowInsert)
 		require.EqualError(t, err, fmt.Sprintf("retryable changefeed error: "+
 			`contacting confluent schema registry: Post "%s/subjects/foo-key/versions": x509: certificate signed by unknown authority`,
-			opts[changefeedbase.OptConfluentSchemaRegistry]))
+			opts.SchemaRegistryURI))
 
 		wrongCert, _, err := cdctest.NewCACertBase64Encoded()
 		require.NoError(t, err)
@@ -420,14 +420,14 @@ func TestAvroEncoderWithTLS(t *testing.T) {
 		wrongCertReg, err := cdctest.StartTestSchemaRegistryWithTLS(wrongCert)
 		require.NoError(t, err)
 		defer wrongCertReg.Close()
-		opts[changefeedbase.OptConfluentSchemaRegistry] = wrongCertReg.URL()
+		opts.SchemaRegistryURI = wrongCertReg.URL()
 
 		enc, err = getEncoder(opts, targets)
 		require.NoError(t, err)
 		_, err = enc.EncodeKey(context.Background(), rowInsert)
 		require.EqualError(t, err, fmt.Sprintf("retryable changefeed error: "+
 			`contacting confluent schema registry: Post "%s/subjects/foo-key/versions": x509: certificate signed by unknown authority`,
-			opts[changefeedbase.OptConfluentSchemaRegistry]))
+			opts.SchemaRegistryURI))
 	})
 }
 
@@ -435,8 +435,8 @@ func TestAvroArray(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b INT[])`)
 		sqlDB.Exec(t,
 			`INSERT INTO foo VALUES
@@ -472,15 +472,15 @@ func TestAvroArray(t *testing.T) {
 
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroArrayCap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b INT[])`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, ARRAY[])`)
 
@@ -511,15 +511,15 @@ func TestAvroArrayCap(t *testing.T) {
 
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroCollatedString(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b string collate "fr-CA")`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'désolée' collate "fr-CA")`)
 
@@ -532,15 +532,15 @@ func TestAvroCollatedString(t *testing.T) {
 		})
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroEnum(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TYPE status AS ENUM ('open', 'closed', 'inactive')`)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b status, c int default 0)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'open')`)
@@ -591,15 +591,24 @@ func TestAvroEnum(t *testing.T) {
 
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroSchemaNaming(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		// The expected results depend on caching in the avro encoder.
+		// With multiple workers, there are multiple encoders which each
+		// maintain their own caches. Depending on the number of
+		// workers, the results below may change, so disable parallel workers
+		// here for simplicity.
+		changefeedbase.EventConsumerWorkers.Override(
+			context.Background(), &s.Server.ClusterSettings().SV, 0)
+
 		sqlDB.Exec(t, `CREATE DATABASE movr`)
 		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
 		sqlDB.Exec(t,
@@ -670,17 +679,37 @@ func TestAvroSchemaNaming(t *testing.T) {
 		//Both changes to the subject are also reflected in the schema name in the posted schemas
 		require.Contains(t, foo.registry.SchemaForSubject(`supermovr.public.drivers-key`), `supermovr`)
 		require.Contains(t, foo.registry.SchemaForSubject(`supermovr.public.drivers-value`), `supermovr`)
+
+		sqlDB.Exec(t, `ALTER TABLE movr.drivers ADD COLUMN vehicle_id int CREATE FAMILY volatile`)
+		multiFamilyFeed := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR movr.drivers `+
+			`WITH format=%s, %s`, changefeedbase.OptFormatAvro, changefeedbase.OptSplitColumnFamilies))
+		defer closeFeed(t, multiFamilyFeed)
+		foo = multiFamilyFeed.(*kafkaFeed)
+
+		sqlDB.Exec(t, `UPDATE movr.drivers SET vehicle_id = 1 WHERE id=1`)
+
+		assertPayloads(t, multiFamilyFeed, []string{
+			`drivers.primary: {"id":{"long":1}}->{"after":{"drivers_u002e_primary":{"id":{"long":1},"name":{"string":"Alice"}}}}`,
+			`drivers.volatile: {"id":{"long":1}}->{"after":{"drivers_u002e_volatile":{"vehicle_id":{"long":1}}}}`,
+		})
+
+		assertRegisteredSubjects(t, foo.registry, []string{
+			`drivers.primary-key`,
+			`drivers.primary-value`,
+			`drivers.volatile-value`,
+		})
+
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroSchemaNamespace(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE DATABASE movr`)
 		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
 		sqlDB.Exec(t,
@@ -714,15 +743,15 @@ func TestAvroSchemaNamespace(t *testing.T) {
 		require.Contains(t, foo.registry.SchemaForSubject(`superdrivers-value`), `"namespace":"super"`)
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestTableNameCollision(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE DATABASE movr`)
 		sqlDB.Exec(t, `CREATE DATABASE printr`)
 		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
@@ -764,15 +793,15 @@ func TestTableNameCollision(t *testing.T) {
 		})
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(db)
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
 
@@ -790,18 +819,18 @@ func TestAvroMigrateToUnsupportedColumn(t *testing.T) {
 		}
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestAvroLedger(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testFn := func(t *testing.T, db *gosql.DB, f cdctest.TestFeedFactory) {
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		ctx := context.Background()
 		gen := ledger.FromFlags(`--customers=1`)
 		var l workloadsql.InsertsDataLoader
-		_, err := workloadsql.Setup(ctx, db, gen, l)
+		_, err := workloadsql.Setup(ctx, s.DB, gen, l)
 		require.NoError(t, err)
 
 		ledger := feed(t, f, fmt.Sprintf(`CREATE CHANGEFEED FOR customer, transaction, entry, session
@@ -824,5 +853,201 @@ func TestAvroLedger(t *testing.T) {
 		})
 	}
 
-	t.Run(`kafka`, kafkaTest(testFn))
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
+}
+
+func BenchmarkEncoders(b *testing.B) {
+	rng := randutil.NewTestRandWithSeed(2365865412074131521)
+
+	// Initialize column types for tests; this is done before
+	// benchmark runs so that all reruns use the same types as generated
+	// by random seed above.
+	const maxKeyCols = 4
+	const maxValCols = 2<<maxKeyCols - maxKeyCols // 28 columns for a maximum of 32 columns in a row
+	keyColTypes, valColTypes := makeTestTypes(rng, maxKeyCols, maxValCols)
+
+	const numRows = 1024
+	makeRowPool := func(numKeyCols int) (updatedRows, prevRows []cdcevent.Row, _ []*types.T) {
+		colTypes := keyColTypes[:numKeyCols]
+		colTypes = append(colTypes, valColTypes[:2<<numKeyCols-numKeyCols]...)
+		encRows := randgen.RandEncDatumRowsOfTypes(rng, numRows, colTypes)
+
+		for _, r := range encRows {
+			updatedRow := cdcevent.TestingMakeEventRowFromEncDatums(r, colTypes, numKeyCols, false)
+			updatedRows = append(updatedRows, updatedRow)
+			// Generate previous row -- use same key datums, but update other datums.
+			prevRowDatums := append(r[:numKeyCols], randgen.RandEncDatumRowOfTypes(rng, colTypes[numKeyCols:])...)
+			prevRow := cdcevent.TestingMakeEventRowFromEncDatums(prevRowDatums, colTypes, numKeyCols, false)
+			prevRows = append(prevRows, prevRow)
+		}
+		return updatedRows, prevRows, colTypes
+	}
+
+	type encodeFn func(encoder Encoder, updatedRow, prevRow cdcevent.Row) error
+	encodeKey := func(encoder Encoder, updatedRow cdcevent.Row, _ cdcevent.Row) error {
+		_, err := encoder.EncodeKey(context.Background(), updatedRow)
+		return err
+	}
+	encodeValue := func(encoder Encoder, updatedRow, prevRow cdcevent.Row) error {
+		evCtx := eventContext{
+			updated: hlc.Timestamp{WallTime: 42},
+			mvcc:    hlc.Timestamp{WallTime: 17},
+			topic:   "testtopic",
+		}
+		_, err := encoder.EncodeValue(context.Background(), evCtx, updatedRow, prevRow)
+		return err
+	}
+
+	var targets changefeedbase.Targets
+	targets.Add(changefeedbase.Target{
+		Type:              0,
+		TableID:           42,
+		FamilyName:        "primary",
+		StatementTimeName: "table",
+	})
+
+	// bench executes benchmark.
+	bench := func(b *testing.B, fn encodeFn, opts changefeedbase.EncodingOptions, updatedRows, prevRows []cdcevent.Row) {
+		b.ReportAllocs()
+		b.StopTimer()
+		encoder, err := getEncoder(opts, targets)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := fn(encoder, updatedRows[i%len(updatedRows)], prevRows[i%len(prevRows)]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+
+	rowOnly := []changefeedbase.EnvelopeType{changefeedbase.OptEnvelopeRow}
+	rowAndWrapped := []changefeedbase.EnvelopeType{
+		changefeedbase.OptEnvelopeRow, changefeedbase.OptEnvelopeWrapped,
+	}
+
+	for _, tc := range []struct {
+		format         changefeedbase.FormatType
+		benchEncodeKey bool
+		supportsDiff   bool
+		envelopes      []changefeedbase.EnvelopeType
+	}{
+		{
+			format:         changefeedbase.OptFormatJSON,
+			benchEncodeKey: true,
+			supportsDiff:   true,
+			envelopes:      rowAndWrapped,
+		},
+		{
+			format:         changefeedbase.OptFormatCSV,
+			benchEncodeKey: false,
+			supportsDiff:   false,
+			envelopes:      rowOnly,
+		},
+	} {
+		b.Run(string(tc.format), func(b *testing.B) {
+			for numKeyCols := 1; numKeyCols <= maxKeyCols; numKeyCols++ {
+				updatedRows, prevRows, colTypes := makeRowPool(numKeyCols)
+				b.Logf("column types: %v, keys: %v", colTypes, colTypes[:numKeyCols])
+
+				if tc.benchEncodeKey {
+					b.Run(fmt.Sprintf("encodeKey/%dcols", numKeyCols),
+						func(b *testing.B) {
+							opts := changefeedbase.EncodingOptions{Format: tc.format}
+							bench(b, encodeKey, opts, updatedRows, prevRows)
+						},
+					)
+				}
+
+				for _, envelope := range tc.envelopes {
+					for _, diff := range []bool{false, true} {
+						// Run benchmark with/without diff (unless encoder does not support
+						// diff, in which case we only run benchmark once).
+						if tc.supportsDiff || !diff {
+							b.Run(fmt.Sprintf("encodeValue/%dcols/envelope=%s/diff=%t",
+								numKeyCols, envelope, diff),
+								func(b *testing.B) {
+									opts := changefeedbase.EncodingOptions{
+										Format:            tc.format,
+										Envelope:          envelope,
+										KeyInValue:        envelope == changefeedbase.OptEnvelopeWrapped,
+										TopicInValue:      envelope == changefeedbase.OptEnvelopeWrapped,
+										UpdatedTimestamps: true,
+										MVCCTimestamps:    true,
+										Diff:              diff,
+									}
+									bench(b, encodeValue, opts, updatedRows, prevRows)
+								},
+							)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// makeTestTypes returns list of key and column types to test against.
+func makeTestTypes(rng *rand.Rand, numKeyTypes, numColTypes int) (keyTypes, valTypes []*types.T) {
+	var allTypes []*types.T
+	for _, typ := range randgen.SeedTypes {
+		switch typ {
+		case types.AnyTuple:
+		// Ignore AnyTuple -- it's not very interesting; we'll generate test tuples below.
+		case types.RegClass, types.RegNamespace, types.RegProc, types.RegProcedure, types.RegRole, types.RegType:
+		// Ignore a bunch of pseudo-OID types (just want regular OID)
+		case types.Geometry, types.Geography:
+		// Ignore geometry/geography: these types are insanely inefficient;
+		// AsJson(Geo) -> MarshalGeo -> go JSON bytes ->  ParseJSON -> Go native -> json.JSON
+		// Benchmarking this generates too much noise.
+		// TODO: fix this.
+		case types.Void:
+		// Just not a very interesting thing to encode
+		default:
+			allTypes = append(allTypes, typ)
+		}
+	}
+
+	// Add tuple types.
+	var tupleTypes []*types.T
+	makeTupleType := func() *types.T {
+		contents := make([]*types.T, rng.Intn(6)) // Up to 6 fields
+		for i := range contents {
+			contents[i] = randgen.RandTypeFromSlice(rng, allTypes)
+		}
+		candidateTuple := types.MakeTuple(contents)
+		// Ensure tuple type is unique.
+		for _, t := range tupleTypes {
+			if t.Equal(candidateTuple) {
+				return nil
+			}
+		}
+		tupleTypes = append(tupleTypes, candidateTuple)
+		return candidateTuple
+	}
+
+	const numTupleTypes = 5
+	for i := 0; i < numTupleTypes; i++ {
+		var typ *types.T
+		for typ == nil {
+			typ = makeTupleType()
+		}
+		allTypes = append(allTypes, typ)
+	}
+
+	randTypes := func(numTypes int, mustBeKeyType bool) []*types.T {
+		typs := make([]*types.T, numTypes)
+		for i := range typs {
+			typ := randgen.RandTypeFromSlice(rng, allTypes)
+			for mustBeKeyType && colinfo.MustBeValueEncoded(typ) {
+				typ = randgen.RandTypeFromSlice(rng, allTypes)
+			}
+			typs[i] = typ
+		}
+		return typs
+	}
+
+	return randTypes(numKeyTypes, true), randTypes(numColTypes, false)
 }

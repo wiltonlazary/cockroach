@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // logging is the global state of the logging setup.
@@ -98,6 +99,11 @@ type loggingT struct {
 		// to this logger already.
 		active        bool
 		firstUseStack string
+
+		// redactionPolicyManaged indicates whether we're running as part of a managed
+		// service (sourced from COCKROACH_REDACTION_POLICY_MANAGED env var). Impacts
+		// log redaction policies for log args marked with SafeManaged.
+		redactionPolicyManaged bool
 	}
 
 	allSinkInfos sinkInfoRegistry
@@ -214,6 +220,24 @@ func (l *loggingT) signalFatalCh() {
 	default:
 		close(l.mu.fatalCh)
 	}
+}
+
+// setManagedRedactionPolicy configures the logging setup to indicate if
+// we are running as part of a managed service. see SafeManaged for details
+// on how this impacts log redaction policies.
+func (l *loggingT) setManagedRedactionPolicy(isManaged bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.mu.redactionPolicyManaged = isManaged
+}
+
+// hasManagedRedactionPolicy indicates if the logging setup is being run
+// as part of a managed service. see SafeManaged for details on how this
+// impacts log redaction policies.
+func (l *loggingT) hasManagedRedactionPolicy() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.mu.redactionPolicyManaged
 }
 
 // outputLogEntry marshals a log entry proto into bytes, and writes
@@ -376,11 +400,13 @@ func (l *loggerT) outputLogEntry(entry logEntry) {
 	}
 }
 
-// DumpStacks produces a dump of the stack traces in the logging output.
-func DumpStacks(ctx context.Context) {
+// DumpStacks produces a dump of the stack traces in the logging
+// output, and also to stderr if the remainder of the logs don't go to
+// stderr by default.
+func DumpStacks(ctx context.Context, reason redact.RedactableString) {
 	allStacks := getStacks(true)
 	// TODO(knz): This should really be a "debug" level, not "info".
-	Infof(ctx, "stack traces:\n%s", allStacks)
+	Shoutf(ctx, severity.INFO, "%s. stack traces:\n%s", reason, allStacks)
 }
 
 func setActive() {

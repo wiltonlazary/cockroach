@@ -12,6 +12,7 @@ package batcheval
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/spanset"
@@ -29,12 +30,13 @@ func declareKeysConditionalPut(
 	header *roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
+	maxOffset time.Duration,
 ) {
 	args := req.(*roachpb.ConditionalPutRequest)
 	if args.Inline {
-		DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans)
+		DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	} else {
-		DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans)
+		DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	}
 }
 
@@ -52,22 +54,14 @@ func ConditionalPut(
 		ts = h.Timestamp
 	}
 
-	var expVal []byte
-	if len(args.ExpBytes) != 0 {
-		expVal = args.ExpBytes
-	} else {
-		// Compatibility with 20.1 requests.
-		if args.DeprecatedExpValue != nil {
-			expVal = args.DeprecatedExpValue.TagAndDataBytes()
-		}
-	}
-
 	handleMissing := storage.CPutMissingBehavior(args.AllowIfDoesNotExist)
 	var err error
 	if args.Blind {
-		err = storage.MVCCBlindConditionalPut(ctx, readWriter, cArgs.Stats, args.Key, ts, args.Value, expVal, handleMissing, h.Txn)
+		err = storage.MVCCBlindConditionalPut(
+			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
 	} else {
-		err = storage.MVCCConditionalPut(ctx, readWriter, cArgs.Stats, args.Key, ts, args.Value, expVal, handleMissing, h.Txn)
+		err = storage.MVCCConditionalPut(
+			ctx, readWriter, cArgs.Stats, args.Key, ts, cArgs.Now, args.Value, args.ExpBytes, handleMissing, h.Txn)
 	}
 	// NB: even if MVCC returns an error, it may still have written an intent
 	// into the batch. This allows callers to consume errors like WriteTooOld

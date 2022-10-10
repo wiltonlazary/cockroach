@@ -19,12 +19,11 @@ import (
 )
 
 // ValidateName validates a name.
-func ValidateName(name, typ string) error {
-	if len(name) == 0 {
-		return pgerror.Newf(pgcode.Syntax, "empty %s name", typ)
+func ValidateName(desc Descriptor) error {
+	if len(desc.GetName()) > 0 {
+		return nil
 	}
-	// TODO(pmattis): Do we want to be more restrictive than this?
-	return nil
+	return pgerror.Newf(pgcode.Syntax, "empty %s name", desc.DescriptorType())
 }
 
 type inactiveDescriptorError struct {
@@ -149,6 +148,24 @@ func AsTypeDescriptor(desc Descriptor) (TypeDescriptor, error) {
 	return typ, nil
 }
 
+// AsFunctionDescriptor tries to case a descriptor to a FunctionDescriptor.
+// Returns a
+func AsFunctionDescriptor(desc Descriptor) (FunctionDescriptor, error) {
+	typ, ok := desc.(FunctionDescriptor)
+	if !ok {
+		if desc == nil {
+			return nil, NewDescriptorTypeError(desc)
+		}
+		return nil, WrapFunctionDescRefErr(desc.GetID(), NewDescriptorTypeError(desc))
+	}
+	return typ, nil
+}
+
+// WrapDescRefErr wraps an error pertaining to a descriptor id.
+func WrapDescRefErr(id descpb.ID, err error) error {
+	return errors.Wrapf(err, "referenced descriptor ID %d", errors.Safe(id))
+}
+
 // WrapDatabaseDescRefErr wraps an error pertaining to a database descriptor id.
 func WrapDatabaseDescRefErr(id descpb.ID, err error) error {
 	return errors.Wrapf(err, "referenced database ID %d", errors.Safe(id))
@@ -169,15 +186,41 @@ func WrapTypeDescRefErr(id descpb.ID, err error) error {
 	return errors.Wrapf(err, "referenced type ID %d", errors.Safe(id))
 }
 
+// WrapFunctionDescRefErr wraps an error pertaining to a function descriptor id.
+func WrapFunctionDescRefErr(id descpb.ID, err error) error {
+	return errors.Wrapf(err, "referenced function ID %d", errors.Safe(id))
+}
+
 // NewMutableAccessToVirtualSchemaError is returned when trying to mutably
 // access a virtual schema object.
-func NewMutableAccessToVirtualSchemaError(entry VirtualSchema, object string) error {
-	switch entry.Desc().GetName() {
+func NewMutableAccessToVirtualSchemaError(schema SchemaDescriptor) error {
+	switch schema.SchemaKind() {
+	case SchemaPublic:
+		return pgerror.New(pgcode.InsufficientPrivilege,
+			"descriptorless public schema cannot be modified")
+	case SchemaTemporary:
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"%s is a temporary schema and cannot be modified", tree.ErrNameString(schema.GetName()))
+	case SchemaVirtual:
+		if schema.GetName() == "pg_catalog" {
+			return pgerror.New(pgcode.InsufficientPrivilege, "pg_catalog is a system catalog")
+		}
+		return pgerror.Newf(pgcode.InsufficientPrivilege,
+			"%s is a virtual schema and cannot be modified", tree.ErrNameString(schema.GetName()))
+	}
+	return errors.AssertionFailedf("schema %q (%d) of kind %d is not virtual",
+		schema.GetName(), schema.GetID(), schema.SchemaKind())
+}
+
+// NewMutableAccessToVirtualObjectError is returned when trying to mutably
+// access a virtual schema object.
+func NewMutableAccessToVirtualObjectError(schema VirtualSchema, object VirtualObject) error {
+	switch schema.Desc().GetName() {
 	case "pg_catalog":
 		return pgerror.Newf(pgcode.InsufficientPrivilege,
-			"%s is a system catalog", tree.ErrNameString(object))
+			"%s is a system catalog", tree.ErrNameString(object.Desc().GetName()))
 	default:
 		return pgerror.Newf(pgcode.WrongObjectType,
-			"%s is a virtual object and cannot be modified", tree.ErrNameString(object))
+			"%s is a virtual object and cannot be modified", tree.ErrNameString(object.Desc().GetName()))
 	}
 }

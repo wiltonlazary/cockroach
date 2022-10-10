@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/sentry-go"
+	sentry "github.com/getsentry/sentry-go"
 )
 
 // The call stack here is usually:
@@ -198,7 +198,7 @@ func PanicAsError(depth int, r interface{}) error {
 // Non-release builds wishing to use Sentry reports
 // are invited to use the following URL instead:
 //
-//   https://ignored@errors.cockroachdb.com/api/sentrydev/v2/1111
+//	https://ignored@errors.cockroachdb.com/api/sentrydev/v2/1111
 //
 // This can be set via e.g. the env var COCKROACH_CRASH_REPORTS.
 // Note that the special number "1111" is important as it
@@ -246,6 +246,8 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 			"distribution": info.Distribution,
 			"rev":          info.Revision,
 			"goversion":    info.GoVersion,
+			"buildchannel": info.Channel,
+			"envchannel":   info.EnvChannel,
 		})
 	})
 }

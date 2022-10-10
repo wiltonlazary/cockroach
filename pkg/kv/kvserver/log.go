@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -79,8 +79,12 @@ func (s *Store) insertRangeLogEvent(
 		s.metrics.RangeRemoves.Inc(1)
 	}
 
+	if !s.cfg.LogRangeAndNodeEvents || !logRangeAndNodeEventsEnabled.Get(&s.ClusterSettings().SV) {
+		return nil
+	}
+
 	rows, err := s.cfg.SQLExecutor.ExecEx(ctx, "log-range-event", txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		insertEventTableStmt, args...)
 	if err != nil {
 		return err
@@ -94,15 +98,9 @@ func (s *Store) insertRangeLogEvent(
 // logSplit logs a range split event into the event table. The affected range is
 // the range which previously existed and is being split in half; the "other"
 // range is the new range which is being created.
-//
-// TODO(mrtracy): There are several different reasons that a range split
-// could occur, and that information should be logged.
 func (s *Store) logSplit(
-	ctx context.Context, txn *kv.Txn, updatedDesc, newDesc roachpb.RangeDescriptor,
+	ctx context.Context, txn *kv.Txn, updatedDesc, newDesc roachpb.RangeDescriptor, reason string,
 ) error {
-	if !s.cfg.LogRangeEvents {
-		return nil
-	}
 	return s.insertRangeLogEvent(ctx, txn, kvserverpb.RangeLogEvent{
 		Timestamp:    selectEventTimestamp(s, txn.ReadTimestamp()),
 		RangeID:      updatedDesc.RangeID,
@@ -112,6 +110,7 @@ func (s *Store) logSplit(
 		Info: &kvserverpb.RangeLogEvent_Info{
 			UpdatedDesc: &updatedDesc,
 			NewDesc:     &newDesc,
+			Details:     reason,
 		},
 	})
 }
@@ -124,9 +123,6 @@ func (s *Store) logSplit(
 func (s *Store) logMerge(
 	ctx context.Context, txn *kv.Txn, updatedLHSDesc, rhsDesc roachpb.RangeDescriptor,
 ) error {
-	if !s.cfg.LogRangeEvents {
-		return nil
-	}
 	return s.insertRangeLogEvent(ctx, txn, kvserverpb.RangeLogEvent{
 		Timestamp:    selectEventTimestamp(s, txn.ReadTimestamp()),
 		RangeID:      updatedLHSDesc.RangeID,
@@ -153,10 +149,6 @@ func (s *Store) logChange(
 	reason kvserverpb.RangeLogEventReason,
 	details string,
 ) error {
-	if !s.cfg.LogRangeEvents {
-		return nil
-	}
-
 	var logType kvserverpb.RangeLogEventType
 	var info kvserverpb.RangeLogEvent_Info
 	switch changeType {

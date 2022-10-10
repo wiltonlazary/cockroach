@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
@@ -7,19 +8,25 @@ go_test(
         "file_table_read_writer_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=295s"],
     deps = [
         "//pkg/cloud/userfile/filetable",
         "//pkg/kv",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
+        "//pkg/security/username",
         "//pkg/server",
         "//pkg/sql",
+        "//pkg/sql/sqlutil",
         "//pkg/sql/tests",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
+        "//pkg/util/ioctx",
         "//pkg/util/leaktest",
         "//pkg/util/randutil",
         "@com_github_cockroachdb_errors//oserror",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

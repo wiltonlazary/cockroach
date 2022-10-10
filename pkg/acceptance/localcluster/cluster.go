@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"go/build"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/url"
@@ -34,11 +33,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -268,15 +266,16 @@ func (c *Cluster) RPCPort(nodeIdx int) string {
 
 func (c *Cluster) makeNode(ctx context.Context, nodeIdx int, cfg NodeConfig) (*Node, <-chan error) {
 	baseCtx := &base.Config{
-		User:     security.NodeUserName(),
+		User:     username.NodeUserName(),
 		Insecure: true,
 	}
 	rpcCtx := rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   baseCtx,
-		Clock:    hlc.NewClock(hlc.UnixNano, 0),
-		Stopper:  c.stopper,
-		Settings: cluster.MakeTestingClusterSettings(),
+		TenantID:  roachpb.SystemTenantID,
+		Config:    baseCtx,
+		Clock:     &timeutil.DefaultTimeSource{},
+		MaxOffset: 0,
+		Stopper:   c.stopper,
+		Settings:  cluster.MakeTestingClusterSettings(),
 	})
 
 	n := &Node{
@@ -664,7 +663,7 @@ func (n *Node) httpAddrFile() string {
 }
 
 func readFileOrEmpty(f string) string {
-	c, err := ioutil.ReadFile(f)
+	c, err := os.ReadFile(f)
 	if err != nil {
 		if !oserror.IsNotExist(err) {
 			panic(err)
@@ -710,7 +709,7 @@ func (n *Node) waitUntilLive(dur time.Duration) error {
 			return nil
 		}
 
-		urlBytes, err := ioutil.ReadFile(n.listeningURLFile())
+		urlBytes, err := os.ReadFile(n.listeningURLFile())
 		if err != nil {
 			log.Infof(ctx, "%v", err)
 			continue

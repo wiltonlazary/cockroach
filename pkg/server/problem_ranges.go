@@ -26,6 +26,10 @@ func (s *statusServer) ProblemRanges(
 ) (*serverpb.ProblemRangesResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
+	if err := s.privilegeChecker.requireViewClusterMetadataPermission(ctx); err != nil {
+		return nil, err
+	}
+
 	response := &serverpb.ProblemRangesResponse{
 		NodeID:           s.gossip.NodeID.Get(),
 		ProblemsByNodeID: make(map[roachpb.NodeID]serverpb.ProblemRangesResponse_NodeProblems),
@@ -129,6 +133,14 @@ func (s *statusServer) ProblemRanges(
 					problems.RaftLogTooLargeRangeIDs =
 						append(problems.RaftLogTooLargeRangeIDs, info.State.Desc.RangeID)
 				}
+				if info.Problems.CircuitBreakerError {
+					problems.CircuitBreakerErrorRangeIDs =
+						append(problems.CircuitBreakerErrorRangeIDs, info.State.Desc.RangeID)
+				}
+				if info.Problems.PausedFollowers {
+					problems.PausedReplicaIDs =
+						append(problems.PausedReplicaIDs, info.State.Desc.RangeID)
+				}
 			}
 			sort.Sort(roachpb.RangeIDSlice(problems.UnavailableRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.RaftLeaderNotLeaseHolderRangeIDs))
@@ -138,6 +150,8 @@ func (s *statusServer) ProblemRanges(
 			sort.Sort(roachpb.RangeIDSlice(problems.OverreplicatedRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.QuiescentEqualsTickingRangeIDs))
 			sort.Sort(roachpb.RangeIDSlice(problems.RaftLogTooLargeRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.CircuitBreakerErrorRangeIDs))
+			sort.Sort(roachpb.RangeIDSlice(problems.PausedReplicaIDs))
 			response.ProblemsByNodeID[resp.nodeID] = problems
 		case <-ctx.Done():
 			return nil, status.Errorf(codes.DeadlineExceeded, ctx.Err().Error())

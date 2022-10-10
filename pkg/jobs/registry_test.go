@@ -22,16 +22,17 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
@@ -81,7 +82,7 @@ func writeMutation(
 ) {
 	tableDesc.Mutations = append(tableDesc.Mutations, m)
 	tableDesc.Version++
-	if err := catalog.ValidateSelf(tableDesc); err != nil {
+	if err := descbuilder.ValidateSelf(tableDesc, clusterversion.TestingClusterVersion); err != nil {
 		t.Fatal(err)
 	}
 	if err := kvDB.Put(
@@ -93,38 +94,16 @@ func writeMutation(
 	}
 }
 
-func writeGCMutation(
-	t *testing.T,
-	kvDB *kv.DB,
-	tableDesc *tabledesc.Mutable,
-	m descpb.TableDescriptor_GCDescriptorMutation,
-) {
-	tableDesc.GCMutations = append(tableDesc.GCMutations, m)
-	tableDesc.Version++
-	if err := catalog.ValidateSelf(tableDesc); err != nil {
-		t.Fatal(err)
-	}
-	if err := kvDB.Put(
-		context.Background(),
-		catalogkeys.MakeDescMetadataKey(keys.SystemSQLCodec, tableDesc.GetID()),
-		tableDesc.DescriptorProto(),
-	); err != nil {
-		t.Fatal(err)
-	}
-}
-
 type mutationOptions struct {
 	// Set if the desc should have any mutations of any sort.
 	hasMutation bool
-	// Set if the mutation being inserted is a GCMutation.
-	hasGCMutation bool
 	// Set if the desc should have a job that is dropping it.
 	hasDropJob bool
 }
 
 func (m mutationOptions) string() string {
-	return fmt.Sprintf("hasMutation=%s_hasGCMutation=%s_hasDropJob=%s",
-		strconv.FormatBool(m.hasMutation), strconv.FormatBool(m.hasGCMutation),
+	return fmt.Sprintf("hasMutation=%s_hasDropJob=%s",
+		strconv.FormatBool(m.hasMutation),
 		strconv.FormatBool(m.hasDropJob))
 }
 
@@ -153,7 +132,7 @@ func TestRegistryGC(t *testing.T) {
 	muchEarlier := ts.Add(-2 * time.Hour)
 
 	setDropJob := func(dbName, tableName string) {
-		desc := catalogkv.TestingGetMutableExistingTableDescriptor(
+		desc := desctestutils.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, dbName, tableName)
 		desc.DropJobID = 123
 		if err := kvDB.Put(
@@ -172,25 +151,21 @@ func TestRegistryGC(t *testing.T) {
 	writeJob := func(name string, created, finished time.Time, status Status, mutOptions mutationOptions) string {
 		tableName := constructTableName(name, mutOptions)
 		if _, err := sqlDB.Exec(fmt.Sprintf(`
-CREATE DATABASE IF NOT EXISTS t; 
+CREATE DATABASE IF NOT EXISTS t;
 CREATE TABLE t."%s" (k VARCHAR PRIMARY KEY DEFAULT 'default', v VARCHAR,i VARCHAR NOT NULL DEFAULT 'i');
 INSERT INTO t."%s" VALUES('a', 'foo');
 `, tableName, tableName)); err != nil {
 			t.Fatal(err)
 		}
-		tableDesc := catalogkv.TestingGetMutableExistingTableDescriptor(
+		tableDesc := desctestutils.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", tableName)
 		if mutOptions.hasDropJob {
 			setDropJob("t", tableName)
 		}
 		if mutOptions.hasMutation {
 			writeColumnMutation(t, kvDB, tableDesc, "i", descpb.DescriptorMutation{State: descpb.
-				DescriptorMutation_DELETE_AND_WRITE_ONLY, Direction: descpb.DescriptorMutation_DROP})
+				DescriptorMutation_WRITE_ONLY, Direction: descpb.DescriptorMutation_DROP})
 		}
-		if mutOptions.hasGCMutation {
-			writeGCMutation(t, kvDB, tableDesc, descpb.TableDescriptor_GCDescriptorMutation{})
-		}
-
 		payload, err := protoutil.Marshal(&jobspb.Payload{
 			Description: name,
 			// register a mutation on the table so that jobs that reference
@@ -222,58 +197,54 @@ INSERT INTO t."%s" VALUES('a', 'foo');
 
 	// Test the descriptor when any of the following are set.
 	// 1. Mutations
-	// 2. GC Mutations
-	// 3. A drop job
+	// 2. A drop job
 	for _, hasMutation := range []bool{true, false} {
-		for _, hasGCMutation := range []bool{true, false} {
-			for _, hasDropJob := range []bool{true, false} {
-				if !hasMutation && !hasGCMutation && !hasDropJob {
-					continue
-				}
-				mutOptions := mutationOptions{
-					hasMutation:   hasMutation,
-					hasGCMutation: hasGCMutation,
-					hasDropJob:    hasDropJob,
-				}
-				oldRunningJob := writeJob("old_running", muchEarlier, time.Time{}, StatusRunning, mutOptions)
-				oldSucceededJob := writeJob("old_succeeded", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded, mutOptions)
-				oldFailedJob := writeJob("old_failed", muchEarlier, muchEarlier.Add(time.Minute),
-					StatusFailed, mutOptions)
-				oldRevertFailedJob := writeJob("old_revert_failed", muchEarlier, muchEarlier.Add(time.Minute),
-					StatusRevertFailed, mutOptions)
-				oldCanceledJob := writeJob("old_canceled", muchEarlier, muchEarlier.Add(time.Minute),
-					StatusCanceled, mutOptions)
-				newRunningJob := writeJob("new_running", earlier, earlier.Add(time.Minute), StatusRunning,
-					mutOptions)
-				newSucceededJob := writeJob("new_succeeded", earlier, earlier.Add(time.Minute), StatusSucceeded, mutOptions)
-				newFailedJob := writeJob("new_failed", earlier, earlier.Add(time.Minute), StatusFailed, mutOptions)
-				newRevertFailedJob := writeJob("new_revert_failed", earlier, earlier.Add(time.Minute), StatusRevertFailed, mutOptions)
-				newCanceledJob := writeJob("new_canceled", earlier, earlier.Add(time.Minute),
-					StatusCanceled, mutOptions)
-
-				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-					{oldRunningJob}, {oldSucceededJob}, {oldFailedJob}, {oldRevertFailedJob}, {oldCanceledJob},
-					{newRunningJob}, {newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
-
-				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
-					t.Fatal(err)
-				}
-				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-					{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newSucceededJob},
-					{newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
-
-				if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
-					t.Fatal(err)
-				}
-				db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
-					{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newRevertFailedJob}})
-
-				// Delete the revert failed, and running jobs for the next run of the
-				// test.
-				_, err := sqlDB.Exec(`DELETE FROM system.jobs WHERE id = $1 OR id = $2 OR id = $3 OR id = $4`,
-					oldRevertFailedJob, newRevertFailedJob, oldRunningJob, newRunningJob)
-				require.NoError(t, err)
+		for _, hasDropJob := range []bool{true, false} {
+			if !hasMutation && !hasDropJob {
+				continue
 			}
+			mutOptions := mutationOptions{
+				hasMutation: hasMutation,
+				hasDropJob:  hasDropJob,
+			}
+			oldRunningJob := writeJob("old_running", muchEarlier, time.Time{}, StatusRunning, mutOptions)
+			oldSucceededJob := writeJob("old_succeeded", muchEarlier, muchEarlier.Add(time.Minute), StatusSucceeded, mutOptions)
+			oldFailedJob := writeJob("old_failed", muchEarlier, muchEarlier.Add(time.Minute),
+				StatusFailed, mutOptions)
+			oldRevertFailedJob := writeJob("old_revert_failed", muchEarlier, muchEarlier.Add(time.Minute),
+				StatusRevertFailed, mutOptions)
+			oldCanceledJob := writeJob("old_canceled", muchEarlier, muchEarlier.Add(time.Minute),
+				StatusCanceled, mutOptions)
+			newRunningJob := writeJob("new_running", earlier, earlier.Add(time.Minute), StatusRunning,
+				mutOptions)
+			newSucceededJob := writeJob("new_succeeded", earlier, earlier.Add(time.Minute), StatusSucceeded, mutOptions)
+			newFailedJob := writeJob("new_failed", earlier, earlier.Add(time.Minute), StatusFailed, mutOptions)
+			newRevertFailedJob := writeJob("new_revert_failed", earlier, earlier.Add(time.Minute), StatusRevertFailed, mutOptions)
+			newCanceledJob := writeJob("new_canceled", earlier, earlier.Add(time.Minute),
+				StatusCanceled, mutOptions)
+
+			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+				{oldRunningJob}, {oldSucceededJob}, {oldFailedJob}, {oldRevertFailedJob}, {oldCanceledJob},
+				{newRunningJob}, {newSucceededJob}, {newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
+
+			if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, earlier); err != nil {
+				t.Fatal(err)
+			}
+			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+				{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newSucceededJob},
+				{newFailedJob}, {newRevertFailedJob}, {newCanceledJob}})
+
+			if err := s.JobRegistry().(*Registry).cleanupOldJobs(ctx, ts.Add(time.Minute*-10)); err != nil {
+				t.Fatal(err)
+			}
+			db.CheckQueryResults(t, `SELECT id FROM system.jobs ORDER BY id`, [][]string{
+				{oldRunningJob}, {oldRevertFailedJob}, {newRunningJob}, {newRevertFailedJob}})
+
+			// Delete the revert failed, and running jobs for the next run of the
+			// test.
+			_, err := sqlDB.Exec(`DELETE FROM system.jobs WHERE id = $1 OR id = $2 OR id = $3 OR id = $4`,
+				oldRevertFailedJob, newRevertFailedJob, oldRunningJob, newRunningJob)
+			require.NoError(t, err)
 		}
 	}
 }
@@ -352,7 +323,7 @@ func TestBatchJobsCreation(t *testing.T) {
 							return nil
 						},
 					}
-				})
+				}, UsesTenantCostControl)
 
 				// Create a batch of job specifications.
 				var records []*Record
@@ -479,9 +450,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 		// We initialize the clock with Now() because the job-creation timestamp,
 		// 'created' column in system.jobs, of a new job is set from txn's time.
 		bti.clock = timeutil.NewManualTime(timeutil.Now())
-		timeSource := hlc.NewClock(func() int64 {
-			return bti.clock.Now().UnixNano()
-		}, base.DefaultMaxClockOffset)
+		timeSource := hlc.NewClock(bti.clock, base.DefaultMaxClockOffset)
 		// Set up the test cluster.
 		knobs := &TestingKnobs{
 			TimeSource: timeSource,
@@ -543,7 +512,7 @@ func TestRetriesWithExponentialBackoff(t *testing.T) {
 					return <-bti.errCh
 				},
 			}
-		})
+		}, UsesTenantCostControl)
 		return cleanup
 	}
 
@@ -816,7 +785,7 @@ func TestExponentialBackoffSettings(t *testing.T) {
 			// Create and run a dummy job.
 			RegisterConstructor(jobspb.TypeImport, func(_ *Job, cs *cluster.Settings) Resumer {
 				return FakeResumer{}
-			})
+			}, UsesTenantCostControl)
 			registry := s.JobRegistry().(*Registry)
 			id := registry.MakeJobID()
 			require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -965,7 +934,7 @@ func TestRunWithoutLoop(t *testing.T) {
 				return nil
 			},
 		}
-	})
+	}, UsesTenantCostControl)
 
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettings()
@@ -982,7 +951,7 @@ func TestRunWithoutLoop(t *testing.T) {
 		records = append(records, &Record{
 			JobID:       r.MakeJobID(),
 			Description: "testing",
-			Username:    security.RootUserName(),
+			Username:    username.RootUserName(),
 			Details:     jobspb.ImportDetails{},
 			Progress:    jobspb.ImportProgress{},
 		})
@@ -1001,4 +970,177 @@ func TestRunWithoutLoop(t *testing.T) {
 	require.Equal(t, int64(0), r.metrics.AdoptIterations.Count())
 	require.Equal(t, int64(N), atomic.LoadInt64(&ran))
 	require.Equal(t, int64(N/2), atomic.LoadInt64(&failure))
+}
+
+func TestJobIdleness(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx := context.Background()
+	intervalOverride := time.Millisecond
+	s, sqlDB, kvDB := serverutils.StartServer(t, base.TestServerArgs{
+		// Ensure no other jobs are created and adoptions and cancellations are quick
+		Knobs: base.TestingKnobs{
+			SpanConfig: &spanconfig.TestingKnobs{
+				ManagerDisableJobCreation: true,
+			},
+			JobsTestingKnobs: &TestingKnobs{
+				IntervalOverrides: TestingIntervalOverrides{
+					Adopt:  &intervalOverride,
+					Cancel: &intervalOverride,
+				},
+			},
+		},
+	})
+	defer s.Stopper().Stop(ctx)
+
+	r := s.JobRegistry().(*Registry)
+
+	resumeStartChan := make(chan struct{})
+	resumeErrChan := make(chan error)
+	defer close(resumeErrChan)
+	RegisterConstructor(jobspb.TypeImport, func(_ *Job, cs *cluster.Settings) Resumer {
+		return FakeResumer{
+			OnResume: func(ctx context.Context) error {
+				resumeStartChan <- struct{}{}
+				return <-resumeErrChan
+			},
+		}
+	}, UsesTenantCostControl)
+
+	currentlyIdle := r.MetricsStruct().JobMetrics[jobspb.TypeImport].CurrentlyIdle
+
+	createJob := func() *Job {
+		jobID := r.MakeJobID()
+		require.NoError(t, kvDB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			_, err := r.CreateJobWithTxn(ctx, Record{
+				Details:  jobspb.ImportDetails{},
+				Progress: jobspb.ImportProgress{},
+			}, jobID, txn)
+			return err
+		}))
+		job, err := r.LoadJob(ctx, jobID)
+		require.NoError(t, err)
+		<-resumeStartChan
+		return job
+	}
+
+	tdb := sqlutils.MakeSQLRunner(sqlDB)
+	waitUntilStatus := func(t *testing.T, jobID jobspb.JobID, status Status) {
+		tdb.CheckQueryResultsRetry(t,
+			fmt.Sprintf("SELECT status FROM [SHOW JOBS] WHERE job_id = %d", jobID),
+			[][]string{{string(status)}})
+	}
+
+	t.Run("MarkIdle", func(t *testing.T) {
+		job1 := createJob()
+		job2 := createJob()
+
+		require.False(t, r.TestingIsJobIdle(job1.ID()))
+		require.EqualValues(t, 2, r.metrics.RunningNonIdleJobs.Value())
+		r.MarkIdle(job1, true)
+		r.MarkIdle(job2, true)
+		require.True(t, r.TestingIsJobIdle(job1.ID()))
+		require.Equal(t, int64(2), currentlyIdle.Value())
+		require.EqualValues(t, 0, r.metrics.RunningNonIdleJobs.Value())
+
+		// Repeated calls should not increase metric
+		r.MarkIdle(job1, true)
+		r.MarkIdle(job1, true)
+		require.Equal(t, int64(2), currentlyIdle.Value())
+		require.EqualValues(t, 0, r.metrics.RunningNonIdleJobs.Value())
+
+		r.MarkIdle(job1, false)
+		require.Equal(t, int64(1), currentlyIdle.Value())
+		require.False(t, r.TestingIsJobIdle(job1.ID()))
+		require.EqualValues(t, 1, r.metrics.RunningNonIdleJobs.Value())
+		r.MarkIdle(job2, false)
+		require.Equal(t, int64(0), currentlyIdle.Value())
+		require.EqualValues(t, 2, r.metrics.RunningNonIdleJobs.Value())
+
+		// Let the jobs complete
+		resumeErrChan <- nil
+		resumeErrChan <- nil
+	})
+
+	t.Run("idleness disabled on state updates", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			update func(jobID jobspb.JobID)
+		}{
+			{"pause", func(jobID jobspb.JobID) {
+				resumeErrChan <- MarkPauseRequestError(errors.Errorf("pause error"))
+				waitUntilStatus(t, jobID, StatusPaused)
+			}},
+			{"succeeded", func(jobID jobspb.JobID) {
+				resumeErrChan <- nil
+				waitUntilStatus(t, jobID, StatusSucceeded)
+			}},
+			{"failed", func(jobID jobspb.JobID) {
+				resumeErrChan <- errors.Errorf("error")
+				waitUntilStatus(t, jobID, StatusFailed)
+			}},
+			{"cancel", func(jobID jobspb.JobID) {
+				resumeErrChan <- errJobCanceled
+				waitUntilStatus(t, jobID, StatusCanceled)
+			}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				job := createJob()
+
+				require.Equal(t, int64(0), currentlyIdle.Value())
+				r.MarkIdle(job, true)
+				require.Equal(t, int64(1), currentlyIdle.Value())
+
+				test.update(job.ID())
+
+				testutils.SucceedsSoon(t, func() error {
+					if r.TestingIsJobIdle(job.ID()) {
+						return errors.Errorf("waiting for job to unmark idle")
+					}
+					return nil
+				})
+				require.Equal(t, int64(0), currentlyIdle.Value())
+			})
+		}
+	})
+
+}
+
+// TestDisablingJobAdoptionClearsClaimSessionID tests that jobs adopted by a
+// registry for which job adoption has been disabled, have their
+// claim_session_id cleared prior to having their context cancelled. This will
+// allow other job registries in the cluster to claim and run this job.
+func TestDisablingJobAdoptionClearsClaimSessionID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	intervalOverride := time.Millisecond
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: &TestingKnobs{
+				DisableAdoptions: true,
+				IntervalOverrides: TestingIntervalOverrides{
+					Adopt:  &intervalOverride,
+					Cancel: &intervalOverride,
+				},
+			},
+		},
+	})
+	ctx := context.Background()
+	defer s.Stopper().Stop(ctx)
+	tdb := sqlutils.MakeSQLRunner(db)
+
+	r := s.JobRegistry().(*Registry)
+	session, err := r.sqlInstance.Session(ctx)
+	require.NoError(t, err)
+
+	// Insert a running job with a `claim_session_id` equal to our overridden test
+	// session.
+	tdb.Exec(t,
+		"INSERT INTO system.jobs (id, status, created, payload, claim_session_id) values ($1, $2, $3, 'test'::bytes, $4)",
+		1, StatusRunning, timeutil.Now(), session.ID(),
+	)
+
+	// We expect the adopt loop to clear the claim session since job adoption is
+	// disabled on this registry.
+	tdb.CheckQueryResultsRetry(t, `SELECT claim_session_id FROM system.jobs WHERE id = 1`, [][]string{{"NULL"}})
 }

@@ -9,6 +9,7 @@ load("//build/bazelutil/staticcheckanalyzers:def.bzl", "STATICCHECK_CHECKS")
 exports_files([
     "DEPS.bzl",
     "TEAMS.yaml",
+    "WORKSPACE",
     "go.mod",
     "go.sum",
 ])
@@ -25,7 +26,7 @@ exports_files([
 #
 # gazelle:prefix github.com/cockroachdb/cockroach
 # gazelle:build_file_name BUILD.bazel
-# gazelle:build_tags bazel,fast_int_set_small,fast_int_set_large,gss
+# gazelle:build_tags bazel,compose,deadlock,fast_int_set_small,fast_int_set_large,gss,slow
 
 # Enable protobuf generation.
 #
@@ -46,44 +47,30 @@ exports_files([
 # gazelle:resolve proto proto gogoproto/gogo.proto @com_github_gogo_protobuf//gogoproto:gogo_proto
 # gazelle:resolve proto go gogoproto/gogo.proto @com_github_gogo_protobuf//gogoproto
 # gazelle:resolve proto go google/api/annotations.proto @org_golang_google_genproto//googleapis/api/annotations:go_default_library
-# gazelle:resolve proto io/prometheus/client/metrics.proto @com_github_prometheus_client_model//io/prometheus/client:client_proto
+# gazelle:resolve proto io/prometheus/client/metrics.proto @com_github_prometheus_client_model//io/prometheus/client:io_prometheus_client_proto
 # gazelle:resolve proto go io/prometheus/client/metrics.proto @com_github_prometheus_client_model//go
 # gazelle:resolve go github.com/prometheus/client_model/go @com_github_prometheus_client_model//go
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl @cockroach//pkg/ccl/gssapiccl
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cli_test @cockroach//pkg/cli:cli_test
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/sql/colflow_test @cockroach//pkg/sql/colflow:colflow_test
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/caller_test @cockroach//pkg/util/caller:caller_test
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/json_test @cockroach//pkg/util/json:json_test
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/ccl/gssapiccl //pkg/ccl/gssapiccl
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cli_test //pkg/cli:cli_test
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/sql/colflow_test //pkg/sql/colflow:colflow_test
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/caller_test //pkg/util/caller:caller_test
+# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/util/json_test //pkg/util/json:json_test
 # gazelle:resolve go google.golang.org/genproto/googleapis/pubsub/v1 @org_golang_google_genproto//googleapis/pubsub/v1:pubsub
-
-# These packages use github.com/golang/mock to generate mocks. The target
-# generating mocks for a given package necessarily depends on the package's
-# go_library target, which then prevents us from including those mock symbols
-# as part of the package's go_library target. We consequently export a second
-# target, embedding the first but also including the mock symbols. We need to
-# tell gazelle to resolve to this second target instead. See
-# pkg/kv/kvclient/rangefeed/BUILD.bazel for an annotated example.
-#
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cmd/roachtest/prometheus //pkg/cmd/roachtest/prometheus:with-mocks
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/cmd/roachtest/tests //pkg/cmd/roachtest/tests:with-mocks
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/roachpb //pkg/roachpb:with-mocks
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord //pkg/kv/kvclient/kvcoord:with-mocks
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed //pkg/kv/kvclient/rangefeed:with-mocks
-# gazelle:resolve go github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache //pkg/kv/kvclient/rangecache:with-mocks
+# gazelle:resolve go google.golang.org/genproto/googleapis/cloud/kms/v1 @org_golang_google_genproto//googleapis/cloud/kms/v1:kms
 
 # See pkg/roachpb/gen/BUILD.bazel for more details.
 #
-# gazelle:resolve proto go roachpb/api.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/app_stats.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/data.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/errors.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/index_usage_stats.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/internal.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/internal_raft.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/io-formats.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/metadata.proto //pkg/roachpb:with-mocks
-# gazelle:resolve proto go roachpb/span_config.proto //pkg/roachpb:with-mocks
-# gazelle:exclude pkg/roachpb/batch_generated-gen.go
+# gazelle:resolve proto go roachpb/api.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/app_stats.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/data.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/errors.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/index_usage_stats.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/internal.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/internal_raft.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/io-formats.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/metadata.proto //pkg/roachpb
+# gazelle:resolve proto go roachpb/span_config.proto //pkg/roachpb
+# gazelle:exclude pkg/roachpb/batch_generated.go
 
 # See pkg/sql/opt/optgen/cmd/langgen/BUILD.bazel for more details.
 #
@@ -111,16 +98,21 @@ exports_files([
 # gazelle:exclude pkg/ui/node_modules
 # gazelle:exclude pkg/ui/workspaces/cluster-ui/node_modules
 # gazelle:exclude pkg/ui/workspaces/db-console/node_modules
+# gazelle:exclude pkg/ui/workspaces/db-console/src/js/node_modules
+# gazelle:exclude pkg/ui/workspaces/e2e-tests/node_modules
+# gazelle:exclude pkg/ui/workspaces/eslint-plugin-crdb/node_modules
 # gazelle:exclude vendor
 # gazelle:exclude .vendor.tmp.*
 # gazelle:exclude **/zcgo_flags.go
 # gazelle:exclude **/zcgo_flags_*.go
 # gazelle:exclude **/*.og.go
 # gazelle:exclude **/*.eg.go
+# gazelle:exclude **/*.pb.go
 # gazelle:exclude **/*.pb.gw.go
 # gazelle:exclude **/*_interval_btree.go
 # gazelle:exclude **/*_interval_btree_test.go
 # gazelle:exclude **/*_generated.go
+# gazelle:exclude **/*_generated_test.go
 # gazelle:exclude pkg/sql/parser/sql.go
 # gazelle:exclude pkg/sql/parser/helpmap_test.go
 # gazelle:exclude pkg/sql/parser/help_messages.go
@@ -135,7 +127,6 @@ exports_files([
 # gazelle:exclude pkg/**/*_string.go
 # gazelle:exclude pkg/ui/distccl/distccl_no_bazel.go
 # gazelle:exclude pkg/ui/distoss/distoss_no_bazel.go
-# gazelle:exclude pkg/util/buildutil/crdb_test_dyn.go
 # gazelle:exclude pkg/util/buildutil/crdb_test_off.go
 # gazelle:exclude pkg/util/buildutil/crdb_test_on.go
 # gazelle:exclude pkg/acceptance/compose/gss/psql/*
@@ -156,8 +147,7 @@ nogo(
     config = "//build/bazelutil:nogo_config.json",
     visibility = ["//visibility:public"],
     deps = select({
-        "//build/toolchains:nonogo": [],
-        "//conditions:default": [
+        "//build/toolchains:nogo": [
             "@org_golang_x_tools//go/analysis/passes/asmdecl:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/assign:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/atomic:go_default_library",
@@ -182,9 +172,6 @@ nogo(
             "@org_golang_x_tools//go/analysis/passes/nilness:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/pkgfact:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/printf:go_default_library",
-            # TODO(ricky): we do want to run the shadow check, we just want to exclude
-            # shadows of the variable "err". Presumably we can hack around this. #73069
-            # "@org_golang_x_tools//go/analysis/passes/shadow:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/shift:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/sortslice:go_default_library",
             "@org_golang_x_tools//go/analysis/passes/stdmethods:go_default_library",
@@ -201,25 +188,20 @@ nogo(
             "//pkg/testutils/lint/passes/errcmp",
             "//pkg/testutils/lint/passes/errwrap",
             "//pkg/testutils/lint/passes/fmtsafe",
+            "//pkg/testutils/lint/passes/generics",
             "//pkg/testutils/lint/passes/grpcclientconnclose",
             "//pkg/testutils/lint/passes/grpcstatuswithdetails",
             "//pkg/testutils/lint/passes/hash",
             "//pkg/testutils/lint/passes/leaktestcall",
+            "//pkg/testutils/lint/passes/loopvarcapture",
             "//pkg/testutils/lint/passes/nilness",
             "//pkg/testutils/lint/passes/nocopy",
+            "//pkg/testutils/lint/passes/returncheck",
             "//pkg/testutils/lint/passes/returnerrcheck",
+            "//pkg/testutils/lint/passes/shadow",
             "//pkg/testutils/lint/passes/timer",
             "//pkg/testutils/lint/passes/unconvert",
         ] + STATICCHECK_CHECKS,
+        "//conditions:default": [],
     }),
-)
-
-go_path(
-    name = "go_path",
-    # TODO(ricky): change back to 'link' when possible, see
-    # https://github.com/cockroachdb/cockroach/issues/75094
-    mode = "copy",
-    deps = [
-        "//pkg/cmd/cockroach-short",
-    ],
 )

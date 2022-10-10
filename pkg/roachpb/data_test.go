@@ -12,6 +12,7 @@ package roachpb
 
 import (
 	"bytes"
+	"encoding/hex"
 	"math"
 	"math/rand"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -34,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -59,6 +62,17 @@ func makeSynTS(walltime int64, logical int32) hlc.Timestamp {
 		Logical:   logical,
 		Synthetic: true,
 	}
+}
+
+func TestKeyClone(t *testing.T) {
+	k := Key{0x01, 0x02, 0x03}
+	c := k.Clone()
+	require.Equal(t, k, c)
+
+	k[0] = 0xff
+	require.NotEqual(t, k, c)
+
+	require.Nil(t, Key(nil).Clone())
 }
 
 // TestKeyNext tests that the method for creating lexicographic
@@ -205,6 +219,27 @@ func TestNextKey(t *testing.T) {
 		if !c.key.Next().Equal(c.next) {
 			t.Fatalf("%d: unexpected next key for %q: %s", i, c.key, c.key.Next())
 		}
+	}
+}
+
+func TestPrevish(t *testing.T) {
+	const length = 4
+	testcases := []struct {
+		key    Key
+		expect Key
+	}{
+		{nil, nil},
+		{[]byte{}, []byte{}},
+		{[]byte{0x00}, []byte{}},
+		{[]byte{0x01, 0x00}, []byte{0x01}},
+		{[]byte{0x01}, []byte{0x00, 0xff, 0xff, 0xff}},
+		{[]byte{0x01, 0x01}, []byte{0x01, 0x00, 0xff, 0xff}},
+		{[]byte{0xff, 0xff, 0xff, 0xff}, []byte{0xff, 0xff, 0xff, 0xfe}},
+	}
+	for _, tc := range testcases {
+		t.Run(hex.EncodeToString(tc.key), func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.key.Prevish(length))
+		})
 	}
 }
 
@@ -739,14 +774,14 @@ func TestTransactionRefresh(t *testing.T) {
 // with the former and contains a subset of its protos.
 //
 // Assertions:
-// 1. Transaction->TransactionRecord->Transaction is lossless for the fields
-//    in TransactionRecord. It drops all other fields.
-// 2. TransactionRecord->Transaction->TransactionRecord is lossless.
-//    Fields not in TransactionRecord are set as zero values.
-// 3. Transaction messages can be decoded as TransactionRecord messages.
-//    Fields not in TransactionRecord are dropped.
-// 4. TransactionRecord messages can be decoded as Transaction messages.
-//    Fields not in TransactionRecord are decoded as zero values.
+//  1. Transaction->TransactionRecord->Transaction is lossless for the fields
+//     in TransactionRecord. It drops all other fields.
+//  2. TransactionRecord->Transaction->TransactionRecord is lossless.
+//     Fields not in TransactionRecord are set as zero values.
+//  3. Transaction messages can be decoded as TransactionRecord messages.
+//     Fields not in TransactionRecord are dropped.
+//  4. TransactionRecord messages can be decoded as Transaction messages.
+//     Fields not in TransactionRecord are decoded as zero values.
 func TestTransactionRecordRoundtrips(t *testing.T) {
 	// Verify that converting from a Transaction to a TransactionRecord
 	// strips out fields but is lossless for the desired fields.
@@ -960,8 +995,8 @@ func TestLeaseEquivalence(t *testing.T) {
 	stasis2 := Lease{Replica: r1, Start: ts1, Epoch: 1, DeprecatedStartStasis: ts2.ToTimestamp().Clone()}
 
 	r1Voter, r1Learner := r1, r1
-	r1Voter.Type = ReplicaTypeVoterFull()
-	r1Learner.Type = ReplicaTypeLearner()
+	r1Voter.Type = VOTER_FULL
+	r1Learner.Type = LEARNER
 	epoch1Voter := Lease{Replica: r1Voter, Start: ts1, Epoch: 1}
 	epoch1Learner := Lease{Replica: r1Learner, Start: ts1, Epoch: 1}
 
@@ -1780,14 +1815,10 @@ func TestUpdateObservedTimestamps(t *testing.T) {
 func TestChangeReplicasTrigger_String(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	vi := VOTER_INCOMING
-	vo := VOTER_OUTGOING
-	vd := VOTER_DEMOTING_LEARNER
-	l := LEARNER
-	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: &vi}
-	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: &vo}
-	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: &l}
-	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: &vd}
+	repl1 := ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3, Type: VOTER_INCOMING}
+	repl2 := ReplicaDescriptor{NodeID: 4, StoreID: 5, ReplicaID: 6, Type: VOTER_OUTGOING}
+	learner := ReplicaDescriptor{NodeID: 7, StoreID: 8, ReplicaID: 9, Type: LEARNER}
+	repl3 := ReplicaDescriptor{NodeID: 10, StoreID: 11, ReplicaID: 12, Type: VOTER_DEMOTING_LEARNER}
 	crt := ChangeReplicasTrigger{
 		InternalAddedReplicas:   []ReplicaDescriptor{repl1},
 		InternalRemovedReplicas: []ReplicaDescriptor{repl2, repl3},
@@ -1814,7 +1845,7 @@ func TestChangeReplicasTrigger_String(t *testing.T) {
 
 	crt.InternalRemovedReplicas = nil
 	crt.InternalAddedReplicas = nil
-	repl1.Type = ReplicaTypeVoterFull()
+	repl1.Type = VOTER_FULL
 	crt.Desc.SetReplicas(MakeReplicaSet([]ReplicaDescriptor{repl1, learner}))
 	act = crt.String()
 	require.Empty(t, crt.Added())
@@ -1845,7 +1876,7 @@ func TestChangeReplicasTrigger_ConfChange(t *testing.T) {
 			typ := alt[i].(ReplicaType)
 			id := alt[i+1].(int)
 			rDescs = append(rDescs, ReplicaDescriptor{
-				Type:      &typ,
+				Type:      typ,
 				NodeID:    NodeID(3 * id),
 				StoreID:   StoreID(2 * id),
 				ReplicaID: ReplicaID(id),
@@ -2049,6 +2080,74 @@ func TestTxnLocksAsLockUpdates(t *testing.T) {
 		require.Equal(t, txn.IgnoredSeqNums, intent.IgnoredSeqNums)
 		require.Equal(t, txn.TxnMeta, intent.Txn)
 	}
+}
+
+func TestLockStateInfoSafeFormat(t *testing.T) {
+	waiter1 := lock.Waiter{
+		WaitingTxn: &enginepb.TxnMeta{
+			Key:               Key("foo"),
+			ID:                uuid.NamespaceDNS,
+			Epoch:             2,
+			WriteTimestamp:    hlc.Timestamp{Logical: 3},
+			MinTimestamp:      hlc.Timestamp{Logical: 3},
+			Priority:          10,
+			Sequence:          456,
+			CoordinatorNodeID: 3,
+		},
+		ActiveWaiter: true,
+		Strength:     lock.Exclusive,
+		WaitDuration: 135 * time.Second,
+	}
+	waiter2 := lock.Waiter{
+		WaitingTxn:   nil,
+		ActiveWaiter: false,
+		Strength:     lock.None,
+		WaitDuration: 17 * time.Millisecond,
+	}
+
+	holder := &enginepb.TxnMeta{
+		Key:               Key("a"),
+		ID:                uuid.Must(uuid.FromString("deadbeef-0000-0000-0000-000000000000")),
+		Epoch:             0,
+		WriteTimestamp:    hlc.Timestamp{Logical: 1},
+		MinTimestamp:      hlc.Timestamp{Logical: 1},
+		Priority:          100,
+		Sequence:          123,
+		CoordinatorNodeID: 1,
+	}
+	lockStateInfo := &LockStateInfo{
+		RangeID:      35,
+		Key:          Key("bar"),
+		LockHolder:   holder,
+		Durability:   lock.Unreplicated,
+		HoldDuration: 5 * time.Minute,
+		Waiters:      []lock.Waiter{waiter1, waiter2},
+	}
+
+	require.EqualValues(t,
+		"range_id=35 key=\"bar\" holder=deadbeef durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprint(lockStateInfo).StripMarkers())
+	require.EqualValues(t,
+		"range_id=35 key=\"bar\" holder=deadbeef-0000-0000-0000-000000000000 durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810-9dad-11d1-80b4-00c04fd430c8 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprintf("%+v", lockStateInfo).StripMarkers())
+	require.EqualValues(t,
+		"range_id=35 key=‹×› holder=deadbeef durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:6ba7b810 active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprint(lockStateInfo).Redact())
+	require.EqualValues(t,
+		"range_id=35 key=‹×› holder=‹×› durability=Unreplicated duration=5m0s\n"+
+			" waiters:\n"+
+			"  waiting_txn:‹×› active_waiter:true strength:Exclusive wait_duration:2m15s\n"+
+			"  waiting_txn:<nil> active_waiter:false strength:None wait_duration:17ms",
+		redact.Sprintf("%+v", lockStateInfo).Redact())
 }
 
 func TestAddIgnoredSeqNumRange(t *testing.T) {

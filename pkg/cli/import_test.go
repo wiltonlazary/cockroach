@@ -12,11 +12,11 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -55,10 +55,10 @@ func runImportCLICommand(
 	case err := <-errCh:
 		t.Fatalf("import command returned before expected: output: %v, error: %v", out, err)
 	}
-	data, err := ioutil.ReadFile(dumpFilePath)
+	data, err := os.ReadFile(dumpFilePath)
 	require.NoError(t, err)
-	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", security.RootUserName())
-	checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(), userfileURI, data)
+	userfileURI := constructUserfileDestinationURI(dumpFilePath, "", username.RootUserName())
+	checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(), userfileURI, data)
 	select {
 	case knobs.pauseAfterUpload <- struct{}{}:
 	case err := <-errCh:
@@ -72,7 +72,7 @@ func runImportCLICommand(
 	// Check that the dump file has been cleaned up after the import CLI command
 	// has completed.
 	store, err := c.ExecutorConfig().(sql.ExecutorConfig).DistSQLSrv.ExternalStorageFromURI(ctx,
-		userfileURI, security.RootUserName())
+		userfileURI, username.RootUserName())
 	require.NoError(t, err)
 	_, err = store.ReadFile(ctx, "")
 	testutils.IsError(err, "file doesn't exist")

@@ -279,6 +279,18 @@ func RangeGCThresholdKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeGCThresholdKey()
 }
 
+// RangeGCHintKey returns a system-local key for GC hint data. This data is used
+// by GC queue to adjust how replicas are being queued for GC.
+func RangeGCHintKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RangeGCHintKey()
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func MVCCRangeKeyGCKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).MVCCRangeKeyGCKey()
+}
+
 // RangeVersionKey returns a system-local for the range version.
 func RangeVersionKey(rangeID roachpb.RangeID) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RangeVersionKey()
@@ -329,6 +341,24 @@ func RaftLogPrefix(rangeID roachpb.RangeID) roachpb.Key {
 // RaftLogKey returns a system-local key for a Raft log entry.
 func RaftLogKey(rangeID roachpb.RangeID, logIndex uint64) roachpb.Key {
 	return MakeRangeIDPrefixBuf(rangeID).RaftLogKey(logIndex)
+}
+
+// RaftLogKeyFromPrefix returns a system-local key for a Raft log entry, using
+// the provided Raft log prefix.
+func RaftLogKeyFromPrefix(raftLogPrefix []byte, logIndex uint64) roachpb.Key {
+	return encoding.EncodeUint64Ascending(raftLogPrefix, logIndex)
+}
+
+// DecodeRaftLogKeyFromSuffix parses the suffix of a system-local key for a Raft
+// log entry and returns the entry's log index.
+func DecodeRaftLogKeyFromSuffix(raftLogSuffix []byte) (uint64, error) {
+	_, logIndex, err := encoding.DecodeUint64Ascending(raftLogSuffix)
+	return logIndex, err
+}
+
+// RaftReplicaIDKey returns a system-local key for a RaftReplicaID.
+func RaftReplicaIDKey(rangeID roachpb.RangeID) roachpb.Key {
+	return MakeRangeIDPrefixBuf(rangeID).RaftReplicaIDKey()
 }
 
 // RangeLastReplicaGCTimestampKey returns a range-local key for
@@ -442,7 +472,7 @@ func LockTableSingleKey(key roachpb.Key, buf []byte) (roachpb.Key, []byte) {
 }
 
 // DecodeLockTableSingleKey decodes the single-key lock table key to return the key
-// that was locked..
+// that was locked.
 func DecodeLockTableSingleKey(key roachpb.Key) (lockedKey roachpb.Key, err error) {
 	if !bytes.HasPrefix(key, LocalRangeLockTablePrefix) {
 		return nil, errors.Errorf("key %q does not have %q prefix",
@@ -830,10 +860,30 @@ func GetRowPrefixLength(key roachpb.Key) (int, error) {
 	}
 	sqlN := len(sqlKey)
 
+	// Check that the prefix contains a valid TableID.
 	if encoding.PeekType(sqlKey) != encoding.Int {
 		// Not a table key, so the row prefix is the entire key.
 		return n, nil
 	}
+	tableIDLen, err := encoding.GetUvarintLen(sqlKey)
+	if err != nil {
+		return 0, err
+	}
+
+	// Check whether the prefix contains a valid IndexID after the TableID. Not
+	// all keys contain an index ID.
+	if encoding.PeekType(sqlKey[tableIDLen:]) != encoding.Int {
+		return n, nil
+	}
+	indexIDLen, err := encoding.GetUvarintLen(sqlKey[tableIDLen:])
+	if err != nil {
+		return 0, err
+	}
+	// If the IndexID is the last part of the key, the entire key is the prefix.
+	if tableIDLen+indexIDLen == sqlN {
+		return n, nil
+	}
+
 	// The column family ID length is encoded as a varint and we take advantage
 	// of the fact that the column family ID itself will be encoded in 0-9 bytes
 	// and thus the length of the column family ID data will fit in a single
@@ -976,6 +1026,11 @@ func (b RangeIDPrefixBuf) RangeGCThresholdKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeGCThresholdSuffix...)
 }
 
+// RangeGCHintKey returns a range-local key for the GC hint data.
+func (b RangeIDPrefixBuf) RangeGCHintKey() roachpb.Key {
+	return append(b.replicatedPrefix(), LocalRangeGCHintSuffix...)
+}
+
 // RangeVersionKey returns a system-local key for the range version.
 func (b RangeIDPrefixBuf) RangeVersionKey() roachpb.Key {
 	return append(b.replicatedPrefix(), LocalRangeVersionSuffix...)
@@ -1004,11 +1059,22 @@ func (b RangeIDPrefixBuf) RaftLogPrefix() roachpb.Key {
 
 // RaftLogKey returns a system-local key for a Raft log entry.
 func (b RangeIDPrefixBuf) RaftLogKey(logIndex uint64) roachpb.Key {
-	return encoding.EncodeUint64Ascending(b.RaftLogPrefix(), logIndex)
+	return RaftLogKeyFromPrefix(b.RaftLogPrefix(), logIndex)
+}
+
+// RaftReplicaIDKey returns a system-local key for a RaftReplicaID.
+func (b RangeIDPrefixBuf) RaftReplicaIDKey() roachpb.Key {
+	return append(b.unreplicatedPrefix(), LocalRaftReplicaIDSuffix...)
 }
 
 // RangeLastReplicaGCTimestampKey returns a range-local key for
 // the range's last replica GC timestamp.
 func (b RangeIDPrefixBuf) RangeLastReplicaGCTimestampKey() roachpb.Key {
 	return append(b.unreplicatedPrefix(), LocalRangeLastReplicaGCTimestampSuffix...)
+}
+
+// MVCCRangeKeyGCKey returns a range local key protecting range
+// tombstone mvcc stats calculations during range tombstone GC.
+func (b RangeIDPrefixBuf) MVCCRangeKeyGCKey() roachpb.Key {
+	return append(b.unreplicatedPrefix(), LocalRangeMVCCRangeKeyGCLockSuffix...)
 }

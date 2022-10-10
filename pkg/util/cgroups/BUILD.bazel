@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -9,6 +10,7 @@ go_library(
         "//pkg/util/log",
         "//pkg/util/system",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -16,9 +18,12 @@ go_test(
     name = "cgroups_test",
     size = "small",
     srcs = ["cgroups_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":cgroups"],
     deps = [
         "//pkg/testutils",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

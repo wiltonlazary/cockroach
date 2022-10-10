@@ -22,20 +22,23 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 )
 
 func TestHashDiskBackedRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -88,9 +91,9 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 	// disk halfway through, keeps on adding rows, and then verifies that all
 	// rows were properly added to the hashDiskBackedRowContainer.
 	t.Run("NormalRun", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)
@@ -133,9 +136,9 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 	})
 
 	t.Run("AddRowOutOfMem", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)
@@ -155,9 +158,9 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 	})
 
 	t.Run("AddRowOutOfDisk", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		rc := getRowContainer()
 		defer rc.Close(ctx)
 
@@ -183,9 +186,9 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 	// container to disk, and verifies that the iterator was recreated and points
 	// to the appropriate row.
 	t.Run("VerifyIteratorRecreation", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)
@@ -258,9 +261,9 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 	// spills the container to disk, and verifies that the iterator was recreated
 	// and is not valid.
 	t.Run("VerifyIteratorRecreationAfterExhaustion", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)
@@ -317,10 +320,11 @@ func TestHashDiskBackedRowContainer(t *testing.T) {
 
 func TestHashDiskBackedRowContainerPreservesMatchesAndMarks(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -375,9 +379,9 @@ func TestHashDiskBackedRowContainerPreservesMatchesAndMarks(t *testing.T) {
 	// from the same buckets, and then verifies that all rows were properly added
 	// to the hashDiskBackedRowContainer.
 	t.Run("PreservingMatches", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)
@@ -424,9 +428,9 @@ func TestHashDiskBackedRowContainerPreservesMatchesAndMarks(t *testing.T) {
 	// hashDiskBackedRowContainer, marks all rows belonging to the first bucket,
 	// spills to disk, and checks that marks are preserved correctly.
 	t.Run("PreservingMarks", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 		rc := getRowContainer()
 		defer rc.Close(ctx)

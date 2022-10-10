@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -28,6 +29,8 @@ go_library(
         "//pkg/workload/tpccchecks",
         "//pkg/workload/tpcds",
         "//pkg/workload/tpch",
+        "//pkg/workload/ttlbench",
+        "//pkg/workload/ttllogger",
         "//pkg/workload/ycsb",
     ],
 )
@@ -39,14 +42,16 @@ go_test(
         "all_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=895s"],
     embed = [":allccl"],
+    shard_count = 16,
     deps = [
         "//pkg/base",
         "//pkg/ccl",
         "//pkg/ccl/utilccl",
         "//pkg/ccl/workloadccl",
         "//pkg/col/coldata",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/types",
@@ -65,3 +70,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

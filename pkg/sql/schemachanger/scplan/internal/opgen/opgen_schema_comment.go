@@ -20,15 +20,21 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.SchemaComment) scop.Op {
-					return notImplemented(this)
+				emit(func(this *scpb.SchemaComment) *scop.UpsertSchemaComment {
+					return &scop.UpsertSchemaComment{
+						SchemaID: this.SchemaID,
+						Comment:  this.Comment,
+					}
+				}),
+				emit(func(this *scpb.SchemaComment, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.SchemaComment) scop.Op {
+				emit(func(this *scpb.SchemaComment) *scop.RemoveSchemaComment {
 					return &scop.RemoveSchemaComment{
 						SchemaID: this.SchemaID,
 					}

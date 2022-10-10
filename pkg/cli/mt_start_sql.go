@@ -13,7 +13,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/signal"
 
@@ -24,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/sdnotify"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -75,6 +73,9 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, drainSignals...)
+
 	// Set up a cancellable context for the entire start command.
 	// The context will be canceled at the end.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,7 +101,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	// In the initial 20.2 release of multi-tenant clusters, no version state was
 	// ever populated in the version cluster setting. A value is populated during
 	// the activation of 21.1. See the documentation attached to the TenantCluster
-	// in migration/migrationcluster for more details on the tenant upgrade flow.
+	// in upgrade/upgradecluster for more details on the tenant upgrade flow.
 	// Note that a the value of 21.1 is populated when a tenant cluster is created
 	// during 21.1 in crdb_internal.create_tenant.
 	//
@@ -120,7 +121,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 
 	initGEOS(ctx)
 
-	sqlServer, _, _, err := server.StartTenant(
+	sqlServer, err := server.StartTenant(
 		ctx,
 		stopper,
 		clusterName,
@@ -134,7 +135,7 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 	// this is when we can tell them the node has started listening.
 	if startCtx.pidFile != "" {
 		log.Ops.Infof(ctx, "PID file: %s", startCtx.pidFile)
-		if err := ioutil.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
+		if err := os.WriteFile(startCtx.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644); err != nil {
 			log.Ops.Errorf(ctx, "failed writing the PID: %v", err)
 		}
 	}
@@ -157,23 +158,25 @@ func runStartSQL(cmd *cobra.Command, args []string) error {
 		sqlServer.StartDiagnostics(ctx)
 	}
 
+	tenantClusterID := sqlServer.LogicalClusterID()
+
 	// Report the server identifiers and other server details
 	// in the same format as 'cockroach start'.
-	if err := reportServerInfo(ctx, tBegin, &serverCfg, st, false /* isHostNode */, false /* initialStart */); err != nil {
+	if err := reportServerInfo(ctx, tBegin, &serverCfg, st, false /* isHostNode */, false /* initialStart */, tenantClusterID); err != nil {
 		return err
 	}
 
 	// TODO(tbg): make the other goodies in `./cockroach start` reusable, such as
-	// logging to files, periodic memory output, heap and goroutine dumps, debug
-	// server, graceful drain. Then use them here.
+	// logging to files, periodic memory output, heap and goroutine dumps.
+	// Then use them here.
 
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, drainSignals...)
-	select {
-	case sig := <-ch:
-		log.Flush()
-		return errors.Newf("received signal %v", sig)
-	case <-stopper.ShouldQuiesce():
-		return nil
-	}
+	errChan := make(chan error, 1)
+	var serverStatusMu serverStatus
+	serverStatusMu.started = true
+
+	return waitForShutdown(
+		func() serverShutdownInterface { return sqlServer },
+		stopper,
+		errChan, signalCh,
+		&serverStatusMu)
 }

@@ -11,7 +11,7 @@
 // Package clusterversion defines the interfaces to interact with cluster/binary
 // versions in order accommodate backward incompatible behaviors. It handles the
 // feature gates and so must maintain a fairly lightweight set of dependencies.
-// The migration sub-package handles advancing a cluster from one version to
+// The upgrade sub-package handles advancing a cluster from one version to
 // a later one.
 //
 // Ideally, every code change in a database would be backward compatible, but
@@ -20,23 +20,23 @@
 // it. This package provides a way to do this safely with (hopefully) minimal
 // disruption. It works as follows:
 //
-// - Each node in the cluster is running a binary that was released at some
-//   version ("binary version"). We allow for rolling upgrades, so two nodes in
-//   the cluster may be running different binary versions. All nodes in a given
-//   cluster must be within 1 major release of each other (i.e. to upgrade two
-//   major releases, the cluster must first be rolled onto X+1 and then to X+2).
-// - Separate from the build versions of the binaries, the cluster itself has a
-//   logical "active cluster version", the version all the binaries are
-//   currently operating at. This is used for two related things: first as a
-//   promise from the user that they'll never downgrade any nodes in the cluster
-//   to a binary below some "minimum supported version", and second, to unlock
-//   features that are not backwards compatible (which is now safe given that
-//   the old binary will never be used).
-// - Each binary can operate within a "range of supported versions". When a
-// 	 cluster is initialized, the binary doing the initialization uses the upper
-//	 end of its supported range as the initial "active cluster version". Each
-//	 node that joins this cluster then must be compatible with this cluster
-//	 version.
+//   - Each node in the cluster is running a binary that was released at some
+//     version ("binary version"). We allow for rolling upgrades, so two nodes in
+//     the cluster may be running different binary versions. All nodes in a given
+//     cluster must be within 1 major release of each other (i.e. to upgrade two
+//     major releases, the cluster must first be rolled onto X+1 and then to X+2).
+//   - Separate from the build versions of the binaries, the cluster itself has a
+//     logical "active cluster version", the version all the binaries are
+//     currently operating at. This is used for two related things: first as a
+//     promise from the user that they'll never downgrade any nodes in the cluster
+//     to a binary below some "minimum supported version", and second, to unlock
+//     features that are not backwards compatible (which is now safe given that
+//     the old binary will never be used).
+//   - Each binary can operate within a "range of supported versions". When a
+//     cluster is initialized, the binary doing the initialization uses the upper
+//     end of its supported range as the initial "active cluster version". Each
+//     node that joins this cluster then must be compatible with this cluster
+//     version.
 package clusterversion
 
 import (
@@ -269,7 +269,7 @@ func (cv ClusterVersion) SafeFormat(p redact.SafePrinter, _ rune) {
 // not it is a fence version.
 func (cv ClusterVersion) PrettyPrint() string {
 	// If we're a version greater than v20.2 and have an odd internal version,
-	// we're a fence version. See fenceVersionFor in pkg/migration to understand
+	// we're a fence version. See fenceVersionFor in pkg/upgrade to understand
 	// what these are.
 	fenceVersion := !cv.Version.LessEq(roachpb.Version{Major: 20, Minor: 2}) && (cv.Internal%2) == 1
 	if !fenceVersion {

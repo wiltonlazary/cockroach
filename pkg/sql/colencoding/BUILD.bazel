@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,7 +11,8 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/col/coldata",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/rowenc/keyside",
         "//pkg/sql/rowenc/valueside",
@@ -19,10 +21,10 @@ go_library(
         "//pkg/util",
         "//pkg/util/duration",
         "//pkg/util/encoding",
-        "//pkg/util/log",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -30,6 +32,7 @@ go_test(
     name = "colencoding_test",
     size = "small",
     srcs = ["value_encoding_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":colencoding"],
     deps = [
         "//pkg/col/coldata",
@@ -42,3 +45,5 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
+
+get_x_data(name = "get_x_data")

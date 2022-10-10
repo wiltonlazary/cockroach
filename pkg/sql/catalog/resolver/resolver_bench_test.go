@@ -16,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -82,13 +83,13 @@ func BenchmarkResolveExistingObject(b *testing.B) {
 
 			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 			txn := kvDB.NewTxn(ctx, "test")
-			p, cleanup := sql.NewInternalPlanner("asdf", txn, security.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData)
+			p, cleanup := sql.NewInternalPlanner("asdf", txn, username.RootUserName(), &sql.MemoryMetrics{}, &execCfg, sessionData)
 			defer cleanup()
 
 			// The internal planner overrides the database to "system", here we
 			// change it back.
 			{
-				ec := p.(interface{ EvalContext() *tree.EvalContext }).EvalContext()
+				ec := p.(interface{ EvalContext() *eval.Context }).EvalContext()
 				require.NoError(b, ec.SessionAccessor.SetSessionVar(
 					ctx, "database", "defaultdb", false,
 				))
@@ -105,7 +106,7 @@ func BenchmarkResolveExistingObject(b *testing.B) {
 			require.NoError(b, err)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				desc, _, err := resolver.ResolveExistingObject(ctx, rs, uon, tc.flags)
+				desc, _, err := resolver.ResolveExistingObject(ctx, rs, &uon, tc.flags)
 				require.NoError(b, err)
 				require.NotNil(b, desc)
 			}

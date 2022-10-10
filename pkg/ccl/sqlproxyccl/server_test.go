@@ -10,13 +10,15 @@ package sqlproxyccl
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,7 +37,7 @@ func TestHandleHealth(t *testing.T) {
 	proxyServer.mux.ServeHTTP(rw, r)
 
 	require.Equal(t, http.StatusOK, rw.Code)
-	out, err := ioutil.ReadAll(rw.Body)
+	out, err := io.ReadAll(rw.Body)
 	require.NoError(t, err)
 
 	require.Equal(t, []byte("OK"), out)
@@ -56,8 +58,39 @@ func TestHandleVars(t *testing.T) {
 	proxyServer.mux.ServeHTTP(rw, r)
 
 	require.Equal(t, http.StatusOK, rw.Code)
-	out, err := ioutil.ReadAll(rw.Body)
+	out, err := io.ReadAll(rw.Body)
 	require.NoError(t, err)
 
 	require.Contains(t, string(out), "# HELP proxy_sql_conns")
+}
+
+func TestAwaitNoConnections(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	originalInterval := awaitNoConnectionsInterval
+	awaitNoConnectionsInterval = time.Millisecond
+	defer func() {
+		awaitNoConnectionsInterval = originalInterval
+	}()
+
+	proxyServer, err := NewServer(ctx, stopper, ProxyOptions{})
+	require.NoError(t, err)
+
+	//simulate a connection coming in
+	proxyServer.metrics.CurConnCount.Inc(1)
+	begin := timeutil.Now()
+
+	// wait a few milliseconds and simulate the connection dropping
+	waitTime := time.Millisecond * 150
+	_ = stopper.RunAsyncTask(ctx, "decrement-con-count", func(context.Context) {
+		<-time.After(waitTime)
+		proxyServer.metrics.CurConnCount.Dec(1)
+	})
+	// wait for there to be no connections
+	<-proxyServer.AwaitNoConnections(ctx)
+	// make sure we waited for the connection to be dropped
+	require.GreaterOrEqual(t, timeutil.Since(begin), waitTime)
 }

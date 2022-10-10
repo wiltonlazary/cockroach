@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -70,6 +71,7 @@ go_test(
         "sysutil_test.go",
         "sysutil_unix_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":sysutil"],
     deps = [
         "@com_github_cockroachdb_errors//:errors",
@@ -128,3 +130,5 @@ go_test(
         "//conditions:default": [],
     }),
 )
+
+get_x_data(name = "get_x_data")

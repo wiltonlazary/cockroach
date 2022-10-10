@@ -20,8 +20,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -30,9 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
-//go:generate mockgen -package=rangefeed -source rangefeed.go -destination=mocks_generated.go .
+//go:generate mockgen -destination=mocks_generated_test.go --package=rangefeed . DB
 
 // TODO(ajwerner): Expose hooks for metrics.
 // TODO(ajwerner): Expose access to checkpoints and the frontier.
@@ -41,8 +44,8 @@ import (
 // TODO(yevgeniy): Instead of rolling our own logic to parallelize scans, we should
 // use streamer API instead (https://github.com/cockroachdb/cockroach/pull/68430)
 
-// kvDB is an adapter to the underlying KV store.
-type kvDB interface {
+// DB is an adapter to the underlying KV store.
+type DB interface {
 
 	// RangeFeed runs a rangefeed on a given span with the given arguments.
 	// It encapsulates the RangeFeed method on roachpb.Internal.
@@ -51,7 +54,7 @@ type kvDB interface {
 		spans []roachpb.Span,
 		startFrom hlc.Timestamp,
 		withDiff bool,
-		eventC chan<- *roachpb.RangeFeedEvent,
+		eventC chan<- kvcoord.RangeFeedMessage,
 	) error
 
 	// Scan encapsulates scanning a key span at a given point in time. The method
@@ -70,7 +73,7 @@ type kvDB interface {
 // Factory is used to construct RangeFeeds.
 type Factory struct {
 	stopper *stop.Stopper
-	client  kvDB
+	client  DB
 	knobs   *TestingKnobs
 }
 
@@ -79,10 +82,16 @@ type TestingKnobs struct {
 
 	// OnRangefeedRestart is called when a rangefeed restarts.
 	OnRangefeedRestart func()
+
+	// IgnoreOnDeleteRangeError will ignore any errors where a DeleteRange event
+	// is emitted without an OnDeleteRange handler. This can be used e.g. with
+	// StoreTestingKnobs.GlobalMVCCRangeTombstone, to prevent the global tombstone
+	// causing rangefeed errors for consumers who don't expect it.
+	IgnoreOnDeleteRangeError bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
-func (t TestingKnobs) ModuleTestingKnobs() {}
+func (*TestingKnobs) ModuleTestingKnobs() {}
 
 var _ base.ModuleTestingKnobs = (*TestingKnobs)(nil)
 
@@ -97,7 +106,7 @@ func NewFactory(
 	return newFactory(stopper, kvDB, knobs), nil
 }
 
-func newFactory(stopper *stop.Stopper, client kvDB, knobs *TestingKnobs) *Factory {
+func newFactory(stopper *stop.Stopper, client DB, knobs *TestingKnobs) *Factory {
 	return &Factory{
 		stopper: stopper,
 		client:  client,
@@ -108,10 +117,17 @@ func newFactory(stopper *stop.Stopper, client kvDB, knobs *TestingKnobs) *Factor
 // RangeFeed constructs a new rangefeed and runs it in an async task.
 //
 // The rangefeed can be stopped via Close(); otherwise, it will stop when the
-// server shuts down.
+// server shuts down. The only error which can be returned will indicate that
+// the server is being shut down.
 //
-// The only error which can be returned will indicate that the server is being
-// shut down.
+// Rangefeeds do not support inline (unversioned) values, and may omit them or
+// error on them. Similarly, rangefeeds will error if MVCC history is mutated
+// via e.g. ClearRange. Do not use rangefeeds across such key spans.
+//
+// NB: for the rangefeed itself, initialTimestamp is exclusive, i.e. the first
+// possible event emitted by the server (including the catchup scan) is at
+// initialTimestamp.Next(). This follows from the gRPC API semantics. However,
+// the initial scan (if any) is run at initialTimestamp.
 func (f *Factory) RangeFeed(
 	ctx context.Context,
 	name string,
@@ -153,7 +169,7 @@ type OnValue func(ctx context.Context, value *roachpb.RangeFeedValue)
 type RangeFeed struct {
 	config
 	name    string
-	client  kvDB
+	client  DB
 	stopper *stop.Stopper
 	knobs   *TestingKnobs
 
@@ -269,8 +285,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 	// TODO(ajwerner): Consider adding event buffering. Doing so would require
 	// draining when the rangefeed fails.
-	eventCh := make(chan *roachpb.RangeFeedEvent)
-	errCh := make(chan error)
+	eventCh := make(chan kvcoord.RangeFeedMessage)
 
 	for i := 0; r.Next(); i++ {
 		ts := frontier.Frontier()
@@ -280,19 +295,16 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 
 		start := timeutil.Now()
 
-		// Note that the below channel send will not block forever because
-		// processEvents will wait for the worker to send. RunWorker is safe here
-		// because processEvents is guaranteed to consume the error before
-		// returning.
-		if err := f.stopper.RunAsyncTask(ctx, "rangefeed", func(ctx context.Context) {
-			errCh <- f.client.RangeFeed(ctx, f.spans, ts, f.withDiff, eventCh)
-		}); err != nil {
-			log.VEventf(ctx, 1, "exiting rangefeed due to stopper")
-			return
+		rangeFeedTask := func(ctx context.Context) error {
+			return f.client.RangeFeed(ctx, f.spans, ts, f.withDiff, eventCh)
+		}
+		processEventsTask := func(ctx context.Context) error {
+			return f.processEvents(ctx, frontier, eventCh)
 		}
 
-		err := f.processEvents(ctx, frontier, eventCh, errCh)
-		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) {
+		err := ctxgroup.GoAndWait(ctx, rangeFeedTask, processEventsTask)
+		if errors.HasType(err, &roachpb.BatchTimestampBeforeGCError{}) ||
+			errors.HasType(err, &roachpb.MVCCHistoryMutationError{}) {
 			if errCallback := f.onUnrecoverableError; errCallback != nil {
 				errCallback(ctx, err)
 			}
@@ -302,7 +314,7 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 		}
 		if err != nil && ctx.Err() == nil && restartLogEvery.ShouldLog() {
 			log.Warningf(ctx, "rangefeed failed %d times, restarting: %v",
-				log.Safe(i), err)
+				redact.Safe(i), err)
 		}
 		if ctx.Err() != nil {
 			log.VEventf(ctx, 1, "exiting rangefeed")
@@ -325,13 +337,9 @@ func (f *RangeFeed) run(ctx context.Context, frontier *span.Frontier) {
 	}
 }
 
-// processEvents processes events sent by the rangefeed on the eventCh. It waits
-// for the rangefeed to signal that it has exited by sending on errCh.
+// processEvents processes events sent by the rangefeed on the eventCh.
 func (f *RangeFeed) processEvents(
-	ctx context.Context,
-	frontier *span.Frontier,
-	eventCh <-chan *roachpb.RangeFeedEvent,
-	errCh <-chan error,
+	ctx context.Context, frontier *span.Frontier, eventCh <-chan kvcoord.RangeFeedMessage,
 ) error {
 	for {
 		select {
@@ -350,16 +358,27 @@ func (f *RangeFeed) processEvents(
 				if advanced && f.onFrontierAdvance != nil {
 					f.onFrontierAdvance(ctx, frontier.Frontier())
 				}
+			case ev.SST != nil:
+				if f.onSSTable == nil {
+					return errors.AssertionFailedf(
+						"received unexpected rangefeed SST event with no OnSSTable handler")
+				}
+				f.onSSTable(ctx, ev.SST, ev.RegisteredSpan)
+			case ev.DeleteRange != nil:
+				if f.onDeleteRange == nil {
+					if f.knobs != nil && f.knobs.IgnoreOnDeleteRangeError {
+						continue
+					}
+					return errors.AssertionFailedf(
+						"received unexpected rangefeed DeleteRange event with no OnDeleteRange handler: %s", ev)
+				}
+				f.onDeleteRange(ctx, ev.DeleteRange)
 			case ev.Error != nil:
 				// Intentionally do nothing, we'll get an error returned from the
 				// call to RangeFeed.
 			}
 		case <-ctx.Done():
-			// Ensure that the RangeFeed goroutine stops.
-			<-errCh
 			return ctx.Err()
-		case err := <-errCh:
-			return err
 		}
 	}
 }

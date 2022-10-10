@@ -19,43 +19,50 @@ func init() {
 	opRegistry.register((*scpb.Database)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_TXN_DROPPED),
 			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.Database) scop.Op {
+			to(scpb.Status_TXN_DROPPED,
+				emit(func(this *scpb.Database) *scop.NotImplemented {
 					return notImplemented(this)
+				}),
+			),
+			to(scpb.Status_PUBLIC,
+				emit(func(this *scpb.Database) *scop.MarkDescriptorAsPublic {
+					return &scop.MarkDescriptorAsPublic{
+						DescriptorID: this.DatabaseID,
+					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Database) scop.Op {
-					return &scop.MarkDescriptorAsDroppedSynthetically{
-						DescID: this.DatabaseID,
+				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
+					return &scop.MarkDescriptorAsSyntheticallyDropped{
+						DescriptorID: this.DatabaseID,
 					}
-				})),
+				}),
+			),
 			to(scpb.Status_DROPPED,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.Database) scop.Op {
+				emit(func(this *scpb.Database) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.DatabaseID,
+						DescriptorID: this.DatabaseID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.Database) scop.Op {
-					return &scop.DrainDescriptorName{
-						TableID: this.DatabaseID,
+				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
+				}),
+				emit(func(this *scpb.Database, md *targetsWithElementMap) *scop.CreateGCJobForDatabase {
+					return &scop.CreateGCJobForDatabase{
+						DatabaseID:          this.DatabaseID,
+						StatementForDropJob: statementForDropJob(this, md),
 					}
 				}),
-				emit(func(this *scpb.Database, ts scpb.TargetState) scop.Op {
-					return newLogEventOp(this, ts)
-				}),
-				emit(func(this *scpb.Database) scop.Op {
-					return &scop.CreateGcJobForDatabase{
-						DatabaseID: this.DatabaseID,
+				emit(func(this *scpb.Database) *scop.DeleteDescriptor {
+					return &scop.DeleteDescriptor{
+						DescriptorID: this.DatabaseID,
 					}
 				}),
 			),

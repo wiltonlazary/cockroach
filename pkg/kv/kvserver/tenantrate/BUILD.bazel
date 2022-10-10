@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -15,7 +16,7 @@ go_library(
     deps = [
         "//pkg/multitenant",
         "//pkg/multitenant/tenantcostmodel",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/util/log",
         "//pkg/util/metric",
@@ -31,11 +32,12 @@ go_test(
     name = "tenantrate_test",
     size = "small",
     srcs = ["limiter_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     deps = [
         ":tenantrate",
         "//pkg/multitenant/tenantcostmodel",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/testutils/metrictestutils",
@@ -49,3 +51,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

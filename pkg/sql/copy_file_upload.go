@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 )
@@ -81,6 +82,7 @@ func newFileUploadMachine(
 	n *tree.CopyFrom,
 	txnOpt copyTxnOpt,
 	execCfg *ExecutorConfig,
+	parentMon *mon.BytesMonitor,
 ) (f *fileUploadMachine, retErr error) {
 	if len(n.Columns) != 0 {
 		return nil, errors.New("expected 0 columns specified for file uploads")
@@ -88,7 +90,7 @@ func newFileUploadMachine(
 	c := &copyMachine{
 		conn: conn,
 		// The planner will be prepared before use.
-		p: planner{execCfg: execCfg, alloc: &tree.DatumAlloc{}},
+		p: &planner{execCfg: execCfg},
 	}
 	f = &fileUploadMachine{
 		c: c,
@@ -96,7 +98,7 @@ func newFileUploadMachine(
 
 	// We need a planner to do the initial planning, even if a planner
 	// is not required after that.
-	cleanup := c.p.preparePlannerForCopy(ctx, txnOpt)
+	cleanup := c.p.preparePlannerForCopy(ctx, &txnOpt, false /* finalBatch */, c.implicitTxn)
 	defer func() {
 		retErr = cleanup(ctx, retErr)
 	}()
@@ -146,13 +148,14 @@ func newFileUploadMachine(
 	c.resultColumns = make(colinfo.ResultColumns, 1)
 	c.resultColumns[0] = colinfo.ResultColumn{Typ: types.Bytes}
 	c.parsingEvalCtx = c.p.EvalContext()
-	c.rowsMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
-	c.bufMemAcc = c.p.extendedEvalCtx.Mon.MakeBoundAccount()
+	c.initMonitoring(ctx, parentMon)
 	c.processRows = f.writeFile
 	c.forceNotNull = true
 	c.format = tree.CopyFormatText
 	c.null = `\N`
 	c.delimiter = '\t'
+	c.rows.Init(c.rowsMemAcc, colinfo.ColTypeInfoFromResCols(c.resultColumns), copyBatchRowSize)
+	c.scratchRow = make(tree.Datums, len(c.resultColumns))
 	return
 }
 
@@ -167,12 +170,23 @@ func CopyInFileStmt(destination, schema, table string) string {
 	)
 }
 
+func (f *fileUploadMachine) numInsertedRows() int {
+	if f == nil {
+		return 0
+	}
+	return f.c.numInsertedRows()
+}
+
+func (f *fileUploadMachine) Close(ctx context.Context) {
+	f.c.Close(ctx)
+}
+
 func (f *fileUploadMachine) run(ctx context.Context) error {
-	err := f.c.run(ctx)
-	if err != nil && f.cancel != nil {
+	runErr := f.c.run(ctx)
+	err := errors.CombineErrors(f.w.Close(), runErr)
+	if runErr != nil && f.cancel != nil {
 		f.cancel()
 	}
-	err = errors.CombineErrors(f.w.Close(), err)
 
 	if err != nil {
 		f.failureCleanup()
@@ -180,8 +194,9 @@ func (f *fileUploadMachine) run(ctx context.Context) error {
 	return err
 }
 
-func (f *fileUploadMachine) writeFile(ctx context.Context) error {
-	for _, r := range f.c.rows {
+func (f *fileUploadMachine) writeFile(ctx context.Context, finalBatch bool) error {
+	for i := 0; i < f.c.rows.Len(); i++ {
+		r := f.c.rows.At(i)
 		b := []byte(*r[0].(*tree.DBytes))
 		n, err := f.w.Write(b)
 		if err != nil {
@@ -197,8 +212,6 @@ func (f *fileUploadMachine) writeFile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	f.c.insertedRows += len(f.c.rows)
-	f.c.rows = f.c.rows[:0]
-	f.c.rowsMemAcc.Clear(ctx)
-	return nil
+	f.c.insertedRows += f.c.rows.Len()
+	return f.c.rows.UnsafeReset(ctx)
 }

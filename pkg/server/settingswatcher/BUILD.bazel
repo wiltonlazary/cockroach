@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,8 +13,10 @@ go_library(
     deps = [
         "//pkg/clusterversion",
         "//pkg/keys",
-        "//pkg/kv/kvclient/rangefeed:with-mocks",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvclient/rangefeed",
+        "//pkg/kv/kvclient/rangefeed/rangefeedbuffer",
+        "//pkg/kv/kvclient/rangefeed/rangefeedcache",
+        "//pkg/roachpb",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/catalog",
@@ -22,13 +25,13 @@ go_library(
         "//pkg/sql/rowenc/valueside",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
-        "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -39,13 +42,17 @@ go_test(
         "row_decoder_external_test.go",
         "settings_watcher_external_test.go",
     ],
+    args = ["-test.timeout=295s"],
     deps = [
         ":settingswatcher",
         "//pkg/base",
         "//pkg/keys",
-        "//pkg/kv/kvclient/rangefeed:with-mocks",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/kv",
+        "//pkg/kv/kvclient/rangefeed",
+        "//pkg/kv/kvclient/rangefeed/rangefeedcache",
+        "//pkg/kv/kvserver",
+        "//pkg/roachpb",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/settings",
@@ -62,3 +69,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

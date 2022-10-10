@@ -128,13 +128,13 @@ eexpect root@
 end_test
 
 # Finally terminate with Ctrl+C.
-interrupt
+send_eof
 eexpect eof
 
 start_test "Check that the hint for a single ? is also printed in non-interactive sessions."
 spawn /bin/bash
 
-send "echo '?' | $argv sql\r"
+send "echo '?' | $argv sql --no-line-editor\r"
 eexpect "Note:"
 eexpect JSON
 eexpect "use '??'"

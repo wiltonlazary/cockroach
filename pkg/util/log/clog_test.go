@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	stdLog "log"
 	"os"
 	"path/filepath"
@@ -35,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/logtags"
 	"github.com/stretchr/testify/require"
 )
@@ -424,7 +424,7 @@ func TestGetLogReader(t *testing.T) {
 	}
 
 	// Some arbitrary non-log file.
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "other.txt"), nil, 0644))
 	relPathFromLogDir := strings.Join([]string{"..", filepath.Base(dir), infoName}, string(os.PathSeparator))
 
 	cntr := 0
@@ -435,14 +435,14 @@ func TestGetLogReader(t *testing.T) {
 
 	// A log file in a non-default directory.
 	fname1 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname1), nil, 0644))
 
 	// A log file that matches the file pattern for the default sink,
 	// in a non-default directory.
 	fname2 := genFileName("")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir1, fname2), nil, 0644))
 	fname3 := genFileName("-g1")
-	require.NoError(t, ioutil.WriteFile(filepath.Join(dir, fname3), nil, 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, fname3), nil, 0644))
 
 	// Fake symlink to check the symlink error below.
 	fname4 := genFileName("")
@@ -611,7 +611,7 @@ func TestFd2Capture(t *testing.T) {
 	const stderrText = "hello stderr"
 	fmt.Fprint(os.Stderr, stderrText)
 
-	contents, err := ioutil.ReadFile(logging.testingFd2CaptureLogger.getFileSink().getFileName(t))
+	contents, err := os.ReadFile(logging.testingFd2CaptureLogger.getFileSink().getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +638,7 @@ func TestFileSeverityFilter(t *testing.T) {
 	Flush()
 
 	debugFileSink := debugFileSinkInfo.sink.(*fileSink)
-	contents, err := ioutil.ReadFile(debugFileSink.getFileName(t))
+	contents, err := os.ReadFile(debugFileSink.getFileName(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,7 +798,7 @@ func BenchmarkEventf_WithVerboseTraceSpan(b *testing.B) {
 			tracer.SetRedactable(redactable)
 			ctx, sp := tracer.StartSpanCtx(ctx, "benchspan", tracing.WithForceRealSpan())
 			defer sp.Finish()
-			sp.SetVerbose(true)
+			sp.SetRecordingType(tracingpb.RecordingVerbose)
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				Eventf(ctx, "%s %s %s", "foo", "bar", "baz")

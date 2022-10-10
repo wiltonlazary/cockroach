@@ -16,6 +16,7 @@ artifacts=/artifacts
 source $root/build/teamcity/util/roachtest_util.sh
 
 build/teamcity-roachtest-invoke.sh \
+  --metamorphic-encryption-probability=0.5 \
   --cloud="${CLOUD}" \
   --count="${COUNT-1}" \
   --parallelism="${PARALLELISM}" \
@@ -23,6 +24,7 @@ build/teamcity-roachtest-invoke.sh \
   --cluster-id="${TC_BUILD_ID}" \
   --build-tag="${BUILD_TAG}" \
   --cockroach="${PWD}/bin/cockroach" \
+  --cockroach-short="${PWD}/bin/cockroach-short-ea" \
   --artifacts=/artifacts \
   --artifacts-literal="${LITERAL_ARTIFACTS_DIR:-}" \
   --slack-token="${SLACK_TOKEN}" \

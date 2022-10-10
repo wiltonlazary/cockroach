@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -84,6 +85,7 @@ const sampleAggregatorProcName = "sample aggregator"
 var SampleAggregatorProgressInterval = 5 * time.Second
 
 func newSampleAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SampleAggregatorSpec,
@@ -106,11 +108,10 @@ func newSampleAggregator(
 		}
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will disable histogram collection if this limit is not
 	// enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "sample-aggregator-mem")
+	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "sample-aggregator-mem")
 	rankCol := len(input.OutputTypes()) - 8
 	s := &sampleAggregator{
 		spec:         spec,
@@ -152,8 +153,9 @@ func newSampleAggregator(
 	)
 	for i := range spec.InvertedSketches {
 		var sr stats.SampleReservoir
-		// The datums are converted to their inverted index bytes and
-		// sent as a single DBytes column.
+		// The datums are converted to their inverted index bytes and sent as a
+		// single DBytes column. We do not use DEncodedKey here because it would
+		// introduce backward compatibility complications.
 		var srCols util.FastIntSet
 		srCols.Add(0)
 		sr.Init(int(spec.SampleSize), int(spec.MinSampleSize), bytesRowType, &s.memAcc, srCols)
@@ -168,7 +170,7 @@ func newSampleAggregator(
 	}
 
 	if err := s.Init(
-		nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
+		ctx, nil, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor,
 		execinfra.ProcStateOpts{
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
 				s.close()
@@ -434,7 +436,7 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 	if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		for _, si := range s.sketches {
 			var histogram *stats.HistogramData
-			if si.spec.GenerateHistogram && len(s.sr.Get()) != 0 {
+			if si.spec.GenerateHistogram {
 				colIdx := int(si.spec.Columns[0])
 				typ := s.inTypes[colIdx]
 
@@ -526,6 +528,33 @@ func (s *sampleAggregator) writeResults(ctx context.Context) error {
 		return err
 	}
 
+	if s.spec.DeleteOtherStats {
+		columnsUsed := make([][]descpb.ColumnID, len(s.sketches))
+		for i, si := range s.sketches {
+			columnIDs := make([]descpb.ColumnID, len(si.spec.Columns))
+			for j, c := range si.spec.Columns {
+				columnIDs[j] = s.sampledCols[c]
+			}
+			columnsUsed[i] = columnIDs
+		}
+		keepTime := stats.TableStatisticsRetentionPeriod.Get(&s.FlowCtx.Cfg.Settings.SV)
+		if err := s.FlowCtx.Cfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+			// Delete old stats from columns that were not collected. This is
+			// important to prevent single-column stats from deleted columns or
+			// multi-column stats from deleted indexes from persisting indefinitely.
+			return stats.DeleteOldStatsForOtherColumns(
+				ctx,
+				s.FlowCtx.Cfg.Executor,
+				txn,
+				s.tableID,
+				columnsUsed,
+				keepTime,
+			)
+		}); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -568,7 +597,7 @@ func (s *sampleAggregator) getDistinctCount(si *sketchInfo, includeNulls bool) i
 // (excluding rows that have NULL values on the histogram column).
 func (s *sampleAggregator) generateHistogram(
 	ctx context.Context,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	sr *stats.SampleReservoir,
 	colIdx int,
 	colType *types.T,
@@ -587,7 +616,10 @@ func (s *sampleAggregator) generateHistogram(
 			prevCapacity, sr.Cap(),
 		)
 	}
-	return stats.EquiDepthHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets)
+	// TODO(michae2): Instead of using the flowCtx's evalCtx, investigate
+	// whether this can use a nil *eval.Context.
+	h, _, err := stats.EquiDepthHistogram(evalCtx, colType, values, numRows, distinctCount, maxBuckets)
+	return h, err
 }
 
 var _ execinfra.DoesNotUseTxn = &sampleAggregator{}

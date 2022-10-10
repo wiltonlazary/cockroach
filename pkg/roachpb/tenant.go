@@ -14,6 +14,8 @@ import (
 	"context"
 	"math"
 	"strconv"
+
+	"github.com/cockroachdb/errors"
 )
 
 // SystemTenantID is the ID associated with the system's internal tenant in a
@@ -73,6 +75,11 @@ func (t TenantID) IsSet() bool {
 	return t.InternalValue != 0
 }
 
+// IsSystem returns whether this ID is that of the system tenant.
+func (t TenantID) IsSystem() bool {
+	return IsSystemTenantID(t.InternalValue)
+}
+
 // IsSystemTenantID returns whether the provided ID corresponds to that of the
 // system tenant.
 func IsSystemTenantID(id uint64) bool {
@@ -90,6 +97,15 @@ func NewContextForTenant(ctx context.Context, tenID TenantID) context.Context {
 func TenantFromContext(ctx context.Context) (tenID TenantID, ok bool) {
 	tenID, ok = ctx.Value(tenantKey{}).(TenantID)
 	return
+}
+
+// TenantIDFromString parses a tenant ID contained within a string.
+func TenantIDFromString(tenantID string) (TenantID, error) {
+	tID, err := strconv.ParseUint(tenantID, 10, 64)
+	if err != nil {
+		return TenantID{}, errors.Wrapf(err, "invalid tenant ID %s, tenant ID should be an unsigned int greater than 0", tenantID)
+	}
+	return MakeTenantID(tID), nil
 }
 
 // Silence unused warning.

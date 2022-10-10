@@ -131,7 +131,7 @@ func BenchmarkSingleRoundtripWithLatency(b *testing.B) {
 // The transaction history looks as follows ("2" refers to the
 // independent goroutine's actions)
 //
-//   R1(A) W2(A,"hi") W1(A,"oops!") C1 [serializable restart] R1(A) W1(A,"correct") C1
+//	R1(A) W2(A,"hi") W1(A,"oops!") C1 [serializable restart] R1(A) W1(A,"correct") C1
 func TestLostUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -355,7 +355,7 @@ func TestTxnLongDelayBetweenWritesWithConcurrentRead(t *testing.T) {
 	// Wait till txnA finish put(a).
 	<-ch
 	// Delay for longer than the cache window.
-	s.Manual.Increment((tscache.MinRetentionWindow + time.Second).Nanoseconds())
+	s.Manual.Advance(tscache.MinRetentionWindow + time.Second)
 	if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 		// Attempt to get first keyB.
 		gr1, err := txn.Get(ctx, keyB)
@@ -427,7 +427,7 @@ func TestTxnRepeatGetWithRangeSplit(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		s.Manual.Increment(time.Second.Nanoseconds())
+		s.Manual.Advance(time.Second)
 		// Split range by keyB.
 		if err := s.DB.AdminSplit(context.Background(), splitKey, hlc.MaxTimestamp /* expirationTime */); err != nil {
 			t.Fatal(err)
@@ -771,6 +771,8 @@ func TestTxnWaitPolicies(t *testing.T) {
 
 	testutils.RunTrueAndFalse(t, "highPriority", func(t *testing.T, highPriority bool) {
 		key := []byte("b")
+		require.NoError(t, s.DB.Put(ctx, key, "old value"))
+
 		txn := s.DB.NewTxn(ctx, "test txn")
 		require.NoError(t, txn.Put(ctx, key, "new value"))
 
@@ -818,6 +820,30 @@ func TestTxnWaitPolicies(t *testing.T) {
 		wiErr := new(roachpb.WriteIntentError)
 		require.True(t, errors.As(err, &wiErr))
 		require.Equal(t, roachpb.WriteIntentError_REASON_WAIT_POLICY, wiErr.Reason)
+
+		// SkipLocked wait policy.
+		type skipRes struct {
+			res []kv.Result
+			err error
+		}
+		skipC := make(chan skipRes)
+		go func() {
+			var b kv.Batch
+			b.Header.UserPriority = pri
+			b.Header.WaitPolicy = lock.WaitPolicy_SkipLocked
+			b.Get(key)
+			err := s.DB.Run(ctx, &b)
+			skipC <- skipRes{res: b.Results, err: err}
+		}()
+
+		// Should return successful but empty result immediately, without blocking.
+		// Priority does not matter.
+		res := <-skipC
+		require.Nil(t, res.err)
+		require.Len(t, res.res, 1)
+		getRes := res.res[0]
+		require.Len(t, getRes.Rows, 1)
+		require.False(t, getRes.Rows[0].Exists())
 
 		// Let blocked requests proceed.
 		require.NoError(t, txn.Commit(ctx))
@@ -915,7 +941,7 @@ func TestRetrySerializableBumpsToNow(t *testing.T) {
 	ctx := context.Background()
 
 	bumpClosedTimestamp := func(delay time.Duration) {
-		s.Manual.Increment(delay.Nanoseconds())
+		s.Manual.Advance(delay)
 		// We need to bump closed timestamp for clock increment to have effect
 		// on further kv writes. Putting anything into proposal buffer will
 		// trigger achieve this.

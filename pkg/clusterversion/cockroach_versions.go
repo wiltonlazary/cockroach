@@ -10,7 +10,10 @@
 
 package clusterversion
 
-import "github.com/cockroachdb/cockroach/pkg/roachpb"
+import (
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+)
 
 // Key is a unique identifier for a version of CockroachDB.
 type Key int
@@ -19,107 +22,110 @@ type Key int
 // migrations. Before you add a version or consider removing one, please
 // familiarize yourself with the rules below.
 //
-// Adding Versions
+// # Adding Versions
 //
 // You'll want to add a new one in the following cases:
 //
 // (a) When introducing a backwards incompatible feature. Broadly, by this we
-//     mean code that's structured as follows:
 //
-//      if (specific-version is active) {
-//          // Implies that all nodes in the cluster are running binaries that
-//          // have this code. We can "enable" the new feature knowing that
-//          // outbound RPCs, requests, etc. will be handled by nodes that know
-//          // how to do so.
-//      } else {
-//          // There may be some nodes running older binaries without this code.
-//          // To be safe, we'll want to behave as we did before introducing
-//          // this feature.
-//      }
+//	 mean code that's structured as follows:
 //
-//     Authors of migrations need to be careful in ensuring that end-users
-//     aren't able to enable feature gates before they're active. This is fine:
+//	  if (specific-version is active) {
+//	      // Implies that all nodes in the cluster are running binaries that
+//	      // have this code. We can "enable" the new feature knowing that
+//	      // outbound RPCs, requests, etc. will be handled by nodes that know
+//	      // how to do so.
+//	  } else {
+//	      // There may be some nodes running older binaries without this code.
+//	      // To be safe, we'll want to behave as we did before introducing
+//	      // this feature.
+//	  }
 //
-//      func handleSomeNewStatement() error {
-//          if !(specific-version is active) {
-//              return errors.New("cluster version needs to be bumped")
-//          }
-//          // ...
-//      }
+//	 Authors of migrations need to be careful in ensuring that end-users
+//	 aren't able to enable feature gates before they're active. This is fine:
 //
-//     At the same time, with requests/RPCs originating at other crdb nodes, the
-//     initiator of the request gets to decide what's supported. A node should
-//     not refuse functionality on the grounds that its view of the version gate
-//     is as yet inactive. Consider the sender:
+//	  func handleSomeNewStatement() error {
+//	      if !(specific-version is active) {
+//	          return errors.New("cluster version needs to be bumped")
+//	      }
+//	      // ...
+//	  }
 //
-//      func invokeSomeRPC(req) {
-//	        if (specific-version is active) {
-//              // Like mentioned above, this implies that all nodes in the
-//              // cluster are running binaries that can handle this new
-//              // feature. We may have learned about this fact before the
-//              // node on the other end. This is due to the fact that migration
-//              // manager informs each node about the specific-version being
-//              // activated active concurrently. See BumpClusterVersion for
-//              // where that happens. Still, it's safe for us to enable the new
-//              // feature flags as we trust the recipient to know how to deal
-//              // with it.
-//		        req.NewFeatureFlag = true
-//	        }
-//	        send(req)
-//      }
+//	 At the same time, with requests/RPCs originating at other crdb nodes, the
+//	 initiator of the request gets to decide what's supported. A node should
+//	 not refuse functionality on the grounds that its view of the version gate
+//	 is as yet inactive. Consider the sender:
 //
-//    And consider the recipient:
+//	  func invokeSomeRPC(req) {
+//	      if (specific-version is active) {
+//	          // Like mentioned above, this implies that all nodes in the
+//	          // cluster are running binaries that can handle this new
+//	          // feature. We may have learned about this fact before the
+//	          // node on the other end. This is due to the fact that migration
+//	          // manager informs each node about the specific-version being
+//	          // activated active concurrently. See BumpClusterVersion for
+//	          // where that happens. Still, it's safe for us to enable the new
+//	          // feature flags as we trust the recipient to know how to deal
+//	          // with it.
+//	        req.NewFeatureFlag = true
+//	      }
+//	      send(req)
+//	  }
 //
-//     func someRPC(req) {
-//         if !req.NewFeatureFlag {
-//             // Legacy behavior...
-//         }
-//         // There's no need to even check if the specific-version is active.
-//         // If the flag is enabled, the specific-version must have been
-//         // activated, even if we haven't yet heard about it (we will pretty
-//         // soon).
-//     }
+//	And consider the recipient:
 //
-//     See clusterversion.Handle.IsActive and usage of some existing versions
-//     below for more clues on the matter.
+//	 func someRPC(req) {
+//	     if !req.NewFeatureFlag {
+//	         // Legacy behavior...
+//	     }
+//	     // There's no need to even check if the specific-version is active.
+//	     // If the flag is enabled, the specific-version must have been
+//	     // activated, even if we haven't yet heard about it (we will pretty
+//	     // soon).
+//	 }
+//
+//	 See clusterversion.Handle.IsActive and usage of some existing versions
+//	 below for more clues on the matter.
 //
 // (b) When cutting a major release branch. When cutting release-20.2 for
-//     example, you'll want to introduce the following to `master`.
 //
-//       (i)  V20_2 (keyed to v20.2.0-0})
-//       (ii) Start21_1 (keyed to v20.2.0-1})
+//	 example, you'll want to introduce the following to `master`.
 //
-//    You'll then want to backport (i) to the release branch itself (i.e.
-//    release-20.2). You'll also want to bump binaryMinSupportedVersion. In the
-//    example above, you'll set it to V20_2. This indicates that the
-//    minimum binary version required in a cluster with nodes running
-//    v21.1 binaries (including pre-release alphas) is v20.2, i.e. that an
-//    upgrade into such a binary must start out from at least v20.2 nodes.
+//	   (i)  V20_2 (keyed to v20.2.0-0})
+//	   (ii) Start21_1 (keyed to v20.2.0-1})
 //
-//    Aside: At the time of writing, the binary min supported version is the
-//    last major release, though we may consider relaxing this in the future
-//    (i.e. for example could skip up to one major release) as we move to a more
-//    frequent release schedule.
+//	You'll then want to backport (i) to the release branch itself (i.e.
+//	release-20.2). You'll also want to bump binaryMinSupportedVersion. In the
+//	example above, you'll set it to V20_2. This indicates that the
+//	minimum binary version required in a cluster with nodes running
+//	v21.1 binaries (including pre-release alphas) is v20.2, i.e. that an
+//	upgrade into such a binary must start out from at least v20.2 nodes.
+//
+//	Aside: At the time of writing, the binary min supported version is the
+//	last major release, though we may consider relaxing this in the future
+//	(i.e. for example could skip up to one major release) as we move to a more
+//	frequent release schedule.
 //
 // When introducing a version constant, you'll want to:
-//   (1) Add it at the end of this block. For versions introduced during and
-//       after the 21.1 release, Internal versions must be even-numbered. The
-//       odd versions are used for internal book-keeping. The Internal version
-//       should be the previous Internal version for the same minor release plus
-//       two.
-//   (2) Add it at the end of the `versionsSingleton` block below.
 //
-// Migrations
+//	(1) Add it at the end of this block. For versions introduced during and
+//	    after the 21.1 release, Internal versions must be even-numbered. The
+//	    odd versions are used for internal book-keeping. The Internal version
+//	    should be the previous Internal version for the same minor release plus
+//	    two.
+//	(2) Add it at the end of the `versionsSingleton` block below.
+//
+// # Migrations
 //
 // Migrations are idempotent functions that can be attached to versions and will
 // be rolled out before the respective cluster version gets rolled out. They are
 // primarily a means to remove legacy state from the cluster. For example, a
 // migration might scan the cluster for an outdated type of table descriptor and
 // rewrite it into a new format. Migrations are tricky to get right and they have
-// their own documentation in ./pkg/migration, which you should peruse should you
+// their own documentation in ./pkg/upgrade, which you should peruse should you
 // feel that a migration is necessary for your use case.
 //
-// Phasing out Versions and Migrations
+// # Phasing out Versions and Migrations
 //
 // Versions and Migrations can be removed once they are no longer going to be
 // exercised. This is primarily driven by the BinaryMinSupportedVersion, which
@@ -154,109 +160,164 @@ type Key int
 //
 //go:generate stringer -type=Key
 const (
-	_ Key = iota - 1 // want first named one to start at zero
+	invalidVersionKey Key = iota - 1 // want first named one to start at zero
 
-	// V21_2 is CockroachDB v21.2. It's used for all v21.2.x patch releases.
-	V21_2
+	// V22_1 is CockroachDB v22.1. It's used for all v22.1.x patch releases.
+	V22_1
 
-	// v22.1 versions.
+	// v22.2 versions.
 	//
-	// Start22_1 demarcates work towards CockroachDB v22.1.
-	Start22_1
+	// Start22_2 demarcates work towards CockroachDB v22.2.
+	Start22_2
 
-	// TargetBytesAvoidExcess prevents exceeding BatchRequest.Header.TargetBytes
-	// except when there is a single value in the response. 21.2 DistSender logic
-	// requires the limit to always be overshot in order to properly enforce
-	// limits when splitting requests.
-	TargetBytesAvoidExcess
-	// AvoidDrainingNames avoids using the draining_names field when renaming or
-	// dropping descriptors.
-	AvoidDrainingNames
-	// DrainingNamesMigration adds the migration which guarantees that no
-	// descriptors have draining names.
-	DrainingNamesMigration
-	// TraceIDDoesntImplyStructuredRecording changes the contract about the kind
-	// of span that RPCs get on the server depending on the tracing context.
-	TraceIDDoesntImplyStructuredRecording
-	// AlterSystemTableStatisticsAddAvgSizeCol adds the column avgSize to the
-	// table system.table_statistics that contains a new statistic.
-	AlterSystemTableStatisticsAddAvgSizeCol
-	// AlterSystemStmtDiagReqs adds the migration for
-	// system.statement_diagnostics_requests table to support collecting stmt
-	// bundles when the query latency exceeds the user provided threshold.
-	AlterSystemStmtDiagReqs
-	// MVCCAddSSTable supports MVCC-compliant AddSSTable requests via the new
-	// WriteAtRequestTimestamp and DisallowConflicts parameters.
-	MVCCAddSSTable
-	// InsertPublicSchemaNamespaceEntryOnRestore ensures all public schemas
-	// have an entry in system.namespace upon being restored.
-	InsertPublicSchemaNamespaceEntryOnRestore
-	// UnsplitRangesInAsyncGCJobs moves ranges unsplitting from transaction of
-	// "drop table"/"truncate table" to async gc jobs
-	UnsplitRangesInAsyncGCJobs
-	// ValidateGrantOption checks whether the current user granting privileges to
-	// another user holds the grant option for those privileges
-	ValidateGrantOption
-	// PebbleFormatBlockPropertyCollector switches to a backwards incompatible
-	// Pebble version that provides block property collectors that can be used
-	// for fine-grained time bound iteration. See
-	// https://github.com/cockroachdb/pebble/issues/1190 for details.
-	PebbleFormatBlockPropertyCollector
-	// ProbeRequest is the version at which roachpb.ProbeRequest was introduced.
-	// This version must be active before any ProbeRequest is issued on the
-	// cluster.
-	ProbeRequest
-	// SelectRPCsTakeTracingInfoInband switches the way tracing works for a couple
-	// of common RPCs. Tracing information for these select RPCs is no longer
-	// marshaled from the client to the server as gRPC metadata, and the gRPC
-	// server interceptor is no longer in charge of transparently creating server
-	// spans. Instead, trace information is carried by the respective request
-	// protos (the client is responsible for filling it in explicitly), and the
-	// server-side handler is responsible for opening a span manually.
-	SelectRPCsTakeTracingInfoInband
-	// PreSeedTenantSpanConfigs precedes SeedTenantSpanConfigs, and enables the
-	// creation of initial span config records for newly created tenants.
-	PreSeedTenantSpanConfigs
-	// SeedTenantSpanConfigs populates system.span_configurations with seed
-	// data for secondary tenants. This state is what ensures that we always
-	// split on tenant boundaries when using the span configs infrastructure.
-	// This version comes with a migration to populate the same seed data
-	// for existing tenants.
-	SeedTenantSpanConfigs
-	// PublicSchemasWithDescriptors backs public schemas with descriptors.
-	PublicSchemasWithDescriptors
-	// AlterSystemProtectedTimestampAddColumn adds a target column to the
-	// system.protected_ts_records table that describes what is protected by the
-	// record.
-	AlterSystemProtectedTimestampAddColumn
-	// EnsureSpanConfigReconciliation ensures that the host tenant has run its
-	// reconciliation process at least once.
-	EnsureSpanConfigReconciliation
-	// EnsureSpanConfigSubscription ensures that all KV nodes are subscribed to
-	// the global span configuration state, observing the entries installed as
-	// in EnsureSpanConfigReconciliation.
-	EnsureSpanConfigSubscription
-	// EnableSpanConfigStore enables the use of the span configs infrastructure
-	// in KV.
-	EnableSpanConfigStore
-	// ScanWholeRows is the version at which the Header.WholeRowsOfSize parameter
-	// was introduced, preventing limited scans from returning partial rows.
-	ScanWholeRows
-	// SCRAM authentication is available.
-	SCRAMAuthentication
+	// LocalTimestamps enables the use of local timestamps in MVCC values.
+	LocalTimestamps
+	// PebbleFormatSplitUserKeysMarkedCompacted updates the Pebble format
+	// version that recombines all user keys that may be split across multiple
+	// files into a single table.
+	PebbleFormatSplitUserKeysMarkedCompacted
+	// EnsurePebbleFormatVersionRangeKeys is the first step of a two-part
+	// migration that bumps Pebble's format major version to a version that
+	// supports range keys.
+	EnsurePebbleFormatVersionRangeKeys
+	// EnablePebbleFormatVersionRangeKeys is the second of a two-part migration
+	// and is used as the feature gate for use of range keys. Any node at this
+	// version is guaranteed to reside in a cluster where all nodes support range
+	// keys at the Pebble layer.
+	EnablePebbleFormatVersionRangeKeys
+	// TrigramInvertedIndexes enables the creation of trigram inverted indexes
+	// on strings.
+	TrigramInvertedIndexes
+	// RemoveGrantPrivilege is the last step to migrate from the GRANT privilege to WITH GRANT OPTION.
+	RemoveGrantPrivilege
+	// MVCCRangeTombstones enables the use of MVCC range tombstones.
+	MVCCRangeTombstones
+	// UpgradeSequenceToBeReferencedByID ensures that sequences are referenced
+	// by IDs rather than by their names. For example, a column's DEFAULT (or
+	// ON UPDATE) expression can be defined to be 'nextval('s')'; we want to be
+	// able to refer to sequence 's' by its ID, since 's' might be later renamed.
+	UpgradeSequenceToBeReferencedByID
+	// SampledStmtDiagReqs enables installing statement diagnostic requests that
+	// probabilistically collects stmt bundles, controlled by the user provided
+	// sampling rate.
+	SampledStmtDiagReqs
+	// AddSSTableTombstones allows writing MVCC point tombstones via AddSSTable.
+	// Previously, SSTs containing these could error.
+	AddSSTableTombstones
+	// SystemPrivilegesTable adds system.privileges table.
+	SystemPrivilegesTable
+	// EnablePredicateProjectionChangefeed indicates that changefeeds support
+	// predicates and projections.
+	EnablePredicateProjectionChangefeed
+	// AlterSystemSQLInstancesAddLocality adds a locality column to the
+	// system.sql_instances table.
+	AlterSystemSQLInstancesAddLocality
+	// SystemExternalConnectionsTable adds system.external_connections table.
+	SystemExternalConnectionsTable
+	// AlterSystemStatementStatisticsAddIndexRecommendations adds an
+	// index_recommendations column to the system.statement_statistics table.
+	AlterSystemStatementStatisticsAddIndexRecommendations
+	// RoleIDSequence is the version where the system.role_id_sequence exists.
+	RoleIDSequence
+	// AddSystemUserIDColumn is the version where the system.users table has
+	// a user_id column for writes only.
+	AddSystemUserIDColumn
+	// SystemUsersIDColumnIsBackfilled is the version where all users in the system.users table
+	// have ids.
+	SystemUsersIDColumnIsBackfilled
+	// SetSystemUsersUserIDColumnNotNull sets the user_id column in system.users to not null.
+	SetSystemUsersUserIDColumnNotNull
+	// SQLSchemaTelemetryScheduledJobs adds an automatic schedule for SQL schema
+	// telemetry logging jobs.
+	SQLSchemaTelemetryScheduledJobs
+	// SchemaChangeSupportsCreateFunction adds support of CREATE FUNCTION
+	// statement.
+	SchemaChangeSupportsCreateFunction
+	// DeleteRequestReturnKey is the version where the DeleteRequest began
+	// populating the FoundKey value in the response.
+	DeleteRequestReturnKey
+	// PebbleFormatPrePebblev1Marked performs a Pebble-level migration and
+	// upgrades the Pebble format major version to FormatPrePebblev1Marked. This
+	// migration occurs at the per-store level and is twofold:
+	//  - Each store is first bumped to a Pebble format major version that raises
+	//  the minimum supported sstable format to (Pebble,v1) (block properties). New
+	//  tables generated by Pebble (via compactions / flushes), and tables written
+	//  for ingestion will be at table format version (Pebble,v1).
+	//  - Each store is then instructed to mark all existing tables that are
+	//  pre-Pebblev1 for a low-priority compaction. In a future release of
+	//  Cockroach (likely 23.1), a blocking migration will be run to
+	//  rewrite-compact on any remaining marked tables.
+	PebbleFormatPrePebblev1Marked
+	// RoleOptionsTableHasIDColumn is the version where the role options table
+	// has ids.
+	RoleOptionsTableHasIDColumn
+	// RoleOptionsIDColumnIsBackfilled is the version where ids in the role options
+	// table are backfilled.
+	RoleOptionsIDColumnIsBackfilled
+	// SetRoleOptionsUserIDColumnNotNull is the version where the role
+	// options table id column cannot be null. This is the final step
+	// of the system.role_options table migration.
+	SetRoleOptionsUserIDColumnNotNull
+	// UseDelRangeInGCJob enables the use of the DelRange operation in the
+	// GC job. Before it is enabled, the GC job uses ClearRange operations
+	// after the job waits out the GC TTL. After it has been enabled, the
+	// job instead issues DelRange operations at the beginning of the job
+	// and then waits for the data to be removed automatically before removing
+	// the descriptor and zone configurations.
+	UseDelRangeInGCJob
+	// WaitedForDelRangeInGCJob corresponds to the migration which waits for
+	// the GC jobs to adopt the use of DelRange with tombstones.
+	WaitedForDelRangeInGCJob
+	// RangefeedUseOneStreamPerNode changes rangefeed implementation to use 1 RPC stream per node.
+	RangefeedUseOneStreamPerNode
+	// NoNonMVCCAddSSTable adds a migration which waits for all
+	// schema changes to complete. After this point, no non-MVCC
+	// AddSSTable calls will be used outside of tenant streaming.
+	NoNonMVCCAddSSTable
+	// GCHintInReplicaState adds GC hint to replica state. When this version is
+	// enabled, replicas will populate GC hint and update them when necessary.
+	GCHintInReplicaState
+	// UpdateInvalidColumnIDsInSequenceBackReferences looks for invalid column
+	// ids in sequences' back references and attempts a best-effort-based matching
+	// to update those column IDs.
+	UpdateInvalidColumnIDsInSequenceBackReferences
+	// TTLDistSQL uses DistSQL to distribute TTL SELECT/DELETE statements to
+	// leaseholder nodes.
+	TTLDistSQL
+	// PrioritizeSnapshots adds prioritization to sender snapshots. When this
+	// version is enabled, the receiver will look at the priority of snapshots
+	// using the fields added in 22.2.
+	PrioritizeSnapshots
+	// EnableLeaseUpgrade version gates a change in the lease transfer protocol
+	// whereby we only ever transfer expiration-based leases (and have
+	// recipients later upgrade them to the more efficient epoch based ones).
+	// This was done to limit the effects of ill-advised lease transfers since
+	// the incoming leaseholder would need to recognize itself as such within a
+	// few seconds. This needs version gating so that in mixed-version clusters,
+	// as part of lease transfers, we don't start sending out expiration based
+	// leases to nodes that (i) don't expect them for certain keyspans, and (ii)
+	// don't know to upgrade them to efficient epoch-based ones.
+	EnableLeaseUpgrade
+	// SupportAssumeRoleAuth is the version where assume role authorization is
+	// supported in cloud storage and KMS.
+	SupportAssumeRoleAuth
 
+	// FixUserfileRelatedDescriptorCorruption adds a migration which uses
+	// heuristics to identify invalid table descriptors for userfile-related
+	// descriptors.
+	FixUserfileRelatedDescriptorCorruption
 	// *************************************************
 	// Step (1): Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 )
 
-// TODOPreV21_2 is an alias for V21_2 for use in any version gate/check that
-// previously referenced a < 21.2 version until that check/gate can be removed.
-const TODOPreV21_2 = V21_2
+// TODOPreV22_1 is an alias for V22_1 for use in any version gate/check that
+// previously referenced a < 22.1 version until that check/gate can be removed.
+const TODOPreV22_1 = V22_1
 
-// versionsSingleton lists all historical versions here in chronological order,
-// with comments describing what backwards-incompatible features were
+// rawVersionsSingleton lists all historical versions here in chronological
+// order, with comments describing what backwards-incompatible features were
 // introduced.
 //
 // A roachpb.Version has the colloquial form MAJOR.MINOR[.PATCH][-INTERNAL],
@@ -272,112 +333,214 @@ const TODOPreV21_2 = V21_2
 // Such clusters would need to be wiped. As a result, do not bump the major or
 // minor version until we are absolutely sure that no new migrations will need
 // to be added (i.e., when cutting the final release candidate).
-var versionsSingleton = keyedVersions{
+//
+// rawVersionsSingleton is converted to versionsSingleton below, by adding a
+// large number to every major if building from master, so as to ensure that
+// master builds cannot be upgraded to release-branch builds.
+var rawVersionsSingleton = keyedVersions{
 	{
-		// V21_2 is CockroachDB v21.2. It's used for all v21.2.x patch releases.
-		Key:     V21_2,
-		Version: roachpb.Version{Major: 21, Minor: 2},
+		Key:     V22_1,
+		Version: roachpb.Version{Major: 22, Minor: 1},
 	},
 
-	// v22.1 versions. Internal versions must be even.
+	// v22.2 versions. Internal versions must be even.
 	{
-		Key:     Start22_1,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 2},
+		Key:     Start22_2,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 2},
 	},
 	{
-		Key:     TargetBytesAvoidExcess,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 4},
+		Key:     LocalTimestamps,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 4},
 	},
 	{
-		Key:     AvoidDrainingNames,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 6},
+		Key:     PebbleFormatSplitUserKeysMarkedCompacted,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 6},
 	},
 	{
-		Key:     DrainingNamesMigration,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 8},
+		Key:     EnsurePebbleFormatVersionRangeKeys,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 8},
 	},
 	{
-		Key:     TraceIDDoesntImplyStructuredRecording,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 10},
+		Key:     EnablePebbleFormatVersionRangeKeys,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 10},
 	},
 	{
-		Key:     AlterSystemTableStatisticsAddAvgSizeCol,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 12},
+		Key:     TrigramInvertedIndexes,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 12},
 	},
 	{
-		Key:     AlterSystemStmtDiagReqs,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 14},
+		Key:     RemoveGrantPrivilege,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 14},
 	},
 	{
-		Key:     MVCCAddSSTable,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 16},
+		Key:     MVCCRangeTombstones,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 16},
 	},
 	{
-		Key:     InsertPublicSchemaNamespaceEntryOnRestore,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 18},
+		Key:     UpgradeSequenceToBeReferencedByID,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 18},
 	},
 	{
-		Key:     UnsplitRangesInAsyncGCJobs,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 20},
+		Key:     SampledStmtDiagReqs,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 20},
 	},
 	{
-		Key:     ValidateGrantOption,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 22},
+		Key:     AddSSTableTombstones,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 22},
 	},
 	{
-		Key:     PebbleFormatBlockPropertyCollector,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 24},
+		Key:     SystemPrivilegesTable,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 24},
 	},
 	{
-		Key:     ProbeRequest,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 26},
+		Key:     EnablePredicateProjectionChangefeed,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 26},
 	},
 	{
-		Key:     SelectRPCsTakeTracingInfoInband,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 28},
+		Key:     AlterSystemSQLInstancesAddLocality,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 28},
 	},
 	{
-		Key:     PreSeedTenantSpanConfigs,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 30},
+		Key:     SystemExternalConnectionsTable,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 30},
 	},
 	{
-		Key:     SeedTenantSpanConfigs,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 32},
+		Key:     AlterSystemStatementStatisticsAddIndexRecommendations,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 32},
 	},
 	{
-		Key:     PublicSchemasWithDescriptors,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 34},
+		Key:     RoleIDSequence,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 34},
 	},
 	{
-		Key:     AlterSystemProtectedTimestampAddColumn,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 36},
+		Key:     AddSystemUserIDColumn,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 36},
 	},
 	{
-		Key:     EnsureSpanConfigReconciliation,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 38},
+		Key:     SystemUsersIDColumnIsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 38},
 	},
 	{
-		Key:     EnsureSpanConfigSubscription,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 40},
+		Key:     SetSystemUsersUserIDColumnNotNull,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 40},
 	},
 	{
-		Key:     EnableSpanConfigStore,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 42},
+		Key:     SQLSchemaTelemetryScheduledJobs,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 42},
 	},
 	{
-		Key:     ScanWholeRows,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 44},
+		Key:     SchemaChangeSupportsCreateFunction,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 44},
 	},
 	{
-		Key:     SCRAMAuthentication,
-		Version: roachpb.Version{Major: 21, Minor: 2, Internal: 46},
+		Key:     DeleteRequestReturnKey,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 46},
 	},
-
+	{
+		Key:     PebbleFormatPrePebblev1Marked,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 48},
+	},
+	{
+		Key:     RoleOptionsTableHasIDColumn,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 50},
+	},
+	{
+		Key:     RoleOptionsIDColumnIsBackfilled,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 52},
+	},
+	{
+		Key:     SetRoleOptionsUserIDColumnNotNull,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 54},
+	},
+	{
+		Key:     UseDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 56},
+	},
+	{
+		Key:     WaitedForDelRangeInGCJob,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 58},
+	},
+	{
+		Key:     RangefeedUseOneStreamPerNode,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 60},
+	},
+	{
+		Key:     NoNonMVCCAddSSTable,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 62},
+	},
+	{
+		Key:     GCHintInReplicaState,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 64},
+	},
+	{
+		Key:     UpdateInvalidColumnIDsInSequenceBackReferences,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 66},
+	},
+	{
+		Key:     TTLDistSQL,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 68},
+	},
+	{
+		Key:     PrioritizeSnapshots,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 70},
+	},
+	{
+		Key:     EnableLeaseUpgrade,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 72},
+	},
+	{
+		Key:     SupportAssumeRoleAuth,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 74},
+	},
+	{
+		Key:     FixUserfileRelatedDescriptorCorruption,
+		Version: roachpb.Version{Major: 22, Minor: 1, Internal: 76},
+	},
 	// *************************************************
 	// Step (2): Add new versions here.
 	// Do not add new versions to a patch release.
 	// *************************************************
 }
+
+const (
+	// developmentBranch should be toggled to false on a release branch once the
+	// set of versions becomes append-only and associated upgrade implementations
+	// are frozen. It is always true on the main development branch.
+	developmentBranch = true
+
+	// finalVersion should be set on a release branch to the minted final cluster
+	// version key, e.g. to V22_2 on the release-22.2 branch once it is minted.
+	// Setting it has the effect of ensuring no versions are subsequently added.
+	finalVersion = invalidVersionKey
+)
+
+// devVersionsAbove is the version key above which all versions are offset to be
+// development version when developmentBranch is true. By default this is all
+// versions, by setting this to -1, but an env var can override this, to leave
+// the first version un-offset. Doing so means that that version, which is
+// generally minBinaryVersion as well, is unchanged, and thus allows upgrading a
+// stable release data-dir to a dev version if desired.
+var devVersionsAbove Key = func() Key {
+	if envutil.EnvOrDefaultBool("COCKROACH_UPGRADE_TO_DEV_VERSION", false) {
+		return invalidVersionKey + 1
+	}
+	return invalidVersionKey
+}()
+
+var versionsSingleton = func() keyedVersions {
+	if developmentBranch {
+		const devOffset = 1000000
+		// Throw every version above the last release (which will be none on a release
+		// branch) 1 million major versions into the future, so any "upgrade" to a
+		// release branch build will be a downgrade and thus blocked.
+		for i := range rawVersionsSingleton {
+			if rawVersionsSingleton[i].Key > devVersionsAbove {
+				rawVersionsSingleton[i].Major += devOffset
+			}
+		}
+	}
+	return rawVersionsSingleton
+}()
 
 // TODO(irfansharif): clusterversion.binary{,MinimumSupported}Version
 // feels out of place. A "cluster version" and a "binary version" are two
@@ -388,7 +551,7 @@ var (
 	// version than binaryMinSupportedVersion, then the binary will exit with
 	// an error. This typically trails the current release by one (see top-level
 	// comment).
-	binaryMinSupportedVersion = ByKey(V21_2)
+	binaryMinSupportedVersion = ByKey(V22_1)
 
 	// binaryVersion is the version of this binary.
 	//
@@ -397,11 +560,12 @@ var (
 )
 
 func init() {
-	const isReleaseBranch = false
-	if isReleaseBranch {
-		if binaryVersion != ByKey(V21_2) {
-			panic("unexpected cluster version greater than release's binary version")
+	if finalVersion > invalidVersionKey {
+		if binaryVersion != ByKey(finalVersion) {
+			panic("binary version does not match final version")
 		}
+	} else if binaryVersion.Internal == 0 {
+		panic("a non-upgrade cluster version must be the final version")
 	}
 }
 

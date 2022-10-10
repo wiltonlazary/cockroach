@@ -16,11 +16,14 @@ import (
 	"time"
 
 	"github.com/cockroachdb/apd/v3"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -39,10 +42,17 @@ type setVarNode struct {
 	typedValues []tree.TypedExpr
 }
 
+// resetAllNode represents a RESET ALL statement.
+type resetAllNode struct{}
+
 // SetVar sets session variables.
 // Privileges: None.
-//   Notes: postgres/mysql do not require privileges for session variables (some exceptions).
+//
+//	Notes: postgres/mysql do not require privileges for session variables (some exceptions).
 func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) {
+	if n.ResetAll {
+		return &resetAllNode{}, nil
+	}
 	if n.Name == "" {
 		// A client has sent the reserved internal syntax SET ROW ...,
 		// or the user entered `SET "" = foo`. Reject it.
@@ -54,6 +64,15 @@ func (p *planner) SetVar(ctx context.Context, n *tree.SetVar) (planNode, error) 
 	_, v, err := getSessionVar(name, false /* missingOk */)
 	if err != nil {
 		return nil, err
+	}
+	if _, ok := settings.Lookup(name, settings.LookupForLocalAccess, p.ExecCfg().Codec.ForSystemTenant()); ok {
+		p.BufferClientNotice(
+			ctx,
+			errors.WithHint(
+				pgnotice.Newf("setting custom variable %q", name),
+				"did you mean SET CLUSTER SETTING?",
+			),
+		)
 	}
 
 	var typedValues []tree.TypedExpr
@@ -112,7 +131,7 @@ func (n *setVarNode) startExec(params runParams) error {
 	}
 	if n.typedValues != nil {
 		for i, v := range n.typedValues {
-			d, err := v.Eval(params.EvalContext())
+			d, err := eval.Expr(params.ctx, params.EvalContext(), v)
 			if err != nil {
 				return err
 			}
@@ -120,10 +139,10 @@ func (n *setVarNode) startExec(params runParams) error {
 		}
 		var err error
 		if n.v.GetStringVal != nil {
-			strVal, err = n.v.GetStringVal(params.ctx, params.extendedEvalCtx, n.typedValues)
+			strVal, err = n.v.GetStringVal(params.ctx, params.extendedEvalCtx, n.typedValues, params.p.Txn())
 		} else {
 			// No string converter defined, use the default one.
-			strVal, err = getStringVal(params.EvalContext(), n.name, n.typedValues)
+			strVal, err = getStringVal(params.ctx, params.EvalContext(), n.name, n.typedValues)
 		}
 		if err != nil {
 			return err
@@ -148,7 +167,7 @@ func (p *planner) applyOnSessionDataMutators(
 	if local {
 		// We don't allocate a new SessionData object on implicit transactions.
 		// This no-ops in postgres with a warning, so copy accordingly.
-		if p.EvalContext().TxnImplicit {
+		if p.extendedEvalCtx.TxnImplicit {
 			p.BufferClientNotice(
 				ctx,
 				pgnotice.NewWithSeverityf(
@@ -182,41 +201,93 @@ func (n *setVarNode) Next(_ runParams) (bool, error) { return false, nil }
 func (n *setVarNode) Values() tree.Datums            { return nil }
 func (n *setVarNode) Close(_ context.Context)        {}
 
-func getStringVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExpr) (string, error) {
+func (p *planner) resetAllSessionVars(ctx context.Context) error {
+	for varName, v := range varGen {
+		if v.Set == nil && v.RuntimeSet == nil && v.SetWithPlanner == nil {
+			continue
+		}
+		// For Postgres compatibility, Don't reset `role` here.
+		if varName == "role" {
+			continue
+		}
+		hasDefault, defVal := getSessionVarDefaultString(
+			varName,
+			v,
+			p.sessionDataMutatorIterator.sessionDataMutatorBase,
+		)
+		if !hasDefault {
+			continue
+		}
+		if err := p.SetSessionVar(ctx, varName, defVal, false /* isLocal */); err != nil {
+			return err
+		}
+	}
+	for varName := range p.SessionData().CustomOptions {
+		_, v, err := getSessionVar(varName, false /* missingOK */)
+		if err != nil {
+			return err
+		}
+		_, defVal := getSessionVarDefaultString(
+			varName,
+			v,
+			p.sessionDataMutatorIterator.sessionDataMutatorBase,
+		)
+		if err := p.SetSessionVar(ctx, varName, defVal, false /* isLocal */); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *resetAllNode) startExec(params runParams) error {
+	return params.p.resetAllSessionVars(params.ctx)
+}
+
+func (n *resetAllNode) Next(_ runParams) (bool, error) { return false, nil }
+func (n *resetAllNode) Values() tree.Datums            { return nil }
+func (n *resetAllNode) Close(_ context.Context)        {}
+
+func getStringVal(
+	ctx context.Context, evalCtx *eval.Context, name string, values []tree.TypedExpr,
+) (string, error) {
 	if len(values) != 1 {
 		return "", newSingleArgVarError(name)
 	}
-	return paramparse.DatumAsString(evalCtx, name, values[0])
+	return paramparse.DatumAsString(ctx, evalCtx, name, values[0])
 }
 
-func getIntVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExpr) (int64, error) {
+func getIntVal(
+	ctx context.Context, evalCtx *eval.Context, name string, values []tree.TypedExpr,
+) (int64, error) {
 	if len(values) != 1 {
 		return 0, newSingleArgVarError(name)
 	}
-	return paramparse.DatumAsInt(evalCtx, name, values[0])
+	return paramparse.DatumAsInt(ctx, evalCtx, name, values[0])
 }
 
-func getFloatVal(evalCtx *tree.EvalContext, name string, values []tree.TypedExpr) (float64, error) {
+func getFloatVal(
+	ctx context.Context, evalCtx *eval.Context, name string, values []tree.TypedExpr,
+) (float64, error) {
 	if len(values) != 1 {
 		return 0, newSingleArgVarError(name)
 	}
-	return paramparse.DatumAsFloat(evalCtx, name, values[0])
+	return paramparse.DatumAsFloat(ctx, evalCtx, name, values[0])
 }
 
 func timeZoneVarGetStringVal(
-	_ context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr,
+	ctx context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr, _ *kv.Txn,
 ) (string, error) {
 	if len(values) != 1 {
 		return "", newSingleArgVarError("timezone")
 	}
-	d, err := values[0].Eval(&evalCtx.EvalContext)
+	d, err := eval.Expr(ctx, &evalCtx.Context, values[0])
 	if err != nil {
 		return "", err
 	}
 
 	var loc *time.Location
 	var offset int64
-	switch v := tree.UnwrapDatum(&evalCtx.EvalContext, d).(type) {
+	switch v := eval.UnwrapDatum(&evalCtx.Context, d).(type) {
 	case *tree.DString:
 		location := string(*v)
 		loc, err = timeutil.TimeZoneStringToLocation(
@@ -276,20 +347,20 @@ func timeZoneVarSet(_ context.Context, m sessionDataMutator, s string) error {
 func makeTimeoutVarGetter(
 	varName string,
 ) func(
-	ctx context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr) (string, error) {
+	ctx context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr, txn *kv.Txn) (string, error) {
 	return func(
-		ctx context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr,
+		ctx context.Context, evalCtx *extendedEvalContext, values []tree.TypedExpr, txn *kv.Txn,
 	) (string, error) {
 		if len(values) != 1 {
 			return "", newSingleArgVarError(varName)
 		}
-		d, err := values[0].Eval(&evalCtx.EvalContext)
+		d, err := eval.Expr(ctx, &evalCtx.Context, values[0])
 		if err != nil {
 			return "", err
 		}
 
 		var timeout time.Duration
-		switch v := tree.UnwrapDatum(&evalCtx.EvalContext, d).(type) {
+		switch v := eval.UnwrapDatum(&evalCtx.Context, d).(type) {
 		case *tree.DString:
 			return string(*v), nil
 		case *tree.DInterval:
@@ -370,6 +441,20 @@ func idleInSessionTimeoutVarSet(ctx context.Context, m sessionDataMutator, s str
 	}
 
 	m.SetIdleInSessionTimeout(timeout)
+	return nil
+}
+
+func transactionTimeoutVarSet(ctx context.Context, m sessionDataMutator, s string) error {
+	timeout, err := validateTimeoutVar(
+		m.data.GetIntervalStyle(),
+		s,
+		"transaction_timeout",
+	)
+	if err != nil {
+		return err
+	}
+
+	m.SetTransactionTimeout(timeout)
 	return nil
 }
 

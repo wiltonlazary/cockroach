@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,7 +13,8 @@ go_library(
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv",
-        "//pkg/kv/kvclient/rangefeed:with-mocks",
+        "//pkg/kv/kvclient/rangefeed",
+        "//pkg/roachpb",
         "//pkg/sql/sqlinstance",
         "//pkg/sql/sqlinstance/instancestorage",
         "//pkg/sql/sqlliveness",
@@ -28,6 +30,7 @@ go_library(
 go_test(
     name = "instanceprovider_test",
     srcs = ["instanceprovider_test.go"],
+    args = ["-test.timeout=295s"],
     deps = [
         ":instanceprovider",
         "//pkg/base",
@@ -46,3 +49,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -49,7 +49,7 @@ func standardOptions(i int) *pebble.Options {
 `,
 		7: `
 [Options]
-  mem_table_size=1000
+  mem_table_size=2000
 `,
 		8: `
 [Options]
@@ -100,11 +100,15 @@ func standardOptions(i int) *pebble.Options {
 	if err := opts.Parse(stdOpts[i], nil); err != nil {
 		panic(err)
 	}
+	// Enable range keys in all options.
+	opts.FormatMajorVersion = pebble.FormatRangeKeys
 	return opts
 }
 
 func randomOptions() *pebble.Options {
 	opts := storage.DefaultPebbleOptions()
+	// Enable range keys in all options.
+	opts.FormatMajorVersion = pebble.FormatRangeKeys
 
 	rng, _ := randutil.NewTestRand()
 	opts.BytesPerSync = 1 << rngIntRange(rng, 8, 30)
@@ -129,9 +133,10 @@ func randomOptions() *pebble.Options {
 	}
 	opts.MaxManifestFileSize = 1 << rngIntRange(rng, 1, 28)
 	opts.MaxOpenFiles = int(rngIntRange(rng, 20, 2000))
-	opts.MemTableSize = 1 << rngIntRange(rng, 10, 28)
+	opts.MemTableSize = 1 << rngIntRange(rng, 11, 28)
 	opts.MemTableStopWritesThreshold = int(rngIntRange(rng, 2, 7))
-	opts.MaxConcurrentCompactions = int(rngIntRange(rng, 1, 4))
+	maxConcurrentCompactions := int(rngIntRange(rng, 1, 4))
+	opts.MaxConcurrentCompactions = func() int { return maxConcurrentCompactions }
 
 	opts.Cache = pebble.NewCache(1 << rngIntRange(rng, 1, 30))
 	defer opts.Cache.Unref()

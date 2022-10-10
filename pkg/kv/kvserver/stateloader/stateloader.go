@@ -19,11 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -44,7 +44,7 @@ type StateLoader struct {
 	keys.RangeIDPrefixBuf
 }
 
-// Make creates a a StateLoader.
+// Make creates a StateLoader.
 func Make(rangeID roachpb.RangeID) StateLoader {
 	rsl := StateLoader{
 		RangeIDPrefixBuf: keys.MakeRangeIDPrefixBuf(rangeID),
@@ -73,17 +73,20 @@ func (rsl StateLoader) Load(
 		return kvserverpb.ReplicaState{}, err
 	}
 
+	if s.GCHint, err = rsl.LoadGCHint(ctx, reader); err != nil {
+		return kvserverpb.ReplicaState{}, err
+	}
+
 	as, err := rsl.LoadRangeAppliedState(ctx, reader)
 	if err != nil {
 		return kvserverpb.ReplicaState{}, err
 	}
 	s.RaftAppliedIndex = as.RaftAppliedIndex
+	s.RaftAppliedIndexTerm = as.RaftAppliedIndexTerm
 	s.LeaseAppliedIndex = as.LeaseAppliedIndex
 	ms := as.RangeStats.ToStats()
 	s.Stats = &ms
-	if as.RaftClosedTimestamp != nil {
-		s.RaftClosedTimestamp = *as.RaftClosedTimestamp
-	}
+	s.RaftClosedTimestamp = as.RaftClosedTimestamp
 
 	// The truncated state should not be optional (i.e. the pointer is
 	// pointless), but it is and the migration is not worth it.
@@ -116,7 +119,10 @@ func (rsl StateLoader) Load(
 // missing whenever save is called. Optional values should be reserved
 // strictly for use in Result. Do before merge.
 func (rsl StateLoader) Save(
-	ctx context.Context, readWriter storage.ReadWriter, state kvserverpb.ReplicaState,
+	ctx context.Context,
+	readWriter storage.ReadWriter,
+	state kvserverpb.ReplicaState,
+	gcHintEnabled bool,
 ) (enginepb.MVCCStats, error) {
 	ms := state.Stats
 	if err := rsl.SetLease(ctx, readWriter, ms, *state.Lease); err != nil {
@@ -124,6 +130,11 @@ func (rsl StateLoader) Save(
 	}
 	if err := rsl.SetGCThreshold(ctx, readWriter, ms, state.GCThreshold); err != nil {
 		return enginepb.MVCCStats{}, err
+	}
+	if gcHintEnabled {
+		if _, err := rsl.SetGCHint(ctx, readWriter, ms, state.GCHint, gcHintEnabled); err != nil {
+			return enginepb.MVCCStats{}, err
+		}
 	}
 	if err := rsl.SetRaftTruncatedState(ctx, readWriter, state.TruncatedState); err != nil {
 		return enginepb.MVCCStats{}, err
@@ -133,8 +144,16 @@ func (rsl StateLoader) Save(
 			return enginepb.MVCCStats{}, err
 		}
 	}
-	rai, lai, ct := state.RaftAppliedIndex, state.LeaseAppliedIndex, &state.RaftClosedTimestamp
-	if err := rsl.SetRangeAppliedState(ctx, readWriter, rai, lai, ms, ct); err != nil {
+	if err := rsl.SetRangeAppliedState(
+		ctx,
+		readWriter,
+		state.RaftAppliedIndex,
+		state.LeaseAppliedIndex,
+		state.RaftAppliedIndexTerm,
+		ms,
+		state.RaftClosedTimestamp,
+		nil,
+	); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
 	return *ms, nil
@@ -155,17 +174,17 @@ func (rsl StateLoader) SetLease(
 	ctx context.Context, readWriter storage.ReadWriter, ms *enginepb.MVCCStats, lease roachpb.Lease,
 ) error {
 	return storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeLeaseKey(),
-		hlc.Timestamp{}, nil, &lease)
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &lease)
 }
 
 // LoadRangeAppliedState loads the Range applied state.
 func (rsl StateLoader) LoadRangeAppliedState(
 	ctx context.Context, reader storage.Reader,
-) (enginepb.RangeAppliedState, error) {
+) (*enginepb.RangeAppliedState, error) {
 	var as enginepb.RangeAppliedState
 	_, err := storage.MVCCGetProto(ctx, reader, rsl.RangeAppliedStateKey(), hlc.Timestamp{}, &as,
 		storage.MVCCGetOptions{})
-	return as, err
+	return &as, err
 }
 
 // LoadMVCCStats loads the MVCC stats.
@@ -186,30 +205,30 @@ func (rsl StateLoader) LoadMVCCStats(
 // The applied indices and the stats used to be stored separately in different
 // keys. We now deem those keys to be "legacy" because they have been replaced
 // by the range applied state key.
-//
-// TODO(andrei): raftClosedTimestamp is a pointer to avoid an allocation when
-// putting it in RangeAppliedState. Once RangeAppliedState.RaftClosedTimestamp
-// is made non-nullable (see comments on the field), this argument should be
-// taken by value.
 func (rsl StateLoader) SetRangeAppliedState(
 	ctx context.Context,
 	readWriter storage.ReadWriter,
-	appliedIndex, leaseAppliedIndex uint64,
+	appliedIndex, leaseAppliedIndex, appliedIndexTerm uint64,
 	newMS *enginepb.MVCCStats,
-	raftClosedTimestamp *hlc.Timestamp,
+	raftClosedTimestamp hlc.Timestamp,
+	asAlloc *enginepb.RangeAppliedState, // optional
 ) error {
-	as := enginepb.RangeAppliedState{
-		RaftAppliedIndex:  appliedIndex,
-		LeaseAppliedIndex: leaseAppliedIndex,
-		RangeStats:        newMS.ToPersistentStats(),
+	if asAlloc == nil {
+		asAlloc = new(enginepb.RangeAppliedState)
 	}
-	if raftClosedTimestamp != nil && !raftClosedTimestamp.IsEmpty() {
-		as.RaftClosedTimestamp = raftClosedTimestamp
+	as := asAlloc
+	*as = enginepb.RangeAppliedState{
+		RaftAppliedIndex:     appliedIndex,
+		LeaseAppliedIndex:    leaseAppliedIndex,
+		RangeStats:           newMS.ToPersistentStats(),
+		RaftClosedTimestamp:  raftClosedTimestamp,
+		RaftAppliedIndexTerm: appliedIndexTerm,
 	}
 	// The RangeAppliedStateKey is not included in stats. This is also reflected
-	// in C.MVCCComputeStats and ComputeStatsForRange.
+	// in ComputeStats.
 	ms := (*enginepb.MVCCStats)(nil)
-	return storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeAppliedStateKey(), hlc.Timestamp{}, nil, &as)
+	return storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeAppliedStateKey(),
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, as)
 }
 
 // SetMVCCStats overwrites the MVCC stats. This needs to perform a read on the
@@ -222,21 +241,24 @@ func (rsl StateLoader) SetMVCCStats(
 	if err != nil {
 		return err
 	}
+	alloc := as // reuse
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, newMS, as.RaftClosedTimestamp)
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm, newMS,
+		as.RaftClosedTimestamp, alloc)
 }
 
 // SetClosedTimestamp overwrites the closed timestamp.
 func (rsl StateLoader) SetClosedTimestamp(
-	ctx context.Context, readWriter storage.ReadWriter, closedTS *hlc.Timestamp,
+	ctx context.Context, readWriter storage.ReadWriter, closedTS hlc.Timestamp,
 ) error {
 	as, err := rsl.LoadRangeAppliedState(ctx, readWriter)
 	if err != nil {
 		return err
 	}
+	alloc := as // reuse
 	return rsl.SetRangeAppliedState(
-		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex,
-		as.RangeStats.ToStatsPtr(), closedTS)
+		ctx, readWriter, as.RaftAppliedIndex, as.LeaseAppliedIndex, as.RaftAppliedIndexTerm,
+		as.RangeStats.ToStatsPtr(), closedTS, alloc)
 }
 
 // LoadGCThreshold loads the GC threshold.
@@ -259,8 +281,42 @@ func (rsl StateLoader) SetGCThreshold(
 	if threshold == nil {
 		return errors.New("cannot persist nil GCThreshold")
 	}
-	return storage.MVCCPutProto(ctx, readWriter, ms,
-		rsl.RangeGCThresholdKey(), hlc.Timestamp{}, nil, threshold)
+	return storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeGCThresholdKey(),
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, threshold)
+}
+
+// LoadGCHint loads GC hint.
+func (rsl StateLoader) LoadGCHint(
+	ctx context.Context, reader storage.Reader,
+) (*roachpb.GCHint, error) {
+	var h roachpb.GCHint
+	_, err := storage.MVCCGetProto(ctx, reader, rsl.RangeGCHintKey(),
+		hlc.Timestamp{}, &h, storage.MVCCGetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
+// SetGCHint writes the GC hint.
+func (rsl StateLoader) SetGCHint(
+	ctx context.Context,
+	readWriter storage.ReadWriter,
+	ms *enginepb.MVCCStats,
+	hint *roachpb.GCHint,
+	gcHintEnabled bool,
+) (updated bool, _ error) {
+	if !gcHintEnabled {
+		return false, nil
+	}
+	if hint == nil {
+		return false, errors.New("cannot persist nil GCHint")
+	}
+	if err := storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeGCHintKey(),
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, hint); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // LoadVersion loads the replica version.
@@ -280,8 +336,8 @@ func (rsl StateLoader) SetVersion(
 	ms *enginepb.MVCCStats,
 	version *roachpb.Version,
 ) error {
-	return storage.MVCCPutProto(ctx, readWriter, ms,
-		rsl.RangeVersionKey(), hlc.Timestamp{}, nil, version)
+	return storage.MVCCPutProto(ctx, readWriter, ms, rsl.RangeVersionKey(),
+		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, version)
 }
 
 // The rest is not technically part of ReplicaState.
@@ -294,13 +350,17 @@ func (rsl StateLoader) LoadLastIndex(ctx context.Context, reader storage.Reader)
 	defer iter.Close()
 
 	var lastIndex uint64
-	iter.SeekLT(storage.MakeMVCCMetadataKey(rsl.RaftLogKey(math.MaxUint64)))
+	iter.SeekLT(storage.MakeMVCCMetadataKey(keys.RaftLogKeyFromPrefix(prefix, math.MaxUint64)))
 	if ok, _ := iter.Valid(); ok {
-		key := iter.Key()
+		key := iter.UnsafeKey().Key
+		if len(key) < len(prefix) {
+			log.Fatalf(ctx, "unable to decode Raft log index key: len(%s) < len(%s)", key.String(), prefix.String())
+		}
+		suffix := key[len(prefix):]
 		var err error
-		_, lastIndex, err = encoding.DecodeUint64Ascending(key.Key[len(prefix):])
+		lastIndex, err = keys.DecodeRaftLogKeyFromSuffix(suffix)
 		if err != nil {
-			log.Fatalf(ctx, "unable to decode Raft log index key: %s", key)
+			log.Fatalf(ctx, "unable to decode Raft log index key: %s; %v", key.String(), err)
 		}
 	}
 
@@ -342,7 +402,8 @@ func (rsl StateLoader) SetRaftTruncatedState(
 		writer,
 		nil, /* ms */
 		rsl.RaftTruncatedStateKey(),
-		hlc.Timestamp{}, /* timestamp */
+		hlc.Timestamp{},      /* timestamp */
+		hlc.ClockTimestamp{}, /* localTimestamp */
 		truncState,
 		nil, /* txn */
 	)
@@ -372,7 +433,8 @@ func (rsl StateLoader) SetHardState(
 		writer,
 		nil, /* ms */
 		rsl.RaftHardStateKey(),
-		hlc.Timestamp{}, /* timestamp */
+		hlc.Timestamp{},      /* timestamp */
+		hlc.ClockTimestamp{}, /* localTimestamp */
 		&hs,
 		nil, /* txn */
 	)
@@ -418,7 +480,7 @@ func (rsl StateLoader) SynthesizeHardState(
 
 	if oldHS.Commit > newHS.Commit {
 		return errors.Newf("can't decrease HardState.Commit from %d to %d",
-			log.Safe(oldHS.Commit), log.Safe(newHS.Commit))
+			redact.Safe(oldHS.Commit), redact.Safe(newHS.Commit))
 	}
 	if oldHS.Term > newHS.Term {
 		// The existing HardState is allowed to be ahead of us, which is
@@ -433,4 +495,31 @@ func (rsl StateLoader) SynthesizeHardState(
 	}
 	err := rsl.SetHardState(ctx, readWriter, newHS)
 	return errors.Wrapf(err, "writing HardState %+v", &newHS)
+}
+
+// SetRaftReplicaID overwrites the RaftReplicaID.
+func (rsl StateLoader) SetRaftReplicaID(
+	ctx context.Context, writer storage.Writer, replicaID roachpb.ReplicaID,
+) error {
+	rid := roachpb.RaftReplicaID{ReplicaID: replicaID}
+	// "Blind" because ms == nil and timestamp.IsEmpty().
+	return storage.MVCCBlindPutProto(
+		ctx,
+		writer,
+		nil, /* ms */
+		rsl.RaftReplicaIDKey(),
+		hlc.Timestamp{},      /* timestamp */
+		hlc.ClockTimestamp{}, /* localTimestamp */
+		&rid,
+		nil, /* txn */
+	)
+}
+
+// LoadRaftReplicaID loads the RaftReplicaID.
+func (rsl StateLoader) LoadRaftReplicaID(
+	ctx context.Context, reader storage.Reader,
+) (replicaID roachpb.RaftReplicaID, found bool, err error) {
+	found, err = storage.MVCCGetProto(ctx, reader, rsl.RaftReplicaIDKey(),
+		hlc.Timestamp{}, &replicaID, storage.MVCCGetOptions{})
+	return
 }

@@ -12,7 +12,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -22,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
+	"github.com/cockroachdb/redact"
 )
 
 // rowContainerHelper is a wrapper around a disk-backed row container that
@@ -35,13 +35,16 @@ type rowContainerHelper struct {
 }
 
 func (c *rowContainerHelper) Init(
-	typs []*types.T, evalContext *extendedEvalContext, opName string,
+	ctx context.Context,
+	typs []*types.T,
+	evalContext *extendedEvalContext,
+	opName redact.RedactableString,
 ) {
-	c.initMonitors(evalContext, opName)
+	c.initMonitors(ctx, evalContext, opName)
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
 	c.rows = &rowcontainer.DiskBackedRowContainer{}
 	c.rows.Init(
-		colinfo.NoOrdering, typs, &evalContext.EvalContext,
+		colinfo.NoOrdering, typs, &evalContext.Context,
 		distSQLCfg.TempStorage, c.memMonitor, c.diskMonitor,
 	)
 	c.scratch = make(rowenc.EncDatumRow, len(typs))
@@ -50,9 +53,12 @@ func (c *rowContainerHelper) Init(
 // InitWithDedup is a variant of init that is used if row deduplication
 // functionality is needed (see addRowWithDedup).
 func (c *rowContainerHelper) InitWithDedup(
-	typs []*types.T, evalContext *extendedEvalContext, opName string,
+	ctx context.Context,
+	typs []*types.T,
+	evalContext *extendedEvalContext,
+	opName redact.RedactableString,
 ) {
-	c.initMonitors(evalContext, opName)
+	c.initMonitors(ctx, evalContext, opName)
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
 	c.rows = &rowcontainer.DiskBackedRowContainer{}
 	// The DiskBackedRowContainer can be configured to deduplicate along the
@@ -64,21 +70,23 @@ func (c *rowContainerHelper) InitWithDedup(
 		ordering[i].Direction = encoding.Ascending
 	}
 	c.rows.Init(
-		ordering, typs, &evalContext.EvalContext,
+		ordering, typs, &evalContext.Context,
 		distSQLCfg.TempStorage, c.memMonitor, c.diskMonitor,
 	)
 	c.rows.DoDeDuplicate()
 	c.scratch = make(rowenc.EncDatumRow, len(typs))
 }
 
-func (c *rowContainerHelper) initMonitors(evalContext *extendedEvalContext, opName string) {
+func (c *rowContainerHelper) initMonitors(
+	ctx context.Context, evalContext *extendedEvalContext, opName redact.RedactableString,
+) {
 	distSQLCfg := &evalContext.DistSQLPlanner.distSQLSrv.ServerConfig
 	c.memMonitor = execinfra.NewLimitedMonitorNoFlowCtx(
-		evalContext.Context, evalContext.Mon, distSQLCfg, evalContext.SessionData(),
-		fmt.Sprintf("%s-limited", opName),
+		ctx, evalContext.Planner.Mon(), distSQLCfg, evalContext.SessionData(),
+		redact.Sprintf("%s-limited", opName),
 	)
 	c.diskMonitor = execinfra.NewMonitor(
-		evalContext.Context, distSQLCfg.ParentDiskMonitor, fmt.Sprintf("%s-disk", opName),
+		ctx, distSQLCfg.ParentDiskMonitor, redact.Sprintf("%s-disk", opName),
 	)
 }
 

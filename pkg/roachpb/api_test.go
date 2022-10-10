@@ -13,9 +13,11 @@ package roachpb
 import (
 	"reflect"
 	"testing"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/redact"
 	gogoproto "github.com/gogo/protobuf/proto"
@@ -233,6 +235,51 @@ func TestCombinable(t *testing.T) {
 		}, v1)
 
 	})
+
+	t.Run("AdminScatter", func(t *testing.T) {
+
+		// Test that AdminScatterResponse properly implement it.
+		ar1 := &AdminScatterResponse{
+			RangeInfos: []RangeInfo{{Desc: RangeDescriptor{
+				RangeID: 1,
+			}}},
+			MVCCStats: enginepb.MVCCStats{
+				LiveBytes: 1,
+				LiveCount: 1,
+				KeyCount:  1,
+			},
+			ReplicasScatteredBytes: 42,
+		}
+
+		if _, ok := interface{}(ar1).(combinable); !ok {
+			t.Fatalf("AdminScatterResponse does not implement combinable")
+		}
+
+		ar2 := &AdminScatterResponse{
+			RangeInfos: []RangeInfo{{Desc: RangeDescriptor{
+				RangeID: 2,
+			}}},
+			MVCCStats: enginepb.MVCCStats{
+				LiveBytes: 2,
+				LiveCount: 2,
+				KeyCount:  2,
+			},
+			ReplicasScatteredBytes: 42,
+		}
+
+		wantedAR := &AdminScatterResponse{
+			RangeInfos:             []RangeInfo{{Desc: RangeDescriptor{RangeID: 1}}, {Desc: RangeDescriptor{RangeID: 2}}},
+			MVCCStats:              enginepb.MVCCStats{LiveBytes: 3, LiveCount: 3, KeyCount: 3},
+			ReplicasScatteredBytes: 84,
+		}
+
+		require.NoError(t, ar1.combine(ar2))
+		require.NoError(t, ar1.combine(&AdminScatterResponse{}))
+
+		if !reflect.DeepEqual(ar1, wantedAR) {
+			t.Errorf("wanted %v, got %v", wantedAR, ar1)
+		}
+	})
 }
 
 // TestMustSetInner makes sure that calls to MustSetInner correctly reset the
@@ -267,12 +314,15 @@ func TestContentionEvent_SafeFormat(t *testing.T) {
 func TestTenantConsumptionAddSub(t *testing.T) {
 	a := TenantConsumption{
 		RU:                1,
-		ReadRequests:      2,
-		ReadBytes:         3,
-		WriteRequests:     4,
-		WriteBytes:        5,
-		SQLPodsCPUSeconds: 6,
-		PGWireEgressBytes: 7,
+		ReadBatches:       2,
+		ReadRequests:      3,
+		ReadBytes:         4,
+		WriteBatches:      5,
+		WriteRequests:     6,
+		WriteBytes:        7,
+		SQLPodsCPUSeconds: 8,
+		PGWireEgressBytes: 9,
+		KVRU:              10,
 	}
 	var b TenantConsumption
 	for i := 0; i < 10; i++ {
@@ -280,12 +330,15 @@ func TestTenantConsumptionAddSub(t *testing.T) {
 	}
 	if exp := (TenantConsumption{
 		RU:                10,
-		ReadRequests:      20,
-		ReadBytes:         30,
-		WriteRequests:     40,
-		WriteBytes:        50,
-		SQLPodsCPUSeconds: 60,
-		PGWireEgressBytes: 70,
+		ReadBatches:       20,
+		ReadRequests:      30,
+		ReadBytes:         40,
+		WriteBatches:      50,
+		WriteRequests:     60,
+		WriteBytes:        70,
+		SQLPodsCPUSeconds: 80,
+		PGWireEgressBytes: 90,
+		KVRU:              100,
 	}); b != exp {
 		t.Errorf("expected\n%#v\ngot\n%#v", exp, b)
 	}
@@ -294,12 +347,15 @@ func TestTenantConsumptionAddSub(t *testing.T) {
 	c.Sub(&a)
 	if exp := (TenantConsumption{
 		RU:                9,
-		ReadRequests:      18,
-		ReadBytes:         27,
-		WriteRequests:     36,
-		WriteBytes:        45,
-		SQLPodsCPUSeconds: 54,
-		PGWireEgressBytes: 63,
+		ReadBatches:       18,
+		ReadRequests:      27,
+		ReadBytes:         36,
+		WriteBatches:      45,
+		WriteRequests:     54,
+		WriteBytes:        63,
+		SQLPodsCPUSeconds: 72,
+		PGWireEgressBytes: 81,
+		KVRU:              90,
 	}); c != exp {
 		t.Errorf("expected\n%#v\ngot\n%#v", exp, c)
 	}
@@ -315,8 +371,9 @@ func TestTenantConsumptionAddSub(t *testing.T) {
 func TestFlagCombinations(t *testing.T) {
 	// Any non-zero-valued request variants that conditionally affect flags.
 	reqVariants := []Request{
-		&AddSSTableRequest{WriteAtRequestTimestamp: true},
+		&AddSSTableRequest{SSTTimestampToRequestTimestamp: hlc.Timestamp{Logical: 1}},
 		&DeleteRangeRequest{Inline: true},
+		&DeleteRangeRequest{UseRangeTombstone: true},
 		&GetRequest{KeyLocking: lock.Exclusive},
 		&ReverseScanRequest{KeyLocking: lock.Exclusive},
 		&ScanRequest{KeyLocking: lock.Exclusive},
@@ -349,4 +406,12 @@ func TestFlagCombinations(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestBatchRequestSize asserts that the size of BatchRequest remains below 256
+// bytes. In #86541, we found that once the size reaches or exceeds this size,
+// end-to-end benchmarks observe a large (~10%) performance regression.
+func TestBatchRequestSize(t *testing.T) {
+	size := int(unsafe.Sizeof(BatchRequest{}))
+	require.Less(t, size, 256)
 }

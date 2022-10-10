@@ -34,13 +34,14 @@ do
     fi
     exit_status=0
     GO_TEST_JSON_OUTPUT_FILE=$ARTIFACTS_DIR/$(echo "$test" | cut -d: -f2).test.json.txt
-    $BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci --config=ci test "$test" -- \
+    $BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci -- --config=ci test "$test" \
                                           --test_env=COCKROACH_NIGHTLY_STRESS=true \
                                           --test_env=GO_TEST_JSON_OUTPUT_FILE=$GO_TEST_JSON_OUTPUT_FILE \
                                           --test_timeout="$TESTTIMEOUTSECS" \
-                                          --run_under "@com_github_cockroachdb_stress//:stress $STRESSFLAGS" \
+                                          --run_under "@com_github_cockroachdb_stress//:stress -bazel -shardable-artifacts 'GO_TEST_JSON_OUTPUT_FILE=cat,XML_OUTPUT_FILE=$BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci merge-test-xmls' $STRESSFLAGS" \
                                           --define "gotags=$TAGS" \
                                           --nocache_test_results \
+                                          --test_output streamed \
                                           ${EXTRA_BAZEL_FLAGS} \
         || exit_status=$?
     process_test_json \

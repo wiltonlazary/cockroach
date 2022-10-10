@@ -227,12 +227,13 @@ func statisticsMutator(
 		for _, def := range create.Defs {
 			switch def := def.(type) {
 			case *tree.ColumnTableDef:
-				var nullCount, distinctCount uint64
+				var nullCount, distinctCount, avgSize uint64
 				if rowCount > 0 {
 					if def.Nullable.Nullability != tree.NotNull {
 						nullCount = uint64(rng.Int63n(rowCount))
 					}
 					distinctCount = uint64(rng.Int63n(rowCount))
+					avgSize = uint64(rng.Int63n(32))
 				}
 				cols[def.Name] = def
 				colStats[def.Name] = &stats.JSONStatistic{
@@ -242,6 +243,7 @@ func statisticsMutator(
 					Columns:       []string{def.Name.String()},
 					DistinctCount: distinctCount,
 					NullCount:     nullCount,
+					AvgSize:       avgSize,
 				}
 				if (def.Unique.IsUnique && !def.Unique.WithoutIndex) || def.PrimaryKey.IsPrimaryKey {
 					makeHistogram(def)
@@ -287,7 +289,7 @@ func statisticsMutator(
 // bounds are byte-encoded inverted index keys.
 func randHistogram(rng *rand.Rand, colType *types.T) stats.HistogramData {
 	histogramColType := colType
-	if colinfo.ColumnTypeIsInvertedIndexable(colType) {
+	if colinfo.ColumnTypeIsOnlyInvertedIndexable(colType) {
 		histogramColType = types.Bytes
 	}
 	h := stats.HistogramData{
@@ -298,7 +300,7 @@ func randHistogram(rng *rand.Rand, colType *types.T) stats.HistogramData {
 	var encodedUpperBounds [][]byte
 	for i, numDatums := 0, rng.Intn(10); i < numDatums; i++ {
 		upper := RandDatum(rng, colType, false /* nullOk */)
-		if colinfo.ColumnTypeIsInvertedIndexable(colType) {
+		if colinfo.ColumnTypeIsOnlyInvertedIndexable(colType) {
 			encs := encodeInvertedIndexHistogramUpperBounds(colType, upper)
 			encodedUpperBounds = append(encodedUpperBounds, encs...)
 		} else {
@@ -362,7 +364,7 @@ func encodeInvertedIndexHistogramUpperBounds(colType *types.T, val tree.Datum) (
 	case types.GeographyFamily:
 		keys, err = rowenc.EncodeGeoInvertedIndexTableKeys(val, nil, *geoindex.DefaultGeographyIndexConfig())
 	default:
-		keys, err = rowenc.EncodeInvertedIndexTableKeys(val, nil, descpb.LatestNonPrimaryIndexDescriptorVersion)
+		keys, err = rowenc.EncodeInvertedIndexTableKeys(val, nil, descpb.LatestIndexDescriptorVersion)
 	}
 
 	if err != nil {
@@ -418,6 +420,27 @@ func foreignKeyMutator(
 	for _, stmt := range stmts {
 		table, ok := stmt.(*tree.CreateTable)
 		if !ok {
+			continue
+		}
+		// Skip partitioned tables, since using foreign keys results in in-between
+		// filters not yielding a constraint.
+		// TODO(harding): Allow foreign keys on partitioned tables.
+		var skip bool
+		for _, def := range table.Defs {
+			switch def := def.(type) {
+			case *tree.IndexTableDef:
+				if def.PartitionByIndex != nil {
+					skip = true
+					break
+				}
+			case *tree.UniqueConstraintTableDef:
+				if def.IndexTableDef.PartitionByIndex != nil {
+					skip = true
+					break
+				}
+			}
+		}
+		if skip {
 			continue
 		}
 		tables = append(tables, table)
@@ -641,7 +664,8 @@ func postgresMutator(rng *rand.Rand, q string) string {
 var postgresStatementMutator MultiStatementMutation = func(rng *rand.Rand, stmts []tree.Statement) (mutated []tree.Statement, changed bool) {
 	for _, stmt := range stmts {
 		switch stmt := stmt.(type) {
-		case *tree.SetClusterSetting, *tree.SetVar:
+		case *tree.SetClusterSetting, *tree.SetVar, *tree.AlterTenantSetClusterSetting:
+			changed = true
 			continue
 		case *tree.CreateTable:
 			if stmt.PartitionByTable != nil {
@@ -754,6 +778,7 @@ func postgresCreateTableMutator(
 							Inverted: def.Inverted,
 							Columns:  newCols,
 							Storing:  def.Storing,
+							// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 						})
 						changed = true
 					}
@@ -804,6 +829,7 @@ func postgresCreateTableMutator(
 						Inverted: def.Inverted,
 						Columns:  newCols,
 						Storing:  def.Storing,
+						// Postgres doesn't support NotVisible Index, so NotVisible is not populated here.
 					})
 					changed = true
 				default:
@@ -949,8 +975,11 @@ func indexStoringMutator(rng *rand.Rand, stmts []tree.Statement) ([]tree.Stateme
 				// Skip PK columns and columns already in the index.
 				continue
 			}
-			if tableInfo.columnsTableDefs[colOrdinal].Computed.Virtual {
-				// Virtual columns can't be stored.
+			// Virtual columns can't be stored.
+			if tableInfo.columnsTableDefs[colOrdinal].Computed.Virtual ||
+				// Neither can TableOID. Neither can MVCCTimestamp, but the logic to
+				// read the columns filters that one out.
+				tableInfo.columnsTableDefs[colOrdinal].Name == colinfo.TableOIDColumnName {
 				continue
 			}
 			if rng.Intn(2) == 0 {

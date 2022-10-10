@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -22,15 +23,16 @@ import (
 )
 
 type commentOnTableNode struct {
-	n         *tree.CommentOnTable
-	tableDesc catalog.TableDescriptor
-	commenter scexec.CommentUpdater
+	n               *tree.CommentOnTable
+	tableDesc       catalog.TableDescriptor
+	metadataUpdater scexec.DescriptorMetadataUpdater
 }
 
 // CommentOnTable add comment on a table.
 // Privileges: CREATE on table.
-//   notes: postgres requires CREATE on the table.
-//          mysql requires ALTER, CREATE, INSERT on the table.
+//
+//	notes: postgres requires CREATE on the table.
+//	       mysql requires ALTER, CREATE, INSERT on the table.
 func (p *planner) CommentOnTable(ctx context.Context, n *tree.CommentOnTable) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -52,8 +54,11 @@ func (p *planner) CommentOnTable(ctx context.Context, n *tree.CommentOnTable) (p
 	return &commentOnTableNode{
 		n:         n,
 		tableDesc: tableDesc,
-		commenter: p.execCfg.CommentUpdaterFactory.NewCommentUpdater(
+		metadataUpdater: descmetadata.NewMetadataUpdater(
 			ctx,
+			p.ExecCfg().InternalExecutorFactory,
+			p.Descriptors(),
+			&p.ExecCfg().Settings.SV,
 			p.txn,
 			p.SessionData(),
 		),
@@ -62,13 +67,13 @@ func (p *planner) CommentOnTable(ctx context.Context, n *tree.CommentOnTable) (p
 
 func (n *commentOnTableNode) startExec(params runParams) error {
 	if n.n.Comment != nil {
-		err := n.commenter.UpsertDescriptorComment(
+		err := n.metadataUpdater.UpsertDescriptorComment(
 			int64(n.tableDesc.GetID()), 0, keys.TableCommentType, *n.n.Comment)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := n.commenter.DeleteDescriptorComment(
+		err := n.metadataUpdater.DeleteDescriptorComment(
 			int64(n.tableDesc.GetID()), 0, keys.TableCommentType)
 		if err != nil {
 			return err

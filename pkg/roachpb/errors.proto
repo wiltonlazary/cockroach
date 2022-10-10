@@ -45,10 +45,15 @@ message NotLeaseHolderError {
   // representation, if known.
   optional roachpb.ReplicaDescriptor replica = 1 [(gogoproto.nullable) = false];
   // The lease holder, if known.
-  optional roachpb.ReplicaDescriptor lease_holder = 2;
-  // The current lease, if known. This might be nil even when lease_holder is
-  // set, as sometimes one can create this error without actually knowing the
-  // current lease, but having a guess about who the leader is.
+  //
+  // This field was only ever meaningful if the full lease was not known, but
+  // when constructing this error there was a guess about who the leaseholder
+  // may be. The same idea applied to speculative leases (which have unset
+  // sequence numbers). In a bid to unify these two cases, from v22.2, we stop
+  // making use of this field.
+  // TODO(arul): remove this field in 23.1.
+  optional roachpb.ReplicaDescriptor deprecated_lease_holder = 2;
+  // The current lease, if known.
   //
   // It's possible for leases returned here to represent speculative leases, not
   // actual committed leases. In this case, the lease will not have its Sequence
@@ -56,6 +61,11 @@ message NotLeaseHolderError {
   optional roachpb.Lease lease = 4;
   optional int64 range_id = 3 [(gogoproto.nullable) = false,
       (gogoproto.customname) = "RangeID", (gogoproto.casttype) = "RangeID"];
+  // The range descriptor from the replica the error originated from.
+  // The generation of the descriptor is used by the DistSender's RangeCache to
+  // determine whether the error was returned because the replica had a stale
+  // understanding of who the leaseholder is.
+  optional roachpb.RangeDescriptor range_desc = 6 [(gogoproto.nullable)=false];
   // If set, the Error() method will return this instead of composing its
   // regular spiel. Useful because we reuse this error when rejecting a command
   // because the lease under which its application was attempted is different
@@ -188,7 +198,7 @@ enum TransactionAbortedReason {
   // TODO(andrei): We should be able to identify the range merge case by saving
   // a bit more info in the timestamp cache.
   ABORT_REASON_TIMESTAMP_CACHE_REJECTED = 7;
-  
+
   reserved 2;
 }
 
@@ -367,16 +377,16 @@ message LeaseRejectedError {
 // An AmbiguousResultError indicates that a request may have succeeded or
 // failed, but the response was not received and the final result is ambiguous.
 message AmbiguousResultError {
-  optional string message = 1 [(gogoproto.nullable) = false];
-  // This can be set to give extra information about which error was converted
-  // into an AmbiguousResultError. Useful for tests.
-  optional Error wrapped_err = 2;
+  // The error that caused the ambiguous result.
+  optional errorspb.EncodedError encoded_error = 3 [(gogoproto.nullable) = false];
+  reserved 2;
 }
 
 message ReplicaUnavailableError {
 
   optional roachpb.RangeDescriptor desc = 2 [(gogoproto.nullable) = false];
   optional roachpb.ReplicaDescriptor replica = 4 [(gogoproto.nullable) = false];
+  optional errorspb.EncodedError cause = 5 [(gogoproto.nullable) = false];
 }
 
 // A RaftGroupDeletedError indicates a raft group has been deleted for
@@ -478,6 +488,16 @@ message IntegerOverflowError {
 message BatchTimestampBeforeGCError {
   optional util.hlc.Timestamp Timestamp = 1 [(gogoproto.nullable) = false];
   optional util.hlc.Timestamp Threshold = 2 [(gogoproto.nullable) = false];
+  // DataExcludedFromBackup is set to true if the request is targeting a range
+  // that has been marked as excluded from a backup via
+  // `ALTER TABLE ... SET (exclude_data_from_backup = true)`.
+  optional bool data_excluded_from_backup = 3 [(gogoproto.nullable) = false];
+}
+
+// A MVCCHistoryMutationError indicates that MVCC history was unexpectedly
+// mutated.
+message MVCCHistoryMutationError {
+  optional roachpb.Span span = 1 [(gogoproto.nullable) = false];
 }
 
 // An IntentMissingError indicates that a QueryIntent request expected
@@ -613,6 +633,8 @@ message ErrorDetail {
     OptimisticEvalConflictsError optimistic_eval_conflicts = 41;
     MinTimestampBoundUnsatisfiableError min_timestamp_bound_unsatisfiable = 42;
     RefreshFailedError refresh_failed_error = 43;
+    MVCCHistoryMutationError mvcc_history_mutation = 44
+      [(gogoproto.customname) = "MVCCHistoryMutation"];
   }
 }
 
@@ -648,17 +670,6 @@ message ErrPosition {
 message Error {
   option (gogoproto.goproto_stringer) = false;
 
-  // message is a human-readable error message.
-  //
-  // DEPRECATED.
-  optional string message = 1 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedMessage"];
-
-  // If transaction_restart is not NONE, the error condition may be handled by
-  // restarting the transaction.
-  //
-  // DEPRECATED.
-  optional TransactionRestart transaction_restart = 3 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedTransactionRestart"];
-
   // An optional updated transaction. This is to be used by the client in case
   // of retryable errors.
   //
@@ -667,12 +678,6 @@ message Error {
 
   // Node at which the error was generated (zero if does not apply).
   optional int32 origin_node = 5 [(gogoproto.nullable) = false, (gogoproto.casttype) = "NodeID"];
-
-  // If an ErrorDetail is present, it may contain additional structured data
-  // about the error.
-  //
-  // DEPRECATED - consult encoded_error instead.
-  optional ErrorDetail detail = 6 [(gogoproto.nullable) = false, (gogoproto.customname) = "deprecatedDetail"];
 
   // encoded_error is the Go error that caused this Error.
   optional errorspb.EncodedError encoded_error = 9 [(gogoproto.nullable) = false];
@@ -686,5 +691,25 @@ message Error {
   optional util.hlc.Timestamp now = 8 [(gogoproto.nullable) = false,
     (gogoproto.casttype) = "github.com/cockroachdb/cockroach/pkg/util/hlc.ClockTimestamp"];
 
-  reserved 2;
+  reserved 1, 2, 3, 6 ;
+}
+
+
+// InsufficientSpaceError is an error due to insufficient space remaining.
+message InsufficientSpaceError {
+   // StoreID is the store that had insufficient space.
+   optional int64 store_id = 1 [(gogoproto.nullable) = false,
+   (gogoproto.customname) = "StoreID", (gogoproto.casttype) = "StoreID"];
+
+  // Op is the operaton that was unable to be performed.
+  optional string op = 2 [(gogoproto.nullable) = false];
+
+   // Available is remaining capacity.
+   optional int64 available = 3 [(gogoproto.nullable) = false];
+
+   // Capacity is total capacity.
+   optional int64 capacity = 4 [(gogoproto.nullable) = false];
+
+   // RequiredFraction is the required remaining capacity fraction.
+   optional double required = 5 [(gogoproto.nullable) = false];
 }

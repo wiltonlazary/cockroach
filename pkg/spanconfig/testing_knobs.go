@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 )
 
 // TestingKnobs provide fine-grained control over the various span config
@@ -41,25 +43,42 @@ type TestingKnobs struct {
 	// job from persisting checkpoints.
 	JobDisablePersistingCheckpoints bool
 
-	// KVSubscriberPostRangefeedStartInterceptor is invoked after the rangefeed
-	// is started.
-	KVSubscriberPostRangefeedStartInterceptor func()
+	// JobDisableInternalRetry disables the span config reconciliation job's
+	// internal retry loop.
+	JobDisableInternalRetry bool
 
-	// KVSubscriberPreExitInterceptor is invoked right before returning from
-	// subscribeInner, after tearing down internal components.
-	KVSubscriberPreExitInterceptor func()
+	// JobOverrideRetryOptions, if set, controls the internal retry behavior for
+	// the reconciliation job.
+	JobOverrideRetryOptions *retry.Options
 
-	// KVSubscriberOnTimestampAdvanceInterceptor is invoked each time the
-	// KVSubscriber has process all updates before the provided timestamp.
-	KVSubscriberOnTimestampAdvanceInterceptor func(hlc.Timestamp)
+	// JobPersistCheckpointInterceptor, if set, is invoked before the
+	// reconciliation job persists checkpoints.
+	JobOnCheckpointInterceptor func() error
 
-	// KVSubscriberErrorInjectionCh is a way for tests to conveniently inject
-	// buffer overflow errors into the subscriber in order to test recovery.
-	KVSubscriberErrorInjectionCh chan error
+	// KVSubscriberRangeFeedKnobs control lifecycle events for the rangefeed
+	// underlying the KVSubscriber.
+	KVSubscriberRangeFeedKnobs base.ModuleTestingKnobs
 
 	// StoreKVSubscriberOverride is used to override the KVSubscriber used when
 	// setting up a new store.
 	StoreKVSubscriberOverride KVSubscriber
+
+	// KVAccessorPaginationInterceptor, if set, is invoked on every pagination
+	// event.
+	KVAccessorPaginationInterceptor func()
+
+	// KVAccessorBatchSizeOverride overrides the batch size KVAccessor makes use
+	// of internally.
+	KVAccessorBatchSizeOverrideFn func() int
+
+	// KVAccessorPreCommitMinTSWaitInterceptor, if set, is invoked before
+	// UpdateSpanConfigRecords waits for present time to be in advance of the
+	// minimum commit timestamp.
+	KVAccessorPreCommitMinTSWaitInterceptor func()
+
+	// KVAccessorPostCommitDeadlineSetInterceptor is invoked after we set the
+	// commit deadline.
+	KVAccessorPostCommitDeadlineSetInterceptor func(*kv.Txn)
 
 	// SQLWatcherOnEventInterceptor, if set, is invoked when the SQLWatcher
 	// receives an event on one of its rangefeeds.
@@ -68,6 +87,10 @@ type TestingKnobs struct {
 	// SQLWatcherCheckpointNoopsEveryDurationOverride, if set, overrides how
 	// often the SQLWatcher checkpoints noops.
 	SQLWatcherCheckpointNoopsEveryDurationOverride time.Duration
+
+	// SplitterStepLogger is used to capture internal steps the splitter is
+	// making, for debugging and test-readability purposes.
+	SplitterStepLogger func(string)
 
 	// ExcludeDroppedDescriptorsFromLookup is used to control if the
 	// SQLTranslator ignores dropped descriptors. If enabled, dropped
@@ -81,7 +104,28 @@ type TestingKnobs struct {
 
 	// ReconcilerInitialInterceptor, if set, is invoked at the very outset of
 	// the reconciliation process.
-	ReconcilerInitialInterceptor func()
+	ReconcilerInitialInterceptor func(startTS hlc.Timestamp)
+
+	// ProtectedTSReaderOverrideFn returns a ProtectedTSReader which is used to
+	// override the ProtectedTSReader used when setting up a new store.
+	ProtectedTSReaderOverrideFn func(clock *hlc.Clock) ProtectedTSReader
+
+	// LimiterLimitOverride, if set, allows tests to dynamically override the span
+	// config limit.
+	LimiterLimitOverride func() int64
+
+	// StoreDisableCoalesceAdjacent, if set, disables coalescing of
+	// adjacent-and-identical span configs.
+	StoreDisableCoalesceAdjacent bool
+
+	// StoreIgnoreCoalesceAdjacentExceptions, if set, ignores the cluster settings
+	// spanconfig.{host,tenant}_coalesce_adjacent.enabled. It also allows
+	// coalescing system database ranges for the host tenant.
+	StoreIgnoreCoalesceAdjacentExceptions bool
+
+	// StoreInternConfigsInDryRuns, if set, will intern span configs even when
+	// applying mutations in dry run mode.
+	StoreInternConfigsInDryRuns bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.

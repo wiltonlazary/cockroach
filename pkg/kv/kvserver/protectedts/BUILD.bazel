@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -13,9 +14,11 @@ go_library(
         "//pkg/base",
         "//pkg/kv",
         "//pkg/kv/kvserver/protectedts/ptpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/settings",
+        "//pkg/spanconfig",
         "//pkg/util/hlc",
+        "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
@@ -26,5 +29,8 @@ go_test(
     name = "protectedts_test",
     size = "small",
     srcs = ["protectedts_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":protectedts"],
 )
+
+get_x_data(name = "get_x_data")

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -17,10 +18,11 @@ go_test(
     name = "sampledataccl_test",
     size = "small",
     srcs = ["main_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":sampledataccl"],
     deps = [
         "//pkg/ccl/utilccl",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/testutils/serverutils",
@@ -28,3 +30,5 @@ go_test(
         "//pkg/util/randutil",
     ],
 )
+
+get_x_data(name = "get_x_data")

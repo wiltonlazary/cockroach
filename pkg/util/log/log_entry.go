@@ -20,7 +20,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
-	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -209,7 +208,7 @@ func makeEntry(ctx context.Context, s Severity, c Channel, depth int) (res logEn
 
 // makeStructuredEntry creates a logEntry using a structured payload.
 func makeStructuredEntry(
-	ctx context.Context, s Severity, c Channel, depth int, payload eventpb.EventPayload,
+	ctx context.Context, s Severity, c Channel, depth int, payload logpb.EventPayload,
 ) (res logEntry) {
 	res = makeEntry(ctx, s, c, depth+1)
 
@@ -276,15 +275,15 @@ func (l *sinkInfo) getStartLines(now time.Time) []*buffer {
 	f := l.formatter
 	messages := make([]*buffer, 0, 6)
 	messages = append(messages,
-		makeStartLine(f, "file created at: %s", Safe(now.Format("2006/01/02 15:04:05"))),
-		makeStartLine(f, "running on machine: %s", fullHostName),
-		makeStartLine(f, "binary: %s", Safe(build.GetInfo().Short())),
-		makeStartLine(f, "arguments: %s", os.Args),
+		makeStartLine(f, "file created at: %s", redact.Safe(now.Format("2006/01/02 15:04:05"))),
+		makeStartLine(f, "running on machine: %s", SafeManaged(fullHostName)),
+		makeStartLine(f, "binary: %s", redact.Safe(build.GetInfo().Short())),
+		makeStartLine(f, "arguments: %s", SafeManaged(os.Args)),
 	)
 
 	// Including a non-ascii character in the first 1024 bytes of the log helps
 	// viewers that attempt to guess the character encoding.
-	messages = append(messages, makeStartLine(f, "log format (utf8=\u2713): %s", Safe(f.formatterName())))
+	messages = append(messages, makeStartLine(f, "log format (utf8=\u2713): %s", redact.Safe(f.formatterName())))
 
 	if strings.HasPrefix(f.formatterName(), "crdb-") {
 		// For the crdb file formats, suggest the structure of each log line.

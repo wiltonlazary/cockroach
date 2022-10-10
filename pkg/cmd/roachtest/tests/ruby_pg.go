@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +30,7 @@ import (
 var rubyPGTestFailureRegex = regexp.MustCompile(`^rspec ./.*# .*`)
 var testFailureFilenameRegexp = regexp.MustCompile("^rspec .*.rb.*([0-9]|]) # ")
 var testSummaryRegexp = regexp.MustCompile("^([0-9]+) examples, [0-9]+ failures")
-var rubyPGVersion = "v1.2.3"
+var rubyPGVersion = "v1.3.5"
 
 // This test runs Ruby PG's full test suite against a single cockroach node.
 func registerRubyPG(r registry.Registry) {
@@ -46,9 +45,6 @@ func registerRubyPG(r registry.Registry) {
 		node := c.Node(1)
 		t.Status("setting up cockroach")
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatal(err)
-		}
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
@@ -86,11 +82,11 @@ func registerRubyPG(r registry.Registry) {
 			t,
 			c,
 			node,
-			"install ruby 2.7",
+			"install ruby 3.1.2",
 			`mkdir -p ruby-install && \
-        curl -fsSL https://github.com/postmodern/ruby-install/archive/v0.6.1.tar.gz | tar --strip-components=1 -C ruby-install -xz && \
+        curl -fsSL https://github.com/postmodern/ruby-install/archive/v0.8.3.tar.gz | tar --strip-components=1 -C ruby-install -xz && \
         sudo make -C ruby-install install && \
-        sudo ruby-install --system ruby 2.7.1 && \
+        sudo ruby-install --system ruby 3.1.2 && \
         sudo gem update --system`,
 		); err != nil {
 			t.Fatal(err)
@@ -133,7 +129,7 @@ func registerRubyPG(r registry.Registry) {
 			c,
 			node,
 			"installing gems",
-			`cd /mnt/data1/ruby-pg/ && sudo bundle install`,
+			`cd /mnt/data1/ruby-pg/ && bundle install`,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -153,7 +149,7 @@ func registerRubyPG(r registry.Registry) {
 		// Note that this is expected to return an error, since the test suite
 		// will fail. And it is safe to swallow it here.
 		result, err := c.RunWithDetailsSingleNode(ctx, t.L(), node,
-			`cd /mnt/data1/ruby-pg/ && sudo rake`,
+			`cd /mnt/data1/ruby-pg/ && bundle exec rake compile test`,
 		)
 
 		// Expected to fail but we should still scan the error to check if
@@ -169,15 +165,11 @@ func registerRubyPG(r registry.Registry) {
 		}
 
 		rawResults := []byte(result.Stdout + result.Stderr)
-
 		t.L().Printf("Test Results:\n%s", rawResults)
 
 		// Find all the failed and errored tests.
 		results := newORMTestsResults()
-		blocklistName, expectedFailures, _, _ := rubyPGBlocklist.getLists(version)
-		if expectedFailures == nil {
-			t.Fatalf("No ruby-pg blocklist defined for cockroach version %s", version)
-		}
+		blocklistName, expectedFailures := "rubyPGBlocklist", rubyPGBlocklist
 
 		scanner := bufio.NewScanner(bytes.NewReader(rawResults))
 		totalTests := int64(0)
@@ -195,7 +187,7 @@ func registerRubyPG(r registry.Registry) {
 				continue
 			}
 			if len(match) != 1 {
-				log.Fatalf(ctx, "expected one match for test name, found: %d", len(match))
+				t.Fatalf("expected one match for test name, found: %d", len(match))
 			}
 
 			// Take the first test name.
@@ -206,7 +198,7 @@ func registerRubyPG(r registry.Registry) {
 			// ie. test.rb:99 # TEST NAME.
 			strs := testFailureFilenameRegexp.Split(test, -1)
 			if len(strs) != 2 {
-				log.Fatalf(ctx, "expected test output line to be split into two strings")
+				t.Fatalf("expected test output line to be split into two strings")
 			}
 			test = strs[1]
 
@@ -229,7 +221,7 @@ func registerRubyPG(r registry.Registry) {
 		}
 
 		if totalTests == 0 {
-			log.Fatalf(ctx, "failed to find total number of tests run")
+			t.Fatalf("failed to find total number of tests run")
 		}
 		totalPasses := int(totalTests) - (results.failUnexpectedCount + results.failExpectedCount)
 		results.passUnexpectedCount = len(expectedFailures) - results.failExpectedCount
@@ -239,10 +231,11 @@ func registerRubyPG(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "ruby-pg",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
+		Name:       "ruby-pg",
+		Owner:      registry.OwnerSQLExperience,
+		Cluster:    r.MakeClusterSpec(1),
+		NativeLibs: registry.LibGEOS,
+		Tags:       []string{`default`, `orm`},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runRubyPGTest(ctx, t, c)
 		},

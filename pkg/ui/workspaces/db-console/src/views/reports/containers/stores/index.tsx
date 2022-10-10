@@ -115,6 +115,7 @@ export class Stores extends React.Component<StoresProps, {}> {
         <h2 className="base-heading">{header} stores</h2>
         <Loading
           loading={this.props.loading}
+          page={"containers stores"}
           error={this.props.lastError}
           render={this.renderContent}
         />
@@ -128,10 +129,11 @@ function selectStoresState(state: AdminUIState, props: StoresProps) {
   return state.cachedData.stores[nodeIDKey];
 }
 
-const selectStoresLoading = createSelector(
-  selectStoresState,
-  stores => _.isEmpty(stores) || _.isEmpty(stores.data),
-);
+const selectStoresLoading = createSelector(selectStoresState, stores => {
+  return (
+    _.isEmpty(stores) || (_.isEmpty(stores.data) && _.isNil(stores.lastError))
+  );
+});
 
 const selectSortedStores = createSelector(
   selectStoresLoading,
@@ -140,7 +142,7 @@ const selectSortedStores = createSelector(
     if (loading) {
       return null;
     }
-    return _.sortBy(stores.data.stores, store => store.store_id);
+    return _.sortBy(stores.data?.stores, store => store.store_id);
   },
 );
 

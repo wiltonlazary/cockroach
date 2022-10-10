@@ -14,227 +14,551 @@ import (
 	"context"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/internal/validate"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
-// GetMutableDescriptorByID returns a mutable implementation of the descriptor
-// with the requested id. An error is returned if no descriptor exists.
-// Deprecated in favor of GetMutableDescriptorByIDWithFlags.
-func (tc *Collection) GetMutableDescriptorByID(
-	ctx context.Context, id descpb.ID, txn *kv.Txn,
-) (catalog.MutableDescriptor, error) {
-	return tc.GetMutableDescriptorByIDWithFlags(ctx, txn, id, tree.CommonLookupFlags{
+// GetMutableDescriptorsByID returns a mutable implementation of the descriptors
+// with the requested ids. An error is returned if no descriptor exists.
+func (tc *Collection) GetMutableDescriptorsByID(
+	ctx context.Context, txn *kv.Txn, ids ...descpb.ID,
+) ([]catalog.MutableDescriptor, error) {
+	flags := tree.CommonLookupFlags{
+		RequireMutable: true,
 		IncludeOffline: true,
 		IncludeDropped: true,
-	})
-}
-
-// GetMutableDescriptorByIDWithFlags returns a mutable implementation of the
-// descriptor with the requested id. An error is returned if no descriptor exists.
-// TODO (lucy): This is meant to replace GetMutableDescriptorByID. Once it does,
-// rename this function.
-func (tc *Collection) GetMutableDescriptorByIDWithFlags(
-	ctx context.Context, txn *kv.Txn, id descpb.ID, flags tree.CommonLookupFlags,
-) (catalog.MutableDescriptor, error) {
-	log.VEventf(ctx, 2, "planner getting mutable descriptor for id %d", id)
-	flags.RequireMutable = true
-	desc, err := tc.getDescriptorByID(ctx, txn, id, flags)
+	}
+	descs, err := tc.getDescriptorsByID(ctx, txn, flags, ids...)
 	if err != nil {
 		return nil, err
 	}
-	return desc.(catalog.MutableDescriptor), nil
+	ret := make([]catalog.MutableDescriptor, len(descs))
+	for i, desc := range descs {
+		ret[i] = desc.(catalog.MutableDescriptor)
+	}
+	return ret, nil
 }
 
-// GetImmutableDescriptorByID returns an immmutable implementation of the
-// descriptor with the requested id. An error is returned if no descriptor exists.
-// Deprecated in favor of GetMutableDescriptorByIDWithFlags.
+// GetMutableDescriptorByID delegates to GetMutableDescriptorsByID.
+func (tc *Collection) GetMutableDescriptorByID(
+	ctx context.Context, txn *kv.Txn, id descpb.ID,
+) (catalog.MutableDescriptor, error) {
+	descs, err := tc.GetMutableDescriptorsByID(ctx, txn, id)
+	if err != nil {
+		return nil, err
+	}
+	return descs[0], nil
+}
+
+// GetImmutableDescriptorsByID returns an immutable implementation of the
+// descriptors with the requested ids. An error is returned if no descriptor
+// exists, regardless of whether the Required flag is set or not.
+func (tc *Collection) GetImmutableDescriptorsByID(
+	ctx context.Context, txn *kv.Txn, flags tree.CommonLookupFlags, ids ...descpb.ID,
+) ([]catalog.Descriptor, error) {
+	flags.RequireMutable = false
+	return tc.getDescriptorsByID(ctx, txn, flags, ids...)
+}
+
+// GetImmutableDescriptorByID delegates to GetImmutableDescriptorsByID.
 func (tc *Collection) GetImmutableDescriptorByID(
 	ctx context.Context, txn *kv.Txn, id descpb.ID, flags tree.CommonLookupFlags,
 ) (catalog.Descriptor, error) {
-	log.VEventf(ctx, 2, "planner getting immutable descriptor for id %d", id)
 	flags.RequireMutable = false
-	return tc.getDescriptorByID(ctx, txn, id, flags)
+	return tc.getDescriptorByID(ctx, txn, flags, id)
 }
 
+// getDescriptorsByID returns a descriptor by ID according to the provided
+// lookup flags.
+//
+// The Required flag is ignored and always overridden.
 func (tc *Collection) getDescriptorByID(
-	ctx context.Context, txn *kv.Txn, id descpb.ID, flags tree.CommonLookupFlags,
+	ctx context.Context, txn *kv.Txn, flags tree.CommonLookupFlags, ids ...descpb.ID,
 ) (catalog.Descriptor, error) {
-	return tc.getDescriptorByIDMaybeSetTxnDeadline(
-		ctx, txn, id, flags, false /* setTxnDeadline */)
+	var arr [1]catalog.Descriptor
+	if err := getDescriptorsByID(
+		ctx, tc, txn, flags, arr[:], ids...,
+	); err != nil {
+		return nil, err
+	}
+	return arr[0], nil
 }
 
-// getDescriptorByIDMaybeSetTxnDeadline returns a descriptor according to the
-// provided lookup flags. Note that flags.Required is ignored, and an error is
-// always returned if no descriptor with the ID exists.
-func (tc *Collection) getDescriptorByIDMaybeSetTxnDeadline(
-	ctx context.Context, txn *kv.Txn, id descpb.ID, flags tree.CommonLookupFlags, setTxnDeadline bool,
-) (catalog.Descriptor, error) {
-	getDescriptorByID := func() (catalog.Descriptor, error) {
-		vd, err := tc.virtual.getByID(ctx, id, flags.RequireMutable)
-		if vd != nil || err != nil {
-			return vd, err
-		}
+// getDescriptorsByID returns a slice of descriptors by ID according to the
+// provided lookup flags.
+//
+// The Required flag is ignored and always overridden.
+func (tc *Collection) getDescriptorsByID(
+	ctx context.Context, txn *kv.Txn, flags tree.CommonLookupFlags, ids ...descpb.ID,
+) ([]catalog.Descriptor, error) {
+	descs := make([]catalog.Descriptor, len(ids))
+	if err := getDescriptorsByID(
+		ctx, tc, txn, flags, descs, ids...,
+	); err != nil {
+		return nil, err
+	}
+	return descs, nil
+}
 
-		if found, sd := tc.synthetic.getByID(id); found && !flags.AvoidSynthetic {
-			if flags.RequireMutable {
-				return nil, newMutableSyntheticDescriptorAssertionError(sd.GetID())
-			}
-			return sd, nil
+// getDescriptorsByID implements the Collection method of the same name.
+// It takes a slice into which the retrieved descriptors will be stored.
+// That slice must be the same length as the ids. This allows callers
+// seeking to get just one descriptor to avoid an allocation by using a
+// fixed-size array.
+func getDescriptorsByID(
+	ctx context.Context,
+	tc *Collection,
+	txn *kv.Txn,
+	flags tree.CommonLookupFlags,
+	descs []catalog.Descriptor,
+	ids ...descpb.ID,
+) (err error) {
+	// Override flags.
+	flags.Required = true
+	if log.ExpensiveLogEnabled(ctx, 2) {
+		// Copy the ids to a new slice to prevent the backing array from
+		// escaping and forcing IDs to escape on this hot path.
+		idsForLog := append(make([]descpb.ID, 0, len(ids)), ids...)
+		log.VEventf(ctx, 2, "looking up descriptors for ids %v", idsForLog)
+	}
+	var vls validationLevelMap
+	{
+		// Look up the descriptors in all layers except the storage layer on a
+		// best-effort basis.
+		q := byIDLookupContext{
+			ctx:   ctx,
+			txn:   txn,
+			tc:    tc,
+			flags: flags,
 		}
-
-		{
-			ud := tc.uncommitted.getByID(id)
-			if ud != nil {
-				log.VEventf(ctx, 2, "found uncommitted descriptor %d", id)
-				if flags.RequireMutable {
-					ud, err = tc.uncommitted.checkOut(id)
-					if err != nil {
-						return nil, err
-					}
+		type lookupFunc = func(
+			id descpb.ID,
+		) (catalog.Descriptor, catalog.ValidationLevel, error)
+		for _, fn := range []lookupFunc{
+			q.lookupVirtual,
+			q.lookupTemporary,
+			q.lookupSynthetic,
+			q.lookupUncommitted,
+			q.lookupCached,
+			q.lookupLeased,
+		} {
+			for i, id := range ids {
+				if descs[i] != nil {
+					continue
 				}
-				return ud, nil
+				desc, vl, err := fn(id)
+				if err != nil {
+					return err
+				}
+				if desc == nil {
+					continue
+				}
+				descs[i] = desc
+				vls.set(i, vl)
 			}
 		}
+	}
 
-		if !flags.AvoidLeased && !flags.RequireMutable && !lease.TestingTableLeasesAreDisabled() {
-			// If we have already read all of the descriptors, use it as a negative
-			// cache to short-circuit a lookup we know will be doomed to fail.
-			//
-			// TODO(ajwerner): More generally leverage this set of kv descriptors on
-			// the resolution path.
-			if tc.kv.idDefinitelyDoesNotExist(id) {
-				return nil, catalog.ErrDescriptorNotFound
-			}
-
-			desc, shouldReadFromStore, err := tc.leased.getByID(ctx, tc.deadlineHolder(txn), id, setTxnDeadline)
-			if err != nil {
-				return nil, err
-			}
-			if !shouldReadFromStore {
-				return desc, nil
+	// Read any missing descriptors from storage and add them to the slice.
+	var readIDs catalog.DescriptorIDSet
+	for i, id := range ids {
+		if descs[i] == nil {
+			readIDs.Add(id)
+		}
+	}
+	if !readIDs.Empty() {
+		if err = tc.stored.EnsureFromStorageByIDs(ctx, txn, readIDs, catalog.Any); err != nil {
+			return err
+		}
+		for i, id := range ids {
+			if descs[i] == nil {
+				descs[i] = tc.stored.GetCachedByID(id)
+				vls.set(i, tc.stored.GetValidationLevelByID(id))
 			}
 		}
-
-		return tc.withReadFromStore(flags.RequireMutable, func() (catalog.MutableDescriptor, error) {
-			return tc.kv.getByID(ctx, txn, id)
-		})
 	}
 
-	desc, err := getDescriptorByID()
-	if err != nil {
-		return nil, err
+	// At this point, all descriptors are in the slice, finalize and hydrate them.
+	if err := tc.finalizeDescriptors(ctx, txn, flags, descs, &vls); err != nil {
+		return err
 	}
-	if dropped, err := filterDescriptorState(desc, true /* required */, flags); err != nil || dropped {
-		// This is a special case for tables in the adding state: Roughly speaking,
-		// we always need to resolve tables in the adding state by ID when they were
-		// newly created in the transaction for DDL statements and for some
-		// information queries (but not for ordinary name resolution for queries/
-		// DML), but we also need to make these tables public in the schema change
-		// job in a separate transaction.
-		// TODO (lucy): We need something like an IncludeAdding flag so that callers
-		// can specify this behavior, instead of having the collection infer the
-		// desired behavior based on the flags (and likely producing unintended
-		// behavior). See the similar comment on etDescriptorByName, which covers
-		// the ordinary name resolution path as well as DDL statements.
-		if desc.Adding() && (desc.IsUncommittedVersion() || flags.AvoidLeased || flags.RequireMutable) {
-			return desc, nil
+	if err := tc.hydrateDescriptors(ctx, txn, flags, descs); err != nil {
+		return err
+	}
+	for _, desc := range descs {
+		if err := catalog.FilterDescriptorState(desc, flags); err != nil {
+			return err
 		}
-		return nil, err
 	}
-	return desc, nil
+	return nil
 }
 
-func (tc *Collection) getByName(
+// byIDLookupContext is a helper struct for getDescriptorsByID which contains
+// the parameters for looking up descriptors by ID at various levels in the
+// Collection.
+type byIDLookupContext struct {
+	ctx   context.Context
+	txn   *kv.Txn
+	tc    *Collection
+	flags tree.CommonLookupFlags
+}
+
+func (q *byIDLookupContext) lookupVirtual(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	// TODO(postamar): get rid of descriptorless public schemas
+	if id == keys.PublicSchemaID {
+		if q.flags.RequireMutable {
+			err := catalog.NewMutableAccessToVirtualSchemaError(schemadesc.GetPublicSchema())
+			return nil, catalog.NoValidation, err
+		}
+		return schemadesc.GetPublicSchema(), validate.Write, nil
+	}
+	desc, err := q.tc.virtual.getByID(q.ctx, id, q.flags.RequireMutable)
+	if err != nil || desc == nil {
+		return nil, catalog.NoValidation, err
+	}
+	return desc, validate.Write, nil
+}
+
+func (q *byIDLookupContext) lookupTemporary(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	td := q.tc.temporary.getSchemaByID(id)
+	if td == nil {
+		return nil, catalog.NoValidation, nil
+	}
+	if q.flags.RequireMutable {
+		err := catalog.NewMutableAccessToVirtualSchemaError(schemadesc.GetPublicSchema())
+		return nil, catalog.NoValidation, err
+	}
+	return td, validate.Write, nil
+}
+
+func (q *byIDLookupContext) lookupSynthetic(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	if q.flags.AvoidSynthetic {
+		return nil, catalog.NoValidation, nil
+	}
+	sd := q.tc.synthetic.getSyntheticByID(id)
+	if sd == nil {
+		return nil, catalog.NoValidation, nil
+	}
+	if q.flags.RequireMutable {
+		return nil, catalog.NoValidation, newMutableSyntheticDescriptorAssertionError(sd.GetID())
+	}
+	return sd, validate.Write, nil
+}
+
+func (q *byIDLookupContext) lookupCached(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	if desc := q.tc.stored.GetCachedByID(id); desc != nil {
+		return desc, q.tc.stored.GetValidationLevelByID(id), nil
+	}
+	return nil, catalog.NoValidation, nil
+}
+
+func (q *byIDLookupContext) lookupUncommitted(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	if desc := q.tc.uncommitted.getUncommittedByID(id); desc != nil {
+		return desc, validate.MutableRead, nil
+	}
+	return nil, catalog.NoValidation, nil
+}
+
+func (q *byIDLookupContext) lookupLeased(
+	id descpb.ID,
+) (catalog.Descriptor, catalog.ValidationLevel, error) {
+	if q.flags.AvoidLeased || q.flags.RequireMutable || lease.TestingTableLeasesAreDisabled() {
+		return nil, catalog.NoValidation, nil
+	}
+	// If we have already read all of the descriptors, use it as a negative
+	// cache to short-circuit a lookup we know will be doomed to fail.
+	if q.tc.stored.IsIDKnownToNotExist(id) {
+		return nil, catalog.NoValidation, catalog.ErrDescriptorNotFound
+	}
+	desc, shouldReadFromStore, err := q.tc.leased.getByID(q.ctx, q.tc.deadlineHolder(q.txn), id)
+	if err != nil || shouldReadFromStore {
+		return nil, catalog.NoValidation, err
+	}
+	return desc, validate.ImmutableRead, nil
+}
+
+// getDescriptorByName looks up a descriptor by name.
+//
+// The Required and AvoidCommittedAdding flags are ignored and overridden.
+func (tc *Collection) getDescriptorByName(
 	ctx context.Context,
 	txn *kv.Txn,
 	db catalog.DatabaseDescriptor,
 	sc catalog.SchemaDescriptor,
 	name string,
-	avoidLeased, mutable, avoidSynthetic bool,
-) (found bool, desc catalog.Descriptor, err error) {
-	var parentID, parentSchemaID descpb.ID
-	if db != nil {
-		if sc == nil {
-			// Schema descriptors are handled in a special way, see getSchemaByName
-			// function declaration for details.
-			return getSchemaByName(ctx, tc, txn, db, name, avoidLeased, mutable, avoidSynthetic)
-		}
-		parentID, parentSchemaID = db.GetID(), sc.GetID()
+	flags tree.CommonLookupFlags,
+	requestedType catalog.DescriptorType,
+) (catalog.Descriptor, error) {
+	mustBeVirtual, vd, err := tc.getVirtualDescriptorByName(sc, name, flags.RequireMutable, requestedType)
+	if mustBeVirtual || vd != nil || err != nil || (db == nil && sc != nil) {
+		return vd, err
 	}
-
-	if found, sd := tc.synthetic.getByName(parentID, parentSchemaID, name); found && !avoidSynthetic {
-		if mutable {
-			return false, nil, newMutableSyntheticDescriptorAssertionError(sd.GetID())
-		}
-		return true, sd, nil
+	id, err := tc.getNonVirtualDescriptorID(ctx, txn, db, sc, name, flags)
+	if err != nil || id == descpb.InvalidID {
+		return nil, err
 	}
+	// When looking up descriptors by name, then descriptors in the adding state
+	// must be uncommitted to be visible (among other things).
+	flags.AvoidCommittedAdding = true
 
-	{
-		refuseFurtherLookup, ud := tc.uncommitted.getByName(parentID, parentSchemaID, name)
-		if ud != nil {
-			log.VEventf(ctx, 2, "found uncommitted descriptor %d", ud.GetID())
-			if mutable {
-				ud, err = tc.uncommitted.checkOut(ud.GetID())
-				if err != nil {
-					return false, nil, err
-				}
+	desc, err := tc.getDescriptorByID(ctx, txn, flags, id)
+	if err != nil {
+		// Swallow error if the descriptor is dropped.
+		if errors.Is(err, catalog.ErrDescriptorDropped) {
+			return nil, nil
+		}
+		if errors.Is(err, catalog.ErrDescriptorNotFound) {
+			// Special case for temporary schemas, which can't always be resolved by
+			// ID alone.
+			if db != nil && sc == nil && isTemporarySchema(name) {
+				return schemadesc.NewTemporarySchema(name, id, db.GetID()), nil
 			}
-			return true, ud, nil
+			// In all other cases, having an ID should imply having a descriptor.
+			return nil, errors.WithAssertionFailure(err)
 		}
-		if refuseFurtherLookup {
-			return false, nil, nil
-		}
+		return nil, err
 	}
-
-	if !avoidLeased && !mutable && !lease.TestingTableLeasesAreDisabled() {
-		var shouldReadFromStore bool
-		desc, shouldReadFromStore, err = tc.leased.getByName(ctx, tc.deadlineHolder(txn), parentID, parentSchemaID, name)
-		if err != nil {
-			return false, nil, err
-		}
-		if !shouldReadFromStore {
-			return desc != nil, desc, nil
-		}
+	if desc.GetName() != name && !(desc.DescriptorType() == catalog.Schema && isTemporarySchema(name)) {
+		// TODO(postamar): make Collection aware of name ops
+		//
+		// We're prevented from removing this check until the Collection mediates
+		// name changes in the system.namespace table similarly to how it mediates
+		// descriptor changes in system.descriptor via the uncommitted descriptors
+		// layer and the WriteDescsToBatch method.
+		return nil, nil
 	}
-
-	desc, err = tc.withReadFromStore(mutable, func() (desc catalog.MutableDescriptor, err error) {
-		uncommittedDB, _ := tc.uncommitted.getByID(parentID).(catalog.DatabaseDescriptor)
-		return tc.kv.getByName(ctx, txn, uncommittedDB, parentID, parentSchemaID, name)
-	})
-	return desc != nil, desc, err
+	return desc, nil
 }
 
-// withReadFromStore updates the state of the Collection, especially its
-// uncommitted descriptors layer, after reading a descriptor from the storage
-// layer. The logic is the same regardless of whether the descriptor was read
-// by name or by ID.
-func (tc *Collection) withReadFromStore(
-	requireMutable bool, readFn func() (catalog.MutableDescriptor, error),
-) (desc catalog.Descriptor, _ error) {
-	mut, err := readFn()
-	if mut == nil || err != nil {
-		return nil, err
+type continueOrHalt bool
+
+const (
+	continueLookups continueOrHalt = false
+	haltLookups     continueOrHalt = true
+)
+
+// getVirtualDescriptorByName looks up a virtual descriptor by name.
+//
+// Virtual descriptors do not always have an ID set, so they need to be treated
+// separately from getNonVirtualDescriptorID. Also, validation, type hydration
+// and state filtering are irrelevant here.
+func (tc *Collection) getVirtualDescriptorByName(
+	sc catalog.SchemaDescriptor,
+	name string,
+	isMutableRequired bool,
+	requestedType catalog.DescriptorType,
+) (continueOrHalt, catalog.Descriptor, error) {
+	objFlags := tree.ObjectLookupFlags{
+		CommonLookupFlags: tree.CommonLookupFlags{
+			RequireMutable: isMutableRequired,
+		},
 	}
-	desc, err = tc.uncommitted.add(mut)
-	if err != nil {
-		return nil, err
-	}
-	if requireMutable {
-		desc, err = tc.uncommitted.checkOut(desc.GetID())
-		if err != nil {
-			return nil, err
+	switch requestedType {
+	case catalog.Schema:
+		if vs := tc.virtual.getSchemaByName(name); vs != nil {
+			return haltLookups, vs, nil
+		}
+	case catalog.Type:
+		objFlags.DesiredObjectKind = tree.TypeObject
+		fallthrough
+	case catalog.Table:
+		isVirtual, vd, err := tc.virtual.getObjectByName(sc.GetName(), name, objFlags)
+		if isVirtual || vd != nil || err != nil {
+			return haltLookups, vd, err
 		}
 	}
-	tc.kv.releaseAllDescriptors()
-	return desc, nil
+	return continueLookups, nil, nil
+}
+
+// getNonVirtualDescriptorID looks up a non-virtual descriptor ID by name by
+// going through layers in sequence.
+//
+// All flags except AvoidLeased, RequireMutable and AvoidSynthetic are ignored.
+func (tc *Collection) getNonVirtualDescriptorID(
+	ctx context.Context,
+	txn *kv.Txn,
+	db catalog.DatabaseDescriptor,
+	sc catalog.SchemaDescriptor,
+	name string,
+	flags tree.CommonLookupFlags,
+) (descpb.ID, error) {
+	flags = tree.CommonLookupFlags{
+		AvoidLeased:    flags.AvoidLeased,
+		RequireMutable: flags.RequireMutable,
+		AvoidSynthetic: flags.AvoidSynthetic,
+	}
+	var parentID, parentSchemaID descpb.ID
+	var isSchema bool
+	if db != nil {
+		parentID = db.GetID()
+		if sc != nil {
+			parentSchemaID = sc.GetID()
+		} else {
+			isSchema = true
+		}
+	}
+
+	// Define the lookup functions for each layer.
+	lookupTemporarySchemaID := func() (continueOrHalt, descpb.ID, error) {
+		if !isSchema || !isTemporarySchema(name) {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		avoidFurtherLookups, td := tc.temporary.getSchemaByName(ctx, parentID, name)
+		if td != nil {
+			return haltLookups, td.GetID(), nil
+		}
+		if avoidFurtherLookups {
+			return haltLookups, descpb.InvalidID, nil
+		}
+		return continueLookups, descpb.InvalidID, nil
+	}
+	lookupSchemaID := func() (continueOrHalt, descpb.ID, error) {
+		if !isSchema {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		// Getting a schema by name uses a special resolution path which can avoid
+		// a namespace lookup because the mapping of database to schema is stored on
+		// the database itself. This is an important optimization in the case when
+		// the schema does not exist.
+		//
+		if !db.HasPublicSchemaWithDescriptor() && name == catconstants.PublicSchemaName {
+			return haltLookups, keys.PublicSchemaID, nil
+		}
+		if id := db.GetSchemaID(name); id != descpb.InvalidID {
+			return haltLookups, id, nil
+		}
+		if isTemporarySchema(name) {
+			// Look for temporary schema IDs in other layers.
+			return continueLookups, descpb.InvalidID, nil
+		}
+		return haltLookups, descpb.InvalidID, nil
+	}
+	lookupSyntheticID := func() (continueOrHalt, descpb.ID, error) {
+		if flags.AvoidSynthetic {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		if sd := tc.synthetic.getSyntheticByName(parentID, parentSchemaID, name); sd != nil {
+			return haltLookups, sd.GetID(), nil
+		}
+		return continueLookups, descpb.InvalidID, nil
+	}
+	lookupUncommittedID := func() (continueOrHalt, descpb.ID, error) {
+		if ud := tc.uncommitted.getUncommittedByName(parentID, parentSchemaID, name); ud != nil {
+			return haltLookups, ud.GetID(), nil
+		}
+		return continueLookups, descpb.InvalidID, nil
+	}
+	lookupStoreCacheID := func() (continueOrHalt, descpb.ID, error) {
+		if cd := tc.stored.GetCachedByName(parentID, parentSchemaID, name); cd != nil {
+			return haltLookups, cd.GetID(), nil
+		}
+		return continueLookups, descpb.InvalidID, nil
+	}
+	lookupLeasedID := func() (continueOrHalt, descpb.ID, error) {
+		if flags.AvoidLeased || flags.RequireMutable || lease.TestingTableLeasesAreDisabled() {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		if isSchema && isTemporarySchema(name) {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		ld, shouldReadFromStore, err := tc.leased.getByName(
+			ctx, tc.deadlineHolder(txn), parentID, parentSchemaID, name,
+		)
+		if err != nil {
+			return haltLookups, descpb.InvalidID, err
+		}
+		if shouldReadFromStore {
+			return continueLookups, descpb.InvalidID, nil
+		}
+		return haltLookups, ld.GetID(), nil
+	}
+	lookupStoredID := func() (continueOrHalt, descpb.ID, error) {
+		id, err := tc.stored.LookupDescriptorID(ctx, txn, parentID, parentSchemaID, name)
+		return haltLookups, id, err
+	}
+
+	// Iterate through each layer until an ID is conclusively found or not, or an
+	// error is thrown.
+	for _, fn := range []func() (continueOrHalt, descpb.ID, error){
+		lookupTemporarySchemaID,
+		lookupSchemaID,
+		lookupSyntheticID,
+		lookupUncommittedID,
+		lookupStoreCacheID,
+		lookupLeasedID,
+		lookupStoredID,
+	} {
+		isDone, id, err := fn()
+		if err != nil {
+			return descpb.InvalidID, err
+		}
+		if isDone {
+			return id, nil
+		}
+	}
+	return descpb.InvalidID, nil
+}
+
+// finalizeDescriptors ensures that all descriptors are (1) properly validated
+// and (2) if mutable descriptors are requested, these are present in the
+// uncommitted descriptors layer.
+func (tc *Collection) finalizeDescriptors(
+	ctx context.Context,
+	txn *kv.Txn,
+	flags tree.CommonLookupFlags,
+	descs []catalog.Descriptor,
+	validationLevels *validationLevelMap,
+) error {
+	// Add the descriptors to the uncommitted layer if we want them to be mutable.
+	if flags.RequireMutable {
+		for i, desc := range descs {
+			mut, err := tc.uncommitted.ensureMutable(ctx, desc)
+			if err != nil {
+				return err
+			}
+			descs[i] = mut
+		}
+	}
+	// Ensure that all descriptors are sufficiently validated.
+	requiredLevel := validate.MutableRead
+	if !flags.RequireMutable && !flags.AvoidLeased {
+		requiredLevel = validate.ImmutableRead
+	}
+	var toValidate []catalog.Descriptor
+	for i := range descs {
+		if validationLevels.get(i) < requiredLevel {
+			toValidate = append(toValidate, descs[i])
+		}
+	}
+	if len(toValidate) > 0 {
+		if err := tc.Validate(ctx, txn, catalog.ValidationReadTelemetry, requiredLevel, toValidate...); err != nil {
+			return err
+		}
+		for _, desc := range toValidate {
+			tc.stored.UpdateValidationLevel(desc, requiredLevel)
+		}
+	}
+	return nil
 }
 
 func (tc *Collection) deadlineHolder(txn *kv.Txn) deadlineHolder {
@@ -244,78 +568,21 @@ func (tc *Collection) deadlineHolder(txn *kv.Txn) deadlineHolder {
 	return &tc.maxTimestampBoundDeadlineHolder
 }
 
-// Getting a schema by name uses a special resolution path which can avoid
-// a namespace lookup because the mapping of database to schema is stored on
-// the database itself. This is an important optimization in the case when
-// the schema does not exist.
-func getSchemaByName(
-	ctx context.Context,
-	tc *Collection,
-	txn *kv.Txn,
-	db catalog.DatabaseDescriptor,
-	name string,
-	avoidLeased, mutable, avoidSynthetic bool,
-) (bool, catalog.Descriptor, error) {
-	if !db.HasPublicSchemaWithDescriptor() && name == tree.PublicSchema {
-		return true, schemadesc.GetPublicSchema(), nil
-	}
-	if sc := tc.virtual.getSchemaByName(name); sc != nil {
-		return true, sc, nil
-	}
-	if isTemporarySchema(name) {
-		if refuseFurtherLookup, sc, err := tc.temporary.getSchemaByName(
-			ctx, txn, db.GetID(), name, tc.settings.Version,
-		); refuseFurtherLookup || sc != nil || err != nil {
-			return sc != nil, sc, err
-		}
-	}
-	if id := db.GetSchemaID(name); id != descpb.InvalidID {
-		// TODO(ajwerner): Fill in flags here or, more likely, get rid of
-		// it on this path.
-		sc, err := tc.getSchemaByID(ctx, txn, id, tree.SchemaLookupFlags{
-			RequireMutable: mutable,
-			AvoidLeased:    avoidLeased,
-			AvoidSynthetic: avoidSynthetic,
-		})
-		// Deal with the fact that ByID retrieval always uses required and the
-		// logic here never returns an error if the descriptor does not exist.
-		if errors.Is(err, catalog.ErrDescriptorNotFound) ||
-			errors.Is(err, catalog.ErrDescriptorDropped) {
-			err = nil
-		}
-		return sc != nil, sc, err
-	}
-	return false, nil, nil
-}
-
 func isTemporarySchema(name string) bool {
 	return strings.HasPrefix(name, catconstants.PgTempSchemaName)
 }
 
-// filterDescriptorState wraps the more general catalog function to swallow
-// the error if the descriptor is being dropped and the descriptor is not
-// required. In that case, dropped will be true. A return value of false, nil
-// means this descriptor is okay given the flags.
-// TODO (lucy): We would like the ByID methods to ignore the Required flag and
-// unconditionally return an error for dropped descriptors if IncludeDropped is
-// not set, so we can't just pass the flags passed into the methods into this
-// function, hence the boolean argument. This is the only user of
-// catalog.FilterDescriptorState which needs to pass in nontrivial flags, at
-// time of writing, so we should clean up the interface around this bit of
-// functionality.
-func filterDescriptorState(
-	desc catalog.Descriptor, required bool, flags tree.CommonLookupFlags,
-) (dropped bool, _ error) {
-	flags = tree.CommonLookupFlags{
-		Required:       required,
-		IncludeOffline: flags.IncludeOffline,
-		IncludeDropped: flags.IncludeDropped,
-	}
-	if err := catalog.FilterDescriptorState(desc, flags); err != nil {
-		if required || !errors.Is(err, catalog.ErrDescriptorDropped) {
-			return false, err
-		}
-		return true, nil
-	}
-	return false, nil
+// validationLevelMap is used to map indexes in a slice to their required
+// validation level. This avoids any heap allocations as compared to a
+// slice containing the correspondence between an index to a validation level.
+type validationLevelMap struct {
+	m util.FastIntMap
+}
+
+func (vlm *validationLevelMap) get(idx int) catalog.ValidationLevel {
+	return catalog.ValidationLevel(vlm.m.GetDefault(idx))
+}
+
+func (vlm *validationLevelMap) set(idx int, l catalog.ValidationLevel) {
+	vlm.m.Set(idx, int(l))
 }

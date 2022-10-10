@@ -11,13 +11,14 @@
 package rowexec
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,11 +31,6 @@ type joinerBase struct {
 	emptyLeft   rowenc.EncDatumRow
 	emptyRight  rowenc.EncDatumRow
 	combinedRow rowenc.EncDatumRow
-
-	// EqCols contains the indices of the columns that are constrained to be
-	// equal. Specifically column EqCols[0][i] on the left side must match the
-	// column EqCols[1][i] on the right side.
-	eqCols [2][]uint32
 }
 
 // Init initializes the joinerBase.
@@ -42,6 +38,7 @@ type joinerBase struct {
 // opts is passed along to the underlying ProcessorBase. The zero value is used
 // if the processor using the joinerBase is not implementing RowSource.
 func (jb *joinerBase) init(
+	ctx context.Context,
 	self execinfra.RowSource,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
@@ -49,8 +46,6 @@ func (jb *joinerBase) init(
 	rightTypes []*types.T,
 	jType descpb.JoinType,
 	onExpr execinfrapb.Expression,
-	leftEqColumns []uint32,
-	rightEqColumns []uint32,
 	outputContinuationColumn bool,
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
@@ -73,9 +68,6 @@ func (jb *joinerBase) init(
 		jb.emptyRight[i] = rowenc.DatumToEncDatum(rightTypes[i], tree.DNull)
 	}
 
-	jb.eqCols[leftSide] = leftEqColumns
-	jb.eqCols[rightSide] = rightEqColumns
-
 	rowSize := len(leftTypes) + len(rightTypes)
 	if outputContinuationColumn {
 		// NB: Can only be true for inner joins and left outer joins.
@@ -93,12 +85,12 @@ func (jb *joinerBase) init(
 	}
 
 	if err := jb.ProcessorBase.Init(
-		self, post, outputTypes, flowCtx, processorID, output, nil /* memMonitor */, opts,
+		ctx, self, post, outputTypes, flowCtx, processorID, output, nil /* memMonitor */, opts,
 	); err != nil {
 		return err
 	}
-	semaCtx := flowCtx.NewSemaContext(flowCtx.EvalCtx.Txn)
-	return jb.onCond.Init(onExpr, onCondTypes, semaCtx, jb.EvalCtx)
+	semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
+	return jb.onCond.Init(ctx, onExpr, onCondTypes, semaCtx, jb.EvalCtx)
 }
 
 // joinSide is the utility type to distinguish between two sides of the join.
@@ -178,7 +170,7 @@ func (jb *joinerBase) render(lrow, rrow rowenc.EncDatumRow) (rowenc.EncDatumRow,
 		} else {
 			combinedRow = jb.combine(lrow, rrow)
 		}
-		res, err := jb.onCond.EvalFilter(combinedRow)
+		res, err := jb.onCond.EvalFilter(jb.Ctx, combinedRow)
 		if !res || err != nil {
 			return nil, err
 		}
@@ -215,15 +207,4 @@ func (jb *joinerBase) renderForOutput(lrow, rrow rowenc.EncDatumRow) rowenc.EncD
 		return lrow
 	}
 	return jb.combine(lrow, rrow)
-}
-
-// addColumnsNeededByOnExpr updates neededCols to include all IndexedVars from
-// onCond that are used and that have ordinals in [startIdx, endIdx) range.
-// Notably, every added needed column ordinal is shifted down by startIdx.
-func (jb *joinerBase) addColumnsNeededByOnExpr(neededCols *util.FastIntSet, startIdx, endIdx int) {
-	for _, v := range jb.onCond.Vars.GetIndexedVars() {
-		if v.Used && v.Idx >= startIdx && v.Idx < endIdx {
-			neededCols.Add(v.Idx - startIdx)
-		}
-	}
 }

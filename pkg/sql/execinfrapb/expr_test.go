@@ -11,11 +11,13 @@
 package execinfrapb
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -23,12 +25,10 @@ import (
 
 type testVarContainer struct{}
 
+var _ tree.IndexedVarContainer = testVarContainer{}
+
 func (d testVarContainer) IndexedVarResolvedType(idx int) *types.T {
 	return types.Int
-}
-
-func (d testVarContainer) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
-	return nil, nil
 }
 
 func (d testVarContainer) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
@@ -43,9 +43,9 @@ func TestProcessExpression(t *testing.T) {
 
 	h := tree.MakeIndexedVarHelper(testVarContainer{}, 4)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	semaCtx := tree.MakeSemaContext()
-	expr, err := processExpression(e, &evalCtx, &semaCtx, &h)
+	expr, err := processExpression(context.Background(), e, &evalCtx, &semaCtx, &h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,9 +70,9 @@ func TestProcessExpressionConstantEval(t *testing.T) {
 
 	h := tree.MakeIndexedVarHelper(nil, 0)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	semaCtx := tree.MakeSemaContext()
-	expr, err := processExpression(e, &evalCtx, &semaCtx, &h)
+	expr, err := processExpression(context.Background(), e, &evalCtx, &semaCtx, &h)
 	if err != nil {
 		t.Fatal(err)
 	}

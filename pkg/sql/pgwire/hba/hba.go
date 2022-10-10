@@ -24,7 +24,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 	"github.com/olekukonko/tablewriter"
@@ -212,7 +212,7 @@ func (h Entry) ConnMatches(clientConn ConnType, ip net.IP) (bool, error) {
 // The provided username must be normalized already.
 // The function assumes the entry was normalized to contain only
 // one user and its username normalized. See ParseAndNormalize().
-func (h Entry) UserMatches(userName security.SQLUsername) bool {
+func (h Entry) UserMatches(userName username.SQLUsername) bool {
 	if h.User == nil {
 		return true
 	}
@@ -320,13 +320,12 @@ func (s String) IsKeyword(v string) bool {
 // ParseAndNormalize parses the HBA configuration from the provided
 // string and performs two tasks:
 //
-// - it unicode-normalizes the usernames. Since usernames are
-//   initialized during pgwire session initialization, this
-//   ensures that string comparisons can be used to match usernames.
+//   - it unicode-normalizes the usernames. Since usernames are
+//     initialized during pgwire session initialization, this
+//     ensures that string comparisons can be used to match usernames.
 //
-// - it ensures there is one entry per username. This simplifies
-//   the code in the authentication logic.
-//
+//   - it ensures there is one entry per username. This simplifies
+//     the code in the authentication logic.
 func ParseAndNormalize(val string) (*Conf, error) {
 	conf, err := Parse(val)
 	if err != nil {

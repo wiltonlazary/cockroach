@@ -43,12 +43,13 @@ type PrepareStoreReport struct {
 }
 
 // PrepareReplicaReport contains information about prepared change for a replica.
-// Its purpose is to inform user about actions to be performed.
+// Its purpose is to inform user about actions to be performed. And create a record
+// that would be applied to structured log, rangelog and other downstream systems
+// for audit purposes.
 type PrepareReplicaReport struct {
 	// Replica identification data.
-	RangeID    roachpb.RangeID
-	StartKey   roachpb.RKey
 	Replica    roachpb.ReplicaDescriptor
+	Descriptor roachpb.RangeDescriptor
 	OldReplica roachpb.ReplicaDescriptor
 
 	// AlreadyUpdated is true if state of replica in store already matches desired
@@ -64,6 +65,16 @@ type PrepareReplicaReport struct {
 	// part or recovery preparation.
 	AbortedTransaction   bool
 	AbortedTransactionID uuid.UUID
+}
+
+// RangeID of underlying range.
+func (r PrepareReplicaReport) RangeID() roachpb.RangeID {
+	return r.Descriptor.RangeID
+}
+
+// StartKey of underlying range.
+func (r PrepareReplicaReport) StartKey() roachpb.RKey {
+	return r.Descriptor.StartKey
 }
 
 // PrepareUpdateReplicas prepares all changes to be committed to provided stores
@@ -129,11 +140,9 @@ func PrepareUpdateReplicas(
 func applyReplicaUpdate(
 	ctx context.Context, readWriter storage.ReadWriter, update loqrecoverypb.ReplicaUpdate,
 ) (PrepareReplicaReport, error) {
-	clock := hlc.NewClock(hlc.UnixNano, 0)
+	clock := hlc.NewClockWithSystemTimeSource(0 /* maxOffset */)
 	report := PrepareReplicaReport{
-		RangeID:  update.RangeID,
-		Replica:  update.NewReplica,
-		StartKey: update.StartKey.AsRKey(),
+		Replica: update.NewReplica,
 	}
 
 	// Write the rewritten descriptor to the range-local descriptor
@@ -200,6 +209,10 @@ func applyReplicaUpdate(
 		return PrepareReplicaReport{}, errors.Wrap(err, "loading MVCCStats")
 	}
 
+	// We need to abort the transaction and clean intent here because otherwise
+	// we won't be able to do MVCCPut later during recovery for the new
+	// descriptor. It should have no effect on the recovery process itself as
+	// transaction would be rolled back anyways.
 	if intent != nil {
 		// We rely on the property that transactions involving the range
 		// descriptor always start on the range-local descriptor's key. When there
@@ -210,27 +223,26 @@ func applyReplicaUpdate(
 		// synced to disk, so in theory whichever store becomes the designated
 		// survivor may temporarily have "forgotten" that the transaction
 		// committed in its applied state (it would still have the committed log
-		// entry, as this is durable state, so it would come back once the node
-		// was running, but we don't see that materialized state in
-		// unsafe-remove-dead-replicas). This is unlikely to be a problem in
-		// practice, since we assume that the store was shut down gracefully and
-		// besides, the write likely had plenty of time to make it to durable
-		// storage. More troubling is the fact that the designated survivor may
-		// simply not yet have learned that the transaction committed; it may not
-		// have been in the quorum and could've been slow to catch up on the log.
-		// It may not even have the intent; in theory the remaining replica could
-		// have missed any number of transactions on the range descriptor (even if
-		// they are in the log, they may not yet be applied, and the replica may
-		// not yet have learned that they are committed). This is particularly
-		// troubling when we miss a split, as the right-hand side of the split
-		// will exist in the meta ranges and could even be able to make progress.
-		// For yet another thing to worry about, note that the determinism (across
-		// different nodes) assumed in this tool can easily break down in similar
-		// ways (not all stores are going to have the same view of what the
-		// descriptors are), and so multiple replicas of a range may declare
-		// themselves the designated survivor. Long story short, use of this tool
-		// with or without the presence of an intent can - in theory - really
-		// tear the cluster apart.
+		// entry, as this is durable state, so it would come back once the node was
+		// running, but we don't see that materialized state in `debug recover`).
+		// This is unlikely to be a problem in practice, since we assume that the
+		// store was shut down gracefully and besides, the write likely had plenty
+		// of time to make it to durable storage. More troubling is the fact that
+		// the designated survivor may simply not yet have learned that the
+		// transaction committed; it may not have been in the quorum and could've
+		// been slow to catch up on the log.  It may not even have the intent; in
+		// theory the remaining replica could have missed any number of transactions
+		// on the range descriptor (even if they are in the log, they may not yet be
+		// applied, and the replica may not yet have learned that they are
+		// committed). This is particularly troubling when we miss a split, as the
+		// right-hand side of the split will exist in the meta ranges and could even
+		// be able to make progress.  For yet another thing to worry about, note
+		// that the determinism (across different nodes) assumed in this tool can
+		// easily break down in similar ways (not all stores are going to have the
+		// same view of what the descriptors are), and so multiple replicas of a
+		// range may declare themselves the designated survivor. Long story short,
+		// use of this tool with or without the presence of an intent can - in
+		// theory - really tear the cluster apart.
 		//
 		// A solution to this would require a global view, where in a first step
 		// we collect from each store in the cluster the replicas present and
@@ -244,7 +256,7 @@ func applyReplicaUpdate(
 		// A crude form of the intent resolution process: abort the
 		// transaction by deleting its record.
 		txnKey := keys.TransactionKey(intent.Txn.Key, intent.Txn.ID)
-		if err := storage.MVCCDelete(ctx, readWriter, &ms, txnKey, hlc.Timestamp{}, nil); err != nil {
+		if _, err := storage.MVCCDelete(ctx, readWriter, &ms, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil); err != nil {
 			return PrepareReplicaReport{}, err
 		}
 		update := roachpb.LockUpdate{
@@ -272,12 +284,19 @@ func applyReplicaUpdate(
 
 	if err := storage.MVCCPutProto(
 		ctx, readWriter, &ms, key, clock.Now(),
-		nil /* txn */, &newDesc); err != nil {
+		hlc.ClockTimestamp{}, nil /* txn */, &newDesc,
+	); err != nil {
 		return PrepareReplicaReport{}, err
 	}
+	report.Descriptor = newDesc
 	report.RemovedReplicas = localDesc.Replicas()
 	report.OldReplica, _ = report.RemovedReplicas.RemoveReplica(
 		update.NewReplica.NodeID, update.NewReplica.StoreID)
+
+	// Persist the new replica ID.
+	if err := sl.SetRaftReplicaID(ctx, readWriter, update.NewReplica.ReplicaID); err != nil {
+		return PrepareReplicaReport{}, errors.Wrap(err, "setting new replica ID")
+	}
 
 	// Refresh stats
 	if err := sl.SetMVCCStats(ctx, readWriter, &ms); err != nil {

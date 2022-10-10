@@ -11,6 +11,7 @@
 package memo
 
 import (
+	"context"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -18,11 +19,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 var fdAnnID = opt.NewTableAnnID()
@@ -33,12 +36,15 @@ var fdAnnID = opt.NewTableAnnID()
 // buildProps is called by the memo group construction code in order to
 // initialize the new group's logical properties.
 // NOTE: When deriving properties from children, be sure to keep the child
-//       properties immutable by copying them if necessary.
+//
+//	properties immutable by copying them if necessary.
+//
 // NOTE: The parent expression is passed as an expression for convenient access
-//       to children, but certain properties on it are not yet defined (like
-//       its logical properties!).
+//
+//	to children, but certain properties on it are not yet defined (like
+//	its logical properties!).
 type logicalPropsBuilder struct {
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 	mem     *Memo
 	sb      statisticsBuilder
 
@@ -50,14 +56,14 @@ type logicalPropsBuilder struct {
 	disableStats bool
 }
 
-func (b *logicalPropsBuilder) init(evalCtx *tree.EvalContext, mem *Memo) {
+func (b *logicalPropsBuilder) init(ctx context.Context, evalCtx *eval.Context, mem *Memo) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*b = logicalPropsBuilder{
 		evalCtx: evalCtx,
 		mem:     mem,
 	}
-	b.sb.init(evalCtx, mem.Metadata())
+	b.sb.init(ctx, evalCtx, mem.Metadata())
 }
 
 func (b *logicalPropsBuilder) clear() {
@@ -74,7 +80,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	// Side Effects
 	// ------------
 	// A Locking option is a side-effect (we don't want to elide this scan).
-	if scan.Locking != nil {
+	if scan.Locking.IsLocking() {
 		rel.VolatilitySet.AddVolatile()
 	}
 
@@ -86,7 +92,7 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 	// Not Null Columns
 	// ----------------
 	// Initialize not-NULL columns from the table schema.
-	rel.NotNullCols = tableNotNullCols(md, scan.Table)
+	rel.NotNullCols = makeTableNotNullCols(md, scan.Table).Copy()
 	// Union not-NULL columns with not-NULL columns in the constraint.
 	if scan.Constraint != nil {
 		rel.NotNullCols.UnionWith(scan.Constraint.ExtractNotNullCols(b.evalCtx))
@@ -166,6 +172,12 @@ func (b *logicalPropsBuilder) buildScanProps(scan *ScanExpr, rel *props.Relation
 			b.updateCardinalityFromFilters(pred, rel)
 		}
 		b.updateCardinalityFromTypes(rel.OutputCols, rel)
+	}
+	if scan.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic above, but this provides
+		// extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
 	}
 
 	// Statistics
@@ -474,7 +486,7 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 	// ----------------
 	// Add not-NULL columns from the table schema, and filter out any not-NULL
 	// columns from the input that are not projected by the index join.
-	rel.NotNullCols = tableNotNullCols(md, indexJoin.Table)
+	rel.NotNullCols = makeTableNotNullCols(md, indexJoin.Table).Copy()
 	rel.NotNullCols.IntersectionWith(rel.OutputCols)
 
 	// Outer Columns
@@ -493,6 +505,10 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 	// -----------
 	// Inherit cardinality from input.
 	rel.Cardinality = inputProps.Cardinality
+	if indexJoin.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
+	}
 
 	// Statistics
 	// ----------
@@ -503,6 +519,12 @@ func (b *logicalPropsBuilder) buildIndexJoinProps(indexJoin *IndexJoinExpr, rel 
 
 func (b *logicalPropsBuilder) buildLookupJoinProps(join *LookupJoinExpr, rel *props.Relational) {
 	b.buildJoinProps(join, rel)
+	if join.Locking.WaitPolicy == tree.LockWaitSkipLocked {
+		// SKIP LOCKED can act like a filter. The minimum cardinality of a scan
+		// should never exceed zero based on the logic in buildJoinProps, but
+		// this provides extra safety.
+		rel.Cardinality = rel.Cardinality.AsLowAs(0)
+	}
 }
 
 func (b *logicalPropsBuilder) buildInvertedJoinProps(
@@ -698,7 +720,7 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 		len(setPrivate.OutCols) != len(setPrivate.RightCols) {
 		panic(errors.AssertionFailedf(
 			"lists in SetPrivate are not all the same length. new:%d, left:%d, right:%d",
-			log.Safe(len(setPrivate.OutCols)), log.Safe(len(setPrivate.LeftCols)), log.Safe(len(setPrivate.RightCols)),
+			redact.Safe(len(setPrivate.OutCols)), redact.Safe(len(setPrivate.LeftCols)), redact.Safe(len(setPrivate.RightCols)),
 		))
 	}
 
@@ -789,33 +811,35 @@ func (b *logicalPropsBuilder) buildSetProps(setNode RelExpr, rel *props.Relation
 	}
 }
 
-func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Relational) {
+func (b *logicalPropsBuilder) buildValuesProps(values ValuesContainer, rel *props.Relational) {
 	BuildSharedProps(values, &rel.Shared, b.evalCtx)
 
-	card := uint32(len(values.Rows))
+	card := uint32(values.Len())
 
 	// Output Columns
 	// --------------
 	// Use output columns that are attached to the values op.
-	rel.OutputCols = values.Cols.ToSet()
+	rel.OutputCols = values.ColList().ToSet()
 
 	// Not Null Columns
 	// ----------------
 	// All columns are assumed to be nullable, unless they contain only constant
 	// non-null values.
 
-	for colIdx, col := range values.Cols {
-		notNull := true
-		for rowIdx := range values.Rows {
-			val := values.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
-			if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
-				// Null or not a constant.
-				notNull = false
-				break
+	if v, ok := values.(*ValuesExpr); ok {
+		for colIdx, col := range v.ColList() {
+			notNull := true
+			for rowIdx := range v.Rows {
+				val := v.Rows[rowIdx].(*TupleExpr).Elems[colIdx]
+				if !opt.IsConstValueOp(val) || val.Op() == opt.NullOp {
+					// Null or not a constant.
+					notNull = false
+					break
+				}
 			}
-		}
-		if notNull {
-			rel.NotNullCols.Add(col)
+			if notNull {
+				rel.NotNullCols.Add(col)
+			}
 		}
 	}
 
@@ -839,6 +863,12 @@ func (b *logicalPropsBuilder) buildValuesProps(values *ValuesExpr, rel *props.Re
 	if !b.disableStats {
 		b.sb.buildValues(values, rel)
 	}
+}
+
+func (b *logicalPropsBuilder) buildLiteralValuesProps(
+	values ValuesContainer, rel *props.Relational,
+) {
+	b.buildValuesProps(values, rel)
 }
 
 func (b *logicalPropsBuilder) buildBasicProps(e opt.Expr, cols opt.ColList, rel *props.Relational) {
@@ -909,7 +939,7 @@ func (b *logicalPropsBuilder) buildWithProps(with *WithExpr, rel *props.Relation
 	// Statistics
 	// ----------
 	// Inherited from the input expression.
-	rel.Stats = inputProps.Stats
+	*rel.Statistics() = *inputProps.Statistics()
 }
 
 func (b *logicalPropsBuilder) buildWithScanProps(withScan *WithScanExpr, rel *props.Relational) {
@@ -1483,19 +1513,21 @@ func (b *logicalPropsBuilder) buildCreateViewProps(cv *CreateViewExpr, rel *prop
 	BuildSharedProps(cv, &rel.Shared, b.evalCtx)
 }
 
+func (b *logicalPropsBuilder) buildCreateFunctionProps(
+	cf *CreateFunctionExpr, rel *props.Relational,
+) {
+	BuildSharedProps(cf, &rel.Shared, b.evalCtx)
+}
+
 func (b *logicalPropsBuilder) buildFiltersItemProps(item *FiltersItem, scalar *props.Scalar) {
 	BuildSharedProps(item.Condition, &scalar.Shared, b.evalCtx)
 
 	// Constraints
 	// -----------
 	cb := constraintsBuilder{md: b.mem.Metadata(), evalCtx: b.evalCtx}
-	// TODO(rytaft): Using local variables here to avoid a data race. It would be
-	// better to avoid lazy building of props altogether.
-	constraints, tightConstraints := cb.buildConstraints(item.Condition)
-	if constraints.IsUnconstrained() {
+	scalar.Constraints, scalar.TightConstraints = cb.buildConstraints(item.Condition)
+	if scalar.Constraints.IsUnconstrained() {
 		scalar.Constraints, scalar.TightConstraints = nil, false
-	} else {
-		scalar.Constraints, scalar.TightConstraints = constraints, tightConstraints
 	}
 
 	// Functional Dependencies
@@ -1571,7 +1603,7 @@ func (b *logicalPropsBuilder) buildZipItemProps(item *ZipItem, scalar *props.Sca
 // to be partially filled in already. Boolean fields such as HasPlaceholder,
 // HasCorrelatedSubquery should never be reset to false once set to true;
 // VolatilitySet should never be re-initialized.
-func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *tree.EvalContext) {
+func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *eval.Context) {
 	switch t := e.(type) {
 	case *VariableExpr:
 		// Variable introduces outer column.
@@ -1618,11 +1650,15 @@ func BuildSharedProps(e opt.Expr, shared *props.Shared, evalCtx *tree.EvalContex
 	case *CastExpr, *AssignmentCastExpr:
 		from := e.Child(0).(opt.ScalarExpr).DataType()
 		to := e.Private().(*types.T)
-		volatility, ok := tree.LookupCastVolatility(from, to, evalCtx.SessionData())
+		volatility, ok := cast.LookupCastVolatility(from, to)
 		if !ok {
 			panic(errors.AssertionFailedf("no volatility for cast %s::%s", from, to))
 		}
 		shared.VolatilitySet.Add(volatility)
+
+	case *UDFExpr:
+		shared.HasUDF = true
+		shared.VolatilitySet.Add(t.Volatility)
 
 	default:
 		if opt.IsUnaryOp(e) {
@@ -1799,48 +1835,50 @@ func MakeTableFuncDep(md *opt.Metadata, tabID opt.TableID) *props.FuncDepSet {
 	}
 
 	// Add keys from unique constraints.
-	if !md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys {
-		for i := 0; i < tab.UniqueCount(); i++ {
-			unique := tab.Unique(i)
+	for i := 0; i < tab.UniqueCount(); i++ {
+		unique := tab.Unique(i)
 
-			if !unique.Validated() {
-				// This unique constraint has not been validated, so we cannot use it
-				// as a key.
-				continue
-			}
+		if md.TableMeta(tabID).IgnoreUniqueWithoutIndexKeys && !unique.UniquenessGuaranteedByAnotherIndex() {
+			continue
+		}
 
-			if _, isPartial := unique.Predicate(); isPartial {
-				// Partial constraints cannot be considered while building functional
-				// dependency keys for the table because their keys are only unique
-				// for a subset of the rows in the table.
-				continue
-			}
+		if !unique.Validated() {
+			// This unique constraint has not been validated, so we cannot use it
+			// as a key.
+			continue
+		}
 
-			// If any of the columns are nullable, add a lax key FD. Otherwise, add a
-			// strict key.
-			var keyCols opt.ColSet
-			hasNulls := false
-			for i := 0; i < unique.ColumnCount(); i++ {
-				ord := unique.ColumnOrdinal(tab, i)
-				keyCols.Add(tabID.ColumnID(ord))
-				if tab.Column(ord).IsNullable() {
-					hasNulls = true
-				}
-			}
+		if _, isPartial := unique.Predicate(); isPartial {
+			// Partial constraints cannot be considered while building functional
+			// dependency keys for the table because their keys are only unique
+			// for a subset of the rows in the table.
+			continue
+		}
 
-			if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
-				// See comment above where excludeColumn is set.
-				// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
-				// or implicitly partitioned UNIQUE indexes, but we add this check in case
-				// of future changes.)
-				continue
+		// If any of the columns are nullable, add a lax key FD. Otherwise, add a
+		// strict key.
+		var keyCols opt.ColSet
+		hasNulls := false
+		for i := 0; i < unique.ColumnCount(); i++ {
+			ord := unique.ColumnOrdinal(tab, i)
+			keyCols.Add(tabID.ColumnID(ord))
+			if tab.Column(ord).IsNullable() {
+				hasNulls = true
 			}
+		}
 
-			if hasNulls {
-				fd.AddLaxKey(keyCols, allCols)
-			} else {
-				fd.AddStrictKey(keyCols, allCols)
-			}
+		if excludeColumn != 0 && keyCols.Contains(excludeColumn) {
+			// See comment above where excludeColumn is set.
+			// (Virtual tables currently do not have UNIQUE WITHOUT INDEX constraints
+			// or implicitly partitioned UNIQUE indexes, but we add this check in case
+			// of future changes.)
+			continue
+		}
+
+		if hasNulls {
+			fd.AddLaxKey(keyCols, allCols)
+		} else {
+			fd.AddStrictKey(keyCols, allCols)
 		}
 	}
 
@@ -1892,8 +1930,13 @@ func (b *logicalPropsBuilder) makeSetCardinality(
 		card = props.Cardinality{Min: 0, Max: left.Max}
 		card = card.Limit(right.Max)
 
-	case opt.ExceptOp, opt.ExceptAllOp:
+	case opt.ExceptOp:
 		// Use left Max cardinality.
+		card = props.Cardinality{Min: 0, Max: left.Max}
+
+	case opt.ExceptAllOp:
+		// Use left Max cardinality. Cardinality cannot be less than left Min minus
+		// right Max.
 		card = props.Cardinality{Min: 0, Max: left.Max}
 		if left.Min > right.Max {
 			card.Min = left.Min - right.Max
@@ -1911,7 +1954,7 @@ func (b *logicalPropsBuilder) makeSetCardinality(
 // NullColsRejectedByFilter returns a set of columns that are "null rejected"
 // by the filters. An input row with a NULL value on any of these columns will
 // not pass the filter.
-func NullColsRejectedByFilter(evalCtx *tree.EvalContext, filters FiltersExpr) opt.ColSet {
+func NullColsRejectedByFilter(evalCtx *eval.Context, filters FiltersExpr) opt.ColSet {
 	var notNullCols opt.ColSet
 	for i := range filters {
 		filterProps := filters[i].ScalarProps()
@@ -2093,12 +2136,12 @@ func ensureLookupJoinInputProps(join *LookupJoinExpr, sb *statisticsBuilder) *pr
 			}
 		}
 
-		relational.NotNullCols = tableNotNullCols(md, join.Table)
+		relational.NotNullCols = makeTableNotNullCols(md, join.Table).Copy()
 		relational.NotNullCols.IntersectionWith(relational.OutputCols)
 		relational.Cardinality = props.AnyCardinality
 		relational.FuncDeps.CopyFrom(MakeTableFuncDep(md, join.Table))
 		relational.FuncDeps.ProjectCols(relational.OutputCols)
-		relational.Stats = *sb.makeTableStatistics(join.Table)
+		*relational.Statistics() = *sb.makeTableStatistics(join.Table)
 	}
 	return relational
 }
@@ -2110,7 +2153,7 @@ func ensureInvertedJoinInputProps(join *InvertedJoinExpr, sb *statisticsBuilder)
 	if relational.OutputCols.Empty() {
 		md := join.Memo().Metadata()
 		relational.OutputCols = join.Cols.Difference(join.Input.Relational().OutputCols)
-		relational.NotNullCols = tableNotNullCols(md, join.Table)
+		relational.NotNullCols = makeTableNotNullCols(md, join.Table).Copy()
 		relational.NotNullCols.IntersectionWith(relational.OutputCols)
 		relational.Cardinality = props.AnyCardinality
 
@@ -2120,7 +2163,7 @@ func ensureInvertedJoinInputProps(join *InvertedJoinExpr, sb *statisticsBuilder)
 		relational.FuncDeps.ProjectCols(relational.OutputCols)
 
 		// TODO(rytaft): Change this to use inverted index stats once available.
-		relational.Stats = *sb.makeTableStatistics(join.Table)
+		*relational.Statistics() = *sb.makeTableStatistics(join.Table)
 	}
 	return relational
 }
@@ -2160,18 +2203,26 @@ func ensureInputPropsForIndex(
 	if relProps.OutputCols.Empty() {
 		relProps.OutputCols = md.TableMeta(tabID).IndexColumns(indexOrd)
 		relProps.OutputCols.IntersectionWith(outputCols)
-		relProps.NotNullCols = tableNotNullCols(md, tabID)
+		relProps.NotNullCols = makeTableNotNullCols(md, tabID).Copy()
 		relProps.NotNullCols.IntersectionWith(relProps.OutputCols)
 		relProps.Cardinality = props.AnyCardinality
 		relProps.FuncDeps.CopyFrom(MakeTableFuncDep(md, tabID))
 		relProps.FuncDeps.ProjectCols(relProps.OutputCols)
-		relProps.Stats = *sb.makeTableStatistics(tabID)
+		*relProps.Statistics() = *sb.makeTableStatistics(tabID)
 	}
 }
 
-// tableNotNullCols returns the set of not-NULL non-mutation columns from the given table.
-func tableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
-	cs := opt.ColSet{}
+// makeTableNotNullCols returns the set of not-NULL non-mutation columns from
+// the given table. The set is derived lazily and is cached in the metadata,
+// since it may be accessed multiple times during query optimization.
+func makeTableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
+	cs, ok := md.TableAnnotation(tabID, opt.NotNullAnnID).(opt.ColSet)
+	if ok {
+		// Already made.
+		return cs
+	}
+
+	cs = opt.ColSet{}
 	tab := md.Table(tabID)
 
 	// Only iterate over non-mutation columns, since even non-null mutation
@@ -2183,6 +2234,8 @@ func tableNotNullCols(md *opt.Metadata, tabID opt.TableID) opt.ColSet {
 			cs.Add(tabID.ColumnID(i))
 		}
 	}
+
+	md.SetTableAnnotation(tabID, opt.NotNullAnnID, cs)
 	return cs
 }
 
@@ -2567,6 +2620,20 @@ func (b *logicalPropsBuilder) buildNormCycleTestRelProps(
 ) {
 }
 
+func (b *logicalPropsBuilder) buildMemoCycleTestRelProps(
+	mc *MemoCycleTestRelExpr, rel *props.Relational,
+) {
+	// Make the cardinality non-zero to prevent SimplifyZeroCardinalityGroup
+	// from transforming mc into an empty Values expression.
+	inputProps := mc.Input.Relational()
+	rel.Cardinality = inputProps.Cardinality
+	// Make the output cols the same as the input cols to avoid assertion
+	// failures.
+	rel.OutputCols = inputProps.OutputCols
+	// Make the row count non-zero to avoid assertion failures.
+	rel.Statistics().RowCount = 1
+}
+
 // WithUses returns the WithUsesMap for the given expression.
 func WithUses(r opt.Expr) props.WithUsesMap {
 	switch e := r.(type) {
@@ -2656,14 +2723,15 @@ func deriveWithUses(r opt.Expr) props.WithUsesMap {
 // DECIMAL.
 //
 // A formal definition:
-//   Let (c1,c2,...) be the outer columns of the scalar expression. Let
-//   f(x1,x2,..) be the result of the scalar expression for the given outer
-//   column values. The expression is composite insensitive if, for any two
-//   sets of values (x1,x2,...) and (y1,y2,...)
-//      (x1=y1 AND x2=y2 AND ...) => f(x1,x2,...) = f(y1,y2,...)
 //
-//   Note that this doesn't mean that the final results are always *identical*
-//   just that they are logically equal.
+//	Let (c1,c2,...) be the outer columns of the scalar expression. Let
+//	f(x1,x2,..) be the result of the scalar expression for the given outer
+//	column values. The expression is composite insensitive if, for any two
+//	sets of values (x1,x2,...) and (y1,y2,...)
+//	   (x1=y1 AND x2=y2 AND ...) => f(x1,x2,...) = f(y1,y2,...)
+//
+//	Note that this doesn't mean that the final results are always *identical*
+//	just that they are logically equal.
 //
 // This property is used to determine when a scalar expression can be copied,
 // with outer column variable references changed to refer to other columns that

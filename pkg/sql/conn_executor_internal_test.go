@@ -17,11 +17,12 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
@@ -262,7 +263,7 @@ func startConnExecutor(
 ) (*StmtBuf, <-chan []resWithPos, <-chan error, *stop.Stopper, ieResultReader, error) {
 	// A lot of boilerplate for creating a connExecutor.
 	stopper := stop.NewStopper()
-	clock := hlc.NewClock(hlc.UnixNano, 0 /* maxOffset */)
+	clock := hlc.NewClockWithSystemTimeSource(0 /* maxOffset */)
 	factory := kv.MakeMockTxnSenderFactory(
 		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -279,20 +280,29 @@ func startConnExecutor(
 	}
 	defer tempEngine.Close()
 	ambientCtx := log.MakeTestingAmbientCtxWithNewTracer()
+	pool := mon.NewUnlimitedMonitor(
+		context.Background(), "test", mon.MemoryResource,
+		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
+	)
+	// This pool should never be Stop()ed because, if the test is failing, memory
+	// is not properly released.
 	cfg := &ExecutorConfig{
-		AmbientCtx:      ambientCtx,
-		Settings:        st,
-		Clock:           clock,
-		DB:              db,
-		SystemConfig:    config.EmptySystemConfigProvider{},
-		SessionRegistry: NewSessionRegistry(),
+		AmbientCtx: ambientCtx,
+		Settings:   st,
+		Clock:      clock,
+		DB:         db,
+		SystemConfig: config.NewConstantSystemConfigProvider(
+			config.NewSystemConfig(zonepb.DefaultZoneConfigRef()),
+		),
+		SessionRegistry:    NewSessionRegistry(),
+		ClosedSessionCache: NewClosedSessionCache(st, pool, time.Now),
 		NodeInfo: NodeInfo{
-			NodeID:    nodeID,
-			ClusterID: func() uuid.UUID { return uuid.UUID{} },
+			NodeID:           nodeID,
+			LogicalClusterID: func() uuid.UUID { return uuid.UUID{} },
 		},
 		Codec: keys.SystemSQLCodec,
 		DistSQLPlanner: NewDistSQLPlanner(
-			ctx, execinfra.Version, st, roachpb.NodeID(1),
+			ctx, execinfra.Version, st, 1, /* sqlInstanceID */
 			nil, /* rpcCtx */
 			distsql.NewServer(
 				ctx,
@@ -311,21 +321,19 @@ func startConnExecutor(
 			nil, /* nodeDescs */
 			gw,
 			stopper,
-			func(roachpb.NodeID) bool { return true }, // everybody is available
-			nil, /* nodeDialer */
+			func(base.SQLInstanceID) bool { return true }, // everybody is available
+			nil, /* connHealthCheckerSystem */
+			nil, /* podNodeDialer */
+			keys.SystemSQLCodec,
+			nil, /* sqlInstanceProvider */
+			clock,
 		),
 		QueryCache:              querycache.New(0),
 		TestingKnobs:            ExecutorTestingKnobs{},
-		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, gw, st),
+		StmtDiagnosticsRecorder: stmtdiagnostics.NewRegistry(nil, nil, st),
 		HistogramWindowInterval: base.DefaultHistogramWindowInterval(),
-		CollectionFactory:       descs.NewCollectionFactory(st, nil, nil, nil),
+		CollectionFactory:       descs.NewBareBonesCollectionFactory(st, keys.SystemSQLCodec),
 	}
-	pool := mon.NewUnlimitedMonitor(
-		context.Background(), "test", mon.MemoryResource,
-		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
-	)
-	// This pool should never be Stop()ed because, if the test is failing, memory
-	// is not properly released.
 
 	s := NewServer(cfg, pool)
 	buf := NewStmtBuf()
@@ -350,7 +358,7 @@ func startConnExecutor(
 	// routine, we're going to push commands into the StmtBuf and, from time to
 	// time, collect and check their results.
 	go func() {
-		finished <- s.ServeConn(ctx, conn, mon.BoundAccount{}, nil /* cancel */)
+		finished <- s.ServeConn(ctx, conn, &mon.BoundAccount{}, nil /* cancel */)
 	}()
 	return buf, syncResults, finished, stopper, resultChannel, nil
 }
@@ -376,7 +384,7 @@ func TestSessionCloseWithPendingTempTableInTxn(t *testing.T) {
 		},
 	}
 	onDefaultIntSizeChange := func(int32) {}
-	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: security.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{}, onDefaultIntSizeChange)
+	connHandler, err := srv.SetupConn(ctx, SessionArgs{User: username.RootUserName()}, stmtBuf, clientComm, MemoryMetrics{}, onDefaultIntSizeChange)
 	require.NoError(t, err)
 
 	stmts, err := parser.Parse(`
@@ -394,7 +402,7 @@ CREATE TEMPORARY TABLE foo();
 
 	done := make(chan error)
 	go func() {
-		done <- srv.ServeConn(ctx, connHandler, mon.BoundAccount{}, nil /* cancel */)
+		done <- srv.ServeConn(ctx, connHandler, &mon.BoundAccount{}, nil /* cancel */)
 	}()
 	results := <-flushed
 	require.Len(t, results, 6) // We expect results for 5 statements + sync.

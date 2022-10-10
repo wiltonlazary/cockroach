@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -29,15 +30,15 @@ import (
 // and other upsert operations into the input query, rather than requiring the
 // upserter to do it. For example:
 //
-//   CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
-//   INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
+//	CREATE TABLE abc (a INT PRIMARY KEY, b INT, c INT)
+//	INSERT INTO abc VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=10
 //
 // The CBO will generate an input expression similar to this:
 //
-//   SELECT ins_a, ins_b, ins_c, fetch_a, fetch_b, fetch_c, 10 AS upd_b
-//   FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
-//   LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
-//   ON ins_a = fetch_a
+//	SELECT ins_a, ins_b, ins_c, fetch_a, fetch_b, fetch_c, 10 AS upd_b
+//	FROM (VALUES (1, 2, NULL)) AS ins(ins_a, ins_b, ins_c)
+//	LEFT OUTER JOIN abc AS fetch(fetch_a, fetch_b, fetch_c)
+//	ON ins_a = fetch_a
 //
 // The other non-CBO upserters perform custom left lookup joins. However, that
 // doesn't allow sharing of optimization rules and doesn't work with correlated
@@ -98,16 +99,18 @@ var _ tableWriter = &optTableUpserter{}
 
 // init is part of the tableWriter interface.
 func (tu *optTableUpserter) init(
-	ctx context.Context, txn *kv.Txn, evalCtx *tree.EvalContext, sv *settings.Values,
+	ctx context.Context, txn *kv.Txn, evalCtx *eval.Context, sv *settings.Values,
 ) error {
-	tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc, evalCtx, sv)
+	if err := tu.tableWriterBase.init(txn, tu.ri.Helper.TableDesc, evalCtx, sv); err != nil {
+		return err
+	}
 
 	// rowsNeeded, set upon initialization, indicates pkg/sql/backfill.gowhether or not we want
 	// rows returned from the operation.
 	if tu.rowsNeeded {
 		tu.resultRow = make(tree.Datums, len(tu.returnCols))
 		tu.rows = rowcontainer.NewRowContainer(
-			evalCtx.Mon.MakeBoundAccount(),
+			evalCtx.Planner.Mon().MakeBoundAccount(),
 			colinfo.ColTypeInfoFromColumns(tu.returnCols),
 		)
 
@@ -268,11 +271,7 @@ func (tu *optTableUpserter) updateConflictingRow(
 	//   via GenerateInsertRow().
 	// - for the fetched part, we assume that the data in the table is
 	//   correct already.
-	if err := enforceLocalColumnConstraints(
-		updateValues,
-		tu.updateCols,
-		true, /* isUpdate */
-	); err != nil {
+	if err := enforceLocalColumnConstraints(updateValues, tu.updateCols); err != nil {
 		return err
 	}
 

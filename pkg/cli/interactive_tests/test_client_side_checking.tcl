@@ -4,7 +4,7 @@ source [file join [file dirname $argv0] common.tcl]
 
 start_server $argv
 
-spawn $argv sql
+spawn $argv sql --no-line-editor
 eexpect root@
 
 start_test "Check that syntax errors are handled client-side when running interactive."
@@ -28,7 +28,7 @@ end_test
 start_test "Check that the syntax checker does not get confused by empty inputs."
 # (issue #22441.)
 send ";\r"
-eexpect "0 rows"
+eexpect "OK"
 eexpect root@
 end_test
 
@@ -52,7 +52,7 @@ send "commit;\r"
 eexpect "ROLLBACK"
 eexpect root@
 
-interrupt
+send_eof
 eexpect eof
 end_test
 
@@ -78,8 +78,20 @@ eexpect "0\r\n:/# "
 end_test
 
 start_test "Check that --debug-sql-cli sets suitable simplified client-side options."
-send "$argv sql --debug-sql-cli\r"
+send "$argv sql --debug-sql-cli --no-line-editor\r"
 eexpect "Welcome"
+
+# Check empty db name for build info query.
+eexpect "\"\".crdb_internal.node_build_info"
+# Check invitation to reset db name.
+eexpect "you might want to set the current database"
+eexpect "to the empty string"
+
+# Check that troubleshooting mode is enabled in debug mode.
+eexpect "root@"
+send "show troubleshooting_mode;\r"
+eexpect "on"
+
 eexpect "root@"
 send "\\set display_format csv\r\\set\r"
 eexpect "check_syntax,false"

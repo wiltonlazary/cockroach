@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -27,7 +28,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -61,8 +64,6 @@ type DoesNotUseTxn interface {
 // ProcOutputHelper is a helper type that performs filtering and projection on
 // the output of a processor.
 type ProcOutputHelper struct {
-	numInternalCols int
-	RowAlloc        rowenc.EncDatumRowAlloc
 	// renderExprs has length > 0 if we have a rendering. Only one of renderExprs
 	// and outputCols can be set.
 	renderExprs []execinfrapb.ExprHelper
@@ -94,8 +95,18 @@ type ProcOutputHelper struct {
 
 // Reset resets this ProcOutputHelper, retaining allocated memory in its slices.
 func (h *ProcOutputHelper) Reset() {
+	// Deeply reset the render expressions and the output row. Note that we
+	// don't bother deeply resetting the types slice since the types are small
+	// objects.
+	for i := range h.renderExprs {
+		h.renderExprs[i] = execinfrapb.ExprHelper{}
+	}
+	for i := range h.outputRow {
+		h.outputRow[i] = rowenc.EncDatum{}
+	}
 	*h = ProcOutputHelper{
 		renderExprs: h.renderExprs[:0],
+		outputRow:   h.outputRow[:0],
 		OutputTypes: h.OutputTypes[:0],
 	}
 }
@@ -106,10 +117,11 @@ func (h *ProcOutputHelper) Reset() {
 // Note that the types slice may be stored directly; the caller should not
 // modify it.
 func (h *ProcOutputHelper) Init(
+	ctx context.Context,
 	post *execinfrapb.PostProcessSpec,
 	coreOutputTypes []*types.T,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 ) error {
 	if !post.Projection && len(post.OutputColumns) > 0 {
 		return errors.Errorf("post-processing has projection unset but output columns set: %s", post)
@@ -117,11 +129,10 @@ func (h *ProcOutputHelper) Init(
 	if post.Projection && len(post.RenderExprs) > 0 {
 		return errors.Errorf("post-processing has both projection and rendering: %s", post)
 	}
-	h.numInternalCols = len(coreOutputTypes)
 	if post.Projection {
 		for _, col := range post.OutputColumns {
-			if int(col) >= h.numInternalCols {
-				return errors.Errorf("invalid output column %d (only %d available)", col, h.numInternalCols)
+			if int(col) >= len(coreOutputTypes) {
+				return errors.Errorf("invalid output column %d (only %d available)", col, len(coreOutputTypes))
 			}
 		}
 		h.outputCols = post.OutputColumns
@@ -150,8 +161,7 @@ func (h *ProcOutputHelper) Init(
 			h.OutputTypes = make([]*types.T, nRenders)
 		}
 		for i, expr := range post.RenderExprs {
-			h.renderExprs[i] = execinfrapb.ExprHelper{}
-			if err := h.renderExprs[i].Init(expr, coreOutputTypes, semaCtx, evalCtx); err != nil {
+			if err := h.renderExprs[i].Init(ctx, expr, coreOutputTypes, semaCtx, evalCtx); err != nil {
 				return err
 			}
 			h.OutputTypes[i] = h.renderExprs[i].Expr.ResolvedType()
@@ -167,7 +177,14 @@ func (h *ProcOutputHelper) Init(
 	}
 	if h.outputCols != nil || len(h.renderExprs) > 0 {
 		// We're rendering or projecting, so allocate an output row.
-		h.outputRow = h.RowAlloc.AllocRow(len(h.OutputTypes))
+		if h.outputRow != nil && cap(h.outputRow) >= len(h.OutputTypes) {
+			// In some cases we might have no output columns, so nil outputRow
+			// would have sufficient width, yet nil row is a special value, so
+			// we can only reuse the old outputRow if it's non-nil.
+			h.outputRow = h.outputRow[:len(h.OutputTypes)]
+		} else {
+			h.outputRow = make(rowenc.EncDatumRow, len(h.OutputTypes))
+		}
 	}
 
 	h.offset = post.Offset
@@ -178,33 +195,6 @@ func (h *ProcOutputHelper) Init(
 	}
 
 	return nil
-}
-
-// NeededColumns calculates the set of internal processor columns that are
-// actually used by the post-processing stage.
-func (h *ProcOutputHelper) NeededColumns() (colIdxs util.FastIntSet) {
-	if h.outputCols == nil && len(h.renderExprs) == 0 {
-		// No projection or rendering; all columns are needed.
-		colIdxs.AddRange(0, h.numInternalCols-1)
-		return colIdxs
-	}
-
-	// Add all explicit output columns.
-	for _, c := range h.outputCols {
-		colIdxs.Add(int(c))
-	}
-
-	for i := 0; i < h.numInternalCols; i++ {
-		// See if render expressions require this column.
-		for j := range h.renderExprs {
-			if h.renderExprs[j].Vars.IndexedVarUsed(i) {
-				colIdxs.Add(i)
-				break
-			}
-		}
-	}
-
-	return colIdxs
 }
 
 // EmitRow sends a row through the post-processing stage. The same row can be
@@ -280,7 +270,7 @@ func (h *ProcOutputHelper) ProcessRow(
 	if len(h.renderExprs) > 0 {
 		// Rendering.
 		for i := range h.renderExprs {
-			datum, err := h.renderExprs[i].Eval(row)
+			datum, err := h.renderExprs[i].Eval(ctx, row)
 			if err != nil {
 				return nil, false, err
 			}
@@ -298,11 +288,6 @@ func (h *ProcOutputHelper) ProcessRow(
 
 	// If this row satisfies the limit, the caller is told to drain.
 	return h.outputRow, h.rowIdx < h.maxRowIdx, nil
-}
-
-// consumerClosed stops output of additional rows from ProcessRow.
-func (h *ProcOutputHelper) consumerClosed() {
-	h.rowIdx = h.maxRowIdx
 }
 
 // Stats returns output statistics.
@@ -360,7 +345,7 @@ type ProcessorBaseNoHelper struct {
 	FlowCtx *FlowCtx
 
 	// EvalCtx is used for expression evaluation. It overrides the one in flowCtx.
-	EvalCtx *tree.EvalContext
+	EvalCtx *eval.Context
 
 	// Closed is set by InternalClose(). Once set, the processor's tracing span
 	// has been closed.
@@ -374,6 +359,9 @@ type ProcessorBaseNoHelper struct {
 	// origCtx is the context from which ctx was derived. InternalClose() resets
 	// ctx to this.
 	origCtx context.Context
+	// evalOrigCtx is the original context that was stored in the eval.Context.
+	// InternalClose() uses it to correctly reset the eval.Context.
+	evalOrigCtx context.Context
 
 	State procState
 
@@ -384,6 +372,14 @@ type ProcessorBaseNoHelper struct {
 	//
 	// Can return nil.
 	ExecStatsForTrace func() *execinfrapb.ComponentStats
+	// storeExecStatsTrace indicates whether ExecStatsTrace should be populated
+	// in InternalClose.
+	storeExecStatsTrace bool
+	// ExecStatsTrace stores the recording in case HijackExecStatsForTrace has
+	// been called. This is needed in order to provide the access to the
+	// recording after the span has been finished in InternalClose. Only set if
+	// storeExecStatsTrace is true.
+	ExecStatsTrace tracingpb.Recording
 	// trailingMetaCallback, if set, will be called by moveToTrailingMeta(). The
 	// callback is expected to close all inputs, do other cleanup on the processor
 	// (including calling InternalClose()) and generate the trailing meta that
@@ -632,9 +628,18 @@ var _ ExecStatsForTraceHijacker = &ProcessorBase{}
 
 // HijackExecStatsForTrace is a part of the ExecStatsForTraceHijacker interface.
 func (pb *ProcessorBase) HijackExecStatsForTrace() func() *execinfrapb.ComponentStats {
+	if pb.ExecStatsForTrace == nil {
+		return nil
+	}
 	execStatsForTrace := pb.ExecStatsForTrace
 	pb.ExecStatsForTrace = nil
-	return execStatsForTrace
+	pb.storeExecStatsTrace = true
+	return func() *execinfrapb.ComponentStats {
+		cs := execStatsForTrace()
+		// Make sure to unset the trace since we don't need it anymore.
+		pb.ExecStatsTrace = nil
+		return cs
+	}
 }
 
 // moveToTrailingMeta switches the processor to the "trailing meta" state: only
@@ -666,8 +671,11 @@ func (pb *ProcessorBaseNoHelper) moveToTrailingMeta() {
 				pb.span.RecordStructured(stats)
 			}
 		}
-		if trace := pb.span.GetRecording(pb.span.RecordingType()); trace != nil {
+		if trace := pb.span.GetConfiguredRecording(); trace != nil {
 			pb.trailingMeta = append(pb.trailingMeta, execinfrapb.ProducerMetadata{TraceData: trace})
+			if pb.storeExecStatsTrace {
+				pb.ExecStatsTrace = trace
+			}
 		}
 	}
 
@@ -706,16 +714,9 @@ func (pb *ProcessorBase) ProcessRowHelper(row rowenc.EncDatumRow) rowenc.EncDatu
 	if !ok {
 		pb.MoveToDraining(nil /* err */)
 	}
-	// Note that outRow might be nil here.
-	// TODO(yuzefovich): there is a problem with this logging when MetadataTest*
-	// processors are planned - there is a mismatch between the row and the
-	// output types (rendering is added to the stage of test processors and the
-	// actual processors that are inputs to the test ones have an unset post
-	// processing; I think that we need to set the post processing on the stages
-	// of processors below the test ones).
-	//if outRow != nil && log.V(3) && pb.Ctx != nil {
-	//	log.InfofDepth(pb.Ctx, 1, "pushing row %s", outRow.String(pb.Out.OutputTypes))
-	//}
+	if outRow != nil && log.V(3) && pb.Ctx != nil {
+		log.InfofDepth(pb.Ctx, 1, "pushing row %s", outRow.String(pb.OutputHelper.OutputTypes))
+	}
 	return outRow
 }
 
@@ -751,6 +752,7 @@ type ProcStateOpts struct {
 // core (i.e. the "internal schema" of the processor, see
 // execinfrapb.ProcessorSpec for more details).
 func (pb *ProcessorBase) Init(
+	ctx context.Context,
 	self RowSource,
 	post *execinfrapb.PostProcessSpec,
 	coreOutputTypes []*types.T,
@@ -761,7 +763,7 @@ func (pb *ProcessorBase) Init(
 	opts ProcStateOpts,
 ) error {
 	return pb.InitWithEvalCtx(
-		self, post, coreOutputTypes, flowCtx, flowCtx.NewEvalCtx(), processorID, output, memMonitor, opts,
+		ctx, self, post, coreOutputTypes, flowCtx, flowCtx.NewEvalCtx(), processorID, output, memMonitor, opts,
 	)
 }
 
@@ -770,11 +772,12 @@ func (pb *ProcessorBase) Init(
 // core (i.e. the "internal schema" of the processor, see
 // execinfrapb.ProcessorSpec for more details).
 func (pb *ProcessorBase) InitWithEvalCtx(
+	ctx context.Context,
 	self RowSource,
 	post *execinfrapb.PostProcessSpec,
 	coreOutputTypes []*types.T,
 	flowCtx *FlowCtx,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	processorID int32,
 	output RowReceiver,
 	memMonitor *mon.BytesMonitor,
@@ -786,21 +789,21 @@ func (pb *ProcessorBase) InitWithEvalCtx(
 	pb.MemMonitor = memMonitor
 
 	// Hydrate all types used in the processor.
-	resolver := flowCtx.NewTypeResolver(evalCtx.Txn)
-	if err := resolver.HydrateTypeSlice(evalCtx.Context, coreOutputTypes); err != nil {
+	resolver := flowCtx.NewTypeResolver(flowCtx.Txn)
+	if err := resolver.HydrateTypeSlice(ctx, coreOutputTypes); err != nil {
 		return err
 	}
 	pb.SemaCtx = tree.MakeSemaContext()
 	pb.SemaCtx.TypeResolver = &resolver
 
-	return pb.OutputHelper.Init(post, coreOutputTypes, &pb.SemaCtx, pb.EvalCtx)
+	return pb.OutputHelper.Init(ctx, post, coreOutputTypes, &pb.SemaCtx, pb.EvalCtx)
 }
 
 // Init initializes the ProcessorBaseNoHelper.
 func (pb *ProcessorBaseNoHelper) Init(
 	self RowSource,
 	flowCtx *FlowCtx,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	processorID int32,
 	output RowReceiver,
 	opts ProcStateOpts,
@@ -847,37 +850,25 @@ func ProcessorSpan(ctx context.Context, name string) (context.Context, *tracing.
 //
 // It is likely that this method is called from RowSource.Start implementation,
 // and the recommended layout is the following:
-//   ctx = pb.StartInternal(ctx, name)
-//   < inputs >.Start(ctx) // if there are any inputs-RowSources to pb
-//   < other initialization >
+//
+//	ctx = pb.StartInternal(ctx, name)
+//	< inputs >.Start(ctx) // if there are any inputs-RowSources to pb
+//	< other initialization >
+//
 // so that the caller doesn't mistakenly use old ctx object.
 func (pb *ProcessorBaseNoHelper) StartInternal(ctx context.Context, name string) context.Context {
-	return pb.startImpl(ctx, true /* createSpan */, name)
-}
-
-// StartInternalNoSpan does the same as StartInternal except that it does not
-// start a span. This is used by pass-through components whose goal is to be a
-// silent translation layer for components that actually do work (e.g. a
-// planNodeToRowSource wrapping an insertNode, or a columnarizer wrapping a
-// rowexec flow).
-func (pb *ProcessorBaseNoHelper) StartInternalNoSpan(ctx context.Context) context.Context {
-	return pb.startImpl(ctx, false /* createSpan */, "")
-}
-
-func (pb *ProcessorBaseNoHelper) startImpl(
-	ctx context.Context, createSpan bool, spanName string,
-) context.Context {
 	pb.origCtx = ctx
-	if createSpan {
-		pb.Ctx, pb.span = ProcessorSpan(ctx, spanName)
+	pb.Ctx = ctx
+	noSpan := pb.FlowCtx != nil && pb.FlowCtx.Cfg != nil &&
+		pb.FlowCtx.Cfg.TestingKnobs.ProcessorNoTracingSpan
+	if !noSpan {
+		pb.Ctx, pb.span = ProcessorSpan(ctx, name)
 		if pb.span != nil && pb.span.IsVerbose() {
 			pb.span.SetTag(execinfrapb.FlowIDTagKey, attribute.StringValue(pb.FlowCtx.ID.String()))
 			pb.span.SetTag(execinfrapb.ProcessorIDTagKey, attribute.IntValue(int(pb.ProcessorID)))
 		}
-	} else {
-		pb.Ctx = ctx
 	}
-	pb.EvalCtx.Context = pb.Ctx
+	pb.evalOrigCtx = pb.EvalCtx.SetDeprecatedContext(pb.Ctx)
 	return pb.Ctx
 }
 
@@ -888,38 +879,28 @@ func (pb *ProcessorBaseNoHelper) startImpl(
 // Notably, it calls ConsumerClosed() on all the inputsToDrain and updates
 // pb.Ctx to the context passed into StartInternal() call.
 //
-//   if pb.InternalClose() {
-//     // Perform processor specific close work.
-//   }
-func (pb *ProcessorBase) InternalClose() bool {
-	closing := pb.ProcessorBaseNoHelper.InternalClose()
-	if closing {
-		// This prevents Next() from returning more rows.
-		pb.OutputHelper.consumerClosed()
-	}
-	return closing
-}
-
-// InternalClose is the meat of ProcessorBase.InternalClose.
+//	if pb.InternalClose() {
+//	  // Perform processor specific close work.
+//	}
 func (pb *ProcessorBaseNoHelper) InternalClose() bool {
-	closing := !pb.Closed
 	// Protection around double closing is useful for allowing ConsumerClosed() to
 	// be called on processors that have already closed themselves by moving to
 	// StateTrailingMeta.
-	if closing {
-		for _, input := range pb.inputsToDrain[pb.curInputToDrain:] {
-			input.ConsumerClosed()
-		}
-
-		pb.Closed = true
-		pb.span.Finish()
-		pb.span = nil
-		// Reset the context so that any incidental uses after this point do not
-		// access the finished span.
-		pb.Ctx = pb.origCtx
-		pb.EvalCtx.Context = pb.origCtx
+	if pb.Closed {
+		return false
 	}
-	return closing
+	for _, input := range pb.inputsToDrain[pb.curInputToDrain:] {
+		input.ConsumerClosed()
+	}
+
+	pb.Closed = true
+	pb.span.Finish()
+	pb.span = nil
+	// Reset the context so that any incidental uses after this point do not
+	// access the finished span.
+	pb.Ctx = pb.origCtx
+	pb.EvalCtx.SetDeprecatedContext(pb.evalOrigCtx)
+	return true
 }
 
 // ConsumerDone is part of the RowSource interface.
@@ -936,9 +917,11 @@ func (pb *ProcessorBaseNoHelper) ConsumerClosed() {
 // NewMonitor is a utility function used by processors to create a new
 // memory monitor with the given name and start it. The returned monitor must
 // be closed.
-func NewMonitor(ctx context.Context, parent *mon.BytesMonitor, name string) *mon.BytesMonitor {
+func NewMonitor(
+	ctx context.Context, parent *mon.BytesMonitor, name redact.RedactableString,
+) *mon.BytesMonitor {
 	monitor := mon.NewMonitorInheritWithLimit(name, 0 /* limit */, parent)
-	monitor.Start(ctx, parent, mon.BoundAccount{})
+	monitor.StartNoReserved(ctx, parent)
 	return monitor
 }
 
@@ -949,10 +932,10 @@ func NewMonitor(ctx context.Context, parent *mon.BytesMonitor, name string) *mon
 // ServerConfig.TestingKnobs.ForceDiskSpill is set or
 // ServerConfig.TestingKnobs.MemoryLimitBytes if not.
 func NewLimitedMonitor(
-	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name string,
+	ctx context.Context, parent *mon.BytesMonitor, flowCtx *FlowCtx, name redact.RedactableString,
 ) *mon.BytesMonitor {
 	limitedMon := mon.NewMonitorInheritWithLimit(name, GetWorkMemLimit(flowCtx), parent)
-	limitedMon.Start(ctx, parent, mon.BoundAccount{})
+	limitedMon.StartNoReserved(ctx, parent)
 	return limitedMon
 }
 
@@ -963,12 +946,12 @@ func NewLimitedMonitorNoFlowCtx(
 	parent *mon.BytesMonitor,
 	config *ServerConfig,
 	sd *sessiondata.SessionData,
-	name string,
+	name redact.RedactableString,
 ) *mon.BytesMonitor {
 	// Create a fake FlowCtx populating only the required fields.
 	flowCtx := &FlowCtx{
 		Cfg: config,
-		EvalCtx: &tree.EvalContext{
+		EvalCtx: &eval.Context{
 			SessionDataStack: sessiondata.NewStack(sd),
 		},
 	}
@@ -981,7 +964,7 @@ func NewLimitedMonitorNoFlowCtx(
 type LocalProcessor interface {
 	RowSourcedProcessor
 	// InitWithOutput initializes this processor.
-	InitWithOutput(flowCtx *FlowCtx, post *execinfrapb.PostProcessSpec, output RowReceiver) error
+	InitWithOutput(ctx context.Context, flowCtx *FlowCtx, post *execinfrapb.PostProcessSpec, output RowReceiver) error
 	// SetInput initializes this LocalProcessor with an input RowSource. Not all
 	// LocalProcessors need inputs, but this needs to be called if a
 	// LocalProcessor expects to get its data from another RowSource.

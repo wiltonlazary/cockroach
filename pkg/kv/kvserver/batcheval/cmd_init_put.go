@@ -32,11 +32,17 @@ func InitPut(
 	args := cArgs.Args.(*roachpb.InitPutRequest)
 	h := cArgs.Header
 
+	if args.FailOnTombstones && cArgs.EvalCtx.EvalKnobs().DisableInitPutFailOnTombstones {
+		args.FailOnTombstones = false
+	}
+
 	var err error
 	if args.Blind {
-		err = storage.MVCCBlindInitPut(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, h.Txn)
+		err = storage.MVCCBlindInitPut(
+			ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, cArgs.Now, args.Value, args.FailOnTombstones, h.Txn)
 	} else {
-		err = storage.MVCCInitPut(ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, args.Value, args.FailOnTombstones, h.Txn)
+		err = storage.MVCCInitPut(
+			ctx, readWriter, cArgs.Stats, args.Key, h.Timestamp, cArgs.Now, args.Value, args.FailOnTombstones, h.Txn)
 	}
 	// NB: even if MVCC returns an error, it may still have written an intent
 	// into the batch. This allows callers to consume errors like WriteTooOld

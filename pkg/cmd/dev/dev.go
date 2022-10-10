@@ -11,7 +11,7 @@
 package main
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	stdos "os"
 
@@ -25,11 +25,17 @@ type dev struct {
 	cli  *cobra.Command
 	os   *os.OS
 	exec *exec.Exec
+
+	knobs struct { // testing knobs
+		skipDoctorCheck           bool
+		skipCacheCheckDuringBuild bool
+		devBinOverride            string
+	}
 }
 
 func makeDevCmd() *dev {
 	var ret dev
-	ret.log = log.New(ioutil.Discard, "DEBUG: ", 0) // used for debug logging (see --debug)
+	ret.log = log.New(io.Discard, "DEBUG: ", 0) // used for debug logging (see --debug)
 	ret.exec = exec.New(exec.WithLogger(ret.log))
 	ret.os = os.New(os.WithLogger(ret.log))
 
@@ -91,6 +97,9 @@ Typical usage:
 
     dev testlogic --config=local
         Run the logic tests for the cluster configuration 'local'.
+
+    dev build short -- --verbose_failures --profile=prof.gz
+        Pass additional arguments directly to bazel (after the stand alone '--').
 `,
 		// Disable automatic printing of usage information whenever an error
 		// occurs. We presume that most errors will not the result of bad
@@ -108,27 +117,46 @@ Typical usage:
 
 	// Create all the sub-commands.
 	ret.cli.AddCommand(
+		makeAcceptanceCmd(ret.acceptance),
 		makeBenchCmd(ret.bench),
 		makeBuildCmd(ret.build),
 		makeBuilderCmd(ret.builder),
+		makeCacheCmd(ret.cache),
+		makeComposeCmd(ret.compose),
 		makeDoctorCmd(ret.doctor),
 		makeGenerateCmd(ret.generate),
 		makeGoCmd(ret.gocmd),
+		makeMergeTestXMLsCmd(ret.mergeTestXMLs),
 		makeTestLogicCmd(ret.testlogic),
 		makeLintCmd(ret.lint),
 		makeTestCmd(ret.test),
+		makeUICmd(&ret),
+		makeRoachprodStressCmd(ret.roachprodStress),
 	)
+
 	// Add all the shared flags.
 	var debugVar bool
-	for _, subCmd := range ret.cli.Commands() {
-		subCmd.Flags().BoolVar(&debugVar, "debug", false, "enable debug logging for dev")
-	}
-	for _, subCmd := range ret.cli.Commands() {
-		subCmd.PreRun = func(cmd *cobra.Command, args []string) {
-			if debugVar {
-				ret.log.SetOutput(stdos.Stderr)
+	ret.cli.PersistentFlags().BoolVar(&debugVar, "debug", false, "enable debug logging for dev")
+	ret.cli.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		skipDoctorCheckCommands := []string{
+			"builder",
+			"doctor",
+			"help",
+			"merge-test-xmls",
+		}
+		var skipDoctorCheck bool
+		for _, skipDoctorCheckCommand := range skipDoctorCheckCommands {
+			skipDoctorCheck = skipDoctorCheck || cmd.Name() == skipDoctorCheckCommand
+		}
+		if !skipDoctorCheck {
+			if err := ret.checkDoctorStatus(cmd.Context()); err != nil {
+				return err
 			}
 		}
+		if debugVar {
+			ret.log.SetOutput(stdos.Stderr)
+		}
+		return nil
 	}
 
 	return &ret

@@ -12,26 +12,12 @@ package descpb
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/protoreflect"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/errors"
 )
-
-// ToEncodingDirection converts a direction from the proto to an encoding.Direction.
-func (dir IndexDescriptor_Direction) ToEncodingDirection() (encoding.Direction, error) {
-	switch dir {
-	case IndexDescriptor_ASC:
-		return encoding.Ascending, nil
-	case IndexDescriptor_DESC:
-		return encoding.Descending, nil
-	default:
-		return encoding.Ascending, errors.Errorf("invalid direction: %s", dir)
-	}
-}
 
 // ID, ColumnID, FamilyID, and IndexID are all uint32, but are each given a
 // type alias to prevent accidental use of one of the types where
@@ -41,7 +27,7 @@ func (dir IndexDescriptor_Direction) ToEncodingDirection() (encoding.Direction, 
 type ID = catid.DescID
 
 // InvalidID is the uninitialised descriptor id.
-const InvalidID ID = 0
+const InvalidID = catid.InvalidDescID
 
 // IDs is a sortable list of IDs.
 type IDs []ID
@@ -50,8 +36,19 @@ func (ids IDs) Len() int           { return len(ids) }
 func (ids IDs) Less(i, j int) bool { return ids[i] < ids[j] }
 func (ids IDs) Swap(i, j int)      { ids[i], ids[j] = ids[j], ids[i] }
 
+// Contains returns whether `ids` contains `targetID`.
+func (ids IDs) Contains(targetID ID) bool {
+	for _, id := range ids {
+		if id == targetID {
+			return true
+		}
+	}
+	return false
+}
+
 // FormatVersion is a custom type for TableDescriptor versions of the sql to
 // key:value mapping.
+//
 //go:generate stringer -type=FormatVersion
 type FormatVersion uint32
 
@@ -73,6 +70,9 @@ type FamilyID = catid.FamilyID
 
 // IndexID is a custom type for IndexDescriptor IDs.
 type IndexID = catid.IndexID
+
+// ConstraintID is a custom type for TableDescriptor constraint IDs.
+type ConstraintID = catid.ConstraintID
 
 // DescriptorVersion is a custom type for TableDescriptor Versions.
 type DescriptorVersion uint64
@@ -112,19 +112,12 @@ const (
 	// these were implicitly derived based on the set of non-virtual columns in
 	// the table.
 	PrimaryIndexWithStoredColumnsVersion
-
-	// LatestPrimaryIndexDescriptorVersion is the latest index descriptor
-	// version value for primary indexes, and so will be found in all
-	// newly-created primary indexes.
-	// This property is tested by TestLatestIndexDescriptorVersionValues.
-	LatestPrimaryIndexDescriptorVersion = PrimaryIndexWithStoredColumnsVersion
-
-	// LatestNonPrimaryIndexDescriptorVersion is the latest index descriptor
-	// version value for non-primary indexes, and so will be found in all
-	// newly-created secondary indexes, as well as index mutations.
-	// this property is tested by TestLatestIndexDescriptorVersionValues.
-	LatestNonPrimaryIndexDescriptorVersion = StrictIndexColumnIDGuaranteesVersion
+	// LatestIndexDescriptorVersion corresponds to the latest encoding version.
+	LatestIndexDescriptorVersion = PrimaryIndexWithStoredColumnsVersion
 )
+
+// PGAttributeNum is a custom type for ColumnDescriptor's PGAttributeNum field.
+type PGAttributeNum = catid.PGAttributeNum
 
 // ColumnID is a custom type for ColumnDescriptor IDs.
 type ColumnID = catid.ColumnID
@@ -282,6 +275,17 @@ func (desc *TableDescriptor) Persistence() tree.Persistence {
 	return tree.PersistencePermanent
 }
 
+// ForEachPublicIndex is exported to provide low-overhead access to the set of
+// public indexes in a table descriptor for use in backup planning.
+//
+// Most users should prefer the methods provided by the catalog package.
+func (desc *TableDescriptor) ForEachPublicIndex(f func(*IndexDescriptor)) {
+	f(&desc.PrimaryIndex)
+	for i := range desc.Indexes {
+		f(&desc.Indexes[i])
+	}
+}
+
 // IsVirtualTable returns true if the TableDescriptor describes a
 // virtual Table (like the information_schema tables) and thus doesn't
 // need to be physically stored.
@@ -291,7 +295,7 @@ func IsVirtualTable(id ID) bool {
 
 // IsSystemConfigID returns whether this ID is for a system config object.
 func IsSystemConfigID(id ID) bool {
-	return id > 0 && id <= keys.MaxSystemConfigDescID
+	return id == keys.DescriptorTableID || id == keys.ZonesTableID
 }
 
 // AnonymousTable is the empty table name, used when a data source
@@ -354,7 +358,7 @@ var _ UniqueConstraint = &IndexDescriptor{}
 func (u *UniqueWithoutIndexConstraint) IsValidReferencedUniqueConstraint(
 	referencedColIDs ColumnIDs,
 ) bool {
-	return ColumnIDs(u.ColumnIDs).PermutationOf(referencedColIDs)
+	return !u.IsPartial() && ColumnIDs(u.ColumnIDs).PermutationOf(referencedColIDs)
 }
 
 // GetName is part of the UniqueConstraint interface.

@@ -11,7 +11,6 @@
 package kvserver
 
 import (
-	"bytes"
 	"context"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/redact"
 )
 
 // Server implements PerReplicaServer.
@@ -53,29 +51,20 @@ func (is Server) execStoreCommand(
 func (is Server) CollectChecksum(
 	ctx context.Context, req *CollectChecksumRequest,
 ) (*CollectChecksumResponse, error) {
-	resp := &CollectChecksumResponse{}
+	var resp *CollectChecksumResponse
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
+			ctx, cancel := s.stopper.WithCancelOnQuiesce(ctx)
+			defer cancel()
 			r, err := s.GetReplica(req.RangeID)
 			if err != nil {
 				return err
 			}
-			c, err := r.getChecksum(ctx, req.ChecksumID)
+			ccr, err := r.getChecksum(ctx, req.ChecksumID)
 			if err != nil {
 				return err
 			}
-			ccr := c.CollectChecksumResponse
-			if !bytes.Equal(req.Checksum, ccr.Checksum) {
-				// If this check is false, then this request is the replica carrying out
-				// the consistency check. The message is spurious, but we want to leave the
-				// snapshot (if present) intact.
-				if len(req.Checksum) > 0 {
-					log.Errorf(ctx, "consistency check failed on range r%d: expected checksum %x, got %x",
-						req.RangeID, redact.Safe(req.Checksum), redact.Safe(ccr.Checksum))
-					// Leave resp.Snapshot alone so that the caller will receive what's
-					// in it (if anything).
-				}
-			} else {
+			if !req.WithSnapshot {
 				ccr.Snapshot = nil
 			}
 			resp = &ccr
@@ -118,7 +107,7 @@ func (is Server) WaitForApplication(
 				// everything up to this point to disk.
 				//
 				// https://github.com/cockroachdb/cockroach/issues/33120
-				return storage.WriteSyncNoop(ctx, s.engine)
+				return storage.WriteSyncNoop(s.engine)
 			}
 		}
 		if ctx.Err() == nil {
@@ -162,7 +151,28 @@ func (is Server) CompactEngineSpan(
 	resp := &CompactEngineSpanResponse{}
 	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
 		func(ctx context.Context, s *Store) error {
-			return s.Engine().CompactRange(req.Span.Key, req.Span.EndKey, true /* forceBottommost */)
+			return s.Engine().CompactRange(req.Span.Key, req.Span.EndKey)
+		})
+	return resp, err
+}
+
+// SetCompactionConcurrency implements PerStoreServer. It changes the compaction
+// concurrency of a store. While SetCompactionConcurrency is safe for concurrent
+// use, it adds uncertainty about the compaction concurrency actually set on
+// the store. It also adds uncertainty about the compaction concurrency set on
+// the store once the request is cancelled.
+func (is Server) SetCompactionConcurrency(
+	ctx context.Context, req *CompactionConcurrencyRequest,
+) (*CompactionConcurrencyResponse, error) {
+	resp := &CompactionConcurrencyResponse{}
+	err := is.execStoreCommand(ctx, req.StoreRequestHeader,
+		func(ctx context.Context, s *Store) error {
+			prevConcurrency := s.Engine().SetCompactionConcurrency(req.CompactionConcurrency)
+
+			// Wait for cancellation, and once cancelled, reset the compaction concurrency.
+			<-ctx.Done()
+			s.Engine().SetCompactionConcurrency(prevConcurrency)
+			return nil
 		})
 	return resp, err
 }

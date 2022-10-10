@@ -9,6 +9,13 @@
 // licenses/APL.txt.
 
 import { Radio, Button, Input, Checkbox, Divider, Select, Alert } from "antd";
+import "antd/lib/radio/style";
+import "antd/lib/button/style";
+import "antd/lib/input/style";
+import "antd/lib/checkbox/style";
+import "antd/lib/divider/style";
+import "antd/lib/select/style";
+import "antd/lib/alert/style";
 import React, { useState, useCallback, useImperativeHandle } from "react";
 import { Modal } from "src/modal";
 import { Anchor } from "src/anchor";
@@ -51,9 +58,8 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
     const [conditional, setConditional] = useState(false);
     const [expires, setExpires] = useState(true);
     const [minExecLatency, setMinExecLatency] = useState(100);
-    const [minExecLatencyUnit, setMinExecLatencyUnit] = useState(
-      "milliseconds",
-    );
+    const [minExecLatencyUnit, setMinExecLatencyUnit] =
+      useState("milliseconds");
     const [expiresAfter, setExpiresAfter] = useState(15);
 
     const handleSelectChange = (value: string) => {
@@ -116,15 +122,13 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
       >
         <Text>
           Diagnostics will be collected for the next execution that matches this{" "}
-          <Anchor href={statementsSql}>statement fingerprint</Anchor>, or
-          according to the latency threshold set below. The request is cancelled
-          when a single bundle is captured.{" "}
+          <Anchor href={statementsSql}>statement fingerprint</Anchor>, or when
+          the execution of the statement fingerprint exceeds a specified
+          latency. The request is cancelled when a single bundle is captured.{" "}
           <Anchor href={statementDiagnostics}>Learn more</Anchor>
         </Text>
         <div className={cx("diagnostic__options-container")}>
-          <Text className={cx("diagnostic__heading")}>
-            Collect Diagnostics:
-          </Text>
+          <Text className={cx("diagnostic__heading")}>Collect diagnostics</Text>
           <Radio.Group value={conditional}>
             <Button.Group className={cx("diagnostic__btn-group")}>
               <Radio
@@ -132,14 +136,14 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
                 className={cx("diagnostic__radio-btn")}
                 onChange={() => setConditional(false)}
               >
-                On the next instance of the statement
+                On the next execution
               </Radio>
               <Radio
                 value={true}
                 className={cx("diagnostic__radio-btn")}
                 onChange={() => setConditional(true)}
               >
-                On the next instance of the statement that runs longer than:
+                On the next execution where the latency exceeds
                 <div className={cx("diagnostic__conditional-container")}>
                   <div className={cx("diagnostic__min-latency-container")}>
                     <Input
@@ -147,9 +151,11 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
                       className={cx("diagnostic__input__min-latency-time")}
                       disabled={!conditional}
                       value={minExecLatency}
-                      onChange={e =>
-                        setMinExecLatency(parseInt(e.target.value))
-                      }
+                      onChange={e => {
+                        if (parseInt(e.target.value) > 0) {
+                          setMinExecLatency(parseInt(e.target.value));
+                        }
+                      }}
                       size="large"
                     />
                     <Select
@@ -179,7 +185,11 @@ export const ActivateStatementDiagnosticsModal = React.forwardRef(
                 className={cx("diagnostic__input__expires-after-time")}
                 disabled={!expires}
                 value={expiresAfter}
-                onChange={e => setExpiresAfter(parseInt(e.target.value))}
+                onChange={e => {
+                  if (parseInt(e.target.value) > 0) {
+                    setExpiresAfter(parseInt(e.target.value));
+                  }
+                }}
               />
               <div className={cx("diagnostic__checkbox-text")}>minutes</div>
             </div>

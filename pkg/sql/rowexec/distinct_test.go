@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -272,14 +273,15 @@ func TestDistinct(t *testing.T) {
 			out := &distsqlutils.RowBuffer{}
 
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 
-			d, err := newDistinct(&flowCtx, 0 /* processorID */, &ds, in, &execinfrapb.PostProcessSpec{}, out)
+			d, err := newDistinct(context.Background(), &flowCtx, 0 /* processorID */, &ds, in, &execinfrapb.PostProcessSpec{}, out)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -320,12 +322,13 @@ func benchmarkDistinct(b *testing.B, orderedColumns []uint32) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	spec := &execinfrapb.DistinctSpec{
 		DistinctColumns: []uint32{0, 1},
@@ -340,7 +343,7 @@ func benchmarkDistinct(b *testing.B, orderedColumns []uint32) {
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newDistinct(flowCtx, 0 /* processorID */, spec, input, post, &rowDisposer{})
+				d, err := newDistinct(ctx, flowCtx, 0 /* processorID */, spec, input, post, &rowDisposer{})
 				if err != nil {
 					b.Fatal(err)
 				}

@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
-	raft "go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -42,7 +42,7 @@ func splitPreApply(
 	//
 	// The exception to that is if the DisableEagerReplicaRemoval testing flag is
 	// enabled.
-	_, hasRightDesc := split.RightDesc.GetReplicaDescriptor(r.StoreID())
+	rightDesc, hasRightDesc := split.RightDesc.GetReplicaDescriptor(r.StoreID())
 	_, hasLeftDesc := split.LeftDesc.GetReplicaDescriptor(r.StoreID())
 	if !hasRightDesc || !hasLeftDesc {
 		log.Fatalf(ctx, "cannot process split on s%s which does not exist in the split: %+v",
@@ -62,6 +62,8 @@ func splitPreApply(
 		// We're in the rare case where we know that the RHS has been removed
 		// and re-added with a higher replica ID (and then maybe removed again).
 		//
+		// If rightRepl is not nil, we are *not* holding raftMu.
+		//
 		// To apply the split, we need to "throw away" the data that would belong to
 		// the RHS, i.e. we clear the user data the RHS would have inherited from the
 		// LHS due to the split and additionally clear all of the range ID local state
@@ -80,8 +82,16 @@ func splitPreApply(
 		// the HardState and tombstone. Note that we only do this if rightRepl
 		// exists; if it doesn't, there's no Raft state to massage (when rightRepl
 		// was removed, a tombstone was written instead).
+		//
+		// TODO(tbg): it would be cleaner to teach clearRangeData to only remove
+		// the replicated state if rightRepl != nil, as opposed to writing back
+		// internal raft state. As is, it's going to break with any new piece of
+		// local state that we add, and it introduces locking between two Replicas
+		// that don't ever need to interact.
 		var hs raftpb.HardState
 		if rightRepl != nil {
+			rightRepl.raftMu.Lock()
+			defer rightRepl.raftMu.Unlock()
 			// Assert that the rightRepl is not initialized. We're about to clear out
 			// the data of the RHS of the split; we cannot have already accepted a
 			// snapshot to initialize this newer RHS.
@@ -100,8 +110,19 @@ func splitPreApply(
 			log.Fatalf(ctx, "failed to clear range data for removed rhs: %v", err)
 		}
 		if rightRepl != nil {
+			// Cleared the HardState and RaftReplicaID, so rewrite them to the
+			// current values.
+			// TODO(sumeer): we know HardState.Commit cannot advance since the RHS
+			// cannot apply a snapshot yet. But there could be a concurrent change
+			// to HardState.{Term,Vote} that we would accidentally undo here,
+			// because we are not actually holding the appropriate mutex. See
+			// https://github.com/cockroachdb/cockroach/issues/75918.
 			if err := rightRepl.raftMu.stateLoader.SetHardState(ctx, readWriter, hs); err != nil {
 				log.Fatalf(ctx, "failed to set hard state with 0 commit index for removed rhs: %v", err)
+			}
+			if err := rightRepl.raftMu.stateLoader.SetRaftReplicaID(
+				ctx, readWriter, rightRepl.ReplicaID()); err != nil {
+				log.Fatalf(ctx, "failed to set RaftReplicaID for removed rhs: %v", err)
 			}
 		}
 		return
@@ -114,20 +135,27 @@ func splitPreApply(
 	if err := rsl.SynthesizeRaftState(ctx, readWriter); err != nil {
 		log.Fatalf(ctx, "%v", err)
 	}
-
+	// Write the RaftReplicaID for the RHS to maintain the invariant that any
+	// replica (uninitialized or initialized), with persistent state, has a
+	// RaftReplicaID. NB: this invariant will not be universally true until we
+	// introduce node startup code that will write this value for existing
+	// ranges.
+	if err := rsl.SetRaftReplicaID(ctx, readWriter, rightDesc.ReplicaID); err != nil {
+		log.Fatalf(ctx, "%v", err)
+	}
 	// Persist the closed timestamp.
 	//
 	// In order to tolerate a nil initClosedTS input, let's forward to
-	// r.GetClosedTimestamp(). Generally, initClosedTS is not expected to be nil
-	// (and is expected to be in advance of r.GetClosedTimestamp() since it's
-	// coming hot off a Raft command), but let's not rely on the non-nil. Note
-	// that r.GetClosedTimestamp() does not yet incorporate initClosedTS because
-	// the split command has not been applied yet.
+	// r.GetCurrentClosedTimestamp(). Generally, initClosedTS is not expected to
+	// be nil (and is expected to be in advance of r.GetCurrentClosedTimestamp()
+	// since it's coming hot off a Raft command), but let's not rely on the
+	// non-nil. Note that r.GetCurrentClosedTimestamp() does not yet incorporate
+	// initClosedTS because the split command has not been applied yet.
 	if initClosedTS == nil {
 		initClosedTS = &hlc.Timestamp{}
 	}
-	initClosedTS.Forward(r.GetClosedTimestamp(ctx))
-	if err := rsl.SetClosedTimestamp(ctx, readWriter, initClosedTS); err != nil {
+	initClosedTS.Forward(r.GetCurrentClosedTimestamp(ctx))
+	if err := rsl.SetClosedTimestamp(ctx, readWriter, *initClosedTS); err != nil {
 		log.Fatalf(ctx, "%s", err)
 	}
 }
@@ -193,11 +221,14 @@ func splitPostApply(
 func prepareRightReplicaForSplit(
 	ctx context.Context, split *roachpb.SplitTrigger, r *Replica,
 ) (rightReplicaOrNil *Replica) {
-	// Copy out the minLeaseProposedTS from the LHS so we can assign it to the
-	// RHS. This ensures that if the LHS was not able to use its current lease
-	// because of a restart or lease transfer, the RHS will also not be able to.
+	// Copy out the minLeaseProposedTS and minValidObservedTimestamp from the LHS,
+	// so we can assign it to the RHS. minLeaseProposedTS ensures that if the LHS
+	// was not able to use its current lease because of a restart or lease
+	// transfer, the RHS will also not be able to. minValidObservedTS ensures that
+	// the bounds for uncertainty interval are preserved.
 	r.mu.RLock()
 	minLeaseProposedTS := r.mu.minLeaseProposedTS
+	minValidObservedTS := r.mu.minValidObservedTimestamp
 	r.mu.RUnlock()
 
 	// The right hand side of the split was already created (and its raftMu
@@ -229,8 +260,11 @@ func prepareRightReplicaForSplit(
 	}
 
 	// Copy the minLeaseProposedTS from the LHS. loadRaftMuLockedReplicaMuLocked
-	// has already assigned a value for this field; this will be overwrite it.
+	// has already assigned a value for this field; this will overwrite it.
 	rightRepl.mu.minLeaseProposedTS = minLeaseProposedTS
+
+	// Copy the minValidObservedTimestamp field from the LHS.
+	rightRepl.mu.minValidObservedTimestamp = minValidObservedTS
 
 	// Invoke the leasePostApplyLocked method to ensure we properly initialize
 	// the replica according to whether it holds the lease. This enables the
@@ -299,16 +333,18 @@ func (s *Store) SplitRange(
 	// clear them.
 	leftRepl.concMgr.OnRangeSplit()
 
-	// Clear the original range's request stats, since they include requests for
-	// spans that are now owned by the new range.
-	leftRepl.leaseholderStats.resetRequestCounts()
-
 	if rightReplOrNil == nil {
-		throwawayRightWriteStats := new(replicaStats)
-		leftRepl.writeStats.splitRequestCounts(throwawayRightWriteStats)
+		// There is no rhs replica, so instead halve the load of the lhs
+		// replica.
+		throwawayRightStats := NewReplicaLoad(s.Clock(), nil)
+		leftRepl.loadStats.split(throwawayRightStats)
 	} else {
 		rightRepl := rightReplOrNil
-		leftRepl.writeStats.splitRequestCounts(rightRepl.writeStats)
+		// Split the replica load of the lhs evenly (50:50) with the rhs. NB:
+		// that this ignores the split point and makes as simplifying
+		// assumption that distribution across all tracked load stats is
+		// identical.
+		leftRepl.loadStats.split(rightRepl.loadStats)
 		if err := s.addReplicaInternalLocked(rightRepl); err != nil {
 			return errors.Wrapf(err, "unable to add replica %v", rightRepl)
 		}

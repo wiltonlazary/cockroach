@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -111,7 +111,7 @@ func (c *caseOp) ChildCount(verbose bool) int {
 	return 1 + len(c.caseOps) + 1
 }
 
-func (c *caseOp) Child(nth int, verbose bool) execinfra.OpNode {
+func (c *caseOp) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return c.buffer
 	} else if nth < len(c.caseOps)+1 {
@@ -127,9 +127,11 @@ func (c *caseOp) Child(nth int, verbose bool) execinfra.OpNode {
 // NewCaseOp returns an operator that runs a case statement.
 // buffer is a bufferOp that will return the input batch repeatedly.
 // caseOps is a list of operator chains, one per branch in the case statement.
-//   Each caseOp is connected to the input buffer op, and filters the input based
-//   on the case arm's WHEN condition, and then projects the remaining selected
-//   tuples based on the case arm's THEN condition.
+//
+//	Each caseOp is connected to the input buffer op, and filters the input based
+//	on the case arm's WHEN condition, and then projects the remaining selected
+//	tuples based on the case arm's THEN condition.
+//
 // elseOp is the ELSE condition.
 // whenCol is the index into the input batch to read from.
 // thenCol is the index into the output batch to write to.
@@ -145,7 +147,7 @@ func NewCaseOp(
 ) colexecop.Operator {
 	// We internally use three selection vectors, scratch.order, origSel, and
 	// prevSel.
-	allocator.AdjustMemoryUsage(3 * colmem.SizeOfBatchSizeSelVector)
+	allocator.AdjustMemoryUsage(3 * colmem.SelVectorSize(coldata.BatchSize()))
 	return &caseOp{
 		allocator: allocator,
 		buffer:    buffer.(*bufferOp),
@@ -212,8 +214,8 @@ func (c *caseOp) Next() coldata.Batch {
 
 	if c.scratch.output == nil || c.scratch.output.Capacity() < origLen {
 		c.scratch.output = c.allocator.NewMemColumn(c.typ, origLen)
-	} else if c.scratch.output.IsBytesLike() {
-		coldata.Reset(c.scratch.output)
+	} else {
+		coldata.ResetIfBytesLike(c.scratch.output)
 	}
 	orderCapacity := origLen
 	if origHasSel {

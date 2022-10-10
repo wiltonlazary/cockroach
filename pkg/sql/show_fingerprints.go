@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -48,7 +48,8 @@ type showFingerprintsNode struct {
 //
 // To extract the fingerprints at some point in the past, the following
 // query can be used:
-//    SELECT * FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE foo] AS OF SYSTEM TIME xxx
+//
+//	SELECT * FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE foo] AS OF SYSTEM TIME xxx
 func (p *planner) ShowFingerprints(
 	ctx context.Context, n *tree.ShowFingerprints,
 ) (planNode, error) {
@@ -91,15 +92,21 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 
 	cols := make([]string, 0, len(n.tableDesc.PublicColumns()))
 	addColumn := func(col catalog.Column) {
+		var colNameOrExpr string
+		if col.IsExpressionIndexColumn() {
+			colNameOrExpr = fmt.Sprintf("(%s)", col.GetComputeExpr())
+		} else {
+			name := col.GetName()
+			colNameOrExpr = tree.NameStringP(&name)
+		}
 		// TODO(dan): This is known to be a flawed way to fingerprint. Any datum
 		// with the same string representation is fingerprinted the same, even
 		// if they're different types.
-		name := col.GetName()
 		switch col.GetType().Family() {
 		case types.BytesFamily:
-			cols = append(cols, fmt.Sprintf("%s:::bytes", tree.NameStringP(&name)))
+			cols = append(cols, fmt.Sprintf("%s:::bytes", colNameOrExpr))
 		default:
-			cols = append(cols, fmt.Sprintf("%s::string::bytes", tree.NameStringP(&name)))
+			cols = append(cols, fmt.Sprintf("%s::string::bytes", colNameOrExpr))
 		}
 	}
 
@@ -147,9 +154,12 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	  xor_agg(fnv64(%s))::string AS fingerprint
 	  FROM [%d AS t]@{FORCE_INDEX=[%d]}
 	`, strings.Join(cols, `,`), n.tableDesc.GetID(), index.GetID())
-	// If were'in in an AOST context, propagate it to the inner statement so that
+	if index.IsPartial() {
+		sql = fmt.Sprintf("%s WHERE %s", sql, index.GetPredicate())
+	}
+	// If we're in an AOST context, propagate it to the inner statement so that
 	// the inner statement gets planned with planner.avoidLeasedDescriptors set,
-	// like the outter one.
+	// like the outer one.
 	if params.p.EvalContext().AsOfSystemTime != nil {
 		ts := params.p.txn.ReadTimestamp()
 		sql = sql + " AS OF SYSTEM TIME " + ts.AsOfSystemTime()
@@ -158,7 +168,7 @@ func (n *showFingerprintsNode) Next(params runParams) (bool, error) {
 	fingerprintCols, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.QueryRowEx(
 		params.ctx, "hash-fingerprint",
 		params.p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		sql,
 	)
 	if err != nil {

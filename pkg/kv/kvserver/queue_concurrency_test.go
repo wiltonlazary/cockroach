@@ -70,7 +70,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 	// replicaInQueue, but this isn't an ideal world. Deal with it.
 	store := &Store{
 		cfg: StoreConfig{
-			Clock:             hlc.NewClock(hlc.UnixNano, time.Second),
+			Clock:             hlc.NewClockWithSystemTimeSource(time.Second /* maxOffset */),
 			AmbientCtx:        log.MakeTestingAmbientContext(tr),
 			DefaultSpanConfig: roachpb.TestingDefaultSpanConfig(),
 		},
@@ -131,6 +131,8 @@ type fakeQueueImpl struct {
 	pr func(context.Context, *Replica, spanconfig.StoreReader) (processed bool, err error)
 }
 
+var _ queueImpl = &fakeQueueImpl{}
+
 func (fakeQueueImpl) shouldQueue(
 	context.Context, hlc.ClockTimestamp, *Replica, spanconfig.StoreReader,
 ) (shouldQueue bool, priority float64) {
@@ -143,12 +145,21 @@ func (fq fakeQueueImpl) process(
 	return fq.pr(ctx, repl, confReader)
 }
 
+func (fakeQueueImpl) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (fakeQueueImpl) timer(time.Duration) time.Duration {
 	return time.Nanosecond
 }
 
 func (fakeQueueImpl) purgatoryChan() <-chan time.Time {
 	return time.After(time.Nanosecond)
+}
+
+func (fakeQueueImpl) updateChan() <-chan time.Time {
+	return nil
 }
 
 type fakeReplica struct {

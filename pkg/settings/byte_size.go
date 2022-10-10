@@ -33,6 +33,15 @@ func (b *ByteSizeSetting) String(sv *Values) string {
 	return string(humanizeutil.IBytes(b.Get(sv)))
 }
 
+// DecodeToString decodes and renders an encoded value.
+func (b *ByteSizeSetting) DecodeToString(encoded string) (string, error) {
+	iv, err := b.DecodeValue(encoded)
+	if err != nil {
+		return "", err
+	}
+	return string(humanizeutil.IBytes(iv)), nil
+}
+
 // WithPublic sets public visibility and can be chained.
 func (b *ByteSizeSetting) WithPublic() *ByteSizeSetting {
 	b.SetVisibility(Public)
@@ -40,14 +49,14 @@ func (b *ByteSizeSetting) WithPublic() *ByteSizeSetting {
 }
 
 // RegisterByteSizeSetting defines a new setting with type bytesize and any
-// supplied validation function(s).
+// supplied validation function(s). If no validation functions are given, then
+// the non-negative int validation is performed.
 func RegisterByteSizeSetting(
 	class Class, key, desc string, defaultValue int64, validateFns ...func(int64) error,
 ) *ByteSizeSetting {
 
-	var validateFn func(int64) error
-	if len(validateFns) > 0 {
-		validateFn = func(v int64) error {
+	var validateFn = func(v int64) error {
+		if len(validateFns) > 0 {
 			for _, fn := range validateFns {
 				if err := fn(v); err != nil {
 					return errors.Wrapf(err, "invalid value for %s", key)
@@ -55,12 +64,11 @@ func RegisterByteSizeSetting(
 			}
 			return nil
 		}
+		return NonNegativeInt(v)
 	}
 
-	if validateFn != nil {
-		if err := validateFn(defaultValue); err != nil {
-			panic(errors.Wrap(err, "invalid default"))
-		}
+	if err := validateFn(defaultValue); err != nil {
+		panic(errors.Wrap(err, "invalid default"))
 	}
 	setting := &ByteSizeSetting{IntSetting{
 		defaultValue: defaultValue,

@@ -245,13 +245,18 @@ func Decode(
 		_, err := ipAddr.FromBuffer(r)
 		return a.NewDIPAddr(tree.DIPAddr{IPAddr: ipAddr}), rkey, err
 	case types.OidFamily:
+		// TODO: This possibly should use DecodeUint32 (with corresponding changes
+		// to encoding) to ensure that the value fits in a DOid without any loss of
+		// precision. In practice, this may not matter, since everything at
+		// execution time uses a uint32 for OIDs. The extra safety may not be worth
+		// the loss of variable length encoding.
 		var i int64
 		if dir == encoding.Ascending {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
 		}
-		return a.NewDOid(tree.MakeDOid(tree.DInt(i))), rkey, err
+		return a.NewDOid(tree.MakeDOid(oid.Oid(i), valType)), rkey, err
 	case types.EnumFamily:
 		var r []byte
 		if dir == encoding.Ascending {
@@ -269,6 +274,15 @@ func Decode(
 			return nil, nil, err
 		}
 		return a.NewDEnum(tree.DEnum{EnumTyp: valType, PhysicalRep: phys, LogicalRep: log}), rkey, nil
+	case types.EncodedKeyFamily:
+		// We don't actually decode anything; we wrap the raw key bytes into a
+		// DEncodedKey.
+		len, err := encoding.PeekLength(key)
+		if err != nil {
+			return nil, nil, err
+		}
+		rkey := key[len:]
+		return a.NewDEncodedKey(tree.DEncodedKey(key[:len])), rkey, nil
 	default:
 		return nil, nil, errors.Errorf("unable to decode table key: %s", valType)
 	}

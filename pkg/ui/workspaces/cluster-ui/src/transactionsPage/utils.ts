@@ -23,46 +23,47 @@ import {
   FixLong,
   longToInt,
   TimestampToNumber,
-  TimestampToString,
   addStatementStats,
   flattenStatementStats,
   DurationToNumber,
   computeOrUseStmtSummary,
   transactionScopedStatementKey,
+  unset,
 } from "../util";
 
-type Statement = protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type Statement =
+  protos.cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 type TransactionStats = protos.cockroach.sql.ITransactionStatistics;
-type Transaction = protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
+type Transaction =
+  protos.cockroach.server.serverpb.StatementsResponse.IExtendedCollectedTransactionStatistics;
 
 export const getTrxAppFilterOptions = (
   transactions: Transaction[],
   prefix: string,
 ): string[] => {
-  const defaultAppFilters = [prefix];
   const uniqueAppNames = new Set(
-    transactions
-      .filter(t => !t.stats_data.app.startsWith(prefix))
-      .map(t => (t.stats_data.app ? t.stats_data.app : "(unset)")),
+    transactions.map(t =>
+      t.stats_data.app
+        ? t.stats_data.app.startsWith(prefix)
+          ? prefix
+          : t.stats_data.app
+        : unset,
+    ),
   );
 
-  return defaultAppFilters.concat(Array.from(uniqueAppNames));
+  return Array.from(uniqueAppNames).sort();
 };
 
 export const collectStatementsText = (statements: Statement[]): string =>
   statements.map(s => s.key.key_data.query).join("\n");
 
-export const getStatementsByFingerprintIdAndTime = (
+export const getStatementsByFingerprintId = (
   statementFingerprintIds: Long[],
-  timestamp: string | null,
   statements: Statement[],
 ): Statement[] => {
-  return statements?.filter(
-    s =>
-      (timestamp == null ||
-        (s.key?.aggregated_ts != null &&
-          timestamp == TimestampToString(s.key.aggregated_ts))) &&
-      statementFingerprintIds.some(id => id.eq(s.id)),
+  return (
+    statements?.filter(s => statementFingerprintIds.some(id => id.eq(s.id))) ||
+    []
   );
 };
 
@@ -101,12 +102,14 @@ export const aggregateStatements = (
     if (!(key in statsKey)) {
       statsKey[key] = {
         aggregatedFingerprintID: s.statement_fingerprint_id?.toString(),
+        aggregatedFingerprintHexID: s.statement_fingerprint_id.toString(16),
         label: s.statement,
         summary: s.statement_summary,
         aggregatedTs: s.aggregated_ts,
         aggregationInterval: s.aggregation_interval,
         implicitTxn: s.implicit_txn,
         database: s.database,
+        applicationName: s.app,
         fullScan: s.full_scan,
         stats: s.stats,
       };
@@ -122,20 +125,35 @@ export const searchTransactionsData = (
   transactions: Transaction[],
   statements: Statement[],
 ): Transaction[] => {
+  let searchTerms = search?.split(" ");
+  // If search term is wrapped by quotes, do the exact search term.
+  if (search?.startsWith('"') && search?.endsWith('"')) {
+    searchTerms = [search.substring(1, search.length - 1)];
+  }
+
+  if (!search) {
+    return transactions;
+  }
+
   return transactions.filter((t: Transaction) =>
-    search
-      ? search.split(" ").every(val =>
-          collectStatementsText(
-            getStatementsByFingerprintIdAndTime(
-              t.stats_data.statement_fingerprint_ids,
-              TimestampToString(t.stats_data.aggregated_ts),
-              statements,
-            ),
-          )
-            .toLowerCase()
-            .includes(val.toLowerCase()),
+    searchTerms.every(val => {
+      if (
+        collectStatementsText(
+          getStatementsByFingerprintId(
+            t.stats_data.statement_fingerprint_ids,
+            statements,
+          ),
         )
-      : true,
+          .toLowerCase()
+          .includes(val.toLowerCase())
+      ) {
+        return true;
+      }
+
+      return t.stats_data.transaction_fingerprint_id
+        ?.toString(16)
+        ?.includes(val);
+    }),
   );
 };
 
@@ -173,7 +191,7 @@ export const filterTransactions = (
         if (apps.includes(internalAppNamePrefix)) {
           showInternal = true;
         }
-        if (apps.includes("(unset)")) {
+        if (apps.includes(unset)) {
           apps.push("");
         }
 
@@ -202,9 +220,8 @@ export const filterTransactions = (
       let foundRegion: boolean = regions.length == 0;
       let foundNode: boolean = nodes.length == 0;
 
-      getStatementsByFingerprintIdAndTime(
+      getStatementsByFingerprintId(
         t.stats_data.statement_fingerprint_ids,
-        TimestampToString(t.stats_data.aggregated_ts),
         statements,
       ).some(stmt => {
         stmt.stats.nodes &&
@@ -247,9 +264,8 @@ export const generateRegionNode = (
   // nodes and regions of all the statements to a single list of `region: nodes`
   // for the transaction.
   // E.g. {"gcp-us-east1" : [1,3,4]}
-  getStatementsByFingerprintIdAndTime(
+  getStatementsByFingerprintId(
     transaction.stats_data.statement_fingerprint_ids,
-    TimestampToString(transaction.stats_data.aggregated_ts),
     statements,
   ).forEach(stmt => {
     stmt.stats.nodes &&
@@ -284,7 +300,7 @@ type TransactionWithFingerprint = Transaction & { fingerprint: string };
 
 // withFingerprint adds the concatenated statement fingerprints to the Transaction object since it
 // only comes with statement_fingerprint_ids
-const withFingerprint = function(
+const withFingerprint = function (
   t: Transaction,
   stmts: Statement[],
 ): TransactionWithFingerprint {
@@ -351,7 +367,7 @@ function combineTransactionStats(
 // and returns a copy of the first element with its `stats_data.stats` object replaced with a
 // merged stats object that aggregates statistics from every copy of the fingerprint in the list
 // provided
-const mergeTransactionStats = function(txns: Transaction[]): Transaction {
+const mergeTransactionStats = function (txns: Transaction[]): Transaction {
   if (txns.length === 0) {
     return null;
   }
@@ -371,7 +387,7 @@ const mergeTransactionStats = function(txns: Transaction[]): Transaction {
 // The function uses the fingerprint and the `app` that ran the transaction as the key to group the
 // transactions when deduping.
 //
-export const aggregateAcrossNodeIDs = function(
+export const aggregateAcrossNodeIDs = function (
   t: Transaction[],
   stmts: Statement[],
 ): Transaction[] {

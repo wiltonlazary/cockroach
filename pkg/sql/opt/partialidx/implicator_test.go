@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	tu "github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -37,30 +38,29 @@ import (
 //
 //   - predtest vars=(var1 type1, var2 type2, ...)"
 //
-//   The vars argument sets the names and types of the variables in the
-//   expressions.
+//     The vars argument sets the names and types of the variables in the
+//     expressions.
 //
-//   The test input must be in the format:
+//     The test input must be in the format:
 //
-//      [filter expression]
-//      =>
-//      [predicate expression]
+//     [filter expression]
+//     =>
+//     [predicate expression]
 //
-//   The "=>" symbol denotes implication. For example, "a => b" tests if
-//   expression a implies expression b.
-//
+//     The "=>" symbol denotes implication. For example, "a => b" tests if
+//     expression a implies expression b.
 func TestImplicator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	datadriven.Walk(t, tu.TestDataPath(t, "implicator"), func(t *testing.T, path string) {
 		semaCtx := tree.MakeSemaContext()
-		evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
 			var err error
 
 			var f norm.Factory
-			f.Init(&evalCtx, nil /* catalog */)
+			f.Init(context.Background(), &evalCtx, nil /* catalog */)
 			md := f.Metadata()
 
 			if d.Cmd != "predtest" {
@@ -113,7 +113,7 @@ func TestImplicator(t *testing.T) {
 				buf.WriteString("none")
 			} else {
 				execBld := execbuilder.New(
-					nil /* factory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
+					context.Background(), nil /* factory */, nil /* optimizer */, f.Memo(), nil, /* catalog */
 					&remainingFilters, &evalCtx, false, /* allowAutoCommit */
 				)
 				expr, err := execBld.BuildScalar()
@@ -263,11 +263,11 @@ func BenchmarkImplicator(b *testing.B) {
 	}
 
 	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	for _, tc := range testCases {
 		var f norm.Factory
-		f.Init(&evalCtx, nil /* catalog */)
+		f.Init(context.Background(), &evalCtx, nil /* catalog */)
 		md := f.Metadata()
 
 		// Parse the variable types.
@@ -311,11 +311,7 @@ func BenchmarkImplicator(b *testing.B) {
 // This ensures that these test filters mimic the filters that will be created
 // during a real query.
 func makeFilters(
-	input string,
-	cols opt.ColSet,
-	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
-	f *norm.Factory,
+	input string, cols opt.ColSet, semaCtx *tree.SemaContext, evalCtx *eval.Context, f *norm.Factory,
 ) (memo.FiltersExpr, error) {
 	filters, err := makeFiltersExpr(input, semaCtx, evalCtx, f)
 	if err != nil {
@@ -344,7 +340,8 @@ func makeFilters(
 	}
 
 	// Create a fake Select and input so that normalization rules are run.
-	p := &props.Relational{OutputCols: cols, Cardinality: card, Stats: stats}
+	p := &props.Relational{OutputCols: cols, Cardinality: card}
+	*p.Statistics() = stats
 	fakeRel := f.ConstructFakeRel(&memo.FakeRelPrivate{Props: p})
 	sel := f.ConstructSelect(fakeRel, filters)
 
@@ -364,7 +361,7 @@ func makeFilters(
 
 // makeFiltersExpr returns a FiltersExpr generated from the input string.
 func makeFiltersExpr(
-	input string, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, f *norm.Factory,
+	input string, semaCtx *tree.SemaContext, evalCtx *eval.Context, f *norm.Factory,
 ) (memo.FiltersExpr, error) {
 	expr, err := parser.ParseExpr(input)
 	if err != nil {

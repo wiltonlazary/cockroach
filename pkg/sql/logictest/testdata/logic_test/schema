@@ -51,9 +51,9 @@ SELECT
 FROM crdb_internal.tables
 WHERE database_name = 'test'
 ----
-test  54  myschema  57  tb  58
-test  54  myschema  57  v   61
-test  54  myschema  57  s   62
+test  104  myschema  107  tb  108
+test  104  myschema  107  v   111
+test  104  myschema  107  s   112
 
 query I
 SELECT * FROM myschema.tb
@@ -132,24 +132,31 @@ CREATE SCHEMA yourschema
 statement error pq: schema "yourschema" already exists
 ALTER SCHEMA myschema RENAME TO yourschema
 
-statement ok
+statement error cannot rename schema because relation "test.myschema.v" depends on relation "test.myschema.tb"
 ALTER SCHEMA myschema RENAME TO myschema2
+
+statement ok
+CREATE SCHEMA myschema2;
+CREATE TABLE myschema2.tb2 (a INT PRIMARY KEY);
+
+statement ok
+ALTER SCHEMA myschema2 RENAME TO myschema3
 
 # We should be able to resolve objects under the new schema name.
 query T
-SELECT * FROM myschema2.tb2
+SELECT * FROM myschema3.tb2
 ----
 
 # The names should be drained after executing, so we should be able
 # to make another schema with the old name.
 statement ok
-CREATE SCHEMA myschema
+CREATE SCHEMA myschema2
 
 statement ok
 BEGIN
 
 statement ok
-ALTER SCHEMA myschema RENAME TO another_schema
+ALTER SCHEMA myschema2 RENAME TO another_schema
 
 statement ok
 ALTER SCHEMA another_schema RENAME TO another_one
@@ -163,39 +170,41 @@ CREATE SCHEMA empty;
 DROP SCHEMA empty
 
 let $schema_id
-SELECT id FROM system.namespace WHERE name = 'myschema'
+SELECT id FROM system.namespace WHERE name = 'myschema2'
 
-# Create some objects under myschema, and have them reference some objects
+# Create some objects under myschema2, and have them reference some objects
 # in other schemas.
 statement ok
-CREATE TABLE myschema.myschema_t1 (x INT);
-CREATE TABLE myschema.myschema_t2 (x INT);
-CREATE SEQUENCE myschema.myschema_seq1;
-CREATE TABLE myschema.myschema_t3 (x INT DEFAULT nextval('myschema.myschema_seq1'));
-CREATE TYPE myschema.myschema_ty1 AS ENUM ('schema');
+CREATE TABLE myschema2.myschema_t1 (x INT);
+CREATE TABLE myschema2.myschema_t2 (x INT);
+CREATE SEQUENCE myschema2.myschema_seq1;
+CREATE TABLE myschema2.myschema_t3 (x INT DEFAULT nextval('myschema2.myschema_seq1'));
+CREATE TYPE myschema2.myschema_ty1 AS ENUM ('schema');
 CREATE SCHEMA otherschema;
-CREATE VIEW otherschema.otherschema_v1 AS SELECT x FROM myschema.myschema_t1;
+CREATE VIEW otherschema.otherschema_v1 AS SELECT x FROM myschema2.myschema_t1;
 CREATE TABLE otherschema.otherschema_t1 (x INT);
-CREATE SEQUENCE otherschema.otherschema_seq1 OWNED BY myschema.myschema_t1.x;
+CREATE SEQUENCE otherschema.otherschema_seq1 OWNED BY myschema2.myschema_t1.x;
 
-statement error pq: schema "myschema" is not empty and CASCADE was not specified
-DROP SCHEMA myschema
+statement error pq: schema "myschema2" is not empty and CASCADE was not specified
+DROP SCHEMA myschema2
 
 # Now drop with cascade.
 statement ok
-DROP SCHEMA myschema CASCADE
+DROP SCHEMA myschema2 CASCADE
 
 query T
-SELECT table_name FROM [SHOW TABLES] WHERE table_name LIKE 'myschema%' OR table_name LIKE 'otherschema%'
+SELECT table_name FROM [SHOW TABLES] WHERE table_name LIKE 'myschema2%' OR table_name LIKE 'otherschema%'
 ----
 otherschema_t1
 
 query T
-SELECT name FROM [SHOW ENUMS] WHERE name LIKE 'myschema%'
+SELECT name FROM [SHOW ENUMS] WHERE name LIKE 'myschema2%'
+----
 
 # The schema should be gone.
 query I
-SELECT id FROM system.namespace WHERE name = 'myschema'
+SELECT id FROM system.namespace WHERE name = 'myschema2'
+----
 
 query IT
 SELECT * FROM system.descriptor WHERE id = $schema_id
@@ -423,7 +432,7 @@ CREATE TYPE privs.denied AS ENUM ('denied')
 statement error pq: must be owner of schema "privs"
 ALTER SCHEMA privs RENAME TO denied
 
-statement error must be owner of schema \"privs\"
+statement error must be owner of schema privs
 DROP SCHEMA privs
 
 # Test the usage privilege.
@@ -710,32 +719,6 @@ SELECT * FROM testuser.test_table
 ----
 a
 
-# Ensure that when we create a schema, it inherits privileges from its parent
-# database, but only those which are valid for schemas.
-subtest create_schema_inherits_db_privileges
-
-user root
-
-statement ok
-CREATE DATABASE d54662;
-GRANT CREATE, SELECT ON DATABASE d54662 TO testuser;
-USE d54662;
-CREATE SCHEMA s
-
-query T
-SELECT privilege_type FROM [SHOW GRANTS ON schema s FOR testuser]
-----
-CREATE
-
-statement ok
-GRANT USAGE ON SCHEMA s TO testuser
-
-query T rowsort
-SELECT privilege_type FROM [SHOW GRANTS ON schema s FOR testuser]
-----
-CREATE
-USAGE
-
 # Verify that a table can be renamed with a schema prefixes
 subtest alter_table_rename
 
@@ -754,13 +737,13 @@ ALTER TABLE sch.table_to_rename RENAME TO renamed_table;
 statement ok
 ALTER TABLE sch.renamed_table RENAME TO sch.renamed_table_2;
 
-statement error pq: relation "d54662.sch.table_exists" already exists
+statement error pq: relation "new_db.sch.table_exists" already exists
 ALTER TABLE sch.renamed_table_2 RENAME TO sch.table_exists;
 
 statement ok
 ALTER TABLE public_table_to_rename RENAME TO public.renamed_public_table;
 
-statement error pq: relation "d54662.public.public_table_exists" already exists
+statement error pq: relation "new_db.public.public_table_exists" already exists
 ALTER TABLE renamed_public_table RENAME TO public_table_exists;
 
 subtest show_tables
@@ -854,10 +837,18 @@ statement ok
 CREATE DATABASE comment_db
 
 statement ok
-USE comment_db
+CREATE SCHEMA comment_db.foo
 
 statement ok
-CREATE SCHEMA foo
+COMMENT ON SCHEMA comment_db.foo IS 'foo'
+
+query T
+SELECT comment FROM system.comments LIMIT 1
+----
+foo
+
+statement ok
+USE comment_db
 
 statement ok
 COMMENT ON SCHEMA foo IS 'bar'
@@ -876,3 +867,30 @@ SELECT comment FROM system.comments LIMIT 1
 
 statement ok
 DROP DATABASE comment_db
+
+statement ok
+USE test
+
+# Test that a schema can be created when writing to the eventlog table is
+# disabled. This is a regression test for #86132.
+subtest create_schema_no_eventlog
+
+statement ok
+SET CLUSTER SETTING server.eventlog.enabled = false
+
+statement ok
+CREATE SCHEMA sc
+
+statement ok
+DROP SCHEMA sc
+
+statement ok
+BEGIN;
+CREATE SCHEMA sc;
+COMMIT
+
+statement ok
+DROP SCHEMA sc
+
+statement ok
+SET CLUSTER SETTING server.eventlog.enabled = false

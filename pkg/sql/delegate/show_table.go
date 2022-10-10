@@ -28,6 +28,8 @@ func (d *delegator) delegateShowCreate(n *tree.ShowCreate) (tree.Statement, erro
 		return d.delegateShowCreateTable(n)
 	case tree.ShowCreateModeDatabase:
 		return d.delegateShowCreateDatabase(n)
+	case tree.ShowCreateModeIndexes, tree.ShowCreateModeSecondaryIndexes:
+		return d.delegateShowCreateIndexes(n)
 	default:
 		return nil, errors.Newf("unknown show create mode: %d", n.Mode)
 	}
@@ -100,6 +102,32 @@ ORDER BY
 	return d.showTableDetails(n.Name, showCreateQuery)
 }
 
+func (d *delegator) delegateShowCreateIndexes(n *tree.ShowCreate) (tree.Statement, error) {
+	sqltelemetry.IncrementShowCounter(sqltelemetry.Indexes)
+
+	showCreateIndexesQuery := `
+SELECT
+	index_name,
+	create_statement
+FROM %[4]s.crdb_internal.table_indexes
+WHERE descriptor_id = %[3]s::regclass::int`
+
+	// Add additional conditions based on desired index types.
+	switch n.Mode {
+	// This case is intentionally empty since it should return all types of indexes.
+	case tree.ShowCreateModeIndexes:
+	case tree.ShowCreateModeSecondaryIndexes:
+		showCreateIndexesQuery += `
+	AND index_type != 'primary'`
+	default:
+		return nil, errors.Newf("unknown show create indexes mode: %d", n.Mode)
+	}
+
+	return d.showTableDetails(n.Name, showCreateIndexesQuery)
+}
+
+// delegateShowIndexes implements SHOW INDEX FROM, SHOW INDEXES FROM, SHOW KEYS
+// FROM which returns all the indexes in the given table.
 func (d *delegator) delegateShowIndexes(n *tree.ShowIndexes) (tree.Statement, error) {
 	sqltelemetry.IncrementShowCounter(sqltelemetry.Indexes)
 	getIndexesQuery := `
@@ -111,7 +139,8 @@ SELECT
     column_name,
     direction,
     storing::BOOL,
-    implicit::BOOL`
+    implicit::BOOL,
+    is_visible::BOOL AS visible`
 
 	if n.WithComment {
 		getIndexesQuery += `,
@@ -135,7 +164,7 @@ WHERE
     AND table_schema=%[5]s
     AND table_name=%[2]s
 ORDER BY
-    1, 2, 3, 4, 5, 6, 7, 8;`
+    1, 2, 4;`
 
 	return d.showTableDetails(n.Table, getIndexesQuery)
 }
@@ -244,12 +273,13 @@ func (d *delegator) delegateShowCreateAllTables() (tree.Statement, error) {
 // showTableDetails returns the AST of a query which extracts information about
 // the given table using the given query patterns in SQL. The query pattern must
 // accept the following formatting parameters:
-//   %[1]s the database name as SQL string literal.
-//   %[2]s the unqualified table name as SQL string literal.
-//   %[3]s the given table name as SQL string literal.
-//   %[4]s the database name as SQL identifier.
-//   %[5]s the schema name as SQL string literal.
-//   %[6]s the table ID.
+//
+//	%[1]s the database name as SQL string literal.
+//	%[2]s the unqualified table name as SQL string literal.
+//	%[3]s the given table name as SQL string literal.
+//	%[4]s the database name as SQL identifier.
+//	%[5]s the schema name as SQL string literal.
+//	%[6]s the table ID.
 func (d *delegator) showTableDetails(
 	name *tree.UnresolvedObjectName, query string,
 ) (tree.Statement, error) {

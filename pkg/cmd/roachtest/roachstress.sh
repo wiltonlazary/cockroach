@@ -20,7 +20,7 @@ function help {
   cat <<EOF
 Build and stress run roachtest
 Usage:
-  $(basename ${0}) [flags] <test name> [-- <roachtest flags>]
+  $(basename "${0}") [flags] <test name> [-- <roachtest flags>]
 
 flags:
   -c COUNT - number of test iterations to run
@@ -46,7 +46,7 @@ function fail {
 
 # Process command line flags
 force_build=
-short=short
+short=-short
 local=
 count=10
 while getopts ":c:lubh" o ; do
@@ -116,12 +116,12 @@ fi
 # Define the artifacts base dir, within which both the built binaries and the
 # artifacts will be stored.
 sha=$(git rev-parse --short HEAD)
-abase="artifacts/${sha}"
 # If local changes are detected use separate artifacts dir and force rebuild.
 if [ -n "$(git status --porcelain --untracked-files=no)" ] ; then
-  abase="${abase}-dirty"
+  sha="${sha}-dirty"
   force_build=${force_build:-y}
 fi
+abase="artifacts/${sha}"
 mkdir -p "${abase}"
 trap 'echo Build artifacts dir is ${abase}' EXIT
 
@@ -133,28 +133,30 @@ cr="${abase}/cockroach${local}"
 # This is the artifacts dir we'll pass to the roachtest invocation. It's
 # disambiguated by a timestamp because one often ends up invoking roachtest on
 # the same SHA multiple times and artifacts shouldn't mix.
-a="${abase}/$(date '+%H%M%S')"
+timestamp=$(date '+%H%M%S')
+a="${abase}/${timestamp}"
+ln -fs "${sha}/${timestamp}" "artifacts/latest"
 
 if [ ! -f "${cr}" ] || [ "${force_build}" = "y" ]; then
   if [ -z "${local}" ]; then
-    ./build/builder.sh mkrelease amd64-linux-gnu "build${short}"
-    cp "cockroach${short}-linux-2.6.32-gnu-amd64" "${cr}"
+    ./dev build "cockroach${short}" --cross=linux
+    cp "artifacts/cockroach${short}" "${cr}"
   else
-    make "build${short}"
+    ./dev build "cockroach${short}"
     cp "cockroach${short}" "${cr}"
   fi
 fi
 
 if [ ! -f "${wl}" ] || [ "${force_build}" = "y" ]; then
   if [ -z "${local}" ]; then
-    ./build/builder.sh mkrelease amd64-linux-gnu bin/workload
-    cp bin.docker_amd64/workload "${wl}"
+    ./dev build workload --cross=linux
+    cp "artifacts/workload" "${wl}"
   else
-    make bin/workload
-    cp bin/workload "${wl}"
+    ./dev build workload
+    cp "bin/workload" "${wl}"
   fi
-  make bin/roachtest
-  cp bin/roachtest "${rt}"
+  ./dev build roachtest
+  cp "bin/roachtest" "${rt}"
 fi
 
 # Creation of test data directory is deferred here to avoid spamming in
@@ -175,7 +177,7 @@ if [ -n "${local}" ]; then
 fi
 args+=("$@")
 
-echo "Running ${rt} ${args[@]}"
+echo "Running ${rt} " "${args[@]}"
 # Run roachtest. Use a random port so that multiple
 # tests can be stressed from the same workstation.
 "${rt}" "${args[@]}"

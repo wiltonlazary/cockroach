@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -719,15 +720,16 @@ func TestMergeJoiner(t *testing.T) {
 			rightInput := distsqlutils.NewRowBuffer(c.rightTypes, c.rightInput, distsqlutils.RowBufferArgs{})
 			out := &distsqlutils.RowBuffer{}
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: c.outCols}
-			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &ms, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(context.Background(), &flowCtx, 0 /* processorID */, &ms, leftInput, rightInput, &post, out)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -825,14 +827,15 @@ func TestConsumerClosed(t *testing.T) {
 			out.ConsumerDone()
 
 			st := cluster.MakeTestingClusterSettings()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(context.Background())
 			flowCtx := execinfra.FlowCtx{
 				Cfg:     &execinfra.ServerConfig{Settings: st},
 				EvalCtx: &evalCtx,
+				Mon:     evalCtx.TestingMon,
 			}
 			post := execinfrapb.PostProcessSpec{Projection: true, OutputColumns: outCols}
-			m, err := newMergeJoiner(&flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
+			m, err := newMergeJoiner(context.Background(), &flowCtx, 0 /* processorID */, &spec, leftInput, rightInput, &post, out)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -850,11 +853,12 @@ func BenchmarkMergeJoiner(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	spec := &execinfrapb.MergeJoinerSpec{
@@ -881,7 +885,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -900,7 +904,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -920,7 +924,7 @@ func BenchmarkMergeJoiner(b *testing.B) {
 			b.SetBytes(int64(8 * inputSize * numCols * 2))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				m, err := newMergeJoiner(flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
+				m, err := newMergeJoiner(ctx, flowCtx, 0 /* processorID */, spec, leftInput, rightInput, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}

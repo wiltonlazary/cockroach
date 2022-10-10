@@ -12,12 +12,16 @@
 package sqlerrors
 
 import (
+	"context"
+	"runtime/debug"
+
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -105,6 +109,7 @@ func NewInvalidSchemaDefinitionError(err error) error {
 // NewUndefinedSchemaError creates an error for an undefined schema.
 // TODO (lucy): Have this take a database name.
 func NewUndefinedSchemaError(name string) error {
+	log.Errorf(context.Background(), "MISSING SCHEMA: %s", debug.Stack())
 	return pgerror.Newf(pgcode.InvalidSchemaName, "unknown schema %q", name)
 }
 
@@ -154,6 +159,12 @@ func NewUndefinedObjectError(name tree.NodeFormatter, kind tree.DesiredObjectKin
 // NewUndefinedTypeError creates an error that represents a missing type.
 func NewUndefinedTypeError(name tree.NodeFormatter) error {
 	return pgerror.Newf(pgcode.UndefinedObject, "type %q does not exist", tree.ErrString(name))
+}
+
+// NewUndefinedFunctionError creates an error that represents a missing user
+// defined function.
+func NewUndefinedFunctionError(fn string) error {
+	return pgerror.Newf(pgcode.UndefinedFunction, "function %q does not exist", fn)
 }
 
 // NewUndefinedRelationError creates an error that represents a missing database table or view.
@@ -232,6 +243,45 @@ func NewDependentObjectErrorf(format string, args ...interface{}) error {
 	return pgerror.Newf(pgcode.DependentObjectsStillExist, format, args...)
 }
 
+// NewColumnReferencedByPrimaryKeyError is returned when attempting to drop a
+// column which is a part of the table's primary key.
+//
+// Note that this limitation is not fundamental; in postgres when dropping a
+// primary key column, it would silently drop the primary key constraint. At
+// the time of writing, cockroach does not permit dropping a primary key
+// constraint as it may require populating a new implicit rowid column for the
+// implicit primary key we use.
+func NewColumnReferencedByPrimaryKeyError(colName string) error {
+	return pgerror.Newf(pgcode.InvalidColumnReference,
+		"column %q is referenced by the primary key", colName)
+}
+
+// NewColumnReferencedByComputedColumnError is returned when dropping a column
+// and that column being dropped is referenced by a computed column. Note that
+// the cockroach behavior where this error is returned does not match the
+// postgres behavior.
+func NewColumnReferencedByComputedColumnError(droppingColumn, computedColumn string) error {
+	return pgerror.Newf(
+		pgcode.InvalidColumnReference,
+		"column %q is referenced by computed column %q",
+		droppingColumn,
+		computedColumn,
+	)
+}
+
+// NewUniqueConstraintReferencedByForeignKeyError generates an error to be
+// returned when dropping a unique constraint that is relied upon by an
+// inbound foreign key constraint.
+func NewUniqueConstraintReferencedByForeignKeyError(
+	uniqueConstraintOrIndexToDrop, tableName string,
+) error {
+	return pgerror.Newf(
+		pgcode.DependentObjectsStillExist,
+		"%q is referenced by foreign key from table %q",
+		uniqueConstraintOrIndexToDrop, tableName,
+	)
+}
+
 // NewRangeUnavailableError creates an unavailable range error.
 func NewRangeUnavailableError(rangeID roachpb.RangeID, origErr error) error {
 	return pgerror.Wrapf(origErr, pgcode.RangeUnavailable, "key range id:%d is unavailable", rangeID)
@@ -253,6 +303,10 @@ func NewAggInAggError() error {
 // QueryTimeoutError is an error representing a query timeout.
 var QueryTimeoutError = pgerror.New(
 	pgcode.QueryCanceled, "query execution canceled due to statement timeout")
+
+// TxnTimeoutError is an error representing a query timeout.
+var TxnTimeoutError = pgerror.New(
+	pgcode.QueryCanceled, "query execution canceled due to transaction timeout")
 
 // IsOutOfMemoryError checks whether this is an out of memory error.
 func IsOutOfMemoryError(err error) bool {
@@ -277,6 +331,11 @@ func IsUndefinedRelationError(err error) bool {
 // IsUndefinedDatabaseError checks whether this is an undefined database error.
 func IsUndefinedDatabaseError(err error) bool {
 	return errHasCode(err, pgcode.UndefinedDatabase)
+}
+
+// IsUndefinedSchemaError checks whether this is an undefined schema error.
+func IsUndefinedSchemaError(err error) bool {
+	return errHasCode(err, pgcode.UndefinedSchema)
 }
 
 func errHasCode(err error, code ...pgcode.Code) bool {

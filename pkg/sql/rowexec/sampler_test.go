@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -61,11 +62,12 @@ func runSampler(
 	out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	// Override the default memory limit. If memLimitBytes is small but
 	// non-zero, the processor will hit this limit and disable sampling.
@@ -83,7 +85,7 @@ func runSampler(
 		MinSampleSize: uint32(minNumSamples),
 	}
 	p, err := newSamplerProcessor(
-		&flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out,
+		context.Background(), &flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -348,13 +350,14 @@ func TestSamplerSketch(t *testing.T) {
 		out := distsqlutils.NewRowBuffer(outTypes, nil /* rows */, distsqlutils.RowBufferArgs{})
 
 		st := cluster.MakeTestingClusterSettings()
-		evalCtx := tree.MakeTestingEvalContext(st)
+		evalCtx := eval.MakeTestingEvalContext(st)
 		defer evalCtx.Stop(context.Background())
 		flowCtx := execinfra.FlowCtx{
 			Cfg: &execinfra.ServerConfig{
 				Settings: st,
 			},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 		}
 
 		spec := &execinfrapb.SamplerSpec{
@@ -380,7 +383,7 @@ func TestSamplerSketch(t *testing.T) {
 				},
 			},
 		}
-		p, err := newSamplerProcessor(&flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out)
+		p, err := newSamplerProcessor(context.Background(), &flowCtx, 0 /* processorID */, spec, in, &execinfrapb.PostProcessSpec{}, out)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -12,6 +12,7 @@ package sql
 
 import (
 	"context"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
@@ -43,7 +44,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	n.run.values = make(tree.Datums, 1)
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
 	distribution := getPlanDistribution(
-		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeID,
+		params.ctx, params.p, params.extendedEvalCtx.ExecCfg.NodeInfo.NodeID,
 		params.extendedEvalCtx.SessionData().DistSQLMode, n.plan.main,
 	)
 	outerSubqueries := params.p.curPlan.subqueryPlans
@@ -51,7 +52,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	defer func() {
 		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 	}()
-	physPlan, err := newPhysPlanForExplainPurposes(planCtx, distSQLPlanner, n.plan.main)
+	physPlan, err := newPhysPlanForExplainPurposes(params.ctx, planCtx, distSQLPlanner, n.plan.main)
 	if err != nil {
 		if len(n.plan.subqueryPlans) > 0 {
 			return errors.New("running EXPLAIN (VEC) on this query is " +
@@ -62,7 +63,8 @@ func (n *explainVecNode) startExec(params runParams) error {
 
 	distSQLPlanner.finalizePlanWithRowCount(planCtx, physPlan, n.plan.mainRowCount)
 	flows := physPlan.GenerateFlowSpecs()
-	flowCtx := newFlowCtxForExplainPurposes(planCtx, params.p)
+	flowCtx, cleanup := newFlowCtxForExplainPurposes(params.ctx, planCtx, params.p)
+	defer cleanup()
 
 	// We want to get the vectorized plan which would be executed with the
 	// current 'vectorize' option. If 'vectorize' is set to 'off', then the
@@ -77,7 +79,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 	willDistribute := physPlan.Distribution.WillDistribute()
 	n.run.lines, n.run.cleanup, err = colflow.ExplainVec(
 		params.ctx, flowCtx, flows, physPlan.LocalProcessors, nil, /* opChains */
-		distSQLPlanner.gatewayNodeID, verbose, willDistribute,
+		distSQLPlanner.gatewaySQLInstanceID, verbose, willDistribute,
 	)
 	if err != nil {
 		return err
@@ -85,19 +87,35 @@ func (n *explainVecNode) startExec(params runParams) error {
 	return nil
 }
 
-func newFlowCtxForExplainPurposes(planCtx *PlanningCtx, p *planner) *execinfra.FlowCtx {
+func newFlowCtxForExplainPurposes(
+	ctx context.Context, planCtx *PlanningCtx, p *planner,
+) (_ *execinfra.FlowCtx, cleanup func()) {
+	monitor := mon.NewMonitor(
+		"explain", /* name */
+		mon.MemoryResource,
+		nil,           /* curCount */
+		nil,           /* maxHist */
+		-1,            /* increment */
+		math.MaxInt64, /* noteworthy */
+		p.execCfg.Settings,
+	)
+	monitor.StartNoReserved(ctx, p.Mon())
+	cleanup = func() {
+		monitor.Stop(ctx)
+	}
 	return &execinfra.FlowCtx{
 		NodeID:  planCtx.EvalContext().NodeID,
 		EvalCtx: planCtx.EvalContext(),
+		Mon:     monitor,
 		Cfg: &execinfra.ServerConfig{
-			Settings:       p.execCfg.Settings,
-			ClusterID:      p.DistSQLPlanner().rpcCtx.ClusterID,
-			VecFDSemaphore: p.execCfg.DistSQLSrv.VecFDSemaphore,
-			NodeDialer:     p.DistSQLPlanner().nodeDialer,
+			Settings:         p.execCfg.Settings,
+			LogicalClusterID: p.DistSQLPlanner().distSQLSrv.ServerConfig.LogicalClusterID,
+			VecFDSemaphore:   p.execCfg.DistSQLSrv.VecFDSemaphore,
+			PodNodeDialer:    p.DistSQLPlanner().podNodeDialer,
 		},
 		Descriptors: p.Descriptors(),
 		DiskMonitor: &mon.BytesMonitor{},
-	}
+	}, cleanup
 }
 
 func newPlanningCtxForExplainPurposes(
@@ -106,8 +124,12 @@ func newPlanningCtxForExplainPurposes(
 	subqueryPlans []subquery,
 	distribution physicalplan.PlanDistribution,
 ) *PlanningCtx {
-	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p, params.p.txn, distribution.WillDistribute())
-	planCtx.ignoreClose = true
+	distribute := DistributionType(DistributionTypeNone)
+	if distribution.WillDistribute() {
+		distribute = DistributionTypeAlways
+	}
+	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx,
+		params.p, params.p.txn, distribute)
 	planCtx.planner.curPlan.subqueryPlans = subqueryPlans
 	for i := range planCtx.planner.curPlan.subqueryPlans {
 		p := &planCtx.planner.curPlan.subqueryPlans[i]

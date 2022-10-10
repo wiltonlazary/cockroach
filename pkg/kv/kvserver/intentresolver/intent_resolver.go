@@ -325,11 +325,14 @@ func (ir *IntentResolver) PushTransaction(
 //
 // Callers are involved with
 // a) conflict resolution for commands being executed at the Store with the
-//    client waiting,
+//
+//	client waiting,
+//
 // b) resolving intents encountered during inconsistent operations, and
 // c) resolving intents upon EndTxn which are not local to the given range.
-//    This is the only path in which the transaction is going to be in
-//    non-pending state and doesn't require a push.
+//
+//	This is the only path in which the transaction is going to be in
+//	non-pending state and doesn't require a push.
 func (ir *IntentResolver) MaybePushTransactions(
 	ctx context.Context,
 	pushTxns map[uuid.UUID]*enginepb.TxnMeta,
@@ -452,6 +455,9 @@ func (ir *IntentResolver) runAsyncTask(
 // encountered during another command but did not interfere with the
 // execution of that command. This occurs during inconsistent
 // reads.
+// TODO(nvanbenschoten): is this needed if the intents could not have
+// expired yet (i.e. they are not at least 5s old)? Should we filter
+// those out? If we don't, will this be too expensive for SKIP LOCKED?
 func (ir *IntentResolver) CleanupIntentsAsync(
 	ctx context.Context, intents []roachpb.Intent, allowSyncProcessing bool,
 ) error {
@@ -768,7 +774,7 @@ func (ir *IntentResolver) cleanupFinishedTxnIntents(
 	}()
 	// Resolve intents.
 	opts := ResolveOptions{Poison: poison, MinTimestamp: txn.MinTimestamp}
-	if pErr := ir.ResolveIntents(ctx, txn.LocksAsLockUpdates(), opts); pErr != nil {
+	if pErr := ir.resolveIntents(ctx, (*txnLockUpdates)(txn), opts); pErr != nil {
 		return errors.Wrapf(pErr.GoError(), "failed to resolve intents")
 	}
 	// Run transaction record GC outside of ir.sem. We need a new context, in case
@@ -834,6 +840,40 @@ func (ir *IntentResolver) lookupRangeID(ctx context.Context, key roachpb.Key) ro
 	return rInfo.Desc().RangeID
 }
 
+// lockUpdates allows for eager or lazy translation of lock spans to lock updates.
+type lockUpdates interface {
+	Len() int
+	Index(i int) roachpb.LockUpdate
+}
+
+type txnLockUpdates roachpb.Transaction
+
+// Len returns the number of LockSpans in a txnLockUpdates,
+// as part of the lockUpdates interface implementation.
+func (t *txnLockUpdates) Len() int {
+	return len(t.LockSpans)
+}
+
+// Index produces a LockUpdate from the respective LockSpan, when called on
+// txnLockUpdates. txnLockUpdates implements the lockUpdates interface.
+func (t *txnLockUpdates) Index(i int) roachpb.LockUpdate {
+	return roachpb.MakeLockUpdate((*roachpb.Transaction)(t), t.LockSpans[i])
+}
+
+type sliceLockUpdates []roachpb.LockUpdate
+
+// Len returns the number of LockUpdates in sliceLockUpdates,
+// as part of the lockUpdates interface implementation.
+func (s *sliceLockUpdates) Len() int {
+	return len(*s)
+}
+
+// Index trivially produces a LockUpdate when called on sliceLockUpdates.
+// sliceLockUpdates implements the lockUpdates interface.
+func (s *sliceLockUpdates) Index(i int) roachpb.LockUpdate {
+	return (*s)[i]
+}
+
 // ResolveIntent synchronously resolves an intent according to opts.
 func (ir *IntentResolver) ResolveIntent(
 	ctx context.Context, intent roachpb.LockUpdate, opts ResolveOptions,
@@ -845,12 +885,22 @@ func (ir *IntentResolver) ResolveIntent(
 func (ir *IntentResolver) ResolveIntents(
 	ctx context.Context, intents []roachpb.LockUpdate, opts ResolveOptions,
 ) (pErr *roachpb.Error) {
-	if len(intents) == 0 {
+	return ir.resolveIntents(ctx, (*sliceLockUpdates)(&intents), opts)
+}
+
+// resolveIntents synchronously resolves intents according to opts.
+// intents can be either sliceLockUpdates or txnLockUpdates. In the
+// latter case, transaction LockSpans will be lazily translated to
+// LockUpdates as they are accessed in this method.
+func (ir *IntentResolver) resolveIntents(
+	ctx context.Context, intents lockUpdates, opts ResolveOptions,
+) (pErr *roachpb.Error) {
+	if intents.Len() == 0 {
 		return nil
 	}
 	defer func() {
 		if pErr != nil {
-			ir.Metrics.IntentResolutionFailed.Inc(int64(len(intents)))
+			ir.Metrics.IntentResolutionFailed.Inc(int64(intents.Len()))
 		}
 	}()
 	// Avoid doing any work on behalf of expired contexts. See
@@ -862,28 +912,31 @@ func (ir *IntentResolver) ResolveIntents(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	respChan := make(chan requestbatcher.Response, len(intents))
-	for _, intent := range intents {
+	respChan := make(chan requestbatcher.Response, intents.Len())
+	for i := 0; i < intents.Len(); i++ {
+		intent := intents.Index(i)
 		rangeID := ir.lookupRangeID(ctx, intent.Key)
 		var req roachpb.Request
 		var batcher *requestbatcher.RequestBatcher
 		if len(intent.EndKey) == 0 {
 			req = &roachpb.ResolveIntentRequest{
-				RequestHeader:  roachpb.RequestHeaderFromSpan(intent.Span),
-				IntentTxn:      intent.Txn,
-				Status:         intent.Status,
-				Poison:         opts.Poison,
-				IgnoredSeqNums: intent.IgnoredSeqNums,
+				RequestHeader:     roachpb.RequestHeaderFromSpan(intent.Span),
+				IntentTxn:         intent.Txn,
+				Status:            intent.Status,
+				Poison:            opts.Poison,
+				IgnoredSeqNums:    intent.IgnoredSeqNums,
+				ClockWhilePending: intent.ClockWhilePending,
 			}
 			batcher = ir.irBatcher
 		} else {
 			req = &roachpb.ResolveIntentRangeRequest{
-				RequestHeader:  roachpb.RequestHeaderFromSpan(intent.Span),
-				IntentTxn:      intent.Txn,
-				Status:         intent.Status,
-				Poison:         opts.Poison,
-				MinTimestamp:   opts.MinTimestamp,
-				IgnoredSeqNums: intent.IgnoredSeqNums,
+				RequestHeader:     roachpb.RequestHeaderFromSpan(intent.Span),
+				IntentTxn:         intent.Txn,
+				Status:            intent.Status,
+				Poison:            opts.Poison,
+				MinTimestamp:      opts.MinTimestamp,
+				IgnoredSeqNums:    intent.IgnoredSeqNums,
+				ClockWhilePending: intent.ClockWhilePending,
 			}
 			batcher = ir.irRangeBatcher
 		}
@@ -891,7 +944,7 @@ func (ir *IntentResolver) ResolveIntents(
 			return roachpb.NewError(err)
 		}
 	}
-	for seen := 0; seen < len(intents); seen++ {
+	for seen := 0; seen < intents.Len(); seen++ {
 		select {
 		case resp := <-respChan:
 			if resp.Err != nil {

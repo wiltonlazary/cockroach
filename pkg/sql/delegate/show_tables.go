@@ -14,9 +14,9 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -30,8 +30,9 @@ var showEstimatedRowCountClusterSetting = settings.RegisterBoolSetting(
 
 // delegateShowTables implements SHOW TABLES which returns all the tables.
 // Privileges: None.
-//   Notes: postgres does not have a SHOW TABLES statement.
-//          mysql only returns tables you have privileges on.
+//
+//	Notes: postgres does not have a SHOW TABLES statement.
+//	       mysql only returns tables you have privileges on.
 func (d *delegator) delegateShowTables(n *tree.ShowTables) (tree.Statement, error) {
 	flags := cat.Flags{AvoidDescriptorCaches: true}
 	_, name, err := d.catalog.ResolveSchema(d.ctx, flags, &n.ObjectNamePrefix)

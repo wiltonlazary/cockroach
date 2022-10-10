@@ -11,7 +11,14 @@
 package opt
 
 import (
+	"context"
+
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/errors"
@@ -35,7 +42,8 @@ const (
 // in the table.
 //
 // NOTE: This method cannot do bounds checking, so it's up to the caller to
-//       ensure that a column really does exist at this ordinal position.
+//
+//	ensure that a column really does exist at this ordinal position.
 func (t TableID) ColumnID(ord int) ColumnID {
 	return t.firstColID() + ColumnID(ord)
 }
@@ -50,7 +58,8 @@ func (t TableID) IndexColumnID(idx cat.Index, idxOrd int) ColumnID {
 // table.
 //
 // NOTE: This method cannot do complete bounds checking, so it's up to the
-//       caller to ensure that this column is really in the given base table.
+//
+//	caller to ensure that this column is really in the given base table.
 func (t TableID) ColumnOrdinal(id ColumnID) int {
 	if buildutil.CrdbTestBuild && id < t.firstColID() {
 		panic(errors.AssertionFailedf("ordinal cannot be negative"))
@@ -89,14 +98,15 @@ func (t TableID) index() int {
 // phase. The returned TableAnnID never clashes with other annotations on the
 // same table. Here is a usage example:
 //
-//   var myAnnID = NewTableAnnID()
+//	var myAnnID = NewTableAnnID()
 //
-//   md.SetTableAnnotation(TableID(1), myAnnID, "foo")
-//   ann := md.TableAnnotation(TableID(1), myAnnID)
+//	md.SetTableAnnotation(TableID(1), myAnnID, "foo")
+//	ann := md.TableAnnotation(TableID(1), myAnnID)
 //
 // Currently, the following annotations are in use:
-//   - WeakKeys: weak keys derived from the base table
+//   - FuncDeps: functional dependencies derived from the base table
 //   - Stats: statistics derived from the base table
+//   - NotNullCols: not null columns derived from the base table
 //
 // To add an additional annotation, increase the value of maxTableAnnIDCount and
 // add a call to NewTableAnnID.
@@ -109,7 +119,13 @@ var tableAnnIDCount TableAnnID
 // called. Calling more than this number of times results in a panic. Having
 // a maximum enables a static annotation array to be inlined into the metadata
 // table struct.
-const maxTableAnnIDCount = 2
+const maxTableAnnIDCount = 4
+
+// NotNullAnnID is the annotation ID for table not null columns.
+var NotNullAnnID = NewTableAnnID()
+
+// regionConfigAnnID is the annotation ID for multiregion table config.
+var regionConfigAnnID = NewTableAnnID()
 
 // TableMeta stores information about one of the tables stored in the metadata.
 //
@@ -164,8 +180,47 @@ type TableMeta struct {
 	// the map.
 	partialIndexPredicates map[cat.IndexOrdinal]ScalarExpr
 
+	// indexPartitionLocalities is a slice containing PrefixSorters for each
+	// index that has local and remote partitions. The i-th PrefixSorter in the
+	// slice corresponds to the i-th index in the table.
+	//
+	// The PrefixSorters represent the PARTITION BY LIST values of the index and
+	// whether each of those partitions is region-local with respect to the
+	// query being run. If an index is partitioned BY LIST, and has both local
+	// and remote partitions, it will have an entry in the map. Local partitions
+	// are those where all row ranges they own have a preferred region for
+	// leaseholder nodes the same as the gateway region of the current
+	// connection that is running the query. Remote partitions have at least one
+	// row range with a leaseholder preferred region which is different from the
+	// gateway region.
+	indexPartitionLocalities []partition.PrefixSorter
+
+	// checkConstraintsStats is a map from the current ColumnID statistics based
+	// on CHECK constraint values is based on back to the original ColumnStatistic
+	// entry that was built for a copy of this table. This is used to look up and
+	// reuse histogram data when a Scan is duplicated so this expensive processing
+	// is done at most once per table reference in a query.
+	checkConstraintsStats map[ColumnID]interface{}
+
 	// anns annotates the table metadata with arbitrary data.
 	anns [maxTableAnnIDCount]interface{}
+}
+
+// TableAnnotation returns the given annotation that is associated with the
+// given table. If the table has no such annotation, TableAnnotation returns
+// nil.
+func (tm *TableMeta) TableAnnotation(annID TableAnnID) interface{} {
+	return tm.anns[annID]
+}
+
+// SetTableAnnotation associates the given annotation with the given table. The
+// annotation is associated by the given ID, which was allocated by calling
+// NewTableAnnID. If an annotation with the ID already exists on the table, then
+// it is overwritten.
+//
+// See the TableAnnID comment for more details and a usage example.
+func (tm *TableMeta) SetTableAnnotation(tabAnnID TableAnnID, ann interface{}) {
+	tm.anns[tabAnnID] = ann
 }
 
 // copyFrom initializes the receiver with a copy of the given TableMeta, which
@@ -202,6 +257,17 @@ func (tm *TableMeta) copyFrom(from *TableMeta, copyScalarFn func(Expr) Expr) {
 			tm.partialIndexPredicates[idx] = copyScalarFn(e).(ScalarExpr)
 		}
 	}
+
+	if from.checkConstraintsStats != nil {
+		tm.checkConstraintsStats = make(map[ColumnID]interface{}, len(from.checkConstraintsStats))
+		for i := range from.checkConstraintsStats {
+			tm.checkConstraintsStats[i] = from.checkConstraintsStats[i]
+		}
+	}
+
+	// This map has no ColumnID or TableID specific information in it, so it can
+	// be shared.
+	tm.indexPartitionLocalities = from.indexPartitionLocalities
 }
 
 // IndexColumns returns the set of table columns in the given index.
@@ -277,6 +343,61 @@ func (tm *TableMeta) AddComputedCol(colID ColumnID, computedCol ScalarExpr) {
 	tm.ComputedCols[colID] = computedCol
 }
 
+// ComputedColExpr returns the computed expression for the given column, if it
+// is a computed column. If it is not a computed column, ok=false is returned.
+func (tm *TableMeta) ComputedColExpr(id ColumnID) (_ ScalarExpr, ok bool) {
+	if tm.ComputedCols == nil {
+		return nil, false
+	}
+	e, ok := tm.ComputedCols[id]
+	return e, ok
+}
+
+// AddCheckConstraintsStats adds a column, ColumnStatistic pair to the
+// checkConstraintsStats map. When the table is duplicated, the mapping from the
+// new check constraint ColumnID back to the original ColumnStatistic is
+// recorded so it can be reused.
+func (tm *TableMeta) AddCheckConstraintsStats(colID ColumnID, colStats interface{}) {
+	if tm.checkConstraintsStats == nil {
+		tm.checkConstraintsStats = make(map[ColumnID]interface{})
+	}
+	tm.checkConstraintsStats[colID] = colStats
+}
+
+// OrigCheckConstraintsStats looks up if statistics were ever created
+// based on a CHECK constraint on colID, and if so, returns the original
+// ColumnStatistic.
+func (tm *TableMeta) OrigCheckConstraintsStats(
+	colID ColumnID,
+) (origColumnStatistic interface{}, ok bool) {
+	if tm.checkConstraintsStats != nil {
+		if origColumnStatistic, ok = tm.checkConstraintsStats[colID]; ok {
+			return origColumnStatistic, true
+		}
+	}
+	return nil, false
+}
+
+// AddIndexPartitionLocality adds a PrefixSorter to the table's metadata for the
+// index with IndexOrdinal ord.
+func (tm *TableMeta) AddIndexPartitionLocality(ord cat.IndexOrdinal, ps partition.PrefixSorter) {
+	if tm.indexPartitionLocalities == nil {
+		tm.indexPartitionLocalities = make([]partition.PrefixSorter, tm.Table.IndexCount())
+	}
+	tm.indexPartitionLocalities[ord] = ps
+}
+
+// IndexPartitionLocality returns the given index's PrefixSorter. An empty
+// PrefixSorter is returned if the index does not have a mix of local and remote
+// partitions.
+func (tm *TableMeta) IndexPartitionLocality(ord cat.IndexOrdinal) (ps partition.PrefixSorter) {
+	if tm.indexPartitionLocalities != nil {
+		ps := tm.indexPartitionLocalities[ord]
+		return ps
+	}
+	return partition.PrefixSorter{}
+}
+
 // AddPartialIndexPredicate adds a partial index predicate to the table's
 // metadata.
 func (tm *TableMeta) AddPartialIndexPredicate(ord cat.IndexOrdinal, pred ScalarExpr) {
@@ -323,6 +444,74 @@ func (tm *TableMeta) VirtualComputedColumns() ColSet {
 		}
 	}
 	return virtualCols
+}
+
+// GetRegionsInDatabase finds the full set of regions in the multiregion
+// database owning the table described by `tm`, or returns hasRegionName=false
+// if not multiregion. The result is cached in TableMeta.
+func (tm *TableMeta) GetRegionsInDatabase(
+	ctx context.Context, planner eval.Planner,
+) (regionNames catpb.RegionNames, hasRegionNames bool) {
+	multiregionConfig, ok := tm.TableAnnotation(regionConfigAnnID).(*multiregion.RegionConfig)
+	if ok {
+		if multiregionConfig == nil {
+			return nil /* regionNames */, false
+		}
+		return multiregionConfig.Regions(), true
+	}
+	dbID := tm.Table.GetDatabaseID()
+	defer func() {
+		if !hasRegionNames {
+			tm.SetTableAnnotation(
+				regionConfigAnnID,
+				// Use a nil pointer to a RegionConfig, which is distinct from the
+				// untyped nil and will be detected in the type assertion above.
+				(*multiregion.RegionConfig)(nil),
+			)
+		}
+	}()
+
+	if dbID == 0 {
+		return nil /* regionNames */, false
+	}
+	regionConfig, ok := planner.GetMultiregionConfig(ctx, dbID)
+	if !ok {
+		return nil /* regionNames */, false
+	}
+	multiregionConfig, _ = regionConfig.(*multiregion.RegionConfig)
+	tm.SetTableAnnotation(regionConfigAnnID, multiregionConfig)
+	return multiregionConfig.Regions(), true
+}
+
+// GetDatabaseSurvivalGoal finds the survival goal of the multiregion database
+// owning the table described by `tm`, or returns ok=false if not multiregion.
+// The result is cached in TableMeta.
+func (tm *TableMeta) GetDatabaseSurvivalGoal(
+	ctx context.Context, planner eval.Planner,
+) (survivalGoal descpb.SurvivalGoal, ok bool) {
+	// If planner is nil, we could be running an internal query or something else
+	// which is not a user query, so make sure we don't error out this case.
+	if planner == nil {
+		return descpb.SurvivalGoal_ZONE_FAILURE /* survivalGoal */, true
+	}
+	multiregionConfig, ok := tm.TableAnnotation(regionConfigAnnID).(*multiregion.RegionConfig)
+	if ok {
+		if multiregionConfig == nil {
+			return descpb.SurvivalGoal_ZONE_FAILURE /* survivalGoal */, false
+		}
+		return multiregionConfig.SurvivalGoal(), true
+	}
+	dbID := tm.Table.GetDatabaseID()
+	regionConfig, ok := planner.GetMultiregionConfig(ctx, dbID)
+	if !ok {
+		// Use a nil pointer to a RegionConfig, which is distinct from the
+		// untyped nil and will be detected in the type assertion above.
+		tm.SetTableAnnotation(regionConfigAnnID, (*multiregion.RegionConfig)(nil))
+		return descpb.SurvivalGoal_ZONE_FAILURE /* survivalGoal */, false
+	}
+	multiregionConfig, _ = regionConfig.(*multiregion.RegionConfig)
+	tm.SetTableAnnotation(regionConfigAnnID, multiregionConfig)
+	return multiregionConfig.SurvivalGoal(), true
 }
 
 // TableAnnotation returns the given annotation that is associated with the

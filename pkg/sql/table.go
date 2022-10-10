@@ -20,11 +20,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
@@ -106,13 +106,13 @@ func (p *planner) createNonDropDatabaseChangeJob(
 func (p *planner) createOrUpdateSchemaChangeJob(
 	ctx context.Context, tableDesc *tabledesc.Mutable, jobDesc string, mutationID descpb.MutationID,
 ) error {
-	if tableDesc.NewSchemaChangeJobID != 0 {
-		return pgerror.Newf(pgcode.ObjectNotInPrerequisiteState,
-			"cannot perform a schema change on table %q while it is undergoing a declarative schema change",
-			// We use the cluster version because the table may have been renamed.
-			// This is a bit of a hack.
-			tableDesc.ClusterVersion.GetName(),
-		)
+
+	// If there is a concurrent schema change using the declarative schema
+	// changer, then we must fail and wait for that schema change to conclude.
+	// The error here will be dealt with in
+	// (*connExecutor).handleWaitingForConcurrentSchemaChanges().
+	if catalog.HasConcurrentDeclarativeSchemaChange(tableDesc) {
+		return scerrors.ConcurrentSchemaChangeError(tableDesc)
 	}
 
 	record, recordExists := p.extendedEvalCtx.SchemaChangeJobRecords[tableDesc.ID]
@@ -135,12 +135,19 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		}
 	}
 	span := tableDesc.PrimaryIndexSpan(p.ExecCfg().Codec)
-	for i := len(tableDesc.ClusterVersion.Mutations) + len(spanList); i < len(tableDesc.Mutations); i++ {
-		spanList = append(spanList,
-			jobspb.ResumeSpanList{
-				ResumeSpans: []roachpb.Span{span},
-			},
-		)
+	for i := len(tableDesc.ClusterVersion().Mutations) + len(spanList); i < len(tableDesc.Mutations); i++ {
+		var resumeSpans []roachpb.Span
+		mut := tableDesc.Mutations[i]
+		if mut.GetIndex() != nil && mut.GetIndex().UseDeletePreservingEncoding {
+			// Resume spans for merging the delete preserving temporary indexes are
+			// the spans of the temporary indexes.
+			resumeSpans = []roachpb.Span{tableDesc.IndexSpan(p.ExecCfg().Codec, mut.GetIndex().ID)}
+		} else {
+			resumeSpans = []roachpb.Span{span}
+		}
+		spanList = append(spanList, jobspb.ResumeSpanList{
+			ResumeSpans: resumeSpans,
+		})
 	}
 
 	if !recordExists {
@@ -171,7 +178,7 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 		// TODO (lucy): get rid of this when we get rid of MutationJobs.
 		if mutationID != descpb.InvalidMutationID {
 			tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-				MutationID: mutationID, JobID: int64(newRecord.JobID)})
+				MutationID: mutationID, JobID: newRecord.JobID})
 		}
 		log.Infof(ctx, "queued new schema-change job %d for table %d, mutation %d",
 			newRecord.JobID, tableDesc.ID, mutationID)
@@ -204,14 +211,16 @@ func (p *planner) createOrUpdateSchemaChangeJob(
 			// Also add a MutationJob on the table descriptor.
 			// TODO (lucy): get rid of this when we get rid of MutationJobs.
 			tableDesc.MutationJobs = append(tableDesc.MutationJobs, descpb.TableDescriptor_MutationJob{
-				MutationID: mutationID, JobID: int64(record.JobID)})
+				MutationID: mutationID, JobID: record.JobID})
 			// For existing records, if a mutation ID ever gets assigned
 			// at a later point then mark it as cancellable again.
 			record.NonCancelable = false
 		}
 	}
 	record.Details = newDetails
-	record.AppendDescription(jobDesc)
+	if record.Description != jobDesc {
+		record.AppendDescription(jobDesc)
+	}
 	log.Infof(ctx, "job %d: updated with schema change for table %d, mutation %d",
 		record.JobID, tableDesc.ID, mutationID)
 	return nil
@@ -294,7 +303,8 @@ func (p *planner) writeTableDescToBatch(
 		}
 	}
 
-	if err := catalog.ValidateSelf(tableDesc); err != nil {
+	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	if err := descbuilder.ValidateSelf(tableDesc, version); err != nil {
 		return errors.NewAssertionErrorWithWrappedErrf(err, "table descriptor is not valid\n%v\n", tableDesc)
 	}
 

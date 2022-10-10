@@ -38,6 +38,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -216,7 +217,7 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 						t.Fatal(pErr)
 					}
 					// Advance clock by 1ns.
-					s.Manual.Increment(1)
+					s.Manual.Advance(1)
 					if lastActive := txn.LastActive(); heartbeatTS.Less(lastActive) {
 						heartbeatTS = lastActive
 						return nil
@@ -254,6 +255,85 @@ func TestTxnCoordSenderHeartbeat(t *testing.T) {
 	}
 }
 
+// Verify the txn sees a retryable error without using the handle: Normally the
+// caller uses the txn handle directly, and if there is a retryable error then
+// Send() fails and the handle gets "poisoned", meaning, the coordinator will be
+// in state txnRetryableError instead of txnPending. But sometimes the handle
+// can be idle and aborted by a heartbeat failure. This test verifies that in
+// those cases the state of the handle ends up as txnRetryableError.
+// This is important to verify because if the handle stays in txnPending then
+// GetTxnRetryableErr() returns nil, and PrepareForRetry() will not reset the
+// handle.
+func TestDB_PrepareForRetryAfterHeartbeatFailure(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Create a DB with a short heartbeat interval.
+	s := createTestDB(t)
+	defer s.Stop()
+	ctx := context.Background()
+	ambient := s.AmbientCtx
+	tsf := kvcoord.NewTxnCoordSenderFactory(
+		kvcoord.TxnCoordSenderFactoryConfig{
+			AmbientCtx: ambient,
+			// Short heartbeat interval.
+			HeartbeatInterval: time.Millisecond,
+			Settings:          s.Cfg.Settings,
+			Clock:             s.Clock,
+			Stopper:           s.Stopper(),
+		},
+		kvcoord.NewDistSenderForLocalTestCluster(
+			ctx,
+			s.Cfg.Settings, &roachpb.NodeDescriptor{NodeID: 1},
+			ambient.Tracer, s.Clock, s.Latency, s.Stores, s.Stopper(), s.Gossip,
+		),
+	)
+	db := kv.NewDB(ambient, tsf, s.Clock, s.Stopper())
+
+	// Create a txn which will be aborted by a high priority txn.
+	txn := kv.NewTxn(ctx, db, 0)
+
+	// We first write to one range, then a high priority txn will abort our txn,
+	// then we will try to read from another range until we see that the
+	// transaction is poisoned because of a heartbeat failure.
+	// Note that if we read from the same range then we will check the AbortSpan
+	// and fail immediately (Send() will fail), even before the heartbeat failure,
+	// which is not the case we want to test here.
+	keyA := roachpb.Key("a")
+	keyC := roachpb.Key("c")
+	splitKey := roachpb.Key("b")
+	require.NoError(t, s.DB.AdminSplit(ctx, splitKey, hlc.MaxTimestamp))
+	require.NoError(t, txn.Put(ctx, keyA, "1"))
+
+	{
+		// High priority txn - will abort the other txn.
+		hpTxn := kv.NewTxn(ctx, db, 0)
+		require.NoError(t, hpTxn.SetUserPriority(roachpb.MaxUserPriority))
+		require.NoError(t, hpTxn.Put(ctx, keyA, "hp txn"))
+		require.NoError(t, hpTxn.Commit(ctx))
+	}
+
+	tc := txn.Sender().(*kvcoord.TxnCoordSender)
+
+	// Wait until we know that the handle was poisoned due to a heartbeat failure.
+	testutils.SucceedsSoon(t, func() error {
+		_, err := txn.Get(ctx, keyC)
+		if err == nil {
+			return errors.New("the handle is not poisoned yet")
+		}
+		require.IsType(t, &roachpb.TransactionRetryWithProtoRefreshError{}, err)
+		return nil
+	})
+
+	// At this point the handle should be in state txnRetryableError - verify we
+	// can read the error.
+	pErr := tc.GetTxnRetryableErr(ctx)
+	require.NotNil(t, pErr)
+	require.Equal(t, txn.ID(), pErr.TxnID)
+	// The transaction was aborted, therefore we should have a new transaction ID.
+	require.NotEqual(t, pErr.TxnID, pErr.Transaction.ID)
+}
+
 // getTxn fetches the requested key and returns the transaction info.
 func getTxn(ctx context.Context, txn *kv.Txn) (*roachpb.Transaction, *roachpb.Error) {
 	txnMeta := txn.TestingCloneTxn().TxnMeta
@@ -281,20 +361,19 @@ func getTxn(ctx context.Context, txn *kv.Txn) (*roachpb.Transaction, *roachpb.Er
 func verifyCleanup(
 	key roachpb.Key, eng storage.Engine, t *testing.T, coords ...*kvcoord.TxnCoordSender,
 ) {
+	ctx := context.Background()
 	testutils.SucceedsSoon(t, func() error {
 		for _, coord := range coords {
 			if coord.IsTracking() {
 				return fmt.Errorf("expected no heartbeat")
 			}
 		}
-		meta := &enginepb.MVCCMetadata{}
-		//lint:ignore SA1019 historical usage of deprecated eng.MVCCGetProto is OK
-		ok, _, _, err := eng.MVCCGetProto(storage.MakeMVCCMetadataKey(key), meta)
-		if err != nil {
-			return errors.Wrap(err, "error getting MVCC metadata")
-		}
-		if ok && meta.Txn != nil {
-			return fmt.Errorf("found unexpected write intent: %s", meta)
+		_, intent, err := storage.MVCCGet(ctx, eng, key, hlc.MaxTimestamp, storage.MVCCGetOptions{
+			Inconsistent: true,
+		})
+		require.NoError(t, err)
+		if intent != nil {
+			return fmt.Errorf("found unexpected write intent: %s", intent)
 		}
 		return nil
 	})
@@ -573,7 +652,7 @@ func TestTxnCoordSenderCleanupOnCommitAfterRestart(t *testing.T) {
 	}
 
 	// Restart the transaction with a new epoch.
-	txn.ManualRestart(ctx, s.Clock.Now())
+	txn.Sender().ManualRestart(ctx, txn.UserPriority(), s.Clock.Now())
 
 	// Now immediately commit.
 	if err := txn.CommitOrCleanup(ctx); err != nil {
@@ -591,7 +670,7 @@ func TestTxnCoordSenderGCWithAmbiguousResultErr(t *testing.T) {
 
 	testutils.RunTrueAndFalse(t, "errOnFirst", func(t *testing.T, errOnFirst bool) {
 		key := roachpb.Key("a")
-		are := roachpb.NewAmbiguousResultError("very ambiguous")
+		are := roachpb.NewAmbiguousResultErrorf("very ambiguous")
 		knobs := &kvserver.StoreTestingKnobs{
 			TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
 				for _, req := range ba.Requests {
@@ -648,6 +727,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 		// The test's name.
 		name                  string
 		pErrGen               func(txn *roachpb.Transaction) *roachpb.Error
+		callPrepareForRetry   bool
 		expEpoch              enginepb.TxnEpoch
 		expPri                enginepb.TxnPriority
 		expWriteTS, expReadTS hlc.Timestamp
@@ -705,18 +785,32 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			expReadTS:  plus20,
 		},
 		{
-			// On abort, nothing changes but we get a new priority to use for
-			// the next attempt.
+			// On abort, nothing changes - we are left with a poisoned txn (unless we
+			// call PrepareForRetry as in the next test case).
 			name: "TransactionAbortedError",
 			pErrGen: func(txn *roachpb.Transaction) *roachpb.Error {
 				txn.WriteTimestamp = plus20
 				txn.Priority = 10
 				return roachpb.NewErrorWithTxn(&roachpb.TransactionAbortedError{}, txn)
 			},
-			expNewTransaction: true,
-			expPri:            10,
-			expWriteTS:        plus20,
-			expReadTS:         plus20,
+			expPri:     1,
+			expWriteTS: origTS,
+			expReadTS:  origTS,
+		},
+		{
+			// On abort, reset the txn by calling PrepareForRetry, and then we get a
+			// new priority to use for the next attempt.
+			name: "TransactionAbortedError with PrepareForRetry",
+			pErrGen: func(txn *roachpb.Transaction) *roachpb.Error {
+				txn.WriteTimestamp = plus20
+				txn.Priority = 10
+				return roachpb.NewErrorWithTxn(&roachpb.TransactionAbortedError{}, txn)
+			},
+			callPrepareForRetry: true,
+			expNewTransaction:   true,
+			expPri:              10,
+			expWriteTS:          plus20,
+			expReadTS:           plus20,
 		},
 		{
 			// On failed push, new epoch begins just past the pushed timestamp.
@@ -753,8 +847,8 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			stopper := stop.NewStopper()
 
-			manual := hlc.NewManualClock(origTS.WallTime)
-			clock := hlc.NewClock(manual.UnixNano, 20*time.Nanosecond)
+			manual := timeutil.NewManualTime(origTS.GoTime())
+			clock := hlc.NewClock(manual, 20*time.Nanosecond /* maxOffset */)
 
 			var senderFn kv.SenderFunc = func(
 				_ context.Context, ba roachpb.BatchRequest,
@@ -767,7 +861,7 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 				} else if txn := pErr.GetTxn(); txn != nil {
 					// Update the manual clock to simulate an
 					// error updating a local hlc clock.
-					manual.Set(txn.WriteTimestamp.WallTime)
+					manual.AdvanceTo(txn.WriteTimestamp.GoTime())
 				}
 				return reply, pErr
 			}
@@ -806,6 +900,9 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			err := txn.Put(ctx, key, []byte("value"))
 			stopper.Stop(ctx)
 
+			if test.callPrepareForRetry {
+				txn.PrepareForRetry(ctx)
+			}
 			if test.name != "nil" && err == nil {
 				t.Fatalf("expected an error")
 			}
@@ -832,6 +929,61 @@ func TestTxnCoordSenderTxnUpdatedOnError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWTOBitTerminatedOnErrorResponses is a regression test for #85711. It
+// ensures that when batch request errors have the WTO bit set, subsequent
+// request don't carry that bit (something that's asserted on in client-side
+// interceptors).
+func TestWTOBitTerminatedOnErrorResponses(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	keyA := roachpb.Key("a")
+	keyB := roachpb.Key("b")
+
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	// Split to ensure batch requests get split through the distsender.
+	require.NoError(t, db.AdminSplit(ctx, keyB /* splitKey */, hlc.MaxTimestamp /* expirationTimestamp */))
+
+	// Write a key that the txn-al CPut below doesn't expect, failing the batch
+	// request.
+	require.NoError(t, db.Put(ctx, keyB, []byte("b-unexpected")))
+
+	txn := db.NewTxn(ctx, "root")
+
+	// Read a key to pin the read timestamp. We'll use it to trigger to WTO
+	// error below.
+	b0 := txn.NewBatch()
+	b0.Get(keyB)
+	require.NoError(t, txn.Run(ctx, b0))
+
+	// Write to keyA out-of-band to induce a WTO condition in the txn-al Put
+	// below.
+	require.NoError(t, db.Put(ctx, keyA, "a-unexpected"))
+
+	// Send a batch (as part of a leaf txn) that will be split into two
+	// sub-batches: [Put(a), CPut(b, nil)]. Put(a) should observe the WTO bit
+	// set in the batch response, whereas the CPut induces an error response.
+	// Since these are two separate requests, the error response is combined
+	// with the batch request such that the error itself has the WTO bit set. In
+	// #85711 we observed that the bit was not terminated on the client side,
+	// and subsequent requests were issued with the WTO bit set, which tripped
+	// up assertions.
+	b1 := txn.NewBatch()
+	b1.Put(keyA, "a")
+	b1.CPut(keyB, "b", nil /* expValue */)
+	require.True(t, testutils.IsError(txn.Run(ctx, b1), "unexpected value"))
+	require.False(t, txn.TestingCloneTxn().WriteTooOld) // WTO bit is terminated
+
+	b2 := txn.NewBatch()
+	b2.Put(keyB, "b")
+	require.NoError(t, txn.Run(ctx, b2))
+	require.False(t, txn.TestingCloneTxn().WriteTooOld) // WTO bit is terminated
+	require.NoError(t, txn.Commit(ctx))
 }
 
 // TestTxnMultipleCoord checks that multiple txn coordinators can be
@@ -890,8 +1042,7 @@ func TestTxnCoordSenderNoDuplicateLockSpans(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	stopper := stop.NewStopper()
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Nanosecond /* maxOffset */)
 
 	var expectedLockSpans []roachpb.Span
 
@@ -976,15 +1127,12 @@ func checkTxnMetrics(
 	commits, commits1PC, aborts, restarts int64,
 ) {
 	testutils.SucceedsSoon(t, func() error {
-		return checkTxnMetricsOnce(t, metrics, name, commits, commits1PC, aborts, restarts)
+		return checkTxnMetricsOnce(metrics, name, commits, commits1PC, aborts, restarts)
 	})
 }
 
 func checkTxnMetricsOnce(
-	t *testing.T,
-	metrics kvcoord.TxnMetrics,
-	name string,
-	commits, commits1PC, aborts, restarts int64,
+	metrics kvcoord.TxnMetrics, name string, commits, commits1PC, aborts, restarts int64,
 ) error {
 	testcases := []struct {
 		name string
@@ -994,28 +1142,13 @@ func checkTxnMetricsOnce(
 		{"commits1PC", metrics.Commits1PC.Count(), commits1PC},
 		{"aborts", metrics.Aborts.Count(), aborts},
 		{"durations", metrics.Durations.TotalCount(), commits + aborts},
+		{"restarts", metrics.Restarts.TotalCount(), restarts},
 	}
 
 	for _, tc := range testcases {
 		if tc.a != tc.e {
 			return errors.Errorf("%s: actual %s %d != expected %d", name, tc.name, tc.a, tc.e)
 		}
-	}
-
-	// Handle restarts separately, because that's a histogram. Though the
-	// histogram is approximate, we're recording so few distinct values
-	// that we should be okay.
-	dist := metrics.Restarts.Snapshot().Distribution()
-	var actualRestarts int64
-	for _, b := range dist {
-		if b.From == b.To {
-			actualRestarts += b.From * b.Count
-		} else {
-			t.Fatalf("unexpected value in histogram: %d-%d", b.From, b.To)
-		}
-	}
-	if a, e := actualRestarts, restarts; a != e {
-		return errors.Errorf("%s: actual restarts %d != expected %d", name, a, e)
 	}
 
 	return nil
@@ -1202,14 +1335,14 @@ func TestTxnDurations(t *testing.T) {
 	defer cleanupFn()
 	const puts = 10
 
-	const incr int64 = 1000
+	const incr time.Duration = 1000
 	for i := 0; i < puts; i++ {
 		key := roachpb.Key(fmt.Sprintf("key-txn-durations-%d", i))
 		if err := s.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
 			if err := txn.Put(ctx, key, []byte("val")); err != nil {
 				return err
 			}
-			manual.Increment(incr)
+			manual.Advance(incr)
 			return nil
 		}); err != nil {
 			t.Fatal(err)
@@ -1227,10 +1360,13 @@ func TestTxnDurations(t *testing.T) {
 		t.Fatalf("durations %d != expected %d", a, e)
 	}
 
-	// Metrics lose fidelity, so we can't compare incr directly.
-	if min, thresh := hist.Min(), incr-10; min < thresh {
-		t.Fatalf("min %d < %d", min, thresh)
+	for _, b := range hist.ToPrometheusMetric().GetHistogram().GetBucket() {
+		thresh := incr.Nanoseconds()
+		if *b.UpperBound < float64(thresh) && *b.CumulativeCount != 0 {
+			t.Fatalf("expected no values in bucket: %f", *b.UpperBound)
+		}
 	}
+
 }
 
 // TestTxnCommitWait tests the commit-wait sleep phase of transactions under
@@ -1252,8 +1388,12 @@ func TestTxnCommitWait(t *testing.T) {
 	//
 	testFn := func(t *testing.T, linearizable, commit, readOnly, futureTime, deferred bool) {
 		s, metrics, cleanupFn := setupMetricsTest(t)
-		s.DB.GetFactory().(*kvcoord.TxnCoordSenderFactory).TestingSetLinearizable(linearizable)
 		defer cleanupFn()
+		s.DB.GetFactory().(*kvcoord.TxnCoordSenderFactory).TestingSetLinearizable(linearizable)
+		commitWaitC := make(chan struct{})
+		s.DB.GetFactory().(*kvcoord.TxnCoordSenderFactory).TestingSetCommitWaitFilter(func() {
+			close(commitWaitC)
+		})
 
 		// maxClockOffset defines the maximum clock offset between nodes in the
 		// cluster. When in linearizable mode, all writing transactions must
@@ -1264,7 +1404,7 @@ func TestTxnCommitWait(t *testing.T) {
 		// gateway they use. This ensures that all causally dependent
 		// transactions commit with higher timestamps, even if their read and
 		// writes sets do not conflict with the original transaction's. This, in
-		// turn, prevents the "causal reverse" anamoly which can be observed by
+		// turn, prevents the "causal reverse" anomaly which can be observed by
 		// a third, concurrent transaction. See the following blog post for
 		// more: https://www.cockroachlabs.com/blog/consistency-model/.
 		maxClockOffset := s.Clock.MaxOffset()
@@ -1371,13 +1511,15 @@ func TestTxnCommitWait(t *testing.T) {
 
 		// Advance the manual clock slowly. If the commit-wait sleep completes
 		// too early, we'll catch it with the require.Empty. If it completes too
-		// late, we'll stall when pulling from the channel.
+		// late, we'll stall when pulling from the channel. Before doing so, wait
+		// until the transaction has begun its commit-wait.
 		for expWait > 0 {
+			<-commitWaitC
 			require.Empty(t, errC)
 
 			adv := futureOffset / 5
 			expWait -= adv
-			s.Manual.Increment(adv.Nanoseconds())
+			s.Manual.Advance(adv)
 		}
 		require.NoError(t, <-errC)
 		require.Equal(t, expMetric, metrics.CommitWaits.Count())
@@ -1409,7 +1551,7 @@ func TestAbortTransactionOnCommitErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 
 	testCases := []struct {
 		err        error
@@ -1538,7 +1680,7 @@ func TestRollbackErrorStopsHeartbeat(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1606,7 +1748,7 @@ func TestOnePCErrorTracking(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1691,7 +1833,7 @@ func TestCommitReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1746,7 +1888,7 @@ func TestCommitMutatingTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1808,7 +1950,10 @@ func TestCommitMutatingTransaction(t *testing.T) {
 			pointWrite: true,
 		},
 		{
-			f:          func(ctx context.Context, txn *kv.Txn) error { return txn.Del(ctx, "a") },
+			f: func(ctx context.Context, txn *kv.Txn) error {
+				_, err := txn.Del(ctx, "a")
+				return err
+			},
 			expMethod:  roachpb.Delete,
 			pointWrite: true,
 		},
@@ -1846,7 +1991,7 @@ func TestAbortReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1887,7 +2032,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -1931,9 +2076,9 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 			calls = nil
 			firstIter := true
 			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+				var err error
 				if firstIter {
 					firstIter = false
-					var err error
 					if write {
 						err = txn.Put(ctx, "consider", "phlebas")
 					} else /* locking read */ {
@@ -1946,7 +2091,7 @@ func TestEndWriteRestartReadOnlyTransaction(t *testing.T) {
 				if !success {
 					return errors.New("aborting on purpose")
 				}
-				return nil
+				return err
 			}); err == nil != success {
 				t.Fatalf("expected error: %t, got error: %v", !success, err)
 			}
@@ -1971,7 +2116,7 @@ func TestTransactionKeyNotChangedInRestart(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -2038,7 +2183,7 @@ func TestSequenceNumbers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -2092,7 +2237,7 @@ func TestConcurrentTxnRequestsProhibited(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -2148,8 +2293,8 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 1))
+	clock := hlc.NewClock(manual, time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -2192,7 +2337,7 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 		return br, nil
 	})
 
-	manual.Set(requests[0].expRequestTS.WallTime)
+	manual.AdvanceTo(requests[0].expRequestTS.GoTime())
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		for curReq = range requests {
@@ -2200,6 +2345,7 @@ func TestTxnRequestTxnTimestamp(t *testing.T) {
 				return err
 			}
 		}
+		manual.AdvanceTo(txn.ProvisionalCommitTimestamp().GoTime())
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -2213,8 +2359,8 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	clock := hlc.NewClock(manual, time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	sender := &mockSender{}
 	stopper := stop.NewStopper()
@@ -2222,7 +2368,7 @@ func TestReadOnlyTxnObeysDeadline(t *testing.T) {
 
 	sender.match(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		if _, ok := ba.GetArg(roachpb.Get); ok {
-			manual.Increment(100)
+			manual.Advance(100)
 			br := ba.CreateReply()
 			br.Txn = ba.Txn.Clone()
 			br.Txn.WriteTimestamp.Forward(clock.Now())
@@ -2357,8 +2503,7 @@ func TestAnchorKey(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	manual := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+	clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Nanosecond /* maxOffset */)
 	ambient := log.MakeTestingAmbientCtxWithNewTracer()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
@@ -2575,7 +2720,7 @@ func TestTxnManualRefresh(t *testing.T) {
 			ctx context.Context,
 			t *testing.T,
 			db *kv.DB,
-			clock *hlc.ManualClock,
+			clock *timeutil.ManualTime,
 			reqCh <-chan req,
 		)
 	}
@@ -2584,7 +2729,7 @@ func TestTxnManualRefresh(t *testing.T) {
 			name: "no-op",
 			run: func(
 				ctx context.Context, t *testing.T, db *kv.DB,
-				clock *hlc.ManualClock, reqCh <-chan req,
+				clock *timeutil.ManualTime, reqCh <-chan req,
 			) {
 				txn := db.NewTxn(ctx, "test")
 				errCh := make(chan error)
@@ -2612,7 +2757,7 @@ func TestTxnManualRefresh(t *testing.T) {
 			name: "refresh occurs successfully due to read",
 			run: func(
 				ctx context.Context, t *testing.T, db *kv.DB,
-				clock *hlc.ManualClock, reqCh <-chan req,
+				clock *timeutil.ManualTime, reqCh <-chan req,
 			) {
 				txn := db.NewTxn(ctx, "test")
 				errCh := make(chan error)
@@ -2668,7 +2813,7 @@ func TestTxnManualRefresh(t *testing.T) {
 			name: "refresh occurs unsuccessfully due to read",
 			run: func(
 				ctx context.Context, t *testing.T, db *kv.DB,
-				clock *hlc.ManualClock, reqCh <-chan req,
+				clock *timeutil.ManualTime, reqCh <-chan req,
 			) {
 				txn := db.NewTxn(ctx, "test")
 				errCh := make(chan error)
@@ -2721,8 +2866,8 @@ func TestTxnManualRefresh(t *testing.T) {
 	}
 	run := func(t *testing.T, tc testCase) {
 		stopper := stop.NewStopper()
-		manual := hlc.NewManualClock(123)
-		clock := hlc.NewClock(manual.UnixNano, time.Nanosecond)
+		manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+		clock := hlc.NewClock(manual, time.Nanosecond /* maxOffset */)
 		ctx := context.Background()
 		defer stopper.Stop(ctx)
 
@@ -2814,14 +2959,14 @@ func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
 			before: func(t *testing.T, txn *kv.Txn) {
 				_, err := txn.Get(ctx, "k")
 				require.NoError(t, err)
-				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+				txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next())
 			},
 		},
 		{
 			name: "write before, in prior epoch",
 			before: func(t *testing.T, txn *kv.Txn) {
 				require.NoError(t, txn.Put(ctx, "k", "v"))
-				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+				txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next())
 			},
 		},
 		{
@@ -2830,7 +2975,7 @@ func TestTxnCoordSenderSetFixedTimestamp(t *testing.T) {
 				_, err := txn.Get(ctx, "k")
 				require.NoError(t, err)
 				require.NoError(t, txn.Put(ctx, "k", "v"))
-				txn.ManualRestart(ctx, txn.ReadTimestamp().Next())
+				txn.Sender().ManualRestart(ctx, txn.UserPriority(), txn.ReadTimestamp().Next())
 			},
 		},
 	} {

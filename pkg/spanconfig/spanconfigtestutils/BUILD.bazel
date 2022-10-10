@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -10,8 +11,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/kv/kvserver/protectedts/ptpb",
+        "//pkg/roachpb",
         "//pkg/spanconfig",
+        "//pkg/sql/catalog/descpb",
+        "//pkg/util/hlc",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_stretchr_testify//require",
@@ -21,6 +25,9 @@ go_library(
 go_test(
     name = "spanconfigtestutils_test",
     srcs = ["utils_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":spanconfigtestutils"],
     deps = ["@com_github_stretchr_testify//require"],
 )
+
+get_x_data(name = "get_x_data")

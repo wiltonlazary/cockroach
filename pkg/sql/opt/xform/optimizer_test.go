@@ -11,6 +11,7 @@
 package xform_test
 
 import (
+	"context"
 	"flag"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/opttester"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	tu "github.com/cockroachdb/cockroach/pkg/testutils"
@@ -41,10 +43,10 @@ func TestDetachMemo(t *testing.T) {
 	}
 
 	var o xform.Optimizer
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	testutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE c=$1")
 
-	before := o.DetachMemo()
+	before := o.DetachMemo(context.Background())
 
 	if !o.Memo().IsEmpty() {
 		t.Error("memo expression should be reinitialized by DetachMemo")
@@ -93,9 +95,9 @@ func TestDetachMemoRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	var o xform.Optimizer
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	testutils.BuildQuery(t, &o, catalog, &evalCtx, "SELECT * FROM abc WHERE a = $1")
-	mem := o.DetachMemo()
+	mem := o.DetachMemo(context.Background())
 
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -103,8 +105,8 @@ func TestDetachMemoRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			var o xform.Optimizer
-			evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-			o.Init(&evalCtx, catalog)
+			evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+			o.Init(context.Background(), &evalCtx, catalog)
 			f := o.Factory()
 			var replaceFn norm.ReplaceFunc
 			replaceFn = func(e opt.Expr) opt.Expr {
@@ -132,23 +134,25 @@ func TestDetachMemoRace(t *testing.T) {
 }
 
 // TestCoster files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestCoster/sort"
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestCoster/scan"
-//   ...
+//
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestCoster/sort"
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestCoster/scan"
+//	...
 func TestCoster(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	runDataDrivenTest(
 		t, tu.TestDataPath(t, "coster", ""),
 		memo.ExprFmtHideRuleProps|memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|
-			memo.ExprFmtHideTypes,
+			memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
 // TestPhysicalProps files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestPhysicalPropsFactory/ordering"
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestPhysicalPropsFactory/presentation"
-//   ...
+//
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestPhysicalPropsFactory/ordering"
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestPhysicalPropsFactory/presentation"
+//	...
 func TestPhysicalProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -160,13 +164,15 @@ func TestPhysicalProps(t *testing.T) {
 			memo.ExprFmtHideCost|
 			memo.ExprFmtHideQualifications|
 			memo.ExprFmtHideScalars|
-			memo.ExprFmtHideTypes,
+			memo.ExprFmtHideTypes|
+			memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
 // TestRuleProps files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestRuleProps/orderings"
-//   ...
+//
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestRuleProps/orderings"
+//	...
 func TestRuleProps(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -174,14 +180,15 @@ func TestRuleProps(t *testing.T) {
 		t,
 		tu.TestDataPath(t, "ruleprops"),
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideQualifications|
-			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+			memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
 // TestRules files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestRules/scan"
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestRules/select"
-//   ...
+//
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestRules/scan"
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestRules/select"
+//	...
 func TestRules(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -189,7 +196,8 @@ func TestRules(t *testing.T) {
 		t,
 		tu.TestDataPath(t, "rules"),
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
-			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
+			memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
@@ -202,12 +210,13 @@ var externalTestData = flag.String(
 // over time.
 //
 // TestExternal files can be run separately like this:
-//   make test PKG=./pkg/sql/opt/xform TESTS="TestExternal/tpch"
-//   ...
+//
+//	make test PKG=./pkg/sql/opt/xform TESTS="TestExternal/tpch"
+//	...
 //
 // Test files from another location can be run using the -d flag:
-//   make test PKG=./pkg/sql/opt/xform TESTS=TestExternal TESTFLAGS='-d /some-dir'
 //
+//	make test PKG=./pkg/sql/opt/xform TESTS=TestExternal TESTFLAGS='-d /some-dir'
 func TestExternal(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -215,7 +224,8 @@ func TestExternal(t *testing.T) {
 		t,
 		*externalTestData,
 		memo.ExprFmtHideStats|memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
-			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
+			memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
@@ -226,15 +236,17 @@ func TestPlaceholderFastPath(t *testing.T) {
 		t,
 		tu.TestDataPath(t, "placeholder-fast-path"),
 		memo.ExprFmtHideCost|memo.ExprFmtHideRuleProps|
-			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+			memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|
+			memo.ExprFmtHideNotVisibleIndexInfo,
 	)
 }
 
 // runDataDrivenTest runs data-driven testcases of the form
-//   <command>
-//   <SQL statement>
-//   ----
-//   <expected results>
+//
+//	<command>
+//	<SQL statement>
+//	----
+//	<expected results>
 //
 // See OptTester.Handle for supported commands.
 func runDataDrivenTest(t *testing.T, path string, fmtFlags memo.ExprFmtFlags) {

@@ -15,7 +15,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -32,13 +31,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
@@ -71,7 +73,7 @@ type transientCluster struct {
 	sqlFirstPort  int
 
 	adminPassword string
-	adminUser     security.SQLUsername
+	adminUser     username.SQLUsername
 
 	stickyEngineRegistry server.StickyInMemEnginesRegistry
 
@@ -154,7 +156,7 @@ func NewDemoCluster(
 	// Create a temporary directory for certificates (if secure) and
 	// the unix sockets.
 	// The directory is removed in the Close() method.
-	if c.demoDir, err = ioutil.TempDir("", "demo"); err != nil {
+	if c.demoDir, err = os.MkdirTemp("", "demo"); err != nil {
 		return c, err
 	}
 
@@ -392,14 +394,14 @@ func (c *transientCluster) Start(
 			for i := 0; i < c.demoCtx.NumNodes; i++ {
 				latencyMap := c.servers[i].Cfg.TestingKnobs.Server.(*server.TestingKnobs).ContextTestingKnobs.ArtificialLatencyMap
 				c.infoLog(ctx, "starting tenant node %d", i)
-				stopper := stop.NewStopper()
+				tenantStopper := stop.NewStopper()
 				ts, err := c.servers[i].StartTenant(ctx, base.TestTenantArgs{
 					// We set the tenant ID to i+2, since tenant 0 is not a tenant, and
 					// tenant 1 is the system tenant. We also subtract 2 for the "starting"
 					// SQL/HTTP ports so the first tenant ends up with the desired default
 					// ports.
 					TenantID:         roachpb.MakeTenantID(uint64(i + 2)),
-					Stopper:          stopper,
+					Stopper:          tenantStopper,
 					ForceInsecure:    c.demoCtx.Insecure,
 					SSLCertsDir:      c.demoDir,
 					StartingSQLPort:  c.demoCtx.SQLPort - 2,
@@ -418,7 +420,7 @@ func (c *transientCluster) Start(
 					if ts != nil {
 						stopCtx = ts.AnnotateCtx(stopCtx)
 					}
-					stopper.Stop(stopCtx)
+					tenantStopper.Stop(stopCtx)
 				}))
 				if err != nil {
 					return err
@@ -435,7 +437,7 @@ func (c *transientCluster) Start(
 					// Set up the demo username and password on each tenant.
 					ie := ts.DistSQLServer().(*distsql.ServerImpl).ServerConfig.Executor
 					_, err = ie.Exec(ctx, "tenant-password", nil,
-						fmt.Sprintf("CREATE USER %s WITH PASSWORD %s", demoUsername, demoPassword))
+						fmt.Sprintf("CREATE USER %s WITH PASSWORD '%s'", demoUsername, demoPassword))
 					if err != nil {
 						return err
 					}
@@ -466,10 +468,10 @@ func (c *transientCluster) Start(
 			return err
 		}
 		if c.demoCtx.Insecure {
-			c.adminUser = security.RootUserName()
+			c.adminUser = username.RootUserName()
 			c.adminPassword = "unused"
 		} else {
-			c.adminUser = security.MakeSQLUsernameFromPreNormalizedString(demoUsername)
+			c.adminUser = username.MakeSQLUsernameFromPreNormalizedString(demoUsername)
 			c.adminPassword = demoPassword
 		}
 
@@ -483,7 +485,7 @@ func (c *transientCluster) Start(
 		// Write the URL to a file if this was requested by configuration.
 		if c.demoCtx.ListeningURLFile != "" {
 			c.infoLog(ctx, "listening URL file: %s", c.demoCtx.ListeningURLFile)
-			if err = ioutil.WriteFile(c.demoCtx.ListeningURLFile, []byte(fmt.Sprintf("%s\n", c.connURL)), 0644); err != nil {
+			if err = os.WriteFile(c.demoCtx.ListeningURLFile, []byte(fmt.Sprintf("%s\n", c.connURL)), 0644); err != nil {
 				c.warnLog(ctx, "failed writing the URL: %v", err)
 			}
 		}
@@ -748,6 +750,9 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		CacheSize:               demoCtx.CacheSize,
 		NoAutoInitializeCluster: true,
 		EnableDemoLoginEndpoint: true,
+		// Demo clusters by default will create their own tenants, so we
+		// don't need to create them here.
+		DisableDefaultTestTenant: true,
 		// This disables the tenant server. We could enable it but would have to
 		// generate the suitable certs at the caller who wishes to do so.
 		TenantAddr: new(string),
@@ -1042,7 +1047,7 @@ This server is running at increased risk of memory-related failures.`,
 
 // generateCerts generates some temporary certificates for cockroach demo.
 func (demoCtx *Context) generateCerts(certsDir string) (err error) {
-	caKeyPath := filepath.Join(certsDir, security.EmbeddedCAKey)
+	caKeyPath := filepath.Join(certsDir, certnames.EmbeddedCAKey)
 	// Create a CA-Key.
 	if err := security.CreateCAPair(
 		certsDir,
@@ -1065,21 +1070,11 @@ func (demoCtx *Context) generateCerts(certsDir string) (err error) {
 	); err != nil {
 		return err
 	}
-	// Create a certificate for the root user.
-	if err := security.CreateClientPair(
-		certsDir,
-		caKeyPath,
-		demoCtx.DefaultKeySize,
-		demoCtx.DefaultCertLifetime,
-		false, /* overwrite */
-		security.RootUserName(),
-		false, /* generatePKCS8Key */
-	); err != nil {
-		return err
-	}
 
+	// rootUserScope contains the tenant IDs the root user is allowed to access.
+	rootUserScope := []roachpb.TenantID{roachpb.SystemTenantID}
 	if demoCtx.Multitenant {
-		tenantCAKeyPath := filepath.Join(certsDir, security.EmbeddedTenantCAKey)
+		tenantCAKeyPath := filepath.Join(certsDir, certnames.EmbeddedTenantCAKey)
 		// Create a CA key for the tenants.
 		if err := security.CreateTenantCAPair(
 			certsDir,
@@ -1103,12 +1098,13 @@ func (demoCtx *Context) generateCerts(certsDir string) (err error) {
 				"localhost",
 				"*.local",
 			}
+			tenantID := uint64(i + 2)
 			pair, err := security.CreateTenantPair(
 				certsDir,
 				tenantCAKeyPath,
 				demoCtx.DefaultKeySize,
 				demoCtx.DefaultCertLifetime,
-				uint64(i+2),
+				tenantID,
 				hostAddrs,
 			)
 			if err != nil {
@@ -1118,11 +1114,26 @@ func (demoCtx *Context) generateCerts(certsDir string) (err error) {
 				return err
 			}
 			if err := security.CreateTenantSigningPair(
-				certsDir, demoCtx.DefaultCertLifetime, false /* overwrite */, uint64(i+2),
+				certsDir, demoCtx.DefaultCertLifetime, false /* overwrite */, tenantID,
 			); err != nil {
 				return err
 			}
+			rootUserScope = append(rootUserScope, roachpb.MakeTenantID(tenantID))
 		}
+	}
+	// Create a certificate for the root user. This certificate will be scoped to the
+	// system tenant and all other tenants created as a part of the demo.
+	if err := security.CreateClientPair(
+		certsDir,
+		caKeyPath,
+		demoCtx.DefaultKeySize,
+		demoCtx.DefaultCertLifetime,
+		false, /* overwrite */
+		username.RootUserName(),
+		rootUserScope,
+		false, /* generatePKCS8Key */
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1156,9 +1167,17 @@ func (c *transientCluster) getNetworkURLForServer(
 	if c.demoCtx.Insecure {
 		u.WithInsecure()
 	} else {
+		caCert := certnames.CACertFilename()
+		if isTenant {
+			caCert = certnames.TenantClientCACertFilename()
+		}
+
 		u.
 			WithAuthn(pgurl.AuthnPassword(true, c.adminPassword)).
-			WithTransport(pgurl.TransportTLS(pgurl.TLSRequire, ""))
+			WithTransport(pgurl.TransportTLS(
+				pgurl.TLSRequire,
+				filepath.Join(c.demoDir, caCert),
+			))
 	}
 	return u, nil
 }
@@ -1168,16 +1187,65 @@ func (c *transientCluster) GetConnURL() string {
 }
 
 func (c *transientCluster) GetSQLCredentials() (
-	adminUser security.SQLUsername,
+	adminUser username.SQLUsername,
 	adminPassword, certsDir string,
 ) {
 	return c.adminUser, c.adminPassword, c.demoDir
 }
 
-func (c *transientCluster) SetupWorkload(ctx context.Context, licenseDone <-chan error) error {
-	gen := c.demoCtx.WorkloadGenerator
+func (c *transientCluster) maybeEnableMultiTenantMultiRegion(ctx context.Context) error {
+	if !c.demoCtx.Multitenant {
+		return nil
+	}
+
+	storageURL, err := c.getNetworkURLForServer(ctx, 0, false /* includeAppName */, false /* isTenant */)
+	if err != nil {
+		return err
+	}
+	db, err := gosql.Open("postgres", storageURL.ToPQ().String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	if _, err = db.Exec(`ALTER TENANT ALL SET CLUSTER SETTING ` +
+		sql.SecondaryTenantsMultiRegionAbstractionsEnabledSettingName + " = true"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *transientCluster) SetClusterSetting(
+	ctx context.Context, setting string, value interface{},
+) error {
+	storageURL, err := c.getNetworkURLForServer(ctx, 0, false /* includeAppName */, false /* isTenant */)
+	if err != nil {
+		return err
+	}
+	db, err := gosql.Open("postgres", storageURL.ToPQ().String())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(fmt.Sprintf("SET CLUSTER SETTING %s = '%v'", setting, value))
+	if err != nil {
+		return err
+	}
+	if c.demoCtx.Multitenant {
+		_, err = db.Exec(fmt.Sprintf("ALTER TENANT ALL SET CLUSTER SETTING %s = '%v'", setting, value))
+	}
+	return err
+}
+
+func (c *transientCluster) SetupWorkload(ctx context.Context) error {
+	if err := c.maybeEnableMultiTenantMultiRegion(ctx); err != nil {
+		return err
+	}
+
 	// If there is a load generator, create its database and load its
 	// fixture.
+	gen := c.demoCtx.WorkloadGenerator
 	if gen != nil {
 		db, err := gosql.Open("postgres", c.connURL)
 		if err != nil {
@@ -1199,13 +1267,6 @@ func (c *transientCluster) SetupWorkload(ctx context.Context, licenseDone <-chan
 		}
 		// Perform partitioning if requested by configuration.
 		if c.demoCtx.GeoPartitionedReplicas {
-			// Wait until the license has been acquired to trigger partitioning.
-			if c.demoCtx.IsInteractive() {
-				fmt.Println("#\n# Waiting for license acquisition to complete...")
-			}
-			if err := <-licenseDone; err != nil {
-				return err
-			}
 			if c.demoCtx.IsInteractive() {
 				fmt.Println("#\n# Partitioning the demo database, please wait...")
 			}
@@ -1300,63 +1361,14 @@ func (c *transientCluster) runWorkload(
 	return nil
 }
 
-// acquireDemoLicense begins an asynchronous process to obtain a
-// temporary demo license from the Cockroach Labs website. It returns
-// a channel that can be waited on if it is needed to wait on the
-// license acquisition.
-func (c *transientCluster) AcquireDemoLicense(ctx context.Context) (chan error, error) {
-	// Communicate information about license acquisition to services
-	// that depend on it.
-	licenseDone := make(chan error)
-	if c.demoCtx.DisableLicenseAcquisition {
-		// If we are not supposed to acquire a license, close the channel
-		// immediately so that future waiters don't hang.
-		close(licenseDone)
-	} else {
-		// If we allow telemetry, then also try and get an enterprise license for the demo.
-		// GetAndApplyLicense will be nil in the pure OSS/BSL build of cockroach.
-		db, err := gosql.Open("postgres", c.connURL)
-		if err != nil {
-			return nil, err
-		}
-		go func() {
-			defer db.Close()
-
-			success, err := GetAndApplyLicense(db, c.firstServer.ClusterID(), demoOrg)
-			if err != nil {
-				select {
-				case licenseDone <- err:
-
-				// Avoid waiting on the license channel write if the
-				// server or cluster is shutting down.
-				case <-ctx.Done():
-				case <-c.firstServer.Stopper().ShouldQuiesce():
-				case <-c.stopper.ShouldQuiesce():
-				}
-				return
-			}
-			if !success {
-				if c.demoCtx.GeoPartitionedReplicas {
-					select {
-					case licenseDone <- errors.WithDetailf(
-						errors.New("unable to acquire a license for this demo"),
-						"Enterprise features are needed for this demo (--%s).",
-						cliflags.DemoGeoPartitionedReplicas.Name):
-
-						// Avoid waiting on the license channel write if the
-						// server or cluster is shutting down.
-					case <-ctx.Done():
-					case <-c.firstServer.Stopper().ShouldQuiesce():
-					case <-c.stopper.ShouldQuiesce():
-					}
-					return
-				}
-			}
-			close(licenseDone)
-		}()
+// EnableEnterprise enables enterprise features if available in this build.
+func (c *transientCluster) EnableEnterprise(ctx context.Context) (func(), error) {
+	db, err := gosql.Open("postgres", c.connURL)
+	if err != nil {
+		return nil, err
 	}
-
-	return licenseDone, nil
+	defer db.Close()
+	return EnableEnterprise(db, demoOrg)
 }
 
 // sockForServer generates the metadata for a unix socket for the given node.

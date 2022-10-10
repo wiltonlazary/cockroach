@@ -39,8 +39,8 @@ func NewCrossJoiner(
 	leftTypes []*types.T,
 	rightTypes []*types.T,
 	diskAcc *mon.BoundAccount,
-) colexecop.Operator {
-	return &crossJoiner{
+) colexecop.ClosableOperator {
+	c := &crossJoiner{
 		crossJoinerBase: newCrossJoinerBase(
 			unlimitedAllocator,
 			joinType,
@@ -51,25 +51,24 @@ func NewCrossJoiner(
 			fdSemaphore,
 			diskAcc,
 		),
-		joinHelper:            newJoinHelper(left, right),
-		unlimitedAllocator:    unlimitedAllocator,
-		outputTypes:           joinType.MakeOutputTypes(leftTypes, rightTypes),
-		maxOutputBatchMemSize: memoryLimit,
+		joinHelper:  newJoinHelper(left, right),
+		outputTypes: joinType.MakeOutputTypes(leftTypes, rightTypes),
 	}
+	c.helper.Init(unlimitedAllocator, memoryLimit)
+	return c
 }
 
 type crossJoiner struct {
 	*crossJoinerBase
 	*joinHelper
 
-	unlimitedAllocator    *colmem.Allocator
-	rightInputConsumed    bool
-	outputTypes           []*types.T
-	maxOutputBatchMemSize int64
+	helper             colmem.AccountingHelper
+	rightInputConsumed bool
+	outputTypes        []*types.T
 	// isLeftAllNulls and isRightAllNulls indicate whether the output vectors
 	// corresponding to the left and right inputs, respectively, should consist
 	// only of NULL values. This is the case when we have right or left,
-	// respectively, unmatched tuples.
+	// respectively, unmatched tuples. Used only in OUTER joins.
 	isLeftAllNulls, isRightAllNulls bool
 	// done indicates that the cross joiner has fully built its output and
 	// closed the spilling queue. Once set to true, only zero-length batches are
@@ -90,6 +89,7 @@ func (c *crossJoiner) Init(ctx context.Context) {
 }
 
 func (c *crossJoiner) Next() coldata.Batch {
+	c.cancelChecker.CheckEveryCall()
 	if c.done {
 		return coldata.ZeroBatch
 	}
@@ -99,15 +99,13 @@ func (c *crossJoiner) Next() coldata.Batch {
 	}
 	willEmit := c.willEmit()
 	if willEmit == 0 {
-		if err := c.Close(); err != nil {
+		if err := c.Close(c.Ctx); err != nil {
 			colexecerror.InternalError(err)
 		}
 		c.done = true
 		return coldata.ZeroBatch
 	}
-	c.output, _ = c.unlimitedAllocator.ResetMaybeReallocate(
-		c.outputTypes, c.output, willEmit, c.maxOutputBatchMemSize,
-	)
+	c.output, _ = c.helper.ResetMaybeReallocate(c.outputTypes, c.output, willEmit)
 	if willEmit > c.output.Capacity() {
 		willEmit = c.output.Capacity()
 	}
@@ -353,7 +351,7 @@ type crossJoinerBase struct {
 
 		// numEmittedCurLeftBatch tracks the number of joined rows returned
 		// based on the current left batch. It is reset on every call to
-		// prepareForNextLeftBatch.
+		// prepareForNextLeftBatch. It is only used in INNER and OUTER joins.
 		numEmittedCurLeftBatch int
 
 		// numEmittedTotal tracks the number of rows that have been emitted
@@ -365,11 +363,13 @@ type crossJoinerBase struct {
 		// that should be "skipped" when building from the right input.
 		rightColOffset int
 	}
-	output coldata.Batch
+	output        coldata.Batch
+	cancelChecker colexecutils.CancelChecker
 }
 
 func (b *crossJoinerBase) init(ctx context.Context) {
 	b.initHelper.Init(ctx)
+	b.cancelChecker.Init(ctx)
 }
 
 func (b *crossJoinerBase) setupLeftBuilder() {
@@ -425,6 +425,8 @@ func (b *crossJoinerBase) prepareForNextLeftBatch(batch coldata.Batch, startIdx,
 // inputs are not empty.
 func (b *crossJoinerBase) canEmit() int {
 	switch b.joinType {
+	case descpb.InnerJoin, descpb.LeftOuterJoin, descpb.RightOuterJoin, descpb.FullOuterJoin:
+		return b.builderState.setup.rightNumRepeats*b.numRightTuples - b.builderState.numEmittedCurLeftBatch
 	case descpb.LeftSemiJoin, descpb.IntersectAllJoin, descpb.ExceptAllJoin:
 		return b.builderState.setup.leftSrcEndIdx - b.builderState.left.curSrcStartIdx
 	case descpb.LeftAntiJoin:
@@ -447,7 +449,9 @@ func (b *crossJoinerBase) canEmit() int {
 		}
 		return b.numRightTuples - b.builderState.numEmittedTotal
 	default:
-		return b.builderState.setup.rightNumRepeats*b.numRightTuples - b.builderState.numEmittedCurLeftBatch
+		colexecerror.InternalError(errors.AssertionFailedf("unexpected join type %s", b.joinType.String()))
+		// The code is unreachable, but the compiler cannot infer that.
+		return 0
 	}
 }
 
@@ -462,8 +466,7 @@ func (b *crossJoinerBase) Reset(ctx context.Context) {
 	b.builderState.numEmittedTotal = 0
 }
 
-func (b *crossJoinerBase) Close() error {
-	ctx := b.initHelper.EnsureCtx()
+func (b *crossJoinerBase) Close(ctx context.Context) error {
 	if b.rightTuples != nil {
 		return b.rightTuples.Close(ctx)
 	}

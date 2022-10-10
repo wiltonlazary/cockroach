@@ -15,12 +15,20 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
 //go:generate go run ./generate_visitor.go scop Mutation mutation.go mutation_visitor_generated.go
 
 type mutationOp struct{ baseOp }
+
+// EventBase basic fields needed for anything event log related
+type EventBase struct {
+	TargetMetadata scpb.TargetMetadata
+	Authorization  scpb.Authorization
+	Statement      string
+	StatementTag   string
+	Element        scpb.ElementProto
+}
 
 // Make sure baseOp is used for linter.
 var _ = mutationOp{baseOp: baseOp{}}
@@ -34,151 +42,166 @@ type NotImplemented struct {
 	ElementType string
 }
 
-// MakeAddedIndexDeleteOnly adds a non-existent primary index to the
-// table.
-type MakeAddedIndexDeleteOnly struct {
+// MakeAbsentTempIndexDeleteOnly adds a non-existent index to the
+// table in the DELETE_ONLY state.
+type MakeAbsentTempIndexDeleteOnly struct {
 	mutationOp
-	TableID descpb.ID
-
-	// Various components needed to build an
-	// index descriptor.
-	PrimaryIndex        descpb.IndexID
-	IndexID             descpb.IndexID
-	Unique              bool
-	KeyColumnIDs        []descpb.ColumnID
-	KeyColumnDirections []descpb.IndexDescriptor_Direction
-	KeySuffixColumnIDs  []descpb.ColumnID
-	StoreColumnIDs      []descpb.ColumnID
-	CompositeColumnIDs  []descpb.ColumnID
-	ShardedDescriptor   *catpb.ShardedDescriptor
-	Inverted            bool
-	Concurrently        bool
-	SecondaryIndex      bool
+	Index            scpb.Index
+	IsSecondaryIndex bool
 }
 
-// MakeAddedIndexDeleteAndWriteOnly transitions an index addition mutation from
-// DELETE_ONLY to DELETE_AND_WRITE_ONLY.
-type MakeAddedIndexDeleteAndWriteOnly struct {
+// MakeAbsentIndexBackfilling adds a non-existent index to the
+// table in the BACKFILLING state.
+type MakeAbsentIndexBackfilling struct {
+	mutationOp
+	Index              scpb.Index
+	IsSecondaryIndex   bool
+	IsDeletePreserving bool
+}
+
+// SetAddedIndexPartialPredicate sets a partial predicate expression in an added
+// secondary index.
+type SetAddedIndexPartialPredicate struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+	Expr    catpb.Expression
+}
+
+// MakeDeleteOnlyIndexWriteOnly transitions an index addition mutation from
+// DELETE_ONLY to WRITE_ONLY.
+type MakeDeleteOnlyIndexWriteOnly struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
 
-// MakeAddedSecondaryIndexPublic moves a new primary index from its mutation to
+// MakeBackfilledIndexMerging transitions an index addition mutation from
+// DELETE_ONLY to MERGING.
+type MakeBackfilledIndexMerging struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
+// MakeMergedIndexWriteOnly transitions an index addition mutation from
+// MERGING to WRITE_ONLY.
+type MakeMergedIndexWriteOnly struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
+// MakeBackfillingIndexDeleteOnly transitions an index addition mutation from
+// BACKFILLING to DELETE_ONLY.
+type MakeBackfillingIndexDeleteOnly struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
+// MakeValidatedSecondaryIndexPublic moves a new primary index from its mutation to
 // public.
-type MakeAddedSecondaryIndexPublic struct {
+type MakeValidatedSecondaryIndexPublic struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
 
-// MakeAddedPrimaryIndexPublic moves a new primary index from its mutation to
+// MakeValidatedPrimaryIndexPublic moves a new primary index from its mutation to
 // public.
-type MakeAddedPrimaryIndexPublic struct {
+type MakeValidatedPrimaryIndexPublic struct {
+	mutationOp
+	EventBase
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
+// MakePublicPrimaryIndexWriteOnly zeros out the table's
+// primary index and adds an index drop mutation in WRITE_ONLY
+// for it.
+type MakePublicPrimaryIndexWriteOnly struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
 
-// MakeDroppedPrimaryIndexDeleteAndWriteOnly moves a dropped primary index from
-// public to DELETE_AND_WRITE_ONLY.
-type MakeDroppedPrimaryIndexDeleteAndWriteOnly struct {
+// CreateGCJobForTable creates a GC job for a given table, when necessary.
+type CreateGCJobForTable struct {
 	mutationOp
 	TableID descpb.ID
-	IndexID descpb.IndexID
+	StatementForDropJob
 }
 
-// CreateGcJobForTable creates a GC job for a given table, when necessary.
-type CreateGcJobForTable struct {
-	mutationOp
-	TableID descpb.ID
-}
-
-// CreateGcJobForDatabase creates a GC job for a given database.
-type CreateGcJobForDatabase struct {
+// CreateGCJobForDatabase creates a GC job for a given database.
+type CreateGCJobForDatabase struct {
 	mutationOp
 	DatabaseID descpb.ID
+	StatementForDropJob
 }
 
-// CreateGcJobForIndex creates a GC job for a given table index.
-type CreateGcJobForIndex struct {
+// CreateGCJobForIndex creates a GC job for a given table index.
+type CreateGCJobForIndex struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
+	StatementForDropJob
 }
 
-// MarkDescriptorAsDroppedSynthetically marks a descriptor as dropped within
-// a transaction by injecting a synthetic descriptor.
-type MarkDescriptorAsDroppedSynthetically struct {
+// MarkDescriptorAsPublic changes the descriptor's state to PUBLIC.
+type MarkDescriptorAsPublic struct {
 	mutationOp
-	DescID descpb.ID
+	DescriptorID descpb.ID
 }
 
-// MarkDescriptorAsDropped marks a descriptor as dropped.
+// MarkDescriptorAsSyntheticallyDropped changes the descriptor's state to
+// DROPPED, but records that status only synthetically.
+type MarkDescriptorAsSyntheticallyDropped struct {
+	mutationOp
+	DescriptorID descpb.ID
+}
+
+// MarkDescriptorAsDropped changes the descriptor's state to DROPPED.
 type MarkDescriptorAsDropped struct {
 	mutationOp
-	DescID descpb.ID
+	DescriptorID descpb.ID
 }
 
-// DrainDescriptorName marks a descriptor as dropped.
+// DrainDescriptorName marks a descriptor's name as to-be-drained from
+// the system.Namespace table.
 type DrainDescriptorName struct {
 	mutationOp
-	TableID descpb.ID
+	Namespace scpb.Namespace
 }
 
-// UpdateRelationDeps updates dependencies for a relation.
-type UpdateRelationDeps struct {
-	mutationOp
-	TableID descpb.ID
-}
-
-// RemoveColumnDefaultExpression removes the default expression on a given table column.
-type RemoveColumnDefaultExpression struct {
+// MakeDeleteOnlyColumnWriteOnly transitions a column addition mutation from
+// DELETE_ONLY to WRITE_ONLY.
+type MakeDeleteOnlyColumnWriteOnly struct {
 	mutationOp
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
 
-// AddTypeBackRef adds a type back references from a relation.
-type AddTypeBackRef struct {
-	mutationOp
-	DescID descpb.ID
-	TypeID descpb.ID
-}
-
-// RemoveRelationDependedOnBy removes a depended on by reference from a given relation.
-type RemoveRelationDependedOnBy struct {
-	mutationOp
-	TableID      descpb.ID
-	DependedOnBy descpb.ID
-}
-
-// RemoveTypeBackRef removes type back references from a relation.
-type RemoveTypeBackRef struct {
-	mutationOp
-	DescID descpb.ID
-	TypeID descpb.ID
-}
-
-// MakeAddedColumnDeleteAndWriteOnly transitions a column addition mutation from
-// DELETE_ONLY to DELETE_AND_WRITE_ONLY.
-type MakeAddedColumnDeleteAndWriteOnly struct {
-	mutationOp
-	TableID  descpb.ID
-	ColumnID descpb.ColumnID
-}
-
-// MakeDroppedNonPrimaryIndexDeleteAndWriteOnly moves a dropped secondary index
-// from public to DELETE_AND_WRITE_ONLY.
-type MakeDroppedNonPrimaryIndexDeleteAndWriteOnly struct {
+// MakePublicSecondaryIndexWriteOnly zeros out the secondary
+// index and adds an index drop mutation in WRITE_ONLY
+// for it.
+type MakePublicSecondaryIndexWriteOnly struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
 
-// MakeDroppedIndexDeleteOnly transitions an index drop mutation from
-// DELETE_AND_WRITE_ONLY to DELETE_ONLY.
-type MakeDroppedIndexDeleteOnly struct {
+// MakeWriteOnlyIndexDeleteOnly transitions an index drop mutation from
+// WRITE_ONLY to DELETE_ONLY.
+type MakeWriteOnlyIndexDeleteOnly struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+}
+
+// RemoveDroppedIndexPartialPredicate removes a partial predicate expression in
+// a dropped secondary index.
+type RemoveDroppedIndexPartialPredicate struct {
 	mutationOp
 	TableID descpb.ID
 	IndexID descpb.IndexID
@@ -188,124 +211,192 @@ type MakeDroppedIndexDeleteOnly struct {
 // table.
 type MakeIndexAbsent struct {
 	mutationOp
+	EventBase
 	TableID descpb.ID
 	IndexID descpb.IndexID
 }
 
-// MakeAddedColumnDeleteOnly adds a new column in the DELETE_ONLY state.
-type MakeAddedColumnDeleteOnly struct {
+// MakeAbsentColumnDeleteOnly adds a new column in the DELETE_ONLY state.
+type MakeAbsentColumnDeleteOnly struct {
 	mutationOp
-	ColumnID                          descpb.ColumnID
-	TableID                           descpb.ID
-	FamilyID                          descpb.FamilyID
-	FamilyName                        string
-	ColumnType                        *types.T
-	Nullable                          bool
-	DefaultExpr                       string
-	OnUpdateExpr                      string
-	Hidden                            bool
-	Inaccessible                      bool
-	GeneratedAsIdentityType           catpb.GeneratedAsIdentityType
-	GeneratedAsIdentitySequenceOption string
-	UsesSequenceIds                   []descpb.ID
-	ComputerExpr                      string
-	PgAttributeNum                    uint32
-	SystemColumnKind                  catpb.SystemColumnKind
-	Virtual                           bool
+	Column scpb.Column
 }
 
-// MakeColumnPublic moves a new column from its mutation to public.
-type MakeColumnPublic struct {
+// SetAddedColumnType sets the type of a new column.
+type SetAddedColumnType struct {
+	mutationOp
+	ColumnType scpb.ColumnType
+}
+
+// MakeWriteOnlyColumnPublic moves a new column from its mutation to public.
+type MakeWriteOnlyColumnPublic struct {
+	mutationOp
+	EventBase
+	TableID  descpb.ID
+	ColumnID descpb.ColumnID
+}
+
+// MakePublicColumnWriteOnly zeros out the column and adds
+// a column drop mutation in WRITE_ONLY for it.
+type MakePublicColumnWriteOnly struct {
 	mutationOp
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
 
-// MakeDroppedColumnDeleteAndWriteOnly moves a dropped column from public to
-// DELETE_AND_WRITE_ONLY.
-type MakeDroppedColumnDeleteAndWriteOnly struct {
+// MakeWriteOnlyColumnDeleteOnly transitions a column drop mutation from
+// WRITE_ONLY to DELETE_ONLY.
+type MakeWriteOnlyColumnDeleteOnly struct {
 	mutationOp
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
 
-// MakeDroppedColumnDeleteOnly transitions a column drop mutation from
-// DELETE_AND_WRITE_ONLY to DELETE_ONLY.
-type MakeDroppedColumnDeleteOnly struct {
+// RemoveDroppedColumnType unsets a column type and computed expr.
+type RemoveDroppedColumnType struct {
 	mutationOp
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
 
-// MakeColumnAbsent removes a dropped column mutation in DELETE_ONLY from the
+// MakeDeleteOnlyColumnAbsent removes a dropped column mutation in DELETE_ONLY from the
 // table.
-type MakeColumnAbsent struct {
+type MakeDeleteOnlyColumnAbsent struct {
 	mutationOp
+	EventBase
 	TableID  descpb.ID
 	ColumnID descpb.ColumnID
 }
 
-// AddCheckConstraint adds a check constraint in the unvalidated state.
-type AddCheckConstraint struct {
-	mutationOp
-	TableID     descpb.ID
-	Name        string
-	Expr        string
-	ColumnIDs   descpb.ColumnIDs
-	Unvalidated bool
-	Hidden      bool
-}
-
-// AddColumnFamily adds a column family with the provided descriptor.
-//
-// TODO(ajwerner): Decide whether this should happen explicitly or should be a
-// side-effect of adding a column. My hunch is the latter.
-type AddColumnFamily struct {
-	mutationOp
-	TableID descpb.ID
-	Family  descpb.ColumnFamilyDescriptor
-}
-
-// DropForeignKeyRef drops a foreign key reference with
-// support for outbound/inbound keys.
-type DropForeignKeyRef struct {
-	mutationOp
-	TableID  descpb.ID
-	Name     string
-	Outbound bool
-}
-
-// RemoveSequenceOwnedBy removes a sequence owned by
-// reference.
-type RemoveSequenceOwnedBy struct {
+// RemoveOwnerBackReferenceInSequence removes a sequence ownership
+// back-reference from a sequence.
+type RemoveOwnerBackReferenceInSequence struct {
 	mutationOp
 	SequenceID descpb.ID
 }
 
-// AddIndexPartitionInfo adds partitoning information into
-// an index
-type AddIndexPartitionInfo struct {
+// RemoveSequenceOwner removes a sequence ownership reference from the owning
+// table column.
+type RemoveSequenceOwner struct {
 	mutationOp
 	TableID         descpb.ID
-	IndexID         descpb.IndexID
-	PartitionFields []string
-	ListPartitions  []*scpb.ListPartition
-	RangePartitions []*scpb.RangePartitions
+	ColumnID        descpb.ColumnID
+	OwnedSequenceID descpb.ID
+}
+
+// RemoveCheckConstraint removes a check constraint from a table.
+type RemoveCheckConstraint struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// RemoveForeignKeyConstraint removes a foreign key from the origin table.
+type RemoveForeignKeyConstraint struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// RemoveForeignKeyBackReference removes a foreign key back-reference from the
+// referenced table.
+type RemoveForeignKeyBackReference struct {
+	mutationOp
+	ReferencedTableID  descpb.ID
+	OriginTableID      descpb.ID
+	OriginConstraintID descpb.ConstraintID
+}
+
+// RemoveSchemaParent removes the schema - parent database relationship.
+type RemoveSchemaParent struct {
+	mutationOp
+	Parent scpb.SchemaParent
+}
+
+// AddIndexPartitionInfo adds a partitioning descriptor to an existing index.
+type AddIndexPartitionInfo struct {
+	mutationOp
+	Partitioning scpb.IndexPartitioning
 }
 
 // LogEvent logs an event for a given descriptor.
 type LogEvent struct {
 	mutationOp
-	TargetMetadata scpb.TargetMetadata
-	Authorization  scpb.Authorization
-	Statement      string
-	StatementTag   string
-	Element        scpb.ElementProto
-	TargetStatus   scpb.Status
+	EventBase
+	Element      scpb.ElementProto
+	TargetStatus scpb.Status
 }
 
-// SetColumnName makes a column only to allocate
-// the name and ID.
+// AddColumnFamily adds a new column family to the table.
+type AddColumnFamily struct {
+	mutationOp
+	TableID  descpb.ID
+	FamilyID descpb.FamilyID
+	Name     string
+}
+
+// AddColumnDefaultExpression adds a DEFAULT expression to a column.
+type AddColumnDefaultExpression struct {
+	mutationOp
+	Default scpb.ColumnDefaultExpression
+}
+
+// RemoveColumnDefaultExpression removes a DEFAULT expression from a column.
+type RemoveColumnDefaultExpression struct {
+	mutationOp
+	TableID  descpb.ID
+	ColumnID descpb.ColumnID
+}
+
+// AddColumnOnUpdateExpression adds an ON UPDATE expression to a column.
+type AddColumnOnUpdateExpression struct {
+	mutationOp
+	OnUpdate scpb.ColumnOnUpdateExpression
+}
+
+// RemoveColumnOnUpdateExpression removes an ON UPDATE expression from a column.
+type RemoveColumnOnUpdateExpression struct {
+	mutationOp
+	TableID  descpb.ID
+	ColumnID descpb.ColumnID
+}
+
+// UpdateTableBackReferencesInTypes updates back references to a table
+// in the specified types.
+type UpdateTableBackReferencesInTypes struct {
+	mutationOp
+	TypeIDs               []descpb.ID
+	BackReferencedTableID descpb.ID
+}
+
+// RemoveBackReferenceInTypes removes back references to a descriptor in the
+// specified types. It is a special case of the previous op for use with views
+// and multi-region elements, where a forward reference to the type is being
+// removed and is known to be unique to the descriptor.
+type RemoveBackReferenceInTypes struct {
+	mutationOp
+	BackReferencedDescriptorID descpb.ID
+	TypeIDs                    []descpb.ID
+}
+
+// UpdateBackReferencesInSequences updates back references to a table expression
+// (in a column or a check constraint) in the specified sequences.
+type UpdateBackReferencesInSequences struct {
+	mutationOp
+	BackReferencedTableID  descpb.ID
+	BackReferencedColumnID descpb.ColumnID
+	SequenceIDs            []descpb.ID
+}
+
+// RemoveViewBackReferencesInRelations removes back references to a view in
+// the specified tables, views or sequences.
+type RemoveViewBackReferencesInRelations struct {
+	mutationOp
+	BackReferencedViewID descpb.ID
+	RelationIDs          []descpb.ID
+}
+
+// SetColumnName renames a column.
 type SetColumnName struct {
 	mutationOp
 	TableID  descpb.ID
@@ -313,8 +404,7 @@ type SetColumnName struct {
 	Name     string
 }
 
-// SetIndexName makes an index name only to allocate
-// the name and ID.
+// SetIndexName renames an index.
 type SetIndexName struct {
 	mutationOp
 	TableID descpb.ID
@@ -328,43 +418,63 @@ type DeleteDescriptor struct {
 	DescriptorID descpb.ID
 }
 
-// DeleteDatabaseSchemaEntry deletes an entry for a schema.
-type DeleteDatabaseSchemaEntry struct {
-	mutationOp
-	DatabaseID descpb.ID
-	SchemaID   descpb.ID
-}
-
-// RemoveJobReference removes the reference to a job from the descriptor.
-type RemoveJobReference struct {
+// RemoveJobStateFromDescriptor removes the reference to a job from the
+// descriptor and clears the pending targets.
+type RemoveJobStateFromDescriptor struct {
 	mutationOp
 	DescriptorID descpb.ID
 	JobID        jobspb.JobID
 }
 
-// AddJobReference adds the reference to a job to the descriptor.
-type AddJobReference struct {
+// SetJobStateOnDescriptor adds the reference to a job to the descriptor.
+type SetJobStateOnDescriptor struct {
 	mutationOp
 	DescriptorID descpb.ID
-	JobID        jobspb.JobID
+	// Initialize indicates whether this op ought to be setting the JobID and
+	// state for the first time for this job or whether it's an update. In true
+	// case, the expectation is that the job and state are currently unset. In
+	// the false case, the expectation is that they are set and match the values
+	// in the op.
+	Initialize bool
+	State      scpb.DescriptorState
 }
 
-// CreateDeclarativeSchemaChangerJob constructs the job for the
-// declarative schema changer post-commit phases.
-type CreateDeclarativeSchemaChangerJob struct {
-	mutationOp
-	JobID       jobspb.JobID
-	TargetState scpb.TargetState
-	Current     []scpb.Status
-}
-
-// UpdateSchemaChangerJob is used to update the progress and payload of the
-// schema changer job.
+// UpdateSchemaChangerJob may update the job's cancelable status.
 type UpdateSchemaChangerJob struct {
 	mutationOp
-	JobID           jobspb.JobID
-	Current         []scpb.Status
-	IsNonCancelable bool
+	IsNonCancelable       bool
+	JobID                 jobspb.JobID
+	RunningStatus         string
+	DescriptorIDsToRemove []descpb.ID
+}
+
+// CreateSchemaChangerJob constructs the job for the
+// declarative schema changer post-commit phases.
+type CreateSchemaChangerJob struct {
+	mutationOp
+	JobID         jobspb.JobID
+	Authorization scpb.Authorization
+	Statements    []scpb.Statement
+	DescriptorIDs []descpb.ID
+
+	// NonCancelable maps to the job's property, but in the schema changer can
+	// be thought of as !Revertible.
+	NonCancelable bool
+	RunningStatus string
+}
+
+// UpsertTableComment is used to add a comment to a table.
+type UpsertTableComment struct {
+	mutationOp
+	TableID descpb.ID
+	Comment string
+}
+
+// RemoveAllTableComments is used to delete all comments associated with a
+// table when dropping a table.
+type RemoveAllTableComments struct {
+	mutationOp
+	TableID descpb.ID
 }
 
 // RemoveTableComment is used to delete a comment associated with a table.
@@ -373,16 +483,38 @@ type RemoveTableComment struct {
 	TableID descpb.ID
 }
 
+// UpsertDatabaseComment is used to add a comment to a database.
+type UpsertDatabaseComment struct {
+	mutationOp
+	DatabaseID descpb.ID
+	Comment    string
+}
+
 // RemoveDatabaseComment is used to delete a comment associated with a database.
 type RemoveDatabaseComment struct {
 	mutationOp
 	DatabaseID descpb.ID
 }
 
+// UpsertSchemaComment is used to add a comment to a schema.
+type UpsertSchemaComment struct {
+	mutationOp
+	SchemaID descpb.ID
+	Comment  string
+}
+
 // RemoveSchemaComment is used to delete a comment associated with a schema.
 type RemoveSchemaComment struct {
 	mutationOp
 	SchemaID descpb.ID
+}
+
+// UpsertIndexComment is used to add a comment to an index.
+type UpsertIndexComment struct {
+	mutationOp
+	TableID descpb.ID
+	IndexID descpb.IndexID
+	Comment string
 }
 
 // RemoveIndexComment is used to delete a comment associated with an index.
@@ -392,18 +524,84 @@ type RemoveIndexComment struct {
 	IndexID descpb.IndexID
 }
 
+// UpsertColumnComment is used to add a comment to a column.
+type UpsertColumnComment struct {
+	mutationOp
+	TableID        descpb.ID
+	ColumnID       descpb.ColumnID
+	PGAttributeNum descpb.PGAttributeNum
+	Comment        string
+}
+
 // RemoveColumnComment is used to delete a comment associated with a column.
 type RemoveColumnComment struct {
 	mutationOp
-	TableID  descpb.ID
-	ColumnID descpb.ColumnID
+	TableID        descpb.ID
+	ColumnID       descpb.ColumnID
+	PgAttributeNum descpb.PGAttributeNum
+}
+
+// UpsertConstraintComment is used to add a comment to a constraint.
+type UpsertConstraintComment struct {
+	mutationOp
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+	Comment      string
 }
 
 // RemoveConstraintComment is used to delete a comment associated with a
 // constraint.
 type RemoveConstraintComment struct {
 	mutationOp
-	TableID        descpb.ID
-	ConstraintType scpb.ConstraintType
-	ConstraintName string
+	TableID      descpb.ID
+	ConstraintID descpb.ConstraintID
+}
+
+// RemoveDatabaseRoleSettings is used to delete a role setting for a database.
+type RemoveDatabaseRoleSettings struct {
+	mutationOp
+	DatabaseID descpb.ID
+}
+
+// RemoveUserPrivileges is used to revoke a user's privileges.
+type RemoveUserPrivileges struct {
+	mutationOp
+	DescriptorID descpb.ID
+	User         string
+}
+
+// DeleteSchedule is used to delete a schedule ID from the database.
+type DeleteSchedule struct {
+	mutationOp
+	ScheduleID int64
+}
+
+// RefreshStats is used to queue a table for stats refresh.
+type RefreshStats struct {
+	mutationOp
+	TableID descpb.ID
+}
+
+// AddColumnToIndex mutates an index to add a column to it.
+// The column should already exist on the table and so should
+// the index.
+type AddColumnToIndex struct {
+	mutationOp
+	TableID   descpb.ID
+	ColumnID  descpb.ColumnID
+	IndexID   descpb.IndexID
+	Kind      scpb.IndexColumn_Kind
+	Direction catpb.IndexColumn_Direction
+	Ordinal   uint32
+}
+
+// RemoveColumnFromIndex mutates an index to removed a column from it.
+// The column should already exist on the table and so should the index.
+type RemoveColumnFromIndex struct {
+	mutationOp
+	TableID  descpb.ID
+	ColumnID descpb.ColumnID
+	IndexID  descpb.IndexID
+	Kind     scpb.IndexColumn_Kind
+	Ordinal  uint32
 }

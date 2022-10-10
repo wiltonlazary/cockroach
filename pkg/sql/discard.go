@@ -13,66 +13,93 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/errors"
 )
 
 // Discard implements the DISCARD statement.
 // See https://www.postgresql.org/docs/9.6/static/sql-discard.html for details.
 func (p *planner) Discard(ctx context.Context, s *tree.Discard) (planNode, error) {
-	switch s.Mode {
+	return &discardNode{mode: s.Mode}, nil
+}
+
+type discardNode struct {
+	mode tree.DiscardMode
+}
+
+func (n *discardNode) Next(_ runParams) (bool, error) { return false, nil }
+func (n *discardNode) Values() tree.Datums            { return nil }
+func (n *discardNode) Close(_ context.Context)        {}
+func (n *discardNode) startExec(params runParams) error {
+	switch n.mode {
 	case tree.DiscardModeAll:
-		if !p.autoCommit {
-			return nil, pgerror.New(pgcode.ActiveSQLTransaction,
+		if !params.p.autoCommit {
+			return pgerror.New(pgcode.ActiveSQLTransaction,
 				"DISCARD ALL cannot run inside a transaction block")
 		}
 
+		// SET SESSION AUTHORIZATION DEFAULT
+		if err := params.p.setRole(params.ctx, false /* local */, params.p.SessionData().SessionUser()); err != nil {
+			return err
+		}
+
 		// RESET ALL
-		if err := p.sessionDataMutatorIterator.applyOnEachMutatorError(
-			func(m sessionDataMutator) error {
-				return resetSessionVars(ctx, m)
-			},
-		); err != nil {
-			return nil, err
+		if err := params.p.resetAllSessionVars(params.ctx); err != nil {
+
+			return err
 		}
 
 		// DEALLOCATE ALL
-		p.preparedStatements.DeleteAll(ctx)
-	default:
-		return nil, errors.AssertionFailedf("unknown mode for DISCARD: %d", s.Mode)
-	}
-	return newZeroNode(nil /* columns */), nil
-}
+		params.p.preparedStatements.DeleteAll(params.ctx)
 
-func resetSessionVars(ctx context.Context, m sessionDataMutator) error {
-	// Always do intervalstyle_enabled and datestyle_enabled first so that
-	// IntervalStyle and DateStyle which depend on these flags are correctly
-	// configured.
-	if err := resetSessionVar(ctx, m, "datestyle_enabled"); err != nil {
-		return err
-	}
-	if err := resetSessionVar(ctx, m, "intervalstyle_enabled"); err != nil {
-		return err
-	}
-	for _, varName := range varNames {
-		if err := resetSessionVar(ctx, m, varName); err != nil {
+		// DISCARD SEQUENCES
+		params.p.sessionDataMutatorIterator.applyOnEachMutator(func(m sessionDataMutator) {
+			m.data.SequenceState = sessiondata.NewSequenceState()
+			m.initSequenceCache()
+		})
+
+		// DISCARD TEMP
+		err := deleteTempTables(params.ctx, params.p)
+		if err != nil {
 			return err
 		}
+
+	case tree.DiscardModeSequences:
+		params.p.sessionDataMutatorIterator.applyOnEachMutator(func(m sessionDataMutator) {
+			m.data.SequenceState = sessiondata.NewSequenceState()
+			m.initSequenceCache()
+		})
+	case tree.DiscardModeTemp:
+		err := deleteTempTables(params.ctx, params.p)
+		if err != nil {
+			return err
+		}
+	default:
+		return errors.AssertionFailedf("unknown mode for DISCARD: %d", n.mode)
 	}
 	return nil
 }
 
-func resetSessionVar(ctx context.Context, m sessionDataMutator, varName string) error {
-	v := varGen[varName]
-	if v.Set != nil {
-		hasDefault, defVal := getSessionVarDefaultString(varName, v, m.sessionDataMutatorBase)
-		if hasDefault {
-			if err := v.Set(ctx, m, defVal); err != nil {
+func deleteTempTables(ctx context.Context, p *planner) error {
+	return p.WithInternalExecutor(ctx, func(ctx context.Context, txn *kv.Txn, ie sqlutil.InternalExecutor) error {
+		codec := p.execCfg.Codec
+		descCol := p.Descriptors()
+		allDbDescs, err := descCol.GetAllDatabaseDescriptors(ctx, p.Txn())
+		if err != nil {
+			return err
+		}
+		for _, dbDesc := range allDbDescs {
+			schemaName := p.TemporarySchemaName()
+			err = cleanupSchemaObjects(ctx, p.Txn(), descCol, codec, ie, dbDesc, schemaName)
+			if err != nil {
 				return err
 			}
 		}
-	}
-	return nil
+		return nil
+	})
 }

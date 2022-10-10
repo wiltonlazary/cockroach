@@ -11,6 +11,8 @@
 package catalog
 
 import (
+	"time"
+
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -40,6 +42,14 @@ type TableElementMaybeMutation interface {
 	// DeleteOnly returns true iff the table element is in a mutation in the
 	// delete-only state.
 	DeleteOnly() bool
+
+	// Backfilling returns true iff the table element is in a
+	// mutation in the backfilling state.
+	Backfilling() bool
+
+	// Mergin returns true iff the table element is in a
+	// mutation in the merging state.
+	Merging() bool
 
 	// Adding returns true iff the table element is in an add mutation.
 	Adding() bool
@@ -75,6 +85,10 @@ type Mutation interface {
 	// AsMaterializedViewRefresh returns the corresponding MaterializedViewRefresh
 	// if the mutation is a materialized view refresh, nil otherwise.
 	AsMaterializedViewRefresh() MaterializedViewRefresh
+
+	// AsModifyRowLevelTTL returns the corresponding ModifyRowLevelTTL
+	// if the mutation is a row-level TTL alter, nil otherwise.
+	AsModifyRowLevelTTL() ModifyRowLevelTTL
 
 	// NOTE: When adding new types of mutations to this interface, be sure to
 	// audit the code which unpacks and introspects mutations to be sure to add
@@ -119,11 +133,13 @@ type Index interface {
 	// The remaining methods operate on the underlying descpb.IndexDescriptor object.
 
 	GetID() descpb.IndexID
+	GetConstraintID() descpb.ConstraintID
 	GetName() string
 	IsPartial() bool
 	IsUnique() bool
 	IsDisabled() bool
 	IsSharded() bool
+	IsNotVisible() bool
 	IsCreatedExplicitly() bool
 	GetPredicate() string
 	GetType() descpb.IndexDescriptor_Type
@@ -135,16 +151,19 @@ type Index interface {
 	GetShardColumnName() string
 
 	IsValidOriginIndex(originColIDs descpb.ColumnIDs) bool
+	IsHelpfulOriginIndex(originColIDs descpb.ColumnIDs) bool
 	IsValidReferencedUniqueConstraint(referencedColIDs descpb.ColumnIDs) bool
 
 	GetPartitioning() Partitioning
+	PartitioningColumnCount() int
+	ImplicitPartitioningColumnCount() int
 
 	ExplicitColumnStartIdx() int
 
 	NumKeyColumns() int
 	GetKeyColumnID(columnOrdinal int) descpb.ColumnID
 	GetKeyColumnName(columnOrdinal int) string
-	GetKeyColumnDirection(columnOrdinal int) descpb.IndexDescriptor_Direction
+	GetKeyColumnDirection(columnOrdinal int) catpb.IndexColumn_Direction
 
 	CollectKeyColumnIDs() TableColSet
 	CollectKeySuffixColumnIDs() TableColSet
@@ -152,8 +171,27 @@ type Index interface {
 	CollectSecondaryStoredColumnIDs() TableColSet
 	CollectCompositeColumnIDs() TableColSet
 
+	// InvertedColumnID returns the ColumnID of the inverted column of the
+	// inverted index.
+	//
+	// Panics if the index is not inverted.
 	InvertedColumnID() descpb.ColumnID
+
+	// InvertedColumnName returns the name of the inverted column of the inverted
+	// index.
+	//
+	// Panics if the index is not inverted.
 	InvertedColumnName() string
+
+	// InvertedColumnKeyType returns the type of the data element that is encoded
+	// as the inverted index key. This is currently always EncodedKey.
+	//
+	// Panics if the index is not inverted.
+	InvertedColumnKeyType() *types.T
+
+	// InvertedColumnKind returns the kind of the inverted column of the inverted
+	// index.
+	InvertedColumnKind() catpb.InvertedIndexColumnKind
 
 	NumPrimaryStoredColumns() int
 	NumSecondaryStoredColumns() int
@@ -167,6 +205,41 @@ type Index interface {
 	NumCompositeColumns() int
 	GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID
 	UseDeletePreservingEncoding() bool
+	// ForcePut forces all writes to use Put rather than CPut or InitPut.
+	//
+	// Users of this options should take great care as it
+	// effectively mean unique constraints are not respected.
+	//
+	// Currently (2022-07-15) there are three users:
+	//   * delete preserving indexes
+	//   * merging indexes
+	//   * dropping primary indexes
+	//
+	// Delete preserving encoding indexes are used only as a log of
+	// index writes during backfill, thus we can blindly put values into
+	// them.
+	//
+	// New indexes may miss updates during the backfilling process
+	// that would lead to CPut failures until the missed updates
+	// are merged into the index. Uniqueness for such indexes is
+	// checked by the schema changer before they are brought back
+	// online.
+	//
+	// In the case of dropping primary indexes, we always ensure that
+	// there's a replacement primary index which has become public.
+	// The reason we must not use cput is that the new primary index
+	// may not store all the columns stored in this index.
+	ForcePut() bool
+
+	// CreatedAt is an approximate timestamp at which the index was created.
+	// It is derived from the statement time at which the relevant statement
+	// was issued.
+	CreatedAt() time.Time
+
+	// IsTemporaryIndexForBackfill() returns true iff the index is
+	// an index being used as the temporary index being used by an
+	// in-progress index backfill.
+	IsTemporaryIndexForBackfill() bool
 }
 
 // Column is an interface around the column descriptor types.
@@ -274,7 +347,7 @@ type Column interface {
 	// GetPGAttributeNum returns the PGAttributeNum of the column descriptor
 	// if the PGAttributeNum is set (non-zero). Returns the ID of the
 	// column descriptor if the PGAttributeNum is not set.
-	GetPGAttributeNum() uint32
+	GetPGAttributeNum() descpb.PGAttributeNum
 
 	// IsSystemColumn returns true iff the column is a system column.
 	IsSystemColumn() bool
@@ -305,9 +378,17 @@ type Column interface {
 	// `GENERATED AS IDENTITY` column.
 	HasGeneratedAsIdentitySequenceOption() bool
 
+	// GetGeneratedAsIdentitySequenceOptionStr returns the string representation
+	// of the column's `GENERATED AS IDENTITY` sequence option if it exists, empty
+	// string otherwise.
+	GetGeneratedAsIdentitySequenceOptionStr() string
+
 	// GetGeneratedAsIdentitySequenceOption returns the column's `GENERATED AS
-	// IDENTITY` sequence option if it exists, empty string otherwise.
-	GetGeneratedAsIdentitySequenceOption() string
+	// IDENTITY` sequence option if it exists, and possible error.
+	// If the column is not an identity column, return nil for both sequence option
+	// and the error.
+	// Note it doesn't return the sequence owner info.
+	GetGeneratedAsIdentitySequenceOption(defaultIntSize int32) (*descpb.TableDescriptor_SequenceOpts, error)
 }
 
 // ConstraintToUpdate is an interface around a constraint mutation.
@@ -345,6 +426,9 @@ type ConstraintToUpdate interface {
 	// UniqueWithoutIndex returns the underlying unique without index constraint, if
 	// there is one.
 	UniqueWithoutIndex() descpb.UniqueWithoutIndexConstraint
+
+	// GetConstraintID returns the ID for the constraint.
+	GetConstraintID() descpb.ConstraintID
 }
 
 // PrimaryKeySwap is an interface around a primary key swap mutation.
@@ -358,14 +442,14 @@ type PrimaryKeySwap interface {
 	NumOldIndexes() int
 
 	// ForEachOldIndexIDs iterates through each of the old index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachOldIndexIDs(fn func(id descpb.IndexID) error) error
 
 	// NumNewIndexes returns the number of new active indexes to swap in.
 	NumNewIndexes() int
 
 	// ForEachNewIndexIDs iterates through each of the new index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachNewIndexIDs(fn func(id descpb.IndexID) error) error
 
 	// HasLocalityConfig returns true iff the locality config is swapped also.
@@ -399,7 +483,7 @@ type MaterializedViewRefresh interface {
 	AsOf() hlc.Timestamp
 
 	// ForEachIndexID iterates through each of the index IDs.
-	// iterutil.Done is supported.
+	// iterutil.StopIteration is supported.
 	ForEachIndexID(func(id descpb.IndexID) error) error
 
 	// TableWithNewIndexes returns a new TableDescriptor based on the old one
@@ -407,11 +491,19 @@ type MaterializedViewRefresh interface {
 	TableWithNewIndexes(tbl TableDescriptor) TableDescriptor
 }
 
+// ModifyRowLevelTTL is an interface around a modify row level TTL mutation.
+type ModifyRowLevelTTL interface {
+	TableElementMaybeMutation
+
+	// RowLevelTTL returns the row level TTL for the mutation.
+	RowLevelTTL() *catpb.RowLevelTTL
+}
+
 // Partitioning is an interface around an index partitioning.
 type Partitioning interface {
 
 	// PartitioningDesc returns the underlying protobuf descriptor.
-	PartitioningDesc() *descpb.PartitioningDescriptor
+	PartitioningDesc() *catpb.PartitioningDescriptor
 
 	// DeepCopy returns a deep copy of the receiver.
 	DeepCopy() Partitioning
@@ -422,15 +514,15 @@ type Partitioning interface {
 
 	// ForEachPartitionName applies fn on each of the partition names in this
 	// partition and recursively in its subpartitions.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachPartitionName(fn func(name string) error) error
 
 	// ForEachList applies fn on each list element of the wrapped partitioning.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachList(fn func(name string, values [][]byte, subPartitioning Partitioning) error) error
 
 	// ForEachRange applies fn on each range element of the wrapped partitioning.
-	// Supports iterutil.Done.
+	// Supports iterutil.StopIteration.
 	ForEachRange(fn func(name string, from, to []byte) error) error
 
 	// NumColumns is how large of a prefix of the columns in an index are used in
@@ -478,10 +570,7 @@ func ForEachIndex(desc TableDescriptor, opts IndexOpts, f func(idx Index) error)
 			continue
 		}
 		if err := f(idx); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -490,10 +579,7 @@ func ForEachIndex(desc TableDescriptor, opts IndexOpts, f func(idx Index) error)
 func forEachIndex(slice []Index, f func(idx Index) error) error {
 	for _, idx := range slice {
 		if err := f(idx); err != nil {
-			if iterutil.Done(err) {
-				return nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
 	return nil
@@ -512,6 +598,12 @@ func ForEachNonDropIndex(desc TableDescriptor, f func(idx Index) error) error {
 // ForEachPartialIndex is like ForEachIndex over PartialIndexes().
 func ForEachPartialIndex(desc TableDescriptor, f func(idx Index) error) error {
 	return forEachIndex(desc.PartialIndexes(), f)
+}
+
+// ForEachNonPrimaryIndex is like ForEachIndex over
+// NonPrimaryIndexes().
+func ForEachNonPrimaryIndex(desc TableDescriptor, f func(idx Index) error) error {
+	return forEachIndex(desc.NonPrimaryIndexes(), f)
 }
 
 // ForEachPublicNonPrimaryIndex is like ForEachIndex over
@@ -598,10 +690,61 @@ func FindDeletableNonPrimaryIndex(desc TableDescriptor, test func(idx Index) boo
 	return findIndex(desc.DeletableNonPrimaryIndexes(), test)
 }
 
+// FindNonPrimaryIndex returns the first index in
+// NonPrimaryIndex() for which test returns true.
+func FindNonPrimaryIndex(desc TableDescriptor, test func(idx Index) bool) Index {
+	return findIndex(desc.NonPrimaryIndexes(), test)
+}
+
 // FindDeleteOnlyNonPrimaryIndex returns the first index in
 // DeleteOnlyNonPrimaryIndex() for which test returns true.
 func FindDeleteOnlyNonPrimaryIndex(desc TableDescriptor, test func(idx Index) bool) Index {
 	return findIndex(desc.DeleteOnlyNonPrimaryIndexes(), test)
+}
+
+// FindCorrespondingTemporaryIndexByID finds the temporary index that
+// corresponds to the currently mutated index identified by ID. It
+// assumes that the temporary index for a given index ID exists
+// directly after it in the mutations array.
+//
+// Callers should take care that AllocateIDs() has been called before
+// using this function.
+func FindCorrespondingTemporaryIndexByID(desc TableDescriptor, id descpb.IndexID) Index {
+	mutations := desc.AllMutations()
+	var ord int
+	for _, m := range mutations {
+		idx := m.AsIndex()
+		if idx != nil && idx.IndexDesc().ID == id {
+			// We want the mutation after this mutation
+			// since the temporary index is added directly
+			// after.
+			ord = m.MutationOrdinal() + 1
+		}
+	}
+
+	// A temporary index will never be found at index 0 since we
+	// always add them _after_ the index they correspond to.
+	if ord == 0 {
+		return nil
+	}
+
+	if len(mutations) >= ord+1 {
+		candidateMutation := mutations[ord]
+		if idx := candidateMutation.AsIndex(); idx != nil {
+			if idx.IsTemporaryIndexForBackfill() {
+				return idx
+			}
+		}
+	}
+	return nil
+}
+
+// IsCorrespondingTemporaryIndex returns true iff idx is a temporary index
+// created during a backfill and is the corresponding temporary index for
+// otherIdx. It assumes that idx and otherIdx are both indexes from the same
+// table.
+func IsCorrespondingTemporaryIndex(idx Index, otherIdx Index) bool {
+	return idx.IsTemporaryIndexForBackfill() && idx.Ordinal() == otherIdx.Ordinal()+1
 }
 
 // UserDefinedTypeColsHaveSameVersion returns whether one table descriptor's
@@ -669,14 +812,4 @@ func ColumnNeedsBackfill(col Column) bool {
 		return false
 	}
 	return col.HasDefault() || !col.IsNullable() || col.IsComputed()
-}
-
-// HasConcurrentSchemaChanges returns whether the table descriptor is undergoing
-// concurrent schema changes.
-func HasConcurrentSchemaChanges(table TableDescriptor) bool {
-	// TODO(ajwerner): For now we simply check for the absence of mutations. Once
-	// we start implementing schema changes with ops to be executed during
-	// statement execution, we'll have to take into account mutations that were
-	// written in this transaction.
-	return len(table.AllMutations()) > 0
 }

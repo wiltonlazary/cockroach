@@ -42,6 +42,7 @@ func (g *exprsGen) generate(compiled *lang.CompiledExpr, w io.Writer) {
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/opt/props\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/sem/tree\"\n")
+	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/types\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/cockroach/pkg/sql/inverted\"\n")
 	fmt.Fprintf(g.w, "  \"github.com/cockroachdb/errors\"\n")
@@ -87,13 +88,12 @@ func (g *exprsGen) genExprDef(define *lang.DefineExpr) {
 // genExprGroupDef generates the group struct definition for a relational
 // expression, plus its methods:
 //
-//   type selectGroup struct {
-//     mem   *Memo
-//     rel   props.Relational
-//     first SelectExpr
-//     best  bestProps
-//   }
-//
+//	type selectGroup struct {
+//	  mem   *Memo
+//	  rel   props.Relational
+//	  first SelectExpr
+//	  best  bestProps
+//	}
 func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 	if !define.Tags.Contains("Relational") {
 		return
@@ -134,13 +134,12 @@ func (g *exprsGen) genExprGroupDef(define *lang.DefineExpr) {
 
 // genPrivateStruct generates the struct for a define tagged as Private:
 //
-//   type FunctionPrivate struct {
-//     Name       string
-//     Typ        *types.T
-//     Properties *tree.FunctionProperties
-//     Overload   *tree.Overload
-//   }
-//
+//	type FunctionPrivate struct {
+//	  Name       string
+//	  Typ        *types.T
+//	  Properties *tree.FunctionProperties
+//	  Overload   *tree.Overload
+//	}
 func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 	privTyp := g.md.typeOf(define)
 
@@ -166,14 +165,13 @@ func (g *exprsGen) genPrivateStruct(define *lang.DefineExpr) {
 
 // genExprStruct generates the struct type definition for an expression:
 //
-//   type SelectExpr struct {
-//     Input   RelExpr
-//     Filters FiltersExpr
+//	type SelectExpr struct {
+//	  Input   RelExpr
+//	  Filters FiltersExpr
 //
-//     grp  exprGroup
-//     next RelExpr
-//   }
-//
+//	  grp  exprGroup
+//	  next RelExpr
+//	}
 func (g *exprsGen) genExprStruct(define *lang.DefineExpr) {
 	opTyp := g.md.typeOf(define)
 
@@ -232,7 +230,7 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	if define.Tags.Contains("Scalar") {
 		fmt.Fprintf(g.w, "var _ opt.ScalarExpr = &%s{}\n\n", opTyp.name)
 
-		// Generate the ID method.
+		// Generate the Rank method.
 		fmt.Fprintf(g.w, "func (e *%s) Rank() opt.ScalarRank {\n", opTyp.name)
 		if define.Tags.Contains("ListItem") {
 			fmt.Fprintf(g.w, "  panic(errors.AssertionFailedf(\"list items have no rank\"))")
@@ -291,9 +289,9 @@ func (g *exprsGen) genExprFuncs(define *lang.DefineExpr) {
 	// Generate the String method.
 	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
 	if define.Tags.Contains("Scalar") {
-		fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)\n")
+		fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)\n")
 	} else {
-		fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)\n")
+		fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, e.Memo(), nil)\n")
 	}
 	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
 	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
@@ -438,7 +436,7 @@ func (g *exprsGen) genEnforcerFuncs(define *lang.DefineExpr) {
 
 	// Generate the String method.
 	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, e.Memo(), nil)\n")
+	fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, e.Memo(), nil)\n")
 	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
 	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
 	fmt.Fprintf(g.w, "}\n\n")
@@ -518,7 +516,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 	opTyp := g.md.typeOf(define)
 	fmt.Fprintf(g.w, "var _ opt.ScalarExpr = &%s{}\n\n", opTyp.name)
 
-	// Generate the ID method.
+	// Generate the Rank method.
 	fmt.Fprintf(g.w, "func (e *%s) Rank() opt.ScalarRank {\n", opTyp.name)
 	fmt.Fprintf(g.w, "  panic(errors.AssertionFailedf(\"lists have no rank\"))")
 	fmt.Fprintf(g.w, "}\n\n")
@@ -547,7 +545,7 @@ func (g *exprsGen) genListExprFuncs(define *lang.DefineExpr) {
 
 	// Generate the String method.
 	fmt.Fprintf(g.w, "func (e *%s) String() string {\n", opTyp.name)
-	fmt.Fprintf(g.w, "  f := MakeExprFmtCtx(ExprFmtHideQualifications, nil, nil)\n")
+	fmt.Fprintf(g.w, "  f := makeExprFmtCtxForString(ExprFmtHideQualifications, nil, nil)\n")
 	fmt.Fprintf(g.w, "  f.FormatExpr(e)\n")
 	fmt.Fprintf(g.w, "  return f.Buffer.String()\n")
 	fmt.Fprintf(g.w, "}\n\n")

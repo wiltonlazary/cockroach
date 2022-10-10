@@ -15,9 +15,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -45,14 +45,14 @@ func TestReplicationManagerRequiresAdminRole(t *testing.T) {
 	}
 
 	getManagerForUser := func(u string) (streaming.ReplicationStreamManager, error) {
-		sqlUser, err := security.MakeSQLUsernameFromUserInput(u, security.UsernameValidation)
+		sqlUser, err := username.MakeSQLUsernameFromUserInput(u, username.PurposeValidation)
 		require.NoError(t, err)
 		execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
 		txn := kvDB.NewTxn(ctx, "test")
 		p, cleanup := sql.NewInternalPlanner("test", txn, sqlUser, &sql.MemoryMetrics{}, &execCfg, sessionData)
 		defer cleanup()
-		ec := p.(interface{ EvalContext() *tree.EvalContext }).EvalContext()
-		return newReplicationStreamManagerWithPrivilegesCheck(ec)
+		ec := p.(interface{ EvalContext() *eval.Context }).EvalContext()
+		return newReplicationStreamManagerWithPrivilegesCheck(ctx, ec)
 	}
 
 	for _, tc := range []struct {

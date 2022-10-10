@@ -11,9 +11,8 @@
 import React from "react";
 import { Link, RouteComponentProps } from "react-router-dom";
 import { Tooltip } from "antd";
+import "antd/lib/tooltip/style";
 import classNames from "classnames/bind";
-import _ from "lodash";
-
 import { Breadcrumbs } from "src/breadcrumbs";
 import { Dropdown, DropdownOption } from "src/dropdown";
 import { CaretRight } from "src/icon/caretRight";
@@ -24,11 +23,12 @@ import { Pagination, ResultsPerPageLabel } from "src/pagination";
 import {
   ColumnDescriptor,
   ISortedTablePagination,
-  SortSetting,
   SortedTable,
+  SortSetting,
 } from "src/sortedtable";
 import * as format from "src/util/format";
-import { syncHistory } from "../util";
+import { DATE_FORMAT } from "src/util/format";
+import { mvccGarbage, syncHistory } from "../util";
 
 import styles from "./databaseDetailsPage.module.scss";
 import sortableTableStyles from "src/sortedtable/sortedtable.module.scss";
@@ -36,6 +36,9 @@ import {
   baseHeadingClasses,
   statisticsClasses,
 } from "src/transactionsPage/transactionsPageClasses";
+import { Moment } from "moment";
+import { Caution } from "@cockroachlabs/icons";
+import { Anchor } from "../anchor";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
@@ -101,6 +104,11 @@ export interface DatabaseDetailsPageDataTableDetails {
   userCount: number;
   roles: string[];
   grants: string[];
+  statsLastUpdated?: Moment;
+  hasIndexRecommendations: boolean;
+  totalBytes: number;
+  liveBytes: number;
+  livePercentage: number;
 }
 
 export interface DatabaseDetailsPageDataTableStats {
@@ -200,7 +208,7 @@ export class DatabaseDetailsPage extends React.Component<
       return this.props.refreshDatabaseDetails(this.props.name);
     }
 
-    _.forEach(this.props.tables, table => {
+    this.props.tables.forEach(table => {
       if (!table.details.loaded && !table.details.loading) {
         return this.props.refreshTableDetails(this.props.name, table.name);
       }
@@ -256,9 +264,25 @@ export class DatabaseDetailsPage extends React.Component<
     }
   }
 
-  private columnsForTablesViewMode(): ColumnDescriptor<
-    DatabaseDetailsPageDataTable
-  >[] {
+  formatMVCCInfo = (
+    details: DatabaseDetailsPageDataTableDetails,
+  ): React.ReactElement => {
+    return (
+      <>
+        <p className={cx("multiple-lines-info")}>
+          {format.Percentage(details.livePercentage, 1, 1)}
+        </p>
+        <p className={cx("multiple-lines-info")}>
+          <span className={cx("bold")}>{format.Bytes(details.liveBytes)}</span>{" "}
+          live data /{" "}
+          <span className={cx("bold")}>{format.Bytes(details.totalBytes)}</span>
+          {" total"}
+        </p>
+      </>
+    );
+  };
+
+  private columnsForTablesViewMode(): ColumnDescriptor<DatabaseDetailsPageDataTable>[] {
     return [
       {
         title: (
@@ -283,7 +307,7 @@ export class DatabaseDetailsPage extends React.Component<
         title: (
           <Tooltip
             placement="bottom"
-            title="The approximate total disk size across all replicas of the table."
+            title="The approximate compressed total disk size across all replicas of the table."
           >
             Replication Size
           </Tooltip>
@@ -330,7 +354,22 @@ export class DatabaseDetailsPage extends React.Component<
             Indexes
           </Tooltip>
         ),
-        cell: table => table.details.indexCount,
+        cell: table => {
+          if (table.details.hasIndexRecommendations) {
+            return (
+              <div className={cx("icon__container")}>
+                <Tooltip
+                  placement="bottom"
+                  title="This table has index recommendations. Click the table name to see more details."
+                >
+                  <Caution className={cx("icon--s", "icon--warning")} />
+                </Tooltip>
+                {table.details.indexCount}
+              </div>
+            );
+          }
+          return table.details.indexCount;
+        },
         sort: table => table.details.indexCount,
         className: cx("database-table__col-index-count"),
         name: "indexCount",
@@ -339,7 +378,7 @@ export class DatabaseDetailsPage extends React.Component<
         title: (
           <Tooltip
             placement="bottom"
-            title="Regions/nodes on which the table data is stored."
+            title="Regions/Nodes on which the table data is stored."
           >
             Regions
           </Tooltip>
@@ -351,12 +390,50 @@ export class DatabaseDetailsPage extends React.Component<
         showByDefault: this.props.showNodeRegionsColumn,
         hideIfTenant: true,
       },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title={
+              <div className={cx("tooltip__table--title")}>
+                {"% of total uncompressed logical data that has not been modified (updated or deleted). " +
+                  "A low percentage can cause statements to scan more data ("}
+                <Anchor href={mvccGarbage} target="_blank">
+                  MVCC values
+                </Anchor>
+                {") than required, which can reduce performance."}
+              </div>
+            }
+          >
+            % of Live Data
+          </Tooltip>
+        ),
+        cell: table => this.formatMVCCInfo(table.details),
+        sort: table => table.details.livePercentage,
+        className: cx("database-table__col-column-count"),
+        name: "livePercentage",
+      },
+      {
+        title: (
+          <Tooltip
+            placement="bottom"
+            title="The last time table statistics were created or updated."
+          >
+            Table Stats Last Updated (UTC)
+          </Tooltip>
+        ),
+        cell: table =>
+          !table.details.statsLastUpdated
+            ? "No table statistics found"
+            : table.details.statsLastUpdated.format(DATE_FORMAT),
+        sort: table => table.details.statsLastUpdated,
+        className: cx("database-table__col--table-stats"),
+        name: "tableStatsUpdated",
+      },
     ];
   }
 
-  private columnsForGrantsViewMode(): ColumnDescriptor<
-    DatabaseDetailsPageDataTable
-  >[] {
+  private columnsForGrantsViewMode(): ColumnDescriptor<DatabaseDetailsPageDataTable>[] {
     return [
       {
         title: (
@@ -394,8 +471,8 @@ export class DatabaseDetailsPage extends React.Component<
             Roles
           </Tooltip>
         ),
-        cell: table => _.join(table.details.roles, ", "),
-        sort: table => _.join(table.details.roles, ", "),
+        cell: table => table.details.roles.join(", "),
+        sort: table => table.details.roles.join(", "),
         className: cx("database-table__col-roles"),
         name: "roles",
       },
@@ -405,8 +482,8 @@ export class DatabaseDetailsPage extends React.Component<
             Grants
           </Tooltip>
         ),
-        cell: table => _.join(table.details.grants, ", "),
-        sort: table => _.join(table.details.grants, ", "),
+        cell: table => table.details.grants.join(", "),
+        sort: table => table.details.grants.join(", "),
         className: cx("database-table__col-grants"),
         name: "grants",
       },

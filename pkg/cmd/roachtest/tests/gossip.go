@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func registerGossip(r registry.Registry) {
@@ -43,7 +44,8 @@ func registerGossip(r registry.Registry) {
 		startOpts := option.DefaultStartOpts()
 		startOpts.RoachprodOpts.ExtraArgs = append(startOpts.RoachprodOpts.ExtraArgs, "--vmodule=*=1")
 		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.All())
-		WaitFor3XReplication(t, c.Conn(ctx, t.L(), 1))
+		err := WaitFor3XReplication(ctx, t, c.Conn(ctx, t.L(), 1))
+		require.NoError(t, err)
 
 		// TODO(irfansharif): We could also look at gossip_liveness to determine
 		// cluster membership as seen by each gossip module, and ensure each
@@ -58,7 +60,7 @@ SELECT string_agg(source_id::TEXT || ':' || target_id::TEXT, ',')
 			db := c.Conn(ctx, t.L(), node)
 			defer db.Close()
 			var s gosql.NullString
-			if err := db.QueryRow(query).Scan(&s); err != nil {
+			if err = db.QueryRow(query).Scan(&s); err != nil {
 				t.Fatal(err)
 			}
 			if s.Valid {
@@ -216,7 +218,7 @@ func (gossipUtil) hasPeers(expected int) checkGossipFunc {
 	return func(infos map[string]gossip.Info) error {
 		count := 0
 		for k := range infos {
-			if strings.HasPrefix(k, gossip.KeyNodeIDPrefix) {
+			if strings.HasPrefix(k, gossip.KeyNodeDescPrefix) {
 				count++
 			}
 		}
@@ -355,9 +357,7 @@ func runGossipRestartNodeOne(ctx context.Context, t test.Test, c cluster.Cluster
 	settings := install.MakeClusterSettings(install.NumRacksOption(c.Spec().NodeCount))
 	settings.Env = append(settings.Env, "COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
 
-	startOpts := option.DefaultStartOpts()
-	startOpts.RoachprodOpts.EncryptedStores = false
-	c.Start(ctx, t.L(), startOpts, settings)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings)
 
 	db := c.Conn(ctx, t.L(), 1)
 	defer db.Close()
@@ -409,10 +409,6 @@ func runGossipRestartNodeOne(ctx context.Context, t test.Test, c cluster.Cluster
 	run(`ALTER DATABASE system %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
 	run(`ALTER RANGE meta %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
 	run(`ALTER RANGE liveness %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
-	// TODO(andrei): Changing the constraints for the system tables shouldn't be
-	// needed given that we've changed them for the system zone. What's going on?
-	// #40921.
-	run(`ALTER TABLE system.jobs %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
 	if t.IsBuildVersion("v19.2.0") {
 		run(`ALTER TABLE system.replication_stats %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
 		run(`ALTER TABLE system.replication_constraint_stats %[1]s CONFIGURE ZONE %[2]s 'constraints: {"-rack=0"}'`)
@@ -466,7 +462,7 @@ SELECT count(replicas)
 	// incoming gossip info in order to determine where range 1 is.
 	settings = install.MakeClusterSettings()
 	settings.Env = append(settings.Env, "COCKROACH_SCAN_MAX_IDLE_TIME=5ms")
-	c.Start(ctx, t.L(), startOpts, settings, c.Range(2, c.Spec().NodeCount))
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.Range(2, c.Spec().NodeCount))
 
 	// We need to override DB connection creation to use the correct port for
 	// node 1. This is more complicated than it should be and a limitation of the

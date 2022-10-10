@@ -24,18 +24,44 @@ type evalContext struct {
 	db *Database
 	ri ResultIterator
 
-	facts      []fact
-	depth, cur int
-	slots      []slot
+	facts []fact
+
+	// depth and cur relate to the join depth in the entities list.
+	depth, cur queryDepth
+
+	slots             []slot
+	filterSliceCaches map[int][]reflect.Value
+	curSubQuery       int
 }
 
 func newEvalContext(q *Query) *evalContext {
 	return &evalContext{
 		q:     q,
-		depth: len(q.entities),
-		slots: append(make([]slot, 0, len(q.slots)), q.slots...),
+		depth: queryDepth(len(q.entities)),
+		slots: cloneSlots(q.slots),
 		facts: q.facts,
 	}
+}
+
+// cloneSlots clones the slots of a query for use in an evalContext.
+func cloneSlots(slots []slot) []slot {
+	clone := append(make([]slot, 0, len(slots)), slots...)
+	for i := range clone {
+		// If there are any slots which map to a set of allowed values, we need
+		// to clone those values because during query evaluation, we'll fill in
+		// inline values in the context of the current entity set. This matters
+		// in particular for constraints related to entities or strings; their
+		// inline values depend on the entitySet.
+		if clone[i].any != nil {
+			vals := clone[i].any
+			clone[i].any = append(make([]typedValue, 0, len(vals)), vals...)
+		}
+		if clone[i].not != nil {
+			cloned := *clone[i].not
+			clone[i].not = &cloned
+		}
+	}
+	return clone
 }
 
 type evalResult evalContext
@@ -71,7 +97,14 @@ func (ec *evalContext) Iterate(db *Database, ri ResultIterator) error {
 // filters and pass along the result or that we need to go on and
 // join the next entity.
 func (ec *evalContext) iterateNext() error {
-
+	nextSubQuery, done, err := ec.maybeVisitSubqueries()
+	if done || err != nil {
+		return err
+	}
+	if curSubQuery := ec.curSubQuery; nextSubQuery != curSubQuery {
+		defer func() { ec.curSubQuery = curSubQuery }()
+		ec.curSubQuery = nextSubQuery
+	}
 	// We're at the bottom of the iteration, check if all conditions have
 	// been satisfied, and then invoke the iterator.
 	if ec.cur == ec.depth {
@@ -90,29 +123,40 @@ func (ec *evalContext) iterateNext() error {
 	// If there exists an any clause, which forms a disjunction, over some
 	// attribute for the next entity, iterate independently over each of the
 	// values.
-	where, anyAttr, anyValues := ec.buildWhere()
-	defer putValues(where)
+	where, hasAttrs, anyAttr, anyValues, err := ec.buildWhere()
+	if err != nil {
+		return err
+	}
 	if len(anyValues) > 0 {
-		for _, v := range anyValues {
-			where.add(anyAttr, v.value)
-			if err := ec.db.iterate(where, ec); err != nil {
+		for i := range anyValues {
+			// Interact with the slice directly in order to potentially set
+			// the inline value.
+			v := &anyValues[i]
+			iv, err := v.inlineValue(&ec.db.entitySet, anyAttr)
+			if err != nil {
+				return err
+			}
+			if !where.add(anyAttr, iv) {
+				return errors.AssertionFailedf(
+					"failed to create predicate with more than %d attributes", numAttrs,
+				)
+			}
+			if err := ec.db.iterate(where, hasAttrs, ec); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	// If there's no anyValues, directly iterate the database.
-	return ec.db.iterate(where, ec)
+	return ec.db.iterate(where, hasAttrs, ec)
 }
 
-func (ec *evalContext) visit(e *entity) error {
+func (ec *evalContext) visit(e entity) error {
 	// Keep track of which slots were filled as part of this step in the
 	// evaluation and then unset them when we pop out of this stack frame.
 	var slotsFilled util.FastIntSet
 	defer func() {
-		slotsFilled.ForEach(func(i int) {
-			ec.slots[i].typedValue = typedValue{}
-		})
+		slotsFilled.ForEach(func(i int) { ec.slots[i].reset() })
 	}()
 
 	// Fill in the slot corresponding to this entity. It should not be filled
@@ -121,8 +165,8 @@ func (ec *evalContext) visit(e *entity) error {
 	if foundContradiction := maybeSet(
 		ec.slots, ec.q.entities[ec.cur],
 		typedValue{
-			typ:   e.getTypeInfo(ec.db.Schema()).typ,
-			value: e.getComparableValue(ec.db.schema, Self),
+			typ:   e.getTypeInfo(&ec.db.entitySet).typ,
+			value: e.getSelf(&ec.db.entitySet),
 		},
 		&slotsFilled,
 	); foundContradiction {
@@ -139,7 +183,7 @@ func (ec *evalContext) visit(e *entity) error {
 				continue
 			}
 
-			tv, ok := e.getTypedValue(ec.db.schema, f.attr)
+			tv, ok := e.getTypedValue(&ec.db.entitySet, f.attr)
 			if !ok {
 				return true // we have no value for this attribute, contradiction
 			}
@@ -182,45 +226,60 @@ func (ec *evalContext) haveUnboundSlots() bool {
 }
 
 func (ec *evalContext) checkFilters() (done bool) {
-	for _, f := range ec.q.filters {
-		// TODO(ajwerner): Catch panics here and convert them to errors.
-		ins := make([]reflect.Value, len(f.input))
-		insI := make([]interface{}, len(f.input))
-		for i, idx := range f.input {
-			inI := ec.slots[idx].typedValue.toInterface()
-			in := reflect.ValueOf(inI)
-			// Note that this will enforce that the type of the input to the filter
-			// matches the expectation by omitting results of the wrong type. This
-			// may or may not be the right behavior.
-			//
-			// TODO(ajwerner): Enforce the typing at a lower layer. See the TODO
-			// where this filter was built.
-			inType := f.predicate.Type().In(i)
-			if in.Type() != inType {
-				if in.Type().ConvertibleTo(inType) {
-					in = in.Convert(inType)
-				} else {
-					return true
-				}
-			}
-			ins[i] = in
-			insI[i] = inI
-		}
-		outs := f.predicate.Call(ins)
-		if !outs[0].Bool() {
+	for i := range ec.q.filters {
+		if done = ec.checkFilter(i); done {
 			return true
 		}
 	}
 	return false
 }
 
+func (ec *evalContext) checkFilter(i int) bool {
+	f := ec.q.filters[i]
+	ins := ec.getFilterInput(i)
+	defer func() {
+		for i := range f.input {
+			ins[i] = reflect.Value{}
+		}
+	}()
+	for i, idx := range f.input {
+		inI := ec.slots[idx].typedValue.toInterface()
+		in := reflect.ValueOf(inI)
+		// Note that this will enforce that the type of the input to the filter
+		// matches the expectation by omitting results of the wrong type. This
+		// may or may not be the right behavior.
+		//
+		// TODO(ajwerner): Enforce the typing at a lower layer. See the TODO
+		// where this filter was built.
+		inType := f.predicate.Type().In(i)
+		if in.Type() != inType {
+			if in.Type().ConvertibleTo(inType) {
+				in = in.Convert(inType)
+			} else {
+				return true
+			}
+		}
+		ins[i] = in
+	}
+	// TODO(ajwerner): Catch panics here and convert them to errors.
+	outs := f.predicate.Call(ins)
+	return !outs[0].Bool()
+}
+
 // Construct a where clause with all the bound values known for the next
 // entity in the join. In the face of an existing any clause for the current
 // entity, the corresponding attribute and values will be returned for use
 // breaking the disjunction into separate indexed searches for each value.
-func (ec *evalContext) buildWhere() (where *valuesMap, anyAttr ordinal, anyValues []typedValue) {
-	where = getValues()
-
+func (ec *evalContext) buildWhere() (
+	where values,
+	hasAttrs ordinalSet,
+	anyAttr ordinal,
+	anyValues []typedValue,
+	_ error,
+) {
+	hasAttrs = hasAttrs.
+		add(ec.db.schema.typeOrdinal).
+		add(ec.db.schema.selfOrdinal)
 	// The logic here is that if there's an any for a slotIdx with a fact for the
 	// current entity, maybe we want to use it to bound our search. In general,
 	// it will help if we have an index that covers the current facts plus this
@@ -233,14 +292,22 @@ func (ec *evalContext) buildWhere() (where *valuesMap, anyAttr ordinal, anyValue
 		if f.variable != ec.q.entities[ec.cur] {
 			continue
 		}
-		s := ec.slots[f.value]
-		if !s.empty() {
-			where.add(f.attr, s.value)
+		hasAttrs = hasAttrs.add(f.attr)
+		if s := &ec.slots[f.value]; !s.empty() {
+			p, err := s.inlineValue(&ec.db.entitySet, f.attr)
+			if err != nil {
+				return values{}, 0, 0, nil, err
+			}
+			if !where.add(f.attr, p) {
+				return values{}, 0, 0, nil, errors.AssertionFailedf(
+					"failed to create predicate with more than %d attributes", numAttrs,
+				)
+			}
 		} else if anyValues == nil && s.any != nil {
 			anyAttr, anyValues = f.attr, s.any
 		}
 	}
-	return where, anyAttr, anyValues
+	return where, hasAttrs, anyAttr, anyValues, nil
 }
 
 // unify is like unifyReturningContradiction but it does not return the fact.
@@ -316,7 +383,7 @@ func (ec *evalContext) maybeVisitAlreadyBoundEntity() (done bool, _ error) {
 	if s.empty() {
 		return false, nil
 	}
-	e, ok := ec.db.entities[s.value]
+	eid, ok := ec.db.hash[s.value]
 
 	// This is the case where we've somehow bound the entity to a
 	// value that does not exist in the database. This could happen
@@ -327,5 +394,83 @@ func (ec *evalContext) maybeVisitAlreadyBoundEntity() (done bool, _ error) {
 	if !ok {
 		return true, nil // contradiction
 	}
-	return true, ec.visit(e)
+	return true, ec.visit(ec.db.entities[eid])
 }
+
+func (ec *evalContext) getFilterInput(i int) (ins []reflect.Value) {
+	if ec.filterSliceCaches == nil {
+		ec.filterSliceCaches = make(map[int][]reflect.Value)
+	}
+	c, ok := ec.filterSliceCaches[i]
+	if !ok {
+		c = make([]reflect.Value, len(ec.q.filters[i].input))
+		ec.filterSliceCaches[i] = c
+	}
+	return c
+}
+
+func (ec *evalContext) maybeVisitSubqueries() (nextSubQuery int, done bool, error error) {
+	nextSubQuery = ec.curSubQuery
+	for nextSubQuery < len(ec.q.notJoins) &&
+		ec.q.notJoins[nextSubQuery].depth <= ec.cur {
+		if done, err := ec.visitSubquery(nextSubQuery); done || err != nil {
+			return ec.curSubQuery, done, err
+		}
+		nextSubQuery++
+	}
+	return nextSubQuery, false, nil
+}
+
+func (ec *evalContext) visitSubquery(query int) (done bool, _ error) {
+	sub := ec.q.notJoins[query]
+	sec := sub.query.getEvalContext()
+	defer sub.query.putEvalContext(sec)
+	defer func() { // reset the slots populated to run the subquery
+		sub.inputSlotMappings.ForEach(func(_, subSlot int) {
+			sec.slots[subSlot].reset()
+		})
+	}()
+	if err := ec.bindSubQuerySlots(sub.inputSlotMappings, sec); err != nil {
+		return false, err
+	}
+	err := sec.Iterate(ec.db, func(r Result) error {
+		return errResultSetNotEmpty
+	})
+	switch {
+	case err == nil:
+		return false, nil
+	case errors.Is(err, errResultSetNotEmpty):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
+func (ec *evalContext) bindSubQuerySlots(mapping util.FastIntMap, sec *evalContext) (err error) {
+	mapping.ForEach(func(src, dst int) {
+		if err != nil {
+			return
+		}
+		if ec.slots[src].empty() {
+			// TODO(ajwerner): Find a way to prove statically that this cannot
+			// happen and make it an assertion failure.
+			err = errors.Errorf(
+				"subquery invocation references unbound variable %q",
+				ec.findSlotVariable(src),
+			)
+		}
+		sec.slots[dst].typedValue = ec.slots[src].typedValue
+	})
+	return err
+}
+
+func (ec *evalContext) findSlotVariable(src int) Var {
+	for v, slot := range ec.q.variableSlots {
+		if src == int(slot) {
+			return v
+		}
+	}
+	return ""
+}
+
+var errResultSetNotEmpty = errors.New("result set not empty")

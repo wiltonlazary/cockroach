@@ -12,9 +12,11 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 )
 
@@ -40,12 +42,16 @@ type CheckpointToken []byte
 // Client provides a way for the stream ingestion job to consume a
 // specified stream.
 // TODO(57427): The stream client does not yet support the concept of
-//  generations in a stream.
+//
+//	generations in a stream.
 type Client interface {
 	// Create initializes a stream with the source, potentially reserving any
 	// required resources, such as protected timestamps, and returns an ID which
 	// can be used to interact with this stream in the future.
 	Create(ctx context.Context, tenantID roachpb.TenantID) (streaming.StreamID, error)
+
+	// Dial checks if the source is able to be connected to for queries
+	Dial(ctx context.Context) error
 
 	// Destroy informs the source of the stream that it may terminate production
 	// and release resources such as protected timestamps.
@@ -55,7 +61,11 @@ type Client interface {
 	// that source cluster protected timestamp _may_ be advanced up to the passed ts
 	// (which may be zero if no progress has been made e.g. during backfill).
 	// TODO(dt): ts -> checkpointToken.
-	Heartbeat(ctx context.Context, streamID streaming.StreamID, consumed hlc.Timestamp) error
+	Heartbeat(
+		ctx context.Context,
+		streamID streaming.StreamID,
+		consumed hlc.Timestamp,
+	) (streampb.StreamReplicationStatus, error)
 
 	// Plan returns a Topology for this stream.
 	// TODO(dt): separate target argument from address argument.
@@ -73,12 +83,24 @@ type Client interface {
 	) (Subscription, error)
 
 	// Close releases all the resources used by this client.
-	Close() error
+	Close(ctx context.Context) error
+
+	// Complete completes a replication stream consumption.
+	Complete(ctx context.Context, streamID streaming.StreamID, successfulIngestion bool) error
 }
 
 // Topology is a configuration of stream partitions. These are particular to a
 // stream. It specifies the number and addresses of partitions of the stream.
 type Topology []PartitionInfo
+
+// StreamAddresses returns the list of source addresses in a topology
+func (t Topology) StreamAddresses() []string {
+	var addresses []string
+	for _, partition := range t {
+		addresses = append(addresses, string(partition.SrcAddr))
+	}
+	return addresses
+}
 
 // PartitionInfo describes a partition of a replication stream, i.e. a set of key
 // spans in a source cluster in which changes will be emitted.
@@ -88,6 +110,7 @@ type PartitionInfo struct {
 	SrcInstanceID int
 	SrcAddr       streamingccl.PartitionAddress
 	SrcLocality   roachpb.Locality
+	Spans         []roachpb.Span
 }
 
 // Subscription represents subscription to a replication stream partition.
@@ -113,9 +136,10 @@ type Subscription interface {
 	Err() error
 }
 
-// NewStreamClient creates a new stream client based on the stream
-// address.
-func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
+// NewStreamClient creates a new stream client based on the stream address.
+func NewStreamClient(
+	ctx context.Context, streamAddress streamingccl.StreamAddress,
+) (Client, error) {
 	var streamClient Client
 	streamURL, err := streamAddress.URL()
 	if err != nil {
@@ -126,7 +150,7 @@ func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
 	case "postgres", "postgresql":
 		// The canonical PostgreSQL URL scheme is "postgresql", however our
 		// own client commands also accept "postgres".
-		return newPGWireReplicationClient(streamURL)
+		return newPartitionedStreamClient(ctx, streamURL)
 	case RandomGenScheme:
 		streamClient, err = newRandomStreamClient(streamURL)
 		if err != nil {
@@ -137,6 +161,28 @@ func NewStreamClient(streamAddress streamingccl.StreamAddress) (Client, error) {
 	}
 
 	return streamClient, nil
+}
+
+// GetFirstActiveClient iterates through each provided stream address
+// and returns the first client it's able to successfully Dial.
+func GetFirstActiveClient(ctx context.Context, streamAddresses []string) (Client, error) {
+	var combinedError error = nil
+	for _, address := range streamAddresses {
+		streamAddress := streamingccl.StreamAddress(address)
+		client, err := NewStreamClient(ctx, streamAddress)
+		if err == nil {
+			err = client.Dial(ctx)
+			if err == nil {
+				return client, err
+			}
+		}
+
+		// Note the failure and attempt the next address
+		log.Errorf(ctx, "failed to connect to address %s: %s", streamAddress, err.Error())
+		combinedError = errors.CombineErrors(combinedError, err)
+	}
+
+	return nil, errors.Wrap(combinedError, "failed to connect to any partition address")
 }
 
 /*

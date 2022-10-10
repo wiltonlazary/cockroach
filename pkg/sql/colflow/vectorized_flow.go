@@ -13,8 +13,6 @@ package colflow
 import (
 	"context"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
@@ -34,9 +33,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow/colrpc"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -46,46 +51,99 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 	"github.com/marusama/semaphore"
 )
 
-// countingSemaphore is a semaphore that keeps track of the semaphore count from
-// its perspective.
-// Note that it effectively implements the execinfra.Releasable interface but
-// due to the method name conflict doesn't.
-type countingSemaphore struct {
+// fdCountingSemaphore is a semaphore that keeps track of the number of file
+// descriptors currently used by the vectorized engine.
+//
+// Note that it effectively implements the execreleasable.Releasable interface
+// but due to the method name conflict doesn't.
+type fdCountingSemaphore struct {
 	semaphore.Semaphore
-	globalCount *metric.Gauge
-	count       int64
+	globalCount       *metric.Gauge
+	count             int64
+	acquireMaxRetries int
 }
 
-var countingSemaphorePool = sync.Pool{
+var fdCountingSemaphorePool = sync.Pool{
 	New: func() interface{} {
-		return &countingSemaphore{}
+		return &fdCountingSemaphore{}
 	},
 }
 
-func newCountingSemaphore(sem semaphore.Semaphore, globalCount *metric.Gauge) *countingSemaphore {
-	s := countingSemaphorePool.Get().(*countingSemaphore)
+func newFDCountingSemaphore(
+	sem semaphore.Semaphore, globalCount *metric.Gauge, sv *settings.Values,
+) *fdCountingSemaphore {
+	s := fdCountingSemaphorePool.Get().(*fdCountingSemaphore)
 	s.Semaphore = sem
 	s.globalCount = globalCount
+	s.acquireMaxRetries = int(fdCountingSemaphoreMaxRetries.Get(sv))
 	return s
 }
 
-func (s *countingSemaphore) Acquire(ctx context.Context, n int) error {
-	if err := s.Semaphore.Acquire(ctx, n); err != nil {
-		return err
+var errAcquireTimeout = pgerror.New(
+	pgcode.ConfigurationLimitExceeded,
+	"acquiring of file descriptors timed out, consider increasing "+
+		"COCKROACH_VEC_MAX_OPEN_FDS environment variable",
+)
+
+var fdCountingSemaphoreMaxRetries = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"sql.distsql.acquire_vec_fds.max_retries",
+	"determines the number of retries performed during the acquisition of "+
+		"file descriptors needed for disk-spilling operations, set to 0 for "+
+		"unlimited retries",
+	8,
+	settings.NonNegativeInt,
+)
+
+func (s *fdCountingSemaphore) Acquire(ctx context.Context, n int) error {
+	if s.TryAcquire(n) {
+		return nil
 	}
-	atomic.AddInt64(&s.count, int64(n))
-	s.globalCount.Inc(int64(n))
-	return nil
+	// Currently there is not enough capacity in the semaphore to acquire the
+	// desired number, so we set up a retry loop that exponentially backs off,
+	// until either the semaphore opens up or we time out (most likely due to a
+	// deadlock).
+	//
+	// The latter situation is possible when multiple queries already hold some
+	// of the quota and each of them needs more to proceed resulting in a
+	// deadlock. We get out of such a deadlock by randomly erroring out one of
+	// the queries (which would release some quota back to the semaphore) making
+	// it possible for other queries to proceed.
+	//
+	// Note that we've already tried to acquire the quota above (which failed),
+	// so the initial backoff time of 100ms seems ok (we are spilling to disk
+	// after all, so the query is likely to experience significant latency). The
+	// current choice of options is such that we'll spend on the order of 25s
+	// in the retry loop before timing out with the default value of the
+	// 'sql.distsql.acquire_vec_fds.max_retries' cluster settings.
+	opts := retry.Options{
+		InitialBackoff:      100 * time.Millisecond,
+		Multiplier:          2.0,
+		RandomizationFactor: 0.25,
+		MaxRetries:          s.acquireMaxRetries,
+	}
+	for r := retry.StartWithCtx(ctx, opts); r.Next(); {
+		if s.TryAcquire(n) {
+			return nil
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	log.Warning(ctx, "acquiring of file descriptors for disk-spilling timed out")
+	return errAcquireTimeout
 }
 
-func (s *countingSemaphore) TryAcquire(n int) bool {
+func (s *fdCountingSemaphore) TryAcquire(n int) bool {
 	success := s.Semaphore.TryAcquire(n)
 	if !success {
 		return false
@@ -95,7 +153,7 @@ func (s *countingSemaphore) TryAcquire(n int) bool {
 	return success
 }
 
-func (s *countingSemaphore) Release(n int) int {
+func (s *fdCountingSemaphore) Release(n int) int {
 	atomic.AddInt64(&s.count, int64(-n))
 	s.globalCount.Dec(int64(n))
 	return s.Semaphore.Release(n)
@@ -104,12 +162,12 @@ func (s *countingSemaphore) Release(n int) int {
 // ReleaseToPool should be named Release and should implement the
 // execinfra.Releasable interface, but that would lead to a conflict with
 // semaphore.Semaphore.Release method.
-func (s *countingSemaphore) ReleaseToPool() {
+func (s *fdCountingSemaphore) ReleaseToPool() {
 	if unreleased := atomic.LoadInt64(&s.count); unreleased != 0 {
 		colexecerror.InternalError(errors.Newf("unexpectedly %d count on the semaphore when releasing it to the pool", unreleased))
 	}
-	*s = countingSemaphore{}
-	countingSemaphorePool.Put(s)
+	*s = fdCountingSemaphore{}
+	fdCountingSemaphorePool.Put(s)
 }
 
 type vectorizedFlow struct {
@@ -128,7 +186,7 @@ type vectorizedFlow struct {
 	// of the number of resources held in a semaphore.Semaphore requested from the
 	// context of this flow so that these can be released unconditionally upon
 	// Cleanup.
-	countingSemaphore *countingSemaphore
+	countingSemaphore *fdCountingSemaphore
 
 	tempStorage struct {
 		syncutil.Mutex
@@ -156,7 +214,7 @@ type vectorizedFlow struct {
 }
 
 var _ flowinfra.Flow = &vectorizedFlow{}
-var _ execinfra.Releasable = &vectorizedFlow{}
+var _ execreleasable.Releasable = &vectorizedFlow{}
 
 var vectorizedFlowPool = sync.Pool{
 	New: func() interface{} {
@@ -174,7 +232,7 @@ func NewVectorizedFlow(base *flowinfra.FlowBase) flowinfra.Flow {
 // Setup is part of the flowinfra.Flow interface.
 func (f *vectorizedFlow) Setup(
 	ctx context.Context, spec *execinfrapb.FlowSpec, opt flowinfra.FuseOpt,
-) (context.Context, execinfra.OpChains, error) {
+) (context.Context, execopnode.OpChains, error) {
 	var err error
 	ctx, _, err = f.FlowBase.Setup(ctx, spec, opt)
 	if err != nil {
@@ -182,21 +240,24 @@ func (f *vectorizedFlow) Setup(
 	}
 	log.VEvent(ctx, 2, "setting up vectorized flow")
 	recordingStats := false
-	if execinfra.ShouldCollectStats(ctx, &f.FlowCtx) {
+	if execstats.ShouldCollectStats(ctx, f.FlowCtx.CollectStats) {
 		recordingStats = true
 	}
 	helper := newVectorizedFlowCreatorHelper(f.FlowBase)
 
 	diskQueueCfg := colcontainer.DiskQueueCfg{
-		FS:             f.Cfg.TempFS,
-		DistSQLMetrics: f.Cfg.Metrics,
-		GetPather:      f,
+		FS:                  f.Cfg.TempFS,
+		GetPather:           f,
+		SpilledBytesWritten: f.Cfg.Metrics.SpilledBytesWritten,
+		SpilledBytesRead:    f.Cfg.Metrics.SpilledBytesRead,
 	}
 	if err := diskQueueCfg.EnsureDefaults(); err != nil {
 		return ctx, nil, err
 	}
-	f.countingSemaphore = newCountingSemaphore(f.Cfg.VecFDSemaphore, f.Cfg.Metrics.VecOpenFDs)
 	flowCtx := f.GetFlowCtx()
+	f.countingSemaphore = newFDCountingSemaphore(
+		f.Cfg.VecFDSemaphore, f.Cfg.Metrics.VecOpenFDs, &flowCtx.EvalCtx.Settings.SV,
+	)
 	f.creator = newVectorizedFlowCreator(
 		helper,
 		vectorizedRemoteComponentCreator{},
@@ -205,11 +266,11 @@ func (f *vectorizedFlow) Setup(
 		f.GetWaitGroup(),
 		f.GetRowSyncFlowConsumer(),
 		f.GetBatchSyncFlowConsumer(),
-		flowCtx.Cfg.NodeDialer,
+		flowCtx.Cfg.PodNodeDialer,
 		f.GetID(),
 		diskQueueCfg,
 		f.countingSemaphore,
-		flowCtx.NewTypeResolver(flowCtx.EvalCtx.Txn),
+		flowCtx.NewTypeResolver(flowCtx.Txn),
 		f.FlowBase.GetAdmissionInfo(),
 	)
 	if f.testingKnobs.onSetupFlow != nil {
@@ -279,6 +340,11 @@ func (f *vectorizedFlow) GetPath(ctx context.Context) string {
 	if err := f.Cfg.TempFS.MkdirAll(f.tempStorage.path); err != nil {
 		colexecerror.InternalError(errors.Wrap(err, "unable to create temporary storage directory"))
 	}
+	// We have just created the temporary directory which will be used for all
+	// disk-spilling operations of this flow, thus, it is a convenient place to
+	// increment the counter of the number of queries spilled - this code won't
+	// be executed for this flow in the future since we short-circuit above.
+	f.Cfg.Metrics.QueriesSpilled.Inc(1)
 	return f.tempStorage.path
 }
 
@@ -404,7 +470,7 @@ func (s *vectorizedFlowCreator) wrapWithNetworkVectorizedStatsCollector(
 func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 	flowCtx *execinfra.FlowCtx,
 	statsCollectors []colexecop.VectorizedStatsCollector,
-	originNodeID roachpb.NodeID,
+	originSQLInstanceID base.SQLInstanceID,
 ) func() []*execinfrapb.ComponentStats {
 	if !s.recordingStats {
 		return nil
@@ -424,9 +490,9 @@ func (s *vectorizedFlowCreator) makeGetStatsFnForOutbox(
 			// whole flow from parent monitors. These stats are added to a
 			// flow-level span.
 			result = append(result, &execinfrapb.ComponentStats{
-				Component: execinfrapb.FlowComponentID(base.SQLInstanceID(originNodeID), flowCtx.ID),
+				Component: execinfrapb.FlowComponentID(originSQLInstanceID, flowCtx.ID),
 				FlowStats: execinfrapb.FlowStats{
-					MaxMemUsage:  optional.MakeUint(uint64(flowCtx.EvalCtx.Mon.MaximumBytes())),
+					MaxMemUsage:  optional.MakeUint(uint64(flowCtx.Mon.MaximumBytes())),
 					MaxDiskUsage: optional.MakeUint(uint64(flowCtx.DiskMonitor.MaximumBytes())),
 				},
 			})
@@ -441,7 +507,7 @@ type runFn func(_ context.Context, flowCtxCancel context.CancelFunc)
 // infrastructure to be run asynchronously as well as to perform some sanity
 // checks.
 type flowCreatorHelper interface {
-	execinfra.Releasable
+	execreleasable.Releasable
 	// addStreamEndpoint stores information about an inbound stream.
 	addStreamEndpoint(execinfrapb.StreamID, *colrpc.Inbox, *sync.WaitGroup)
 	// checkInboundStreamID checks that the provided stream ID has not been seen
@@ -528,7 +594,7 @@ type vectorizedFlowCreator struct {
 	recordingStats    bool
 	isGatewayNode     bool
 	waitGroup         *sync.WaitGroup
-	nodeDialer        *nodedialer.Dialer
+	podNodeDialer     *nodedialer.Dialer
 	flowID            execinfrapb.FlowID
 	exprHelper        *colexecargs.ExprHelper
 	typeResolver      descs.DistSQLTypeResolver
@@ -547,12 +613,12 @@ type vectorizedFlowCreator struct {
 	procIdxQueue []int
 	// opChains accumulates all operators that have no further outputs on the
 	// current node, for the purposes of EXPLAIN output.
-	opChains execinfra.OpChains
+	opChains execopnode.OpChains
 	// operatorConcurrency is set if any operators are executed in parallel.
 	operatorConcurrency bool
 	// releasables contains all components that should be released back to their
 	// pools during the flow cleanup.
-	releasables []execinfra.Releasable
+	releasables []execreleasable.Releasable
 
 	monitorRegistry colexecargs.MonitorRegistry
 	diskQueueCfg    colcontainer.DiskQueueCfg
@@ -564,7 +630,7 @@ type vectorizedFlowCreator struct {
 	numClosed  int32
 }
 
-var _ execinfra.Releasable = &vectorizedFlowCreator{}
+var _ execreleasable.Releasable = &vectorizedFlowCreator{}
 
 var vectorizedFlowCreatorPool = sync.Pool{
 	New: func() interface{} {
@@ -584,7 +650,7 @@ func newVectorizedFlowCreator(
 	waitGroup *sync.WaitGroup,
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
-	nodeDialer *nodedialer.Dialer,
+	podNodeDialer *nodedialer.Dialer,
 	flowID execinfrapb.FlowID,
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	fdSemaphore semaphore.Semaphore,
@@ -602,7 +668,7 @@ func newVectorizedFlowCreator(
 		waitGroup:              waitGroup,
 		rowReceiver:            rowSyncFlowConsumer,
 		batchReceiver:          batchSyncFlowConsumer,
-		nodeDialer:             nodeDialer,
+		podNodeDialer:          podNodeDialer,
 		flowID:                 flowID,
 		exprHelper:             creator.exprHelper,
 		typeResolver:           typeResolver,
@@ -672,7 +738,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	stream *execinfrapb.StreamEndpointSpec,
 	factory coldata.ColumnFactory,
 	getStats func() []*execinfrapb.ComponentStats,
-) (execinfra.OpNode, error) {
+) (execopnode.OpNode, error) {
 	outbox, err := s.remoteComponentCreator.newOutbox(
 		colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
 		op, outputTyps, getStats,
@@ -685,7 +751,7 @@ func (s *vectorizedFlowCreator) setupRemoteOutputStream(
 	run := func(ctx context.Context, flowCtxCancel context.CancelFunc) {
 		outbox.Run(
 			ctx,
-			s.nodeDialer,
+			s.podNodeDialer,
 			stream.TargetNodeID,
 			s.flowID,
 			stream.StreamID,
@@ -719,13 +785,16 @@ func (s *vectorizedFlowCreator) setupRouter(
 	}
 
 	// HashRouter memory monitor names are the concatenated output stream IDs.
-	streamIDs := make([]string, len(output.Streams))
+	var streamIDs redact.RedactableString
 	for i, s := range output.Streams {
-		streamIDs[i] = strconv.Itoa(int(s.StreamID))
+		if i > 0 {
+			streamIDs = streamIDs + ","
+		}
+		streamIDs = redact.Sprintf("%s%d", streamIDs, s.StreamID)
 	}
-	mmName := "hash-router-[" + strings.Join(streamIDs, ",") + "]"
+	mmName := "hash-router-[" + streamIDs + "]"
 
-	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccounts(ctx, flowCtx, mmName, len(output.Streams))
+	hashRouterMemMonitor, accounts := s.monitorRegistry.CreateUnlimitedMemAccountsWithName(ctx, flowCtx, mmName, len(output.Streams))
 	allocators := make([]*colmem.Allocator, len(output.Streams))
 	for i := range allocators {
 		allocators[i] = colmem.NewAllocator(ctx, accounts[i], factory)
@@ -736,7 +805,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 		s.diskQueueCfg, s.fdSemaphore, diskAccounts,
 	)
 	runRouter := func(ctx context.Context, _ context.CancelFunc) {
-		router.Run(logtags.AddTag(ctx, "hashRouterID", strings.Join(streamIDs, ",")))
+		router.Run(logtags.AddTag(ctx, "hashRouterID", streamIDs))
 	}
 	s.accumulateAsyncComponent(runRouter)
 
@@ -756,6 +825,7 @@ func (s *vectorizedFlowCreator) setupRouter(
 				ctx, flowCtx, colexecargs.OpWithMetaInfo{
 					Root:            op,
 					MetadataSources: colexecop.MetadataSources{op},
+					ToClose:         colexecop.Closers{op},
 				}, outputTyps, stream, factory, nil, /* getStats */
 			); err != nil {
 				return err
@@ -765,8 +835,8 @@ func (s *vectorizedFlowCreator) setupRouter(
 			opWithMetaInfo := colexecargs.OpWithMetaInfo{
 				Root:            op,
 				MetadataSources: colexecop.MetadataSources{op},
-				// ToClose will be closed by the hash router.
-				ToClose: nil,
+				// input.ToClose will be closed by the hash router.
+				ToClose: colexecop.Closers{op},
 			}
 			if s.recordingStats {
 				mons := []*mon.BytesMonitor{hashRouterMemMonitor, diskMon}
@@ -828,7 +898,7 @@ func (s *vectorizedFlowCreator) setupInput(
 
 			// Retrieve the latency from the origin node (the one that has the
 			// outbox).
-			latency, err := s.nodeDialer.Latency(inputStream.OriginNodeID)
+			latency, err := s.podNodeDialer.Latency(roachpb.NodeID(inputStream.OriginNodeID))
 			if err != nil {
 				// If an error occurred, latency's nil value of 0 is used. If latency is
 				// 0, it is not included in the displayed stats for EXPLAIN ANALYZE
@@ -864,7 +934,7 @@ func (s *vectorizedFlowCreator) setupInput(
 				// Note: we can't use flowCtx.StreamComponentID because the stream does
 				// not originate from this node (we are the target node).
 				compID := execinfrapb.StreamComponentID(
-					base.SQLInstanceID(inputStream.OriginNodeID), flowCtx.ID, inputStream.StreamID,
+					inputStream.OriginNodeID, flowCtx.ID, inputStream.StreamID,
 				)
 				s.wrapWithNetworkVectorizedStatsCollector(&opWithMetaInfo, inbox, compID, latency)
 			}
@@ -880,7 +950,7 @@ func (s *vectorizedFlowCreator) setupInput(
 			os := colexec.NewOrderedSynchronizer(
 				colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
 				execinfra.GetWorkMemLimit(flowCtx), inputStreamOps,
-				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering),
+				input.ColumnTypes, execinfrapb.ConvertToColumnOrdering(input.Ordering), 0, /* tuplesToMerge */
 			)
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            os,
@@ -898,7 +968,8 @@ func (s *vectorizedFlowCreator) setupInput(
 			// Note that if we have opt == flowinfra.FuseAggressively, then we
 			// must use the serial unordered sync above in order to remove any
 			// concurrency.
-			sync := colexec.NewParallelUnorderedSynchronizer(inputStreamOps, s.waitGroup)
+			allocator := colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory)
+			sync := colexec.NewParallelUnorderedSynchronizer(allocator, inputStreamOps, s.waitGroup)
 			sync.LocalPlan = flowCtx.Local
 			opWithMetaInfo = colexecargs.OpWithMetaInfo{
 				Root:            sync,
@@ -1005,6 +1076,7 @@ func (s *vectorizedFlowCreator) setupOutput(
 				}
 			} else {
 				input = colexec.NewMaterializerNoEvalCtxCopy(
+					colmem.NewAllocator(ctx, s.monitorRegistry.NewStreamingMemAccount(flowCtx), factory),
 					flowCtx,
 					pspec.ProcessorID,
 					opWithMetaInfo,
@@ -1037,14 +1109,14 @@ func (s *vectorizedFlowCreator) setupOutput(
 // callbackCloser is a utility struct that implements the Closer interface by
 // calling the provided callback.
 type callbackCloser struct {
-	closeCb func() error
+	closeCb func(context.Context) error
 }
 
 var _ colexecop.Closer = &callbackCloser{}
 
 // Close implements the Closer interface.
-func (c *callbackCloser) Close() error {
-	return c.closeCb()
+func (c *callbackCloser) Close(ctx context.Context) error {
+	return c.closeCb(ctx)
 }
 
 func (s *vectorizedFlowCreator) setupFlow(
@@ -1053,7 +1125,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 	processorSpecs []execinfrapb.ProcessorSpec,
 	localProcessors []execinfra.LocalProcessor,
 	opt flowinfra.FuseOpt,
-) (opChains execinfra.OpChains, batchFlowCoordinator *BatchFlowCoordinator, err error) {
+) (opChains execopnode.OpChains, batchFlowCoordinator *BatchFlowCoordinator, err error) {
 	if vecErr := colexecerror.CatchVectorizedRuntimeError(func() {
 		// The column factory will not change the eval context, so we can use
 		// the one we have in the flow context, without making a copy.
@@ -1109,10 +1181,13 @@ func (s *vectorizedFlowCreator) setupFlow(
 				ExprHelper:           s.exprHelper,
 				Factory:              factory,
 				MonitorRegistry:      &s.monitorRegistry,
+				TypeResolver:         &s.typeResolver,
 			}
 			numOldMonitors := len(s.monitorRegistry.GetMonitors())
 			if args.ExprHelper.SemaCtx == nil {
-				args.ExprHelper.SemaCtx = flowCtx.NewSemaContext(flowCtx.EvalCtx.Txn)
+				semaCtx := tree.MakeSemaContext()
+				semaCtx.TypeResolver = &s.typeResolver
+				args.ExprHelper.SemaCtx = &semaCtx
 			}
 			var result *colexecargs.NewColOperatorResult
 			result, err = colbuilder.NewColOperator(ctx, flowCtx, args)
@@ -1131,12 +1206,12 @@ func (s *vectorizedFlowCreator) setupFlow(
 				for i := range toCloseCopy {
 					func(idx int) {
 						closed := false
-						result.ToClose[idx] = &callbackCloser{closeCb: func() error {
+						result.ToClose[idx] = &callbackCloser{closeCb: func(ctx context.Context) error {
 							if !closed {
 								closed = true
 								atomic.AddInt32(&s.numClosed, 1)
 							}
-							return toCloseCopy[idx].Close()
+							return toCloseCopy[idx].Close(ctx)
 						}}
 					}(i)
 				}
@@ -1145,7 +1220,7 @@ func (s *vectorizedFlowCreator) setupFlow(
 
 			if s.recordingStats {
 				newMonitors := s.monitorRegistry.GetMonitors()[numOldMonitors:]
-				if err := s.wrapWithVectorizedStatsCollectorBase(
+				if err = s.wrapWithVectorizedStatsCollectorBase(
 					&result.OpWithMetaInfo, result.KVReader, result.Columnarizer, inputs,
 					flowCtx.ProcessorComponentID(pspec.ProcessorID), newMonitors,
 				); err != nil {

@@ -1,4 +1,4 @@
-# LogicTest: local-v1.1@v1.0-noupgrade
+# LogicTest: local-v1.1-at-v1.0-noupgrade
 
 query T
 SHOW CLUSTER SETTING version
@@ -9,11 +9,6 @@ query T
 SELECT crdb_internal.node_executable_version()
 ----
 1.1
-
-user testuser
-
-statement error only users with the admin role are allowed to set cluster setting 'version'
-SET CLUSTER SETTING version = '2.0'
 
 user root
 

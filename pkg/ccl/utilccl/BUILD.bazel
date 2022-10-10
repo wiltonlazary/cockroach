@@ -1,10 +1,10 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "utilccl",
     srcs = [
-        "errors.go",
-        "jobutils.go",
+        "builtins.go",
         "license_check.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/utilccl",
@@ -12,23 +12,19 @@ go_library(
     deps = [
         "//pkg/base",
         "//pkg/ccl/utilccl/licenseccl",
-        "//pkg/kv/kvclient/kvcoord:with-mocks",
         "//pkg/server",
         "//pkg/settings",
         "//pkg/settings/cluster",
-        "//pkg/sql/catalog/colinfo",
-        "//pkg/sql/flowinfra",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
-        "//pkg/sql/types",
+        "//pkg/sql/sem/builtins/builtinsregistry",
+        "//pkg/sql/sem/tree",
         "//pkg/util/envutil",
-        "//pkg/util/grpcutil",
         "//pkg/util/log",
         "//pkg/util/metric",
         "//pkg/util/stop",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
-        "@com_github_cockroachdb_circuitbreaker//:circuitbreaker",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
     ],
@@ -41,10 +37,12 @@ go_test(
         "license_check_test.go",
         "license_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":utilccl"],
     deps = [
         "//pkg/base",
         "//pkg/ccl/utilccl/licenseccl",
+        "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/testutils",
         "//pkg/util/envutil",
@@ -54,3 +52,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

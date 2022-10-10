@@ -304,7 +304,8 @@ func TestStopperNumTasks(t *testing.T) {
 func TestStopperRunTaskPanic(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ch := make(chan interface{})
-	s := stop.NewStopper(stop.OnPanic(func(v interface{}) {
+	s := stop.NewStopper(stop.OnPanic(func(ctx context.Context, v interface{}) {
+		log.Infof(ctx, "recovering from panic")
 		ch <- v
 	}))
 	defer s.Stop(context.Background())
@@ -331,11 +332,13 @@ func TestStopperRunTaskPanic(t *testing.T) {
 			)
 		},
 	} {
-		go test()
-		recovered := <-ch
-		if recovered != ch {
-			t.Errorf("%d: unexpected recovered value: %+v", i, recovered)
-		}
+		t.Run("", func(t *testing.T) {
+			go test()
+			recovered := <-ch
+			if recovered != ch {
+				t.Errorf("%d: unexpected recovered value: %+v", i, recovered)
+			}
+		})
 	}
 }
 
@@ -724,13 +727,14 @@ func TestStopperRunAsyncTaskTracing(t *testing.T) {
 		},
 			func(ctx context.Context) {
 				log.Event(ctx, "async 3")
-				sp := tracing.SpanFromContext(ctx)
-				if sp == nil {
+				sp1 := tracing.SpanFromContext(ctx)
+				if sp1 == nil {
 					errC <- errors.Errorf("missing span")
 					return
 				}
-				sp = tr.StartSpan("child", tracing.WithParent(sp))
-				if sp.TraceID() == traceID {
+				sp2 := tr.StartSpan("child", tracing.WithParent(sp1))
+				defer sp2.Finish()
+				if sp2.TraceID() == traceID {
 					errC <- errors.Errorf("expected different trace")
 				}
 				close(errC)

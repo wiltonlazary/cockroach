@@ -30,7 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexeccmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -189,9 +191,31 @@ type selOpBase struct {
 type _OP_CONST_NAME struct {
 	selConstOpBase
 	constArg _R_GO_TYPE
+	// {{if .Negatable}}
+	negate bool
+	// {{end}}
+	// {{if .CaseInsensitive}}
+	caseInsensitive bool
+	// {{end}}
 }
 
 func (p *_OP_CONST_NAME) Next() coldata.Batch {
+	// {{if .Negatable}}
+	// {{/*
+	//     In order to inline the templated code of the LIKE overloads, we need
+	//     to have a `_negate` local variable indicating whether the assignment
+	//     should be negated.
+	// */}}
+	_negate := p.negate
+	// {{end}}
+	// {{if .CaseInsensitive}}
+	// {{/*
+	//     In order to inline the templated code of the LIKE overloads, we need
+	//     to have a `_caseInsensitive` local variable indicating whether the
+	//     operator is case insensitive.
+	// */}}
+	_caseInsensitive := p.caseInsensitive
+	// {{end}}
 	for {
 		batch := p.Input.Next()
 		if batch.Length() == 0 {
@@ -269,12 +293,12 @@ func (p *_OP_NAME) Next() coldata.Batch {
 // GetSelectionConstOperator returns the appropriate constant selection operator
 // for the given left and right column types and comparison.
 func GetSelectionConstOperator(
-	cmpOp tree.ComparisonOperator,
+	cmpOp treecmp.ComparisonOperator,
 	input colexecop.Operator,
 	inputTypes []*types.T,
 	colIdx int,
 	constArg tree.Datum,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	cmpExpr *tree.ComparisonExpr,
 ) (colexecop.Operator, error) {
 	leftType, constType := inputTypes[colIdx], constArg.ResolvedType()
@@ -289,7 +313,7 @@ func GetSelectionConstOperator(
 		// input vectors is of a tuple type.
 		switch cmpOp.Symbol {
 		// {{range .CmpOps}}
-		case tree._NAME:
+		case treecmp._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:
@@ -325,12 +349,12 @@ func GetSelectionConstOperator(
 // GetSelectionOperator returns the appropriate two column selection operator
 // for the given left and right column types and comparison.
 func GetSelectionOperator(
-	cmpOp tree.ComparisonOperator,
+	cmpOp treecmp.ComparisonOperator,
 	input colexecop.Operator,
 	inputTypes []*types.T,
 	col1Idx int,
 	col2Idx int,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	cmpExpr *tree.ComparisonExpr,
 ) (colexecop.Operator, error) {
 	leftType, rightType := inputTypes[col1Idx], inputTypes[col2Idx]
@@ -345,7 +369,7 @@ func GetSelectionOperator(
 		// input vectors is of a tuple type.
 		switch cmpOp.Symbol {
 		// {{range .CmpOps}}
-		case tree._NAME:
+		case treecmp._NAME:
 			switch typeconv.TypeFamilyToCanonicalTypeFamily(leftType.Family()) {
 			// {{range .LeftFamilies}}
 			case _LEFT_CANONICAL_TYPE_FAMILY:

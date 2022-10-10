@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -23,6 +24,7 @@ go_library(
         "schema.go",
         "session.go",
         "show.go",
+        "ttl.go",
         "user_defined_schema.go",
         "virtual_schema.go",
     ],
@@ -33,8 +35,12 @@ go_library(
         "//pkg/settings",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
+        "//pkg/sql/sem/builtins/builtinsregistry",
+        "//pkg/sql/sem/tree",
         "//pkg/util/log",
         "//pkg/util/log/logcrash",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
+
+get_x_data(name = "get_x_data")

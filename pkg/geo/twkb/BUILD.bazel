@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -6,7 +7,8 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/geo/twkb",
     visibility = ["//visibility:public"],
     deps = [
-        "@com_github_cockroachdb_errors//:errors",
+        "//pkg/sql/pgwire/pgcode",
+        "//pkg/sql/pgwire/pgerror",
         "@com_github_twpayne_go_geom//:go-geom",
     ],
 )
@@ -14,9 +16,12 @@ go_library(
 go_test(
     name = "twkb_test",
     srcs = ["twkb_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":twkb"],
     deps = [
         "@com_github_stretchr_testify//require",
         "@com_github_twpayne_go_geom//:go-geom",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -12,26 +12,31 @@ package sql
 
 import (
 	"context"
+	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
-	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/storageparam"
+	"github.com/cockroachdb/cockroach/pkg/sql/storageparam/indexstorageparam"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/errors"
 )
@@ -43,8 +48,9 @@ type createIndexNode struct {
 
 // CreateIndex creates an index.
 // Privileges: CREATE on table.
-//   notes: postgres requires CREATE on the table.
-//          mysql requires INDEX on the table.
+//
+//	notes: postgres requires CREATE on the table.
+//	       mysql requires INDEX on the table.
 func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNode, error) {
 	if err := checkSchemaChangeEnabled(
 		ctx,
@@ -97,7 +103,8 @@ func (p *planner) maybeSetupConstraintForShard(
 ) error {
 	// Assign an ID to the newly-added shard column, which is needed for the creation
 	// of a valid check constraint.
-	if err := tableDesc.AllocateIDs(ctx); err != nil {
+	version := p.ExecCfg().Settings.Version.ActiveVersion(ctx)
+	if err := tableDesc.AllocateIDs(ctx, version); err != nil {
 		return err
 	}
 
@@ -135,10 +142,22 @@ func (p *planner) maybeSetupConstraintForShard(
 func makeIndexDescriptor(
 	params runParams, n tree.CreateIndex, tableDesc *tabledesc.Mutable,
 ) (*descpb.IndexDescriptor, error) {
+	if n.Sharded == nil && n.StorageParams.GetVal(`bucket_count`) != nil {
+		return nil, pgerror.New(
+			pgcode.InvalidParameterValue,
+			`"bucket_count" storage param should only be set with "USING HASH" for hash sharded index`,
+		)
+	}
+	// Since we mutate the columns below, we make copies of them
+	// here so that on retry we do not attempt to validate the
+	// mutated columns.
+	columns := make(tree.IndexElemList, len(n.Columns))
+	copy(columns, n.Columns)
+
 	// Ensure that the columns we want to index are accessible before trying to
 	// create the index. This must be checked before inaccessible columns are
 	// created for expression indexes in replaceExpressionElemsWithVirtualCols.
-	if err := validateColumnsAreAccessible(tableDesc, n.Columns); err != nil {
+	if err := validateColumnsAreAccessible(tableDesc, columns); err != nil {
 		return nil, err
 	}
 
@@ -153,19 +172,17 @@ func makeIndexDescriptor(
 		params.ctx,
 		tableDesc,
 		tn,
-		n.Columns,
+		columns,
 		n.Inverted,
 		false, /* isNewTable */
 		params.p.SemaCtx(),
-		params.EvalContext(),
-		params.SessionData(),
 	); err != nil {
 		return nil, err
 	}
 
 	// Ensure that the columns we want to index exist before trying to create the
 	// index.
-	if err := validateIndexColumnsExist(tableDesc, n.Columns); err != nil {
+	if err := validateIndexColumnsExist(tableDesc, columns); err != nil {
 		return nil, err
 	}
 
@@ -177,11 +194,17 @@ func makeIndexDescriptor(
 		return nil, pgerror.Newf(pgcode.DuplicateRelation, "index with name %q already exists", n.Name)
 	}
 
+	if err := checkIndexColumns(tableDesc, columns, n.Storing, n.Inverted); err != nil {
+		return nil, err
+	}
+
 	indexDesc := descpb.IndexDescriptor{
 		Name:              string(n.Name),
 		Unique:            n.Unique,
 		StoreColumnNames:  n.Storing.ToStrings(),
 		CreatedExplicitly: true,
+		CreatedAtNanos:    params.EvalContext().GetTxnTimestamp(time.Microsecond).UnixNano(),
+		NotVisible:        n.NotVisible,
 	}
 
 	if n.Inverted {
@@ -198,38 +221,31 @@ func makeIndexDescriptor(
 		}
 
 		indexDesc.Type = descpb.IndexDescriptor_INVERTED
-		column, err := tableDesc.FindColumnWithName(n.Columns[len(n.Columns)-1].Column)
+		invCol := columns[len(columns)-1]
+		column, err := tableDesc.FindColumnWithName(invCol.Column)
 		if err != nil {
 			return nil, err
 		}
-		switch column.GetType().Family() {
-		case types.GeometryFamily:
-			config, err := geoindex.GeometryIndexConfigForSRID(column.GetType().GeoSRIDOrZero())
-			if err != nil {
-				return nil, err
-			}
-			indexDesc.GeoConfig = *config
-		case types.GeographyFamily:
-			indexDesc.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
+		if err := populateInvertedIndexDescriptor(
+			params.ctx, params.ExecCfg().Settings, column, &indexDesc, invCol); err != nil {
+			return nil, err
 		}
 	}
-	columns := n.Columns
+
 	if n.Sharded != nil {
 		if n.PartitionByIndex.ContainsPartitions() {
-			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support partitioning")
+			return nil, pgerror.New(pgcode.FeatureNotSupported, "sharded indexes don't support explicit partitioning")
 		}
-		if tableDesc.IsLocalityRegionalByRow() {
-			return nil, hashShardedIndexesOnRegionalByRowError()
-		}
+
 		shardCol, newColumns, err := setupShardedIndex(
 			params.ctx,
 			params.EvalContext(),
 			&params.p.semaCtx,
-			params.SessionData().HashShardedIndexesEnabled,
-			n.Columns,
+			columns,
 			n.Sharded.ShardBuckets,
 			tableDesc,
 			&indexDesc,
+			n.StorageParams,
 			false /* isNewTable */)
 		if err != nil {
 			return nil, err
@@ -256,12 +272,12 @@ func makeIndexDescriptor(
 		return nil, err
 	}
 
-	if err := paramparse.ApplyStorageParameters(
+	if err := storageparam.Set(
 		params.ctx,
 		params.p.SemaCtx(),
 		params.EvalContext(),
 		n.StorageParams,
-		&paramparse.IndexStorageParamObserver{IndexDesc: &indexDesc},
+		&indexstorageparam.Setter{IndexDesc: &indexDesc},
 	); err != nil {
 		return nil, err
 	}
@@ -269,11 +285,14 @@ func makeIndexDescriptor(
 	// Increment telemetry once a descriptor has been successfully created.
 	if indexDesc.Type == descpb.IndexDescriptor_INVERTED {
 		telemetry.Inc(sqltelemetry.InvertedIndexCounter)
-		if geoindex.IsGeometryConfig(&indexDesc.GeoConfig) {
+		if indexDesc.GeoConfig.IsGeometry() {
 			telemetry.Inc(sqltelemetry.GeometryInvertedIndexCounter)
 		}
-		if geoindex.IsGeographyConfig(&indexDesc.GeoConfig) {
+		if indexDesc.GeoConfig.IsGeography() {
 			telemetry.Inc(sqltelemetry.GeographyInvertedIndexCounter)
+		}
+		if len(indexDesc.InvertedColumnKinds) > 0 && indexDesc.InvertedColumnKinds[0] == catpb.InvertedIndexColumnKind_TRIGRAM {
+			telemetry.Inc(sqltelemetry.TrigramInvertedIndexCounter)
 		}
 		if indexDesc.IsPartial() {
 			telemetry.Inc(sqltelemetry.PartialInvertedIndexCounter)
@@ -290,6 +309,115 @@ func makeIndexDescriptor(
 	}
 
 	return &indexDesc, nil
+}
+
+func checkIndexColumns(
+	desc catalog.TableDescriptor, columns tree.IndexElemList, storing tree.NameList, inverted bool,
+) error {
+	for i, colDef := range columns {
+		col, err := desc.FindColumnWithName(colDef.Column)
+		if err != nil {
+			return errors.Wrapf(err, "finding column %d", i)
+		}
+		if col.IsSystemColumn() {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"cannot index system column %v", colDef.Column,
+			)
+		}
+		if colDef.OpClass != "" && (i < len(columns)-1 || !inverted) {
+			return pgerror.New(pgcode.DatatypeMismatch,
+				"operator classes are only allowed for the last column of an inverted index")
+		}
+	}
+	for i, colName := range storing {
+		col, err := desc.FindColumnWithName(colName)
+		if err != nil {
+			return errors.Wrapf(err, "finding store column %d", i)
+		}
+		if col.IsVirtual() {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"index cannot store virtual column %v", colName,
+			)
+		}
+		if col.IsSystemColumn() {
+			return pgerror.Newf(
+				pgcode.FeatureNotSupported,
+				"index cannot store system column %v", colName,
+			)
+		}
+	}
+	return nil
+}
+
+// populateInvertedIndexDescriptor adds information to the input index descriptor
+// for the inverted index given by the input column and invCol, which should
+// match (column is the catalog column, and invCol is the grammar node of
+// the column in the index creation statement).
+func populateInvertedIndexDescriptor(
+	ctx context.Context,
+	cs *cluster.Settings,
+	column catalog.Column,
+	indexDesc *descpb.IndexDescriptor,
+	invCol tree.IndexElem,
+) error {
+	indexDesc.InvertedColumnKinds = []catpb.InvertedIndexColumnKind{catpb.InvertedIndexColumnKind_DEFAULT}
+	switch column.GetType().Family() {
+	case types.ArrayFamily:
+		switch invCol.OpClass {
+		case "array_ops", "":
+		default:
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
+	case types.JsonFamily:
+		switch invCol.OpClass {
+		case "jsonb_ops", "":
+		case "jsonb_path_ops":
+			return unimplemented.NewWithIssue(81115, "operator class \"jsonb_path_ops\" is not supported")
+		default:
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
+	case types.GeometryFamily:
+		if invCol.OpClass != "" {
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
+		config, err := geoindex.GeometryIndexConfigForSRID(column.GetType().GeoSRIDOrZero())
+		if err != nil {
+			return err
+		}
+		indexDesc.GeoConfig = *config
+	case types.GeographyFamily:
+		if invCol.OpClass != "" {
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
+		indexDesc.GeoConfig = *geoindex.DefaultGeographyIndexConfig()
+	case types.StringFamily:
+		// Check the opclass of the last column in the list, which is the column
+		// we're going to inverted index.
+		switch invCol.OpClass {
+		case "gin_trgm_ops", "gist_trgm_ops":
+			if !cs.Version.IsActive(ctx, clusterversion.TrigramInvertedIndexes) {
+				return pgerror.Newf(pgcode.FeatureNotSupported,
+					"version %v must be finalized to create trigram inverted indexes",
+					clusterversion.ByKey(clusterversion.TrigramInvertedIndexes))
+			}
+		case "":
+			return errors.WithHint(
+				pgerror.New(pgcode.UndefinedObject, "data type text has no default operator class for access method \"gin\""),
+				"You must specify an operator class for the index (did you mean gin_trgm_ops?)")
+		default:
+			return newUndefinedOpclassError(invCol.OpClass)
+		}
+		indexDesc.InvertedColumnKinds[0] = catpb.InvertedIndexColumnKind_TRIGRAM
+	default:
+		return tabledesc.NewInvalidInvertedColumnError(column.GetName(), column.GetType().Name())
+	}
+	return nil
+}
+
+func newUndefinedOpclassError(opclass tree.Name) error {
+	return pgerror.Newf(pgcode.UndefinedObject, "operator class %q does not exist", opclass)
 }
 
 // validateColumnsAreAccessible validates that the columns for an index are
@@ -346,9 +474,16 @@ func replaceExpressionElemsWithVirtualCols(
 	isInverted bool,
 	isNewTable bool,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
-	sessionData *sessiondata.SessionData,
 ) error {
+	findExistingExprIndexCol := func(expr string) (colName string, ok bool) {
+		for _, col := range desc.AllColumns() {
+			if col.IsExpressionIndexColumn() && col.GetComputeExpr() == expr {
+				return col.GetName(), true
+			}
+		}
+		return "", false
+	}
+
 	lastColumnIdx := len(elems) - 1
 	for i := range elems {
 		elem := &elems[i]
@@ -374,6 +509,17 @@ func replaceExpressionElemsWithVirtualCols(
 			)
 			if err != nil {
 				return err
+			}
+
+			// Use an existing expression index column if one exists, rather
+			// than creating a new one.
+			if existingColName, ok := findExistingExprIndexCol(expr); ok {
+				// Set the column name and unset the expression.
+				elem.Column = tree.Name(existingColName)
+				elem.Expr = nil
+				// Increment expression index telemetry.
+				telemetry.Inc(sqltelemetry.ExpressionIndexCounter)
+				continue
 			}
 
 			// The expression type cannot be ambiguous.
@@ -472,9 +618,6 @@ func replaceExpressionElemsWithVirtualCols(
 // and expects to see its own writes.
 func (n *createIndexNode) ReadingOwnWrites() {}
 
-var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
-	"hash sharded indexes require the experimental_enable_hash_sharded_indexes session variable")
-
 // setupShardedIndex creates a shard column for the given index descriptor. It
 // returns the shard column and the new column list for the index. If the shard
 // column is new, either of the following happens:
@@ -482,24 +625,33 @@ var hashShardedIndexesDisabledError = pgerror.Newf(pgcode.FeatureNotSupported,
 // (2) a column mutation is added to tableDesc if the table is not new.
 func setupShardedIndex(
 	ctx context.Context,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
-	shardedIndexEnabled bool,
 	columns tree.IndexElemList,
 	bucketsExpr tree.Expr,
 	tableDesc *tabledesc.Mutable,
 	indexDesc *descpb.IndexDescriptor,
+	storageParams tree.StorageParams,
 	isNewTable bool,
 ) (shard catalog.Column, newColumns tree.IndexElemList, err error) {
-	if !shardedIndexEnabled {
-		return nil, nil, hashShardedIndexesDisabledError
+	if !isNewTable && tableDesc.IsPartitionAllBy() {
+		partitionAllBy, err := partitionByFromTableDesc(evalCtx.Codec, tableDesc)
+		if err != nil {
+			return nil, nil, err
+		}
+		if anyColumnIsPartitioningField(columns, partitionAllBy) {
+			return nil, nil, pgerror.New(
+				pgcode.FeatureNotSupported,
+				`hash sharded indexes cannot include implicit partitioning columns from "PARTITION ALL BY" or "LOCALITY REGIONAL BY ROW"`,
+			)
+		}
 	}
 
 	colNames := make([]string, 0, len(columns))
 	for _, c := range columns {
 		colNames = append(colNames, string(c.Column))
 	}
-	buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr)
+	buckets, err := tabledesc.EvalShardBucketCount(ctx, semaCtx, evalCtx, bucketsExpr, storageParams)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -586,7 +738,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	// Avoid the warning if we have PARTITION ALL BY as all indexes will implicitly
 	// have relevant partitioning columns prepended at the front.
 	if n.n.PartitionByIndex == nil &&
-		n.tableDesc.GetPrimaryIndex().GetPartitioning().NumColumns() > 0 &&
+		n.tableDesc.GetPrimaryIndex().PartitioningColumnCount() > 0 &&
 		!n.tableDesc.IsPartitionAllBy() {
 		params.p.BufferClientNotice(
 			params.ctx,
@@ -607,7 +759,10 @@ func (n *createIndexNode) startExec(params runParams) error {
 		telemetry.Inc(sqltelemetry.SecondaryIndexColumnFamiliesCounter)
 	}
 
-	indexDesc.Version = descpb.LatestNonPrimaryIndexDescriptorVersion
+	// TODO(postamar): bump version to LatestIndexDescriptorVersion in 22.2
+	// This is not possible until then because of a limitation in 21.2 which
+	// affects mixed-21.2-22.1-version clusters (issue #78426).
+	indexDesc.Version = descpb.StrictIndexColumnIDGuaranteesVersion
 
 	if n.n.PartitionByIndex != nil && n.tableDesc.GetLocalityConfig() != nil {
 		return pgerror.New(
@@ -631,12 +786,16 @@ func (n *createIndexNode) startExec(params runParams) error {
 	}
 
 	mutationIdx := len(n.tableDesc.Mutations)
-	if err := n.tableDesc.AddIndexMutation(indexDesc, descpb.DescriptorMutation_ADD); err != nil {
+	if err := n.tableDesc.AddIndexMutationMaybeWithTempIndex(
+		indexDesc, descpb.DescriptorMutation_ADD,
+	); err != nil {
 		return err
 	}
-	if err := n.tableDesc.AllocateIDs(params.ctx); err != nil {
+	version := params.ExecCfg().Settings.Version.ActiveVersion(params.ctx)
+	if err := n.tableDesc.AllocateIDs(params.ctx, version); err != nil {
 		return err
 	}
+
 	if err := params.p.configureZoneConfigForNewIndexPartitioning(
 		params.ctx,
 		n.tableDesc,
@@ -650,7 +809,7 @@ func (n *createIndexNode) startExec(params runParams) error {
 	index := n.tableDesc.Mutations[mutationIdx].GetIndex()
 	indexName := index.Name
 
-	mutationID := n.tableDesc.ClusterVersion.NextMutationID
+	mutationID := n.tableDesc.ClusterVersion().NextMutationID
 	if err := params.p.writeSchemaChange(
 		params.ctx, n.tableDesc, mutationID, tree.AsStringWithFQNames(n.n, params.Ann()),
 	); err != nil {
@@ -741,16 +900,34 @@ func (p *planner) configureZoneConfigForNewIndexPartitioning(
 		if err != nil {
 			return err
 		}
+
+		indexIDs := []descpb.IndexID{indexDesc.ID}
+		if idx := catalog.FindCorrespondingTemporaryIndexByID(tableDesc, indexDesc.ID); idx != nil {
+			indexIDs = append(indexIDs, idx.GetID())
+		}
+
 		if err := ApplyZoneConfigForMultiRegionTable(
 			ctx,
 			p.txn,
 			p.ExecCfg(),
+			p.Descriptors(),
 			regionConfig,
 			tableDesc,
-			applyZoneConfigForMultiRegionTableOptionNewIndexes(indexDesc.ID),
+			applyZoneConfigForMultiRegionTableOptionNewIndexes(indexIDs...),
 		); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func anyColumnIsPartitioningField(columns tree.IndexElemList, partitionBy *tree.PartitionBy) bool {
+	for _, field := range partitionBy.Fields {
+		for _, column := range columns {
+			if field == column.Column {
+				return true
+			}
+		}
+	}
+	return false
 }

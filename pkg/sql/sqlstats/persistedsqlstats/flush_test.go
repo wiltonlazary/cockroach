@@ -20,7 +20,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
@@ -88,11 +88,11 @@ func TestSQLStatsFlush(t *testing.T) {
 	secondServer := testCluster.Server(1 /* idx */)
 
 	firstPgURL, firstServerConnCleanup := sqlutils.PGUrl(
-		t, firstServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(security.RootUser))
+		t, firstServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
 	defer firstServerConnCleanup()
 
 	secondPgURL, secondServerConnCleanup := sqlutils.PGUrl(
-		t, secondServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(security.RootUser))
+		t, secondServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
 	defer secondServerConnCleanup()
 
 	pgFirstSQLConn, err := gosql.Open("postgres", firstPgURL.String())
@@ -243,6 +243,219 @@ func TestSQLStatsInitialDelay(t *testing.T) {
 		"expected latest nextFlushAt to be %s, but found %s", maxNextRunAt, initialNextFlushAt)
 }
 
+func TestSQLStatsMinimumFlushInterval(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	fakeTime := stubTime{
+		aggInterval: time.Hour,
+	}
+	fakeTime.setTime(timeutil.Now())
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
+		StubTimeNow: fakeTime.Now,
+	}
+	s, conn, _ := serverutils.StartServer(t, params)
+
+	defer s.Stopper().Stop(context.Background())
+
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.stats.flush.minimum_interval = '10m'")
+	sqlConn.Exec(t, "SET application_name = 'min_flush_test'")
+	sqlConn.Exec(t, "SELECT 1")
+
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	sqlConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.statement_statistics
+		WHERE app_name = 'min_flush_test'
+		`, [][]string{{"1"}})
+
+	sqlConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.transaction_statistics
+		WHERE app_name = 'min_flush_test'
+		`, [][]string{{"1"}})
+
+	// Since by default, the minimum flush interval is 10 minutes, a subsequent
+	// flush should be no-op.
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	sqlConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.statement_statistics
+		WHERE app_name = 'min_flush_test'
+		`, [][]string{{"1"}})
+
+	sqlConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.transaction_statistics
+		WHERE app_name = 'min_flush_test'
+		`, [][]string{{"1"}})
+
+	// We manually set the time to past the minimum flush interval, now the flush
+	// should succeed.
+	fakeTime.setTime(fakeTime.Now().Add(time.Hour))
+
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	sqlConn.CheckQueryResults(t, `
+		SELECT count(*) > 1
+		FROM system.statement_statistics
+		WHERE app_name = 'min_flush_test'
+		`, [][]string{{"true"}})
+
+}
+
+func TestInMemoryStatsDiscard(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, conn, _ := serverutils.StartServer(t, params)
+	observer :=
+		serverutils.OpenDBConn(t, s.ServingSQLAddr(), "", false /* insecure */, s.Stopper())
+
+	defer s.Stopper().Stop(context.Background())
+
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+	sqlConn.Exec(t,
+		"SET CLUSTER SETTING sql.stats.flush.minimum_interval = '10m'")
+	observerConn := sqlutils.MakeSQLRunner(observer)
+
+	t.Run("flush_disabled", func(t *testing.T) {
+		sqlConn.Exec(t,
+			"SET CLUSTER SETTING sql.stats.flush.force_cleanup.enabled = true")
+		sqlConn.Exec(t,
+			"SET CLUSTER SETTING sql.stats.flush.enabled = false")
+
+		sqlConn.Exec(t, "SET application_name = 'flush_disabled_test'")
+		sqlConn.Exec(t, "SELECT 1")
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.statement_statistics
+		WHERE app_name = 'flush_disabled_test'
+		`, [][]string{{"1"}})
+
+		s.SQLServer().(*sql.Server).
+			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.statement_statistics
+		WHERE app_name = 'flush_disabled_test'
+		`, [][]string{{"0"}})
+	})
+
+	t.Run("flush_enabled", func(t *testing.T) {
+		// Now turn back SQL Stats flush. If the flush is aborted due to violating
+		// minimum flush interval constraint, we should not be clearing in-memory
+		// stats.
+		sqlConn.Exec(t,
+			"SET CLUSTER SETTING sql.stats.flush.enabled = true")
+		sqlConn.Exec(t, "SET application_name = 'flush_enabled_test'")
+		sqlConn.Exec(t, "SELECT 1")
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.statement_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.transaction_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		// First flush should flush everything into the system tables.
+		s.SQLServer().(*sql.Server).
+			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.statement_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.transaction_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		sqlConn.Exec(t, "SELECT 1,1")
+
+		// Second flush should be aborted due to violating the minimum flush
+		// interval requirement. Though the data should still remain in-memory.
+		s.SQLServer().(*sql.Server).
+			GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.statement_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM system.transaction_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"1"}})
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.statement_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"2"}})
+
+		observerConn.CheckQueryResults(t, `
+		SELECT count(*)
+		FROM crdb_internal.transaction_statistics
+		WHERE app_name = 'flush_enabled_test'
+		`, [][]string{{"2"}})
+	})
+}
+
+func TestSQLStatsGatewayNodeSetting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	params, _ := tests.CreateTestServerParams()
+	s, conn, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(context.Background())
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+
+	// Gateway Node ID enabled, so should persist the value.
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.metrics.statement_details.gateway_node.enabled = true")
+	sqlConn.Exec(t, "SET application_name = 'gateway_enabled'")
+	sqlConn.Exec(t, "SELECT 1")
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	verifyNodeID(t, sqlConn, "SELECT _", true, "gateway_enabled")
+
+	// Gateway Node ID disabled, so shouldn't persist the value on the node_id column, but it should
+	// still store the value on the statistics column.
+	sqlConn.Exec(t, "SET CLUSTER SETTING sql.metrics.statement_details.gateway_node.enabled = false")
+	sqlConn.Exec(t, "SET application_name = 'gateway_disabled'")
+	sqlConn.Exec(t, "SELECT 1")
+	s.SQLServer().(*sql.Server).
+		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).Flush(ctx)
+
+	verifyNodeID(t, sqlConn, "SELECT _", false, "gateway_disabled")
+}
+
 type stubTime struct {
 	syncutil.RWMutex
 	t           time.Time
@@ -391,4 +604,36 @@ func verifyInMemoryStatsEmpty(
 
 		require.NoError(t, err)
 	}
+}
+
+func verifyNodeID(
+	t *testing.T,
+	sqlConn *sqlutils.SQLRunner,
+	fingerprint string,
+	gatewayEnabled bool,
+	appName string,
+) {
+	row := sqlConn.DB.QueryRowContext(context.Background(),
+		`
+SELECT
+  node_id,
+  statistics -> 'statistics' ->> 'nodes' as nodes
+FROM
+	system.statement_statistics
+WHERE
+	metadata ->> 'query' = $1 AND
+  app_name = $2
+`, fingerprint, appName)
+
+	var gatewayNodeID int64
+	var allNodesIds string
+
+	e := row.Scan(&gatewayNodeID, &allNodesIds)
+	require.NoError(t, e)
+	nodeID := int64(1)
+	if !gatewayEnabled {
+		nodeID = int64(0)
+	}
+	require.Equal(t, nodeID, gatewayNodeID, "Gateway NodeID")
+	require.Equal(t, "[1]", allNodesIds, "All NodeIDs from statistics")
 }

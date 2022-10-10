@@ -14,6 +14,7 @@ artifacts
 /bin.*
 /lib
 /lib.*
+/tmp
 .buildinfo
 # cockroach-data, cockroach{,.race}-{darwin,linux,windows}-*
 /cockroach*
@@ -25,6 +26,12 @@ work-Fuzz*
 *-fuzz.zip
 # vendoring by `go mod vendor` may produce this file temporarily
 /.vendor.tmp.*
+# The Observability Service binary.
+/obsservice
+
+# Instrumentation artifacts.
+/instrument*
+.instrumentor_exclusions.tmp
 
 # Custom or private env vars (e.g. internal keys, access tokens, etc).
 customenv.mk
@@ -45,9 +52,8 @@ build/Railroad.jar
 # Generated code.
 *.pb.go
 *.pb.gw.go
-pkg/cmd/roachtest/prometheus/mock_generated.go
-pkg/cmd/roachtest/tests/drt_generated.go
-pkg/kv/kvclient/rangefeed/mocks_generated.go
 pkg/roachprod/vm/aws/embedded.go
-pkg/security/certmgr/mocks_generated.go
 pkg/security/securitytest/embedded.go
+
+# Temporary directories during gomock generate
+**/gomock_reflect_*

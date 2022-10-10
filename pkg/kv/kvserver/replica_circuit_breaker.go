@@ -14,7 +14,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/v3"
@@ -36,11 +37,18 @@ type replicaInCircuitBreaker interface {
 	Desc() *roachpb.RangeDescriptor
 	Send(context.Context, roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error)
 	slowReplicationThreshold(ba *roachpb.BatchRequest) (time.Duration, bool)
-	replicaUnavailableError() error
+	replicaUnavailableError(err error) error
+	poisonInflightLatches(err error)
 }
 
 var defaultReplicaCircuitBreakerSlowReplicationThreshold = envutil.EnvOrDefaultDuration(
-	"COCKROACH_REPLICA_CIRCUIT_BREAKER_SLOW_REPLICATION_THRESHOLD", 0,
+	"COCKROACH_REPLICA_CIRCUIT_BREAKER_SLOW_REPLICATION_THRESHOLD",
+	// SlowRequestThreshold is used in various places to log warnings on slow
+	// request phases. We are even more conservative about the circuit breakers,
+	// i.e. multiply by a factor. This is mainly defense in depth; at time of
+	// writing the slow request threshold is 15s which *should* also be good
+	// enough for circuit breakers since it's already fairly conservative.
+	4*base.SlowRequestThreshold,
 )
 
 var replicaCircuitBreakerSlowReplicationThreshold = settings.RegisterPublicDurationSettingWithExplicitUnit(
@@ -48,7 +56,19 @@ var replicaCircuitBreakerSlowReplicationThreshold = settings.RegisterPublicDurat
 	"kv.replica_circuit_breaker.slow_replication_threshold",
 	"duration after which slow proposals trip the per-Replica circuit breaker (zero duration disables breakers)",
 	defaultReplicaCircuitBreakerSlowReplicationThreshold,
-	settings.NonNegativeDuration,
+	func(d time.Duration) error {
+		// Setting the breaker duration too low could be very dangerous to cluster
+		// health (breaking things to the point where the cluster setting can't be
+		// changed), so enforce a sane minimum.
+		const min = 500 * time.Millisecond
+		if d == 0 {
+			return nil
+		}
+		if d <= min {
+			return errors.Errorf("must specify a minimum of %s", min)
+		}
+		return nil
+	},
 )
 
 // Telemetry counter to count number of trip events.
@@ -64,16 +84,15 @@ type replicaCircuitBreaker struct {
 	wrapped *circuit.Breaker
 }
 
+func (br *replicaCircuitBreaker) HasMark(err error) bool {
+	return br.wrapped.HasMark(err)
+}
+
 func (br *replicaCircuitBreaker) enabled() bool {
-	return replicaCircuitBreakerSlowReplicationThreshold.Get(&br.st.SV) > 0 &&
-		br.st.Version.IsActive(context.Background(), clusterversion.ProbeRequest)
+	return replicaCircuitBreakerSlowReplicationThreshold.Get(&br.st.SV) > 0
 }
 
-func (br *replicaCircuitBreaker) newError() error {
-	return br.r.replicaUnavailableError()
-}
-
-func (br *replicaCircuitBreaker) TripAsync() {
+func (br *replicaCircuitBreaker) TripAsync(err error) {
 	if !br.enabled() {
 		return
 	}
@@ -81,9 +100,13 @@ func (br *replicaCircuitBreaker) TripAsync() {
 	_ = br.stopper.RunAsyncTask(
 		br.ambCtx.AnnotateCtx(context.Background()), "trip-breaker",
 		func(ctx context.Context) {
-			br.wrapped.Report(br.newError())
+			br.tripSync(err)
 		},
 	)
+}
+
+func (br *replicaCircuitBreaker) tripSync(err error) {
+	br.wrapped.Report(br.r.replicaUnavailableError(err))
 }
 
 type signaller interface {
@@ -117,7 +140,6 @@ func newReplicaCircuitBreaker(
 		r:       r,
 		st:      cs,
 	}
-
 	br.wrapped = circuit.NewBreaker(circuit.Options{
 		Name:       "breaker", // log bridge has ctx tags
 		AsyncProbe: br.asyncProbe,
@@ -153,16 +175,6 @@ func (r replicaCircuitBreakerLogger) OnReset(br *circuit.Breaker) {
 	r.EventHandler.OnReset(br)
 }
 
-type probeKey struct{}
-
-func isCircuitBreakerProbe(ctx context.Context) bool {
-	return ctx.Value(probeKey{}) != nil
-}
-
-func withCircuitBreakerProbeMarker(ctx context.Context) context.Context {
-	return context.WithValue(ctx, probeKey{}, probeKey{})
-}
-
 func (br *replicaCircuitBreaker) asyncProbe(report func(error), done func()) {
 	bgCtx := br.ambCtx.AnnotateCtx(context.Background())
 	if err := br.stopper.RunAsyncTask(bgCtx, "replica-probe", func(ctx context.Context) {
@@ -173,6 +185,19 @@ func (br *replicaCircuitBreaker) asyncProbe(report func(error), done func()) {
 			return
 		}
 
+		brErr := br.Signal().Err()
+		if brErr == nil {
+			// This shouldn't happen, but if we're not even tripped, don't do
+			// anything.
+			return
+		}
+
+		// Poison any inflight latches. Note that any new request that is added in
+		// while the probe is running but after poisonInflightLatches has been
+		// invoked will remain untouched. We rely on the replica to periodically
+		// access the circuit breaker to trigger additional probes in that case.
+		// (This happens in refreshProposalsLocked).
+		br.r.poisonInflightLatches(brErr)
 		err := sendProbe(ctx, br.r)
 		report(err)
 	}); err != nil {
@@ -181,7 +206,9 @@ func (br *replicaCircuitBreaker) asyncProbe(report func(error), done func()) {
 }
 
 func sendProbe(ctx context.Context, r replicaInCircuitBreaker) error {
-	ctx = withCircuitBreakerProbeMarker(ctx)
+	// NB: ProbeRequest has the bypassesCircuitBreaker flag. If in the future we
+	// enhance the probe, we may need to allow any additional requests we send to
+	// chose to bypass the circuit breaker explicitly.
 	desc := r.Desc()
 	if !desc.IsInitialized() {
 		return nil
@@ -203,16 +230,18 @@ func sendProbe(ctx context.Context, r replicaInCircuitBreaker) error {
 			return pErr.GoError()
 		},
 	); err != nil {
-		return errors.CombineErrors(r.replicaUnavailableError(), err)
+		return r.replicaUnavailableError(err)
 	}
 	return nil
 }
 
 func replicaUnavailableError(
+	err error,
 	desc *roachpb.RangeDescriptor,
 	replDesc roachpb.ReplicaDescriptor,
 	lm liveness.IsLiveMap,
 	rs *raft.Status,
+	closedTS hlc.Timestamp,
 ) error {
 	nonLiveRepls := roachpb.MakeReplicaSet(nil)
 	for _, rDesc := range desc.Replicas().Descriptors() {
@@ -233,25 +262,25 @@ func replicaUnavailableError(
 	var _ redact.SafeFormatter = desc
 	var _ redact.SafeFormatter = replDesc
 
-	err := roachpb.NewReplicaUnavailableError(desc, replDesc)
-	err = errors.Wrapf(
-		err,
-		"raft status: %+v", redact.Safe(rs), // raft status contains no PII
-	)
-	if len(nonLiveRepls.AsProto()) > 0 {
-		err = errors.Wrapf(err, "replicas on non-live nodes: %v (lost quorum: %t)", nonLiveRepls, !canMakeProgress)
+	var buf redact.StringBuilder
+	if !canMakeProgress {
+		buf.Printf("lost quorum (down: %v); ", nonLiveRepls)
 	}
+	buf.Printf(
+		"closed timestamp: %s (%s); raft status: %+v",
+		closedTS,
+		redact.Safe(timeutil.Unix(0, closedTS.WallTime).UTC().Format("2006-01-02 15:04:05")),
+		redact.Safe(rs), /* raft status contains no PII */
+	)
 
-	return err
+	return roachpb.NewReplicaUnavailableError(errors.Wrapf(err, "%s", buf), desc, replDesc)
 }
 
-func (r *Replica) replicaUnavailableError() error {
+func (r *Replica) replicaUnavailableError(err error) error {
 	desc := r.Desc()
 	replDesc, _ := desc.GetReplicaDescriptor(r.store.StoreID())
 
-	var isLiveMap liveness.IsLiveMap
-	if nl := r.store.cfg.NodeLiveness; nl != nil { // exclude unit test
-		isLiveMap = nl.GetIsLiveMap()
-	}
-	return replicaUnavailableError(desc, replDesc, isLiveMap, r.RaftStatus())
+	isLiveMap, _ := r.store.livenessMap.Load().(liveness.IsLiveMap)
+	ct := r.GetCurrentClosedTimestamp(context.Background())
+	return replicaUnavailableError(err, desc, replDesc, isLiveMap, r.RaftStatus(), ct)
 }

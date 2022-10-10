@@ -1,54 +1,112 @@
-try-import %workspace%/.bazelrc.user
+# HEY! DON'T edit this file unless you really want to change a configuration for
+# everyone building cockroach ever.
+# This file is checked into tree and is not auto-generated.
+# If you are following directions from `dev doctor`, you probably want to put
+# your configurations in ~/.bazelrc or .bazelrc.user instead.
+# Configurations in ~/.bazelrc apply to all Bazel builds across all projects on
+# your machine. Configurations in .bazelrc.user apply only to builds in this
+# workspace. Take a closer look to see which one `dev doctor` is talking about.
+# Note that .bazelrc.user should be in your checkout (next to this file), not
+# your home directory.
 
+# Define a set up flag aliases, so people can use `--cross` instead of the
+# longer `//build/toolchains:cross_flag`.
+build --flag_alias=crdb_test=//build/toolchains:crdb_test_flag
+build --flag_alias=crdb_test_off=//build/toolchains:crdb_test_off_flag
+build --flag_alias=cross=//build/toolchains:cross_flag
+build --flag_alias=dev=//build/toolchains:dev_flag
+build --flag_alias=force_build_cdeps=//build/toolchains:force_build_cdeps_flag
+build --flag_alias=lintonbuild=//build/toolchains:nogo_flag
+build --flag_alias=nolintonbuild=//build/toolchains:nonogo_explicit_flag
+build --flag_alias=with_ui=//pkg/ui:with_ui_flag
+
+build:crdb_test_off --crdb_test_off
+build:cross --cross
+build:dev --dev
+build:force_build_cdeps --force_build_cdeps
+build:lintonbuild --lintonbuild
+build:nolintonbuild --nolintonbuild
+# Note: nonogo is classically the name of the nolintonbuild configuration.
+build:nonogo --nolintonbuild
+build:test --crdb_test
+build:with_ui --with_ui
+
+# Basic settings.
 build --define gotags=bazel,gss
 build --experimental_proto_descriptor_sets_include_source_info
 build --incompatible_strict_action_env --incompatible_enable_cc_toolchain_resolution
-build --symlink_prefix=_bazel/ --experimental_no_product_name_out_symlink
+build --symlink_prefix=_bazel/
+common --experimental_allow_tags_propagation
 test --config=test --experimental_ui_max_stdouterr_bytes=10485760
-build:with_ui --define cockroach_with_ui=y
-build:test --define crdb_test=y
-build:race --@io_bazel_rules_go//go/config:race --test_env=GORACE=halt_on_error=1 --test_sharding_strategy=disabled
-test:test --test_env=TZ=
-test:race --test_timeout=1200,6000,18000,72000
-
 build --ui_event_filters=-DEBUG
 query --ui_event_filters=-DEBUG
+clean --ui_event_filters=-WARNING
+info --ui_event_filters=-WARNING
 
-# CI should always run with `--config=ci`.
-build:ci --experimental_convenience_symlinks=ignore
+build:race --@io_bazel_rules_go//go/config:race "--test_env=GORACE=halt_on_error=1 log_path=stdout" --test_sharding_strategy=disabled
+test:test --test_env=TZ=
+# Note: these timeout values are used indirectly in `build/teamcity/cockroach/ci/tests/testrace_impl.sh`.
+# If those values are updated, the script should be updated accordingly.
+test:race --test_timeout=1200,6000,18000,72000
+
+# CI should always run with `--config=ci` or `--config=cinolint`.
+# Prefer the first to the second unless some other job will handle linting the
+# same code you're building.
+build:ci --config=cinolint
+build:ci --lintonbuild
 # Set `-test.v` in Go tests.
 # Ref: https://github.com/bazelbuild/rules_go/pull/2456
-test:ci --test_env=GO_TEST_WRAP_TESTV=1
+test:cinolint --test_env=GO_TEST_WRAP_TESTV=1
 # Dump all output for failed tests to the build log.
-test:ci --test_output=errors
+test:cinolint --test_output=errors
 # Put all tmp artifacts in /artifacts/tmp.
-test:ci --test_tmpdir=/artifacts/tmp
+build:cinolint --test_tmpdir=/artifacts/tmp
 
 build:cross --stamp
-build:cross --define cockroach_cross=y
 
 # Cross-compilation configurations. Add e.g. --config=crosslinux to turn these on.
-build:crosslinux --platforms=//build/toolchains:cross_linux
+# Generally these should be used for development builds. Each cross config has
+# a corresponding `base` config that is the same thing but without the
+# `--workspace_status_command`; if using these `base` configs, you need to
+# specify an appropriate `--workspace_status_command`. These `base` configs are
+# used by the release process which needs to have more control over stamping.
 build:crosslinux '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-pc-linux-gnu'
-build:crosslinux --config=cross
-build:crosswindows --platforms=//build/toolchains:cross_windows
+build:crosslinux --config=crosslinuxbase
+build:crosslinuxbase --platforms=//build/toolchains:cross_linux
+build:crosslinuxbase --config=cross
 build:crosswindows '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-w64-mingw32'
-build:crosswindows --config=cross
-build:crossmacos --platforms=//build/toolchains:cross_macos
-build:crossmacos '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-apple-darwin19'
-build:crossmacos --config=cross
-build:crosslinuxarm --platforms=//build/toolchains:cross_linux_arm
+build:crosswindows --config=crosswindowsbase
+build:crosswindowsbase --platforms=//build/toolchains:cross_windows
+build:crosswindowsbase --config=cross
+build:crossmacos '--workspace_status_command=./build/bazelutil/stamp.sh x86_64-apple-darwin21.2'
+build:crossmacos --config=crossmacosbase
+build:crossmacosbase --platforms=//build/toolchains:cross_macos
+build:crossmacosbase --config=cross
+build:crossmacosarm '--workspace_status_command=./build/bazelutil/stamp.sh aarch64-apple-darwin21.2'
+build:crossmacosarm --config=crossmacosarmbase
+build:crossmacosarmbase --platforms=//build/toolchains:cross_macos_arm
+build:crossmacosarmbase --config=cross
 build:crosslinuxarm '--workspace_status_command=./build/bazelutil/stamp.sh aarch64-unknown-linux-gnu'
-build:crosslinuxarm --config=cross
+build:crosslinuxarm --config=crosslinuxarmbase
+build:crosslinuxarmbase --platforms=//build/toolchains:cross_linux_arm
+build:crosslinuxarmbase --config=cross
+build:crosslinuxs390x '--workspace_status_command=./build/bazelutil/stamp.sh s390x-unknown-linux-gnu'
+build:crosslinuxs390x --config=crosslinuxs390xbase
+build:crosslinuxs390xbase --platforms=//build/toolchains:cross_linux_s390x
+build:crosslinuxs390xbase --config=cross
 
-# Developer configurations. Add e.g. --config=devdarwinx86_64 to turn these on.
-# NB: This is consumed in `BUILD` files (see build/toolchains/BUILD.bazel).
-build:devdarwinx86_64 --platforms=//build/toolchains:darwin_x86_64
+# devdarwinx86_64 is a legacy setting that implies `--config=dev`.
 build:devdarwinx86_64 --config=dev
-build:dev --define cockroach_bazel_dev=y
-build:dev --stamp --workspace_status_command=./build/bazelutil/stamp.sh
+build:dev --config=simplestamp
 build:dev --action_env=PATH
 build:dev --host_action_env=PATH
 
-build:nonogo --define cockroach_nonogo=y
+# --config=simplestamp configures the build to stamp the build with inferred
+# information about the configuration.
+# All `dev` builds will use this configuration; all `cross` builds will use a
+# more precise --workspace_status_command option.
+build:simplestamp --stamp --workspace_status_command=./build/bazelutil/stamp.sh
+
+try-import %workspace%/.bazelrc.user
+
 # vi: ft=sh

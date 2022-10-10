@@ -52,7 +52,7 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 	for _, meta := range workload.Registered() {
 		meta := meta
 		gen := meta.New()
-		hasInitialData := true
+		hasInitialData := len(gen.Tables()) != 0
 		for _, table := range gen.Tables() {
 			if table.InitialRows.FillBatch == nil {
 				hasInitialData = false
@@ -71,7 +71,7 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 		}
 
 		switch meta.Name {
-		case `startrek`, `roachmart`, `interleavedpartitioned`:
+		case `startrek`, `roachmart`, `interleavedpartitioned`, `ttlbench`:
 			// These don't work with IMPORT.
 			continue
 		case `tpch`:
@@ -88,8 +88,11 @@ func TestAllRegisteredImportFixture(t *testing.T) {
 
 			ctx := context.Background()
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-				UseDatabase:       "d",
-				SQLMemoryPoolSize: sqlMemoryPoolSize,
+				// The test tenant needs to be disabled for this test until
+				// we address #75449.
+				DisableDefaultTestTenant: true,
+				UseDatabase:              "d",
+				SQLMemoryPoolSize:        sqlMemoryPoolSize,
 			})
 			defer s.Stopper().Stop(ctx)
 			sqlutils.MakeSQLRunner(db).Exec(t, `CREATE DATABASE d`)
@@ -140,13 +143,18 @@ func TestAllRegisteredSetup(t *testing.T) {
 		case `interleavedpartitioned`:
 			// This require a specific node locality setup
 			continue
+		case `ttlbench`:
+			continue
 		}
 
 		t.Run(meta.Name, func(t *testing.T) {
 			defer log.Scope(t).Close(t)
 			ctx := context.Background()
 			s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-				UseDatabase: "d",
+				// Need to disable the test tenant here until we resolve
+				// #75449 as this test makes use of import through a fixture.
+				DisableDefaultTestTenant: true,
+				UseDatabase:              "d",
 			})
 			defer s.Stopper().Stop(ctx)
 			sqlutils.MakeSQLRunner(db).Exec(t, `CREATE DATABASE d`)

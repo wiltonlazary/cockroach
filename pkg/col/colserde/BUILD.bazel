@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -36,6 +37,7 @@ go_test(
         "main_test.go",
         "record_batch_test.go",
     ],
+    args = ["-test.timeout=55s"],
     deps = [
         ":colserde",
         "//pkg/col/coldata",
@@ -62,3 +64,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

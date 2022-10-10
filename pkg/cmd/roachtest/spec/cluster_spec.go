@@ -43,15 +43,17 @@ type ClusterSpec struct {
 	InstanceType string // auto-chosen if left empty
 	NodeCount    int
 	// CPUs is the number of CPUs per node.
-	CPUs           int
-	SSDs           int
-	RAID0          bool
-	VolumeSize     int
-	PreferLocalSSD bool
-	Zones          string
-	Geo            bool
-	Lifetime       time.Duration
-	ReusePolicy    clusterReusePolicy
+	CPUs                 int
+	HighMem              bool
+	SSDs                 int
+	RAID0                bool
+	VolumeSize           int
+	PreferLocalSSD       bool
+	Zones                string
+	Geo                  bool
+	Lifetime             time.Duration
+	ReusePolicy          clusterReusePolicy
+	TerminateOnMigration bool
 
 	// FileSystem determines the underlying FileSystem
 	// to be used. The default is ext4.
@@ -81,6 +83,9 @@ func ClustersCompatible(s1, s2 ClusterSpec) bool {
 // String implements fmt.Stringer.
 func (s ClusterSpec) String() string {
 	str := fmt.Sprintf("n%dcpu%d", s.NodeCount, s.CPUs)
+	if s.HighMem {
+		str += "m"
+	}
 	if s.Geo {
 		str += "-Geo"
 	}
@@ -111,7 +116,12 @@ func getAWSOpts(machineType string, zones []string, localSSD bool) vm.ProviderOp
 }
 
 func getGCEOpts(
-	machineType string, zones []string, volumeSize, localSSDCount int, localSSD bool, RAID0 bool,
+	machineType string,
+	zones []string,
+	volumeSize, localSSDCount int,
+	localSSD bool,
+	RAID0 bool,
+	terminateOnMigration bool,
 ) vm.ProviderOpts {
 	opts := gce.DefaultProviderOpts()
 	opts.MachineType = machineType
@@ -129,6 +139,8 @@ func getGCEOpts(
 		// test has explicitly asked for RAID0.
 		opts.UseMultipleDisks = !RAID0
 	}
+	opts.TerminateOnMigration = terminateOnMigration
+
 	return opts
 }
 
@@ -183,11 +195,11 @@ func (s *ClusterSpec) RoachprodOpts(
 			// based on the cloud and CPU count.
 			switch s.Cloud {
 			case AWS:
-				machineType = AWSMachineType(s.CPUs)
+				machineType = AWSMachineType(s.CPUs, s.HighMem)
 			case GCE:
-				machineType = GCEMachineType(s.CPUs)
+				machineType = GCEMachineType(s.CPUs, s.HighMem)
 			case Azure:
-				machineType = AzureMachineType(s.CPUs)
+				machineType = AzureMachineType(s.CPUs, s.HighMem)
 			}
 		}
 
@@ -233,7 +245,8 @@ func (s *ClusterSpec) RoachprodOpts(
 	case AWS:
 		providerOpts = getAWSOpts(machineType, zones, createVMOpts.SSDOpts.UseLocalSSD)
 	case GCE:
-		providerOpts = getGCEOpts(machineType, zones, s.VolumeSize, ssdCount, createVMOpts.SSDOpts.UseLocalSSD, s.RAID0)
+		providerOpts = getGCEOpts(machineType, zones, s.VolumeSize, ssdCount,
+			createVMOpts.SSDOpts.UseLocalSSD, s.RAID0, s.TerminateOnMigration)
 	case Azure:
 		providerOpts = getAzureOpts(machineType, zones)
 	}

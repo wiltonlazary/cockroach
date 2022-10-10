@@ -11,17 +11,23 @@
 package optbuilder
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -54,6 +60,8 @@ func (b *Builder) buildDataSource(
 			indexFlags = source.IndexFlags
 		}
 		if source.As.Alias != "" {
+			inScope = inScope.push()
+			inScope.alias = &source.As
 			locking = locking.filter(source.As.Alias)
 		}
 
@@ -115,12 +123,12 @@ func (b *Builder) buildDataSource(
 			return b.buildScan(
 				tabMeta,
 				tableOrdinals(t, columnKinds{
-					includeMutations:       false,
-					includeSystem:          true,
-					includeInverted:        false,
-					includeVirtualComputed: true,
+					includeMutations: false,
+					includeSystem:    true,
+					includeInverted:  false,
 				}),
 				indexFlags, locking, inScope,
+				false, /* disableNotVisibleIndex */
 			)
 
 		case cat.Sequence:
@@ -280,12 +288,12 @@ func (b *Builder) buildView(
 		b.skipSelectPrivilegeChecks = true
 		defer func() { b.skipSelectPrivilegeChecks = false }()
 	}
-	trackDeps := b.trackViewDeps
+	trackDeps := b.trackSchemaDeps
 	if trackDeps {
 		// We are only interested in the direct dependency on this view descriptor.
 		// Any further dependency by the view's query should not be tracked.
-		b.trackViewDeps = false
-		defer func() { b.trackViewDeps = true }()
+		b.trackSchemaDeps = false
+		defer func() { b.trackSchemaDeps = true }()
 	}
 
 	// We don't want the view to be able to refer to any outer scopes in the
@@ -309,11 +317,11 @@ func (b *Builder) buildView(
 	}
 
 	if trackDeps && !view.IsSystemView() {
-		dep := opt.ViewDep{DataSource: view}
+		dep := opt.SchemaDep{DataSource: view}
 		for i := range outScope.cols {
 			dep.ColumnOrdinals.Add(i)
 		}
-		b.viewDeps = append(b.viewDeps, dep)
+		b.schemaDeps = append(b.schemaDeps, dep)
 	}
 
 	return outScope
@@ -331,7 +339,7 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 		// table name.
 		noColNameSpecified := len(colAlias) == 0
 		if scope.isAnonymousTable() && noColNameSpecified && scope.singleSRFColumn {
-			colAlias = tree.NameList{as.Alias}
+			colAlias = tree.ColumnDefList{tree.ColumnDef{Name: as.Alias}}
 		}
 
 		// If an alias was specified, use that to qualify the column names.
@@ -361,11 +369,11 @@ func (b *Builder) renameSource(as tree.AliasClause, scope *scope) {
 				if col.visibility != visible {
 					continue
 				}
-				col.name = scopeColName(colAlias[aliasIdx])
+				col.name = scopeColName(colAlias[aliasIdx].Name)
 				if isScan {
 					// Override column metadata alias.
 					colMeta := b.factory.Metadata().ColumnMeta(col.id)
-					colMeta.Alias = string(colAlias[aliasIdx])
+					colMeta.Alias = string(colAlias[aliasIdx].Name)
 				}
 				aliasIdx++
 			}
@@ -399,16 +407,16 @@ func (b *Builder) buildScanFromTableRef(
 		ordinals = resolveNumericColumnRefs(tab, ref.Columns)
 	} else {
 		ordinals = tableOrdinals(tab, columnKinds{
-			includeMutations:       false,
-			includeSystem:          true,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: false,
+			includeSystem:    true,
+			includeInverted:  false,
 		})
 	}
 
 	tn := tree.MakeUnqualifiedTableName(tab.Name())
 	tabMeta := b.addTable(tab, &tn)
-	return b.buildScan(tabMeta, ordinals, indexFlags, locking, inScope)
+
+	return b.buildScan(tabMeta, ordinals, indexFlags, locking, inScope, false /* disableNotVisibleIndex */)
 }
 
 // addTable adds a table to the metadata and returns the TableMeta. The table
@@ -418,6 +426,25 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 	md := b.factory.Metadata()
 	tabID := md.AddTable(tab, alias)
 	return md.TableMeta(tabID)
+}
+
+// errorOnInvalidMultiregionDB panics if the table described by tabMeta is owned
+// by a non-multiregion database or a multiregion database with SURVIVE REGION
+// FAILURE goal.
+func errorOnInvalidMultiregionDB(
+	ctx context.Context, evalCtx *eval.Context, tabMeta *opt.TableMeta,
+) {
+	survivalGoal, ok := tabMeta.GetDatabaseSurvivalGoal(ctx, evalCtx.Planner)
+	// non-multiregional database or SURVIVE REGION FAILURE option
+	if !ok {
+		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
+			"Query has no home region. Try accessing only tables in multi-region databases with ZONE survivability.")
+		panic(err)
+	} else if survivalGoal == descpb.SurvivalGoal_REGION_FAILURE {
+		err := pgerror.New(pgcode.QueryHasNoHomeRegion,
+			"The enforce_home_region setting cannot be combined with REGION survivability. Try accessing only tables in multi-region databases with ZONE survivability.")
+		panic(err)
+	}
 }
 
 // buildScan builds a memo group for a ScanOp expression on the given table. If
@@ -435,10 +462,11 @@ func (b *Builder) addTable(tab cat.Table, alias *tree.TableName) *opt.TableMeta 
 // DELETE).
 //
 // NOTE: Callers must take care that mutation columns (columns that are being
-//       added or dropped from the table) are only used when performing mutation
-//       DML statements (INSERT, UPDATE, UPSERT, DELETE). They cannot be used in
-//       any other way because they may not have been initialized yet by the
-//       backfiller!
+//
+//	added or dropped from the table) are only used when performing mutation
+//	DML statements (INSERT, UPDATE, UPSERT, DELETE). They cannot be used in
+//	any other way because they may not have been initialized yet by the
+//	backfiller!
 //
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
@@ -448,6 +476,7 @@ func (b *Builder) buildScan(
 	indexFlags *tree.IndexFlags,
 	locking lockingSpec,
 	inScope *scope,
+	disableNotVisibleIndex bool,
 ) (outScope *scope) {
 	if ordinals == nil {
 		panic(errors.AssertionFailedf("no ordinals"))
@@ -492,6 +521,12 @@ func (b *Builder) buildScan(
 		}
 	}
 
+	if tab.IsRefreshViewRequired() {
+		err := errors.WithHint(
+			pgerror.Newf(pgcode.ObjectNotInPrerequisiteState, "materialized view %q has not been populated", tab.Name()),
+			"use the REFRESH MATERIALIZED VIEW command.")
+		panic(err)
+	}
 	if tab.IsVirtualTable() {
 		if indexFlags != nil {
 			panic(pgerror.Newf(pgcode.Syntax,
@@ -506,6 +541,12 @@ func (b *Builder) buildScan(
 
 		// Note: virtual tables should not be collected as view dependencies.
 		return outScope
+	}
+
+	// Scanning tables in databases that don't use the SURVIVE ZONE FAILURE option
+	// is disallowed when EnforceHomeRegion is true.
+	if b.evalCtx.SessionData().EnforceHomeRegion {
+		errorOnInvalidMultiregionDB(b.ctx, b.evalCtx, tabMeta)
 	}
 
 	private := memo.ScanPrivate{Table: tabID, Cols: scanColIDs}
@@ -584,14 +625,23 @@ func (b *Builder) buildScan(
 	}
 	if locking.isSet() {
 		private.Locking = locking.get()
+		if private.Locking.WaitPolicy == tree.LockWaitSkipLocked && tab.FamilyCount() > 1 {
+			// TODO(rytaft): We may be able to support this if enough columns are
+			// pruned that only a single family is scanned.
+			panic(pgerror.Newf(pgcode.FeatureNotSupported,
+				"SKIP LOCKED cannot be used for tables with multiple column families",
+			))
+		}
 	}
 	if b.evalCtx.AsOfSystemTime != nil && b.evalCtx.AsOfSystemTime.BoundedStaleness {
 		private.Flags.NoIndexJoin = true
 		private.Flags.NoZigzagJoin = true
 	}
+	private.Flags.DisableNotVisibleIndex = disableNotVisibleIndex
 
 	b.addCheckConstraintsForTable(tabMeta)
 	b.addComputedColsForTable(tabMeta)
+	b.addIndexPartitionLocalitiesForTable(tabMeta)
 
 	outScope.expr = b.factory.ConstructScan(&private)
 
@@ -615,8 +665,8 @@ func (b *Builder) buildScan(
 		outScope.expr = b.factory.ConstructProject(outScope.expr, proj, scanColIDs)
 	}
 
-	if b.trackViewDeps {
-		dep := opt.ViewDep{DataSource: tab}
+	if b.trackSchemaDeps {
+		dep := opt.SchemaDep{DataSource: tab}
 		dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
 		// We will track the ColumnID to Ord mapping so Ords can be added
 		// when a column is referenced.
@@ -627,7 +677,7 @@ func (b *Builder) buildScan(
 			dep.SpecificIndex = true
 			dep.Index = private.Flags.Index
 		}
-		b.viewDeps = append(b.viewDeps, dep)
+		b.schemaDeps = append(b.schemaDeps, dep)
 	}
 	return outScope
 }
@@ -645,10 +695,10 @@ func (b *Builder) addCheckConstraintsForTable(tabMeta *opt.TableMeta) {
 	// track view deps here, or else a view depending on a table with a
 	// column that is a UDT will result in a type dependency being added
 	// between the view and the UDT, even if the view does not use that column.
-	if b.trackViewDeps {
-		b.trackViewDeps = false
+	if b.trackSchemaDeps {
+		b.trackSchemaDeps = false
 		defer func() {
-			b.trackViewDeps = true
+			b.trackSchemaDeps = true
 		}()
 	}
 	tab := tabMeta.Table
@@ -724,10 +774,10 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 	// on a table with a computed column of a UDT will result in a
 	// type dependency being added between the view and the UDT,
 	// even if the view does not use that column.
-	if b.trackViewDeps {
-		b.trackViewDeps = false
+	if b.trackSchemaDeps {
+		b.trackSchemaDeps = false
 		defer func() {
-			b.trackViewDeps = true
+			b.trackSchemaDeps = true
 		}()
 	}
 	var tableScope *scope
@@ -768,6 +818,19 @@ func (b *Builder) addComputedColsForTable(tabMeta *opt.TableMeta) {
 	}
 }
 
+// addIndexPartitionLocalitiesForTable caches locality prefix sorters in the
+// table metadata for indexes that have a mix of local and remote partitions.
+func (b *Builder) addIndexPartitionLocalitiesForTable(tabMeta *opt.TableMeta) {
+	tab := tabMeta.Table
+	for indexOrd, n := 0, tab.IndexCount(); indexOrd < n; indexOrd++ {
+		index := tab.Index(indexOrd)
+		if localPartitions, ok := partition.HasMixOfLocalAndRemotePartitions(b.evalCtx, index); ok {
+			ps := partition.GetSortedPrefixes(index, localPartitions, b.evalCtx)
+			tabMeta.AddIndexPartitionLocality(indexOrd, ps)
+		}
+	}
+}
+
 func (b *Builder) buildSequenceSelect(
 	seq cat.Sequence, seqName *tree.TableName, inScope *scope,
 ) (outScope *scope) {
@@ -797,8 +860,8 @@ func (b *Builder) buildSequenceSelect(
 	}
 	outScope.expr = b.factory.ConstructSequenceSelect(&private)
 
-	if b.trackViewDeps {
-		b.viewDeps = append(b.viewDeps, opt.ViewDep{DataSource: seq})
+	if b.trackSchemaDeps {
+		b.schemaDeps = append(b.schemaDeps, opt.SchemaDep{DataSource: seq})
 	}
 	return outScope
 }
@@ -833,6 +896,9 @@ func (b *Builder) buildSelectStmt(
 ) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch stmt := stmt.(type) {
+	case *tree.LiteralValuesClause:
+		return b.buildLiteralValuesClause(stmt, desiredTypes, inScope)
+
 	case *tree.ParenSelect:
 		return b.buildSelect(stmt.Select, locking, desiredTypes, inScope)
 
@@ -922,6 +988,10 @@ func (b *Builder) buildSelectStmtWithoutParens(
 ) (outScope *scope) {
 	// NB: The case statements are sorted lexicographically.
 	switch t := wrapped.(type) {
+	case *tree.LiteralValuesClause:
+		b.rejectIfLocking(locking, "VALUES")
+		outScope = b.buildLiteralValuesClause(t, desiredTypes, inScope)
+
 	case *tree.ParenSelect:
 		panic(errors.AssertionFailedf(
 			"%T in buildSelectStmtWithoutParens", wrapped))
@@ -1139,11 +1209,11 @@ func (b *Builder) buildFromTables(
 // in the reverse order that they appear in the list, with the innermost join
 // involving the tables at the end of the list. For example:
 //
-//   SELECT * FROM a,b,c
+//	SELECT * FROM a,b,c
 //
 // is joined like:
 //
-//   SELECT * FROM a JOIN (b JOIN c ON true) ON true
+//	SELECT * FROM a JOIN (b JOIN c ON true) ON true
 //
 // This ordering is guaranteed for queries not involving lateral joins for the
 // time being, to ensure we don't break any queries which have been
@@ -1197,10 +1267,10 @@ func (b *Builder) exprIsLateral(t tree.TableExpr) bool {
 // left-to-right) rather than right-deep (from right-to-left) which we do
 // typically for perf backwards-compatibility.
 //
-//   SELECT * FROM a, b, c
+//	SELECT * FROM a, b, c
 //
-//   buildFromTablesRightDeep: a JOIN (b JOIN c)
-//   buildFromWithLateral:     (a JOIN b) JOIN c
+//	buildFromTablesRightDeep: a JOIN (b JOIN c)
+//	buildFromWithLateral:     (a JOIN b) JOIN c
 func (b *Builder) buildFromWithLateral(
 	tables tree.TableExprs, locking lockingSpec, inScope *scope,
 ) (outScope *scope) {
@@ -1231,12 +1301,12 @@ func (b *Builder) buildFromWithLateral(
 // validateAsOf ensures that any AS OF SYSTEM TIME timestamp is consistent with
 // that of the root statement.
 func (b *Builder) validateAsOf(asOfClause tree.AsOfClause) {
-	asOf, err := tree.EvalAsOfTimestamp(
+	asOf, err := asof.Eval(
 		b.ctx,
 		asOfClause,
 		b.semaCtx,
 		b.evalCtx,
-		tree.EvalAsOfTimestampOptionAllowBoundedStaleness,
+		asof.OptionAllowBoundedStaleness,
 	)
 	if err != nil {
 		panic(err)
@@ -1307,9 +1377,8 @@ func (b *Builder) validateLockingInFrom(
 		switch li.WaitPolicy {
 		case tree.LockWaitBlock:
 			// Default. Block on conflicting locks.
-		case tree.LockWaitSkip:
-			panic(unimplementedWithIssueDetailf(40476, "",
-				"SKIP LOCKED lock wait policy is not supported"))
+		case tree.LockWaitSkipLocked:
+			// Skip rows that can't be locked.
 		case tree.LockWaitError:
 			// Raise an error on conflicting locks.
 		default:

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,10 +8,9 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/clusterversion",
-        "//pkg/gossip",
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/multitenant",
+        "//pkg/security/username",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/sem/tree",
@@ -34,19 +34,21 @@ go_test(
         "statement_diagnostics_helpers_test.go",
         "statement_diagnostics_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":stmtdiagnostics"],
     tags = ["no-remote"],
     deps = [
         "//pkg/base",
         "//pkg/keys",
         "//pkg/kv/kvserver",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/roachpb",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/settings/cluster",
         "//pkg/sql",
         "//pkg/sql/catalog/systemschema",
+        "//pkg/sql/sqlerrors",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/testcluster",
@@ -58,3 +60,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

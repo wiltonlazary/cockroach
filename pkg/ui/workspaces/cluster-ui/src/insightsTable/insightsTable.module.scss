@@ -1,0 +1,41 @@
+@import "src/core/index.module";
+
+.insight-type {
+  color: $colors--functional-orange-4;
+  font-weight: $font-weight--bold;
+}
+
+.label-bold {
+  font-family: $font-family--semi-bold;
+  font-size: $font-size--medium;
+  line-height: $line-height--x-small;
+  color: $colors--neutral-7;
+}
+
+.description-item {
+  margin-bottom: 5px;
+
+  .table-link {
+    color: $colors--link
+  }
+  a {
+    color: $colors--link
+  }
+}
+
+.margin-bottom {
+  margin-bottom: 20px;
+}
+
+.margin-bottom-large {
+  margin-bottom: 30px;
+}
+
+.section {
+  flex: 0 0 auto;
+  padding: 12px 24px 12px 0px;
+}
+
+.inline {
+  display: inline-flex;
+}

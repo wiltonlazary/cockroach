@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -18,6 +19,7 @@ go_test(
     name = "geogen_test",
     size = "small",
     srcs = ["geogen_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":geogen"],
     deps = [
         "//pkg/geo/geopb",
@@ -26,3 +28,5 @@ go_test(
         "@com_github_twpayne_go_geom//:go-geom",
     ],
 )
+
+get_x_data(name = "get_x_data")

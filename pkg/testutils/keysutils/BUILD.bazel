@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,7 +8,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/sql/rowenc/keyside",
         "//pkg/sql/sem/tree",
         "//pkg/util/encoding",
@@ -19,11 +20,14 @@ go_test(
     name = "keysutils_test",
     size = "small",
     srcs = ["pretty_scanner_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":keysutils"],
     deps = [
         "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/encoding",
     ],
 )
+
+get_x_data(name = "get_x_data")

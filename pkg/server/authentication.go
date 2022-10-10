@@ -21,8 +21,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/password"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -59,6 +62,8 @@ const (
 
 type noOIDCConfigured struct{}
 
+var _ ui.OIDCUI = &noOIDCConfigured{}
+
 func (c *noOIDCConfigured) GetOIDCConf() ui.OIDCUIConf {
 	return ui.OIDCUIConf{
 		Enabled: false,
@@ -77,7 +82,7 @@ var ConfigureOIDC = func(
 	ctx context.Context,
 	st *cluster.Settings,
 	locality roachpb.Locality,
-	mux *http.ServeMux,
+	handleHTTP func(pattern string, handler http.Handler),
 	userLoginFromSSO func(ctx context.Context, username string) (*http.Cookie, error),
 	ambientCtx log.AmbientContext,
 	cluster uuid.UUID,
@@ -94,14 +99,16 @@ var webSessionTimeout = settings.RegisterDurationSetting(
 ).WithPublic()
 
 type authenticationServer struct {
-	server *Server
+	cfg       *base.Config
+	sqlServer *SQLServer
 }
 
 // newAuthenticationServer allocates and returns a new REST server for
 // authentication APIs.
-func newAuthenticationServer(s *Server) *authenticationServer {
+func newAuthenticationServer(cfg *base.Config, s *SQLServer) *authenticationServer {
 	return &authenticationServer{
-		server: s,
+		cfg:       cfg,
+		sqlServer: s,
 	}
 }
 
@@ -142,7 +149,7 @@ func (s *authenticationServer) UserLogin(
 	// here, so that the normalized username is retained in the session
 	// table: the APIs extract the username from the session table
 	// without further normalization.
-	username, _ := security.MakeSQLUsernameFromUserInput(req.Username, security.UsernameValidation)
+	username, _ := username.MakeSQLUsernameFromUserInput(req.Username, username.PurposeValidation)
 
 	// Verify the provided username/password pair.
 	verified, expired, err := s.verifyPasswordDBConsole(ctx, username, req.Password)
@@ -177,7 +184,7 @@ func (s *authenticationServer) UserLogin(
 // It is only available for demo and test clusters.
 func (s *authenticationServer) demoLogin(w http.ResponseWriter, req *http.Request) {
 	ctx := context.Background()
-	ctx = logtags.AddTag(ctx, "client", req.RemoteAddr)
+	ctx = logtags.AddTag(ctx, "client", log.SafeOperational(req.RemoteAddr))
 	ctx = logtags.AddTag(ctx, "demologin", nil)
 
 	fail := func(err error) {
@@ -207,7 +214,7 @@ func (s *authenticationServer) demoLogin(w http.ResponseWriter, req *http.Reques
 	// here, so that the normalized username is retained in the session
 	// table: the APIs extract the username from the session table
 	// without further normalization.
-	username, _ := security.MakeSQLUsernameFromUserInput(userInput, security.UsernameValidation)
+	username, _ := username.MakeSQLUsernameFromUserInput(userInput, username.PurposeValidation)
 	// Verify the provided username/password pair.
 	verified, expired, err := s.verifyPasswordDBConsole(ctx, username, password)
 	if err != nil {
@@ -252,12 +259,12 @@ func (s *authenticationServer) UserLoginFromSSO(
 	// here, so that the normalized username is retained in the session
 	// table: the APIs extract the username from the session table
 	// without further normalization.
-	username, _ := security.MakeSQLUsernameFromUserInput(reqUsername, security.UsernameValidation)
+	username, _ := username.MakeSQLUsernameFromUserInput(reqUsername, username.PurposeValidation)
 
 	exists, _, canLoginDBConsole, _, _, _, err := sql.GetUserSessionInitInfo(
 		ctx,
-		s.server.sqlServer.execCfg,
-		s.server.sqlServer.execCfg.InternalExecutor,
+		s.sqlServer.execCfg,
+		s.sqlServer.execCfg.InternalExecutor,
 		username,
 		"", /* databaseName */
 	)
@@ -276,10 +283,10 @@ func (s *authenticationServer) UserLoginFromSSO(
 //
 // The caller is responsible to ensure the username has been normalized already.
 func (s *authenticationServer) createSessionFor(
-	ctx context.Context, username security.SQLUsername,
+	ctx context.Context, userName username.SQLUsername,
 ) (*http.Cookie, error) {
 	// Create a new database session, generating an ID and secret key.
-	id, secret, err := s.newAuthSession(ctx, username)
+	id, secret, err := s.newAuthSession(ctx, userName)
 	if err != nil {
 		return nil, apiInternalError(ctx, err)
 	}
@@ -291,7 +298,7 @@ func (s *authenticationServer) createSessionFor(
 		ID:     id,
 		Secret: secret,
 	}
-	return EncodeSessionCookie(cookieValue, !s.server.cfg.DisableTLSForHTTP)
+	return EncodeSessionCookie(cookieValue, !s.cfg.DisableTLSForHTTP)
 }
 
 // UserLogout allows a user to terminate their currently active session.
@@ -315,11 +322,11 @@ func (s *authenticationServer) UserLogout(
 	}
 
 	// Revoke the session.
-	if n, err := s.server.sqlServer.internalExecutor.ExecEx(
+	if n, err := s.sqlServer.internalExecutor.ExecEx(
 		ctx,
 		"revoke-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		`UPDATE system.web_sessions SET "revokedAt" = now() WHERE id = $1`,
 		sessionID,
 	); err != nil {
@@ -360,16 +367,16 @@ WHERE id = $1`
 
 	var (
 		hashedSecret []byte
-		username     string
+		userName     string
 		expiresAt    time.Time
 		isRevoked    bool
 	)
 
-	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
+	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"lookup-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		sessionQuery, cookie.ID)
 	if row == nil || err != nil {
 		return false, "", err
@@ -384,7 +391,7 @@ WHERE id = $1`
 
 	// Extract datum values.
 	hashedSecret = []byte(*row[0].(*tree.DBytes))
-	username = string(*row[1].(*tree.DString))
+	userName = string(*row[1].(*tree.DString))
 	expiresAt = row[2].(*tree.DTimestamp).Time
 	isRevoked = row[3].ResolvedType().Family() != types.UnknownFamily
 
@@ -392,7 +399,7 @@ WHERE id = $1`
 		return false, "", nil
 	}
 
-	if now := s.server.clock.PhysicalTime(); !now.Before(expiresAt) {
+	if now := s.sqlServer.execCfg.Clock.PhysicalTime(); !now.Before(expiresAt) {
 		return false, "", nil
 	}
 
@@ -403,7 +410,7 @@ WHERE id = $1`
 		return false, "", nil
 	}
 
-	return true, username, nil
+	return true, userName, nil
 }
 
 // verifyPasswordDBConsole verifies the passed username/password pair against the
@@ -417,13 +424,13 @@ WHERE id = $1`
 // The caller is responsible for ensuring that the username is normalized.
 // (CockroachDB has case-insensitive usernames, unlike PostgreSQL.)
 func (s *authenticationServer) verifyPasswordDBConsole(
-	ctx context.Context, username security.SQLUsername, password string,
+	ctx context.Context, userName username.SQLUsername, passwordStr string,
 ) (valid bool, expired bool, err error) {
 	exists, _, canLoginDBConsole, _, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
 		ctx,
-		s.server.sqlServer.execCfg,
-		s.server.sqlServer.execCfg.InternalExecutor,
-		username,
+		s.sqlServer.execCfg,
+		s.sqlServer.execCfg.InternalExecutor,
+		userName,
 		"", /* databaseName */
 	)
 	if err != nil {
@@ -441,7 +448,9 @@ func (s *authenticationServer) verifyPasswordDBConsole(
 		return false, true, nil
 	}
 
-	ok, err := security.CompareHashAndCleartextPassword(ctx, hashedPassword, password)
+	ok, err := password.CompareHashAndCleartextPassword(
+		ctx, hashedPassword, passwordStr, security.GetExpensiveHashComputeSem(ctx),
+	)
 	if ok && err == nil {
 		// Password authentication succeeded using cleartext.  If the
 		// stored hash was encoded using crdb-bcrypt, we might want to
@@ -451,9 +460,9 @@ func (s *authenticationServer) verifyPasswordDBConsole(
 		// pushes clusters upgraded from a previous version into using
 		// SCRAM-SHA-256.
 		sql.MaybeUpgradeStoredPasswordHash(ctx,
-			s.server.sqlServer.execCfg,
-			username,
-			password, hashedPassword)
+			s.sqlServer.execCfg,
+			userName,
+			passwordStr, hashedPassword)
 	}
 	return ok, false, err
 }
@@ -476,14 +485,14 @@ func CreateAuthSecret() (secret, hashedSecret []byte, err error) {
 //
 // The caller is responsible to ensure the username has been normalized already.
 func (s *authenticationServer) newAuthSession(
-	ctx context.Context, username security.SQLUsername,
+	ctx context.Context, userName username.SQLUsername,
 ) (int64, []byte, error) {
 	secret, hashedSecret, err := CreateAuthSecret()
 	if err != nil {
 		return 0, nil, err
 	}
 
-	expiration := s.server.clock.PhysicalTime().Add(webSessionTimeout.Get(&s.server.st.SV))
+	expiration := s.sqlServer.execCfg.Clock.PhysicalTime().Add(webSessionTimeout.Get(&s.sqlServer.execCfg.Settings.SV))
 
 	insertSessionStmt := `
 INSERT INTO system.web_sessions ("hashedSecret", username, "expiresAt")
@@ -492,14 +501,14 @@ RETURNING id
 `
 	var id int64
 
-	row, err := s.server.sqlServer.internalExecutor.QueryRowEx(
+	row, err := s.sqlServer.internalExecutor.QueryRowEx(
 		ctx,
 		"create-auth-session",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		insertSessionStmt,
 		hashedSecret,
-		username.Normalized(),
+		userName.Normalized(),
 		expiration,
 	)
 	if err != nil {

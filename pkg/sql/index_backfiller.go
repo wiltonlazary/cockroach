@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
@@ -30,15 +29,12 @@ import (
 // IndexBackfillPlanner holds dependencies for an index backfiller
 // for use in the declarative schema changer.
 type IndexBackfillPlanner struct {
-	execCfg   *ExecutorConfig
-	ieFactory sqlutil.SessionBoundInternalExecutorFactory
+	execCfg *ExecutorConfig
 }
 
 // NewIndexBackfiller creates a new IndexBackfillPlanner.
-func NewIndexBackfiller(
-	execCfg *ExecutorConfig, ieFactory sqlutil.SessionBoundInternalExecutorFactory,
-) *IndexBackfillPlanner {
-	return &IndexBackfillPlanner{execCfg: execCfg, ieFactory: ieFactory}
+func NewIndexBackfiller(execCfg *ExecutorConfig) *IndexBackfillPlanner {
+	return &IndexBackfillPlanner{execCfg: execCfg}
 }
 
 // MaybePrepareDestIndexesForBackfill is part of the scexec.Backfiller interface.
@@ -68,11 +64,11 @@ func (ib *IndexBackfillPlanner) MaybePrepareDestIndexesForBackfill(
 	}, nil
 }
 
-// BackfillIndex is part of the scexec.Backfiller interface.
-func (ib *IndexBackfillPlanner) BackfillIndex(
+// BackfillIndexes is part of the scexec.Backfiller interface.
+func (ib *IndexBackfillPlanner) BackfillIndexes(
 	ctx context.Context,
 	progress scexec.BackfillProgress,
-	tracker scexec.BackfillProgressWriter,
+	tracker scexec.BackfillerProgressWriter,
 	descriptor catalog.TableDescriptor,
 ) error {
 	var completed = struct {
@@ -102,6 +98,9 @@ func (ib *IndexBackfillPlanner) BackfillIndex(
 		g.Add(sourceIndexSpan)
 		g.Sub(progress.CompletedSpans...)
 		spansToDo = g.Slice()
+	}
+	if len(spansToDo) == 0 { // already done
+		return nil
 	}
 	now := ib.execCfg.DB.Clock().Now()
 	run, err := ib.plan(
@@ -167,17 +166,22 @@ func (ib *IndexBackfillPlanner) plan(
 	if err := DescsTxn(ctx, ib.execCfg, func(
 		ctx context.Context, txn *kv.Txn, descriptors *descs.Collection,
 	) error {
-		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, nowTimestamp, descriptors)
-		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn,
-			true /* distribute */)
+		sd := NewFakeSessionData(ib.execCfg.SV())
+		evalCtx = createSchemaChangeEvalCtx(ctx, ib.execCfg, sd, nowTimestamp, descriptors)
+		planCtx = ib.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx,
+			nil /* planner */, txn, DistributionTypeSystemTenantOnly)
 		// TODO(ajwerner): Adopt util.ConstantWithMetamorphicTestRange for the
 		// batch size. Also plumb in a testing knob.
 		chunkSize := indexBackfillBatchSize.Get(&ib.execCfg.Settings.SV)
-		spec, err := initIndexBackfillerSpec(*td.TableDesc(), writeAsOf, readAsOf, chunkSize, indexesToBackfill)
+		const writeAtRequestTimestamp = true
+		spec, err := initIndexBackfillerSpec(
+			*td.TableDesc(), writeAsOf, readAsOf, writeAtRequestTimestamp, chunkSize,
+			indexesToBackfill,
+		)
 		if err != nil {
 			return err
 		}
-		p, err = ib.execCfg.DistSQLPlanner.createBackfillerPhysicalPlan(planCtx, spec, sourceSpans)
+		p, err = ib.execCfg.DistSQLPlanner.createBackfillerPhysicalPlan(ctx, planCtx, spec, sourceSpans)
 		return err
 	}); err != nil {
 		return nil, err
@@ -198,7 +202,7 @@ func (ib *IndexBackfillPlanner) plan(
 		)
 		defer recv.Release()
 		evalCtxCopy := evalCtx
-		ib.execCfg.DistSQLPlanner.Run(planCtx, nil, p, recv, &evalCtxCopy, nil)()
+		ib.execCfg.DistSQLPlanner.Run(ctx, planCtx, nil, p, recv, &evalCtxCopy, nil)
 		return cbw.Err()
 	}, nil
 }

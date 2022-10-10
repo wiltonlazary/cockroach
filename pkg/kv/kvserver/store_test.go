@@ -32,7 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
@@ -55,12 +57,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/gogo/protobuf/proto"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
-	raft "go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/time/rate"
@@ -159,11 +162,12 @@ func createTestStoreWithoutStart(
 
 	rpcContext := rpc.NewContext(ctx,
 		rpc.ContextOptions{
-			TenantID: roachpb.SystemTenantID,
-			Config:   &base.Config{Insecure: true},
-			Clock:    cfg.Clock,
-			Stopper:  stopper,
-			Settings: cfg.Settings,
+			TenantID:  roachpb.SystemTenantID,
+			Config:    &base.Config{Insecure: true},
+			Clock:     cfg.Clock.WallClock(),
+			MaxOffset: cfg.Clock.MaxOffset(),
+			Stopper:   stopper,
+			Settings:  cfg.Settings,
 		})
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
 	server := rpc.NewServer(rpcContext) // never started
@@ -257,9 +261,9 @@ func createTestStoreWithoutStart(
 
 func createTestStore(
 	ctx context.Context, t testing.TB, opts testStoreOpts, stopper *stop.Stopper,
-) (*Store, *hlc.ManualClock) {
-	manual := hlc.NewManualClock(123)
-	cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+) (*Store, *timeutil.ManualTime) {
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	cfg := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
 	store := createTestStoreWithConfig(ctx, t, stopper, opts, &cfg)
 	return store, manual
 }
@@ -273,7 +277,10 @@ func createTestStoreWithConfig(
 ) *Store {
 	store := createTestStoreWithoutStart(ctx, t, stopper, opts, cfg)
 	// Put an empty system config into gossip.
-	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig,
+	//
+	// TODO(ajwerner): Remove this in 22.2. It's possible it can be removed
+	// already.
+	if err := store.Gossip().AddInfoProto(gossip.KeyDeprecatedSystemConfig,
 		&config.SystemConfigEntries{}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +306,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 	stopper.AddCloser(eng)
 
 	seed := randutil.NewPseudoSeed()
-	//const seed = -1666367124291055473
+	// const seed = -1666367124291055473
 	t.Logf("seed is %d", seed)
 	rng := rand.New(rand.NewSource(seed))
 
@@ -334,6 +341,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 				nil, /* ms */
 				key,
 				hlc.Timestamp{},
+				hlc.ClockTimestamp{},
 				roachpb.MakeValueFromString("fake value for "+key.String()),
 				nil, /* txn */
 			); err != nil {
@@ -367,7 +375,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 
 			t.Logf("writing tombstone at rangeID=%d", rangeID)
 			if err := storage.MVCCPutProto(
-				ctx, eng, nil /* ms */, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, nil /* txn */, &tombstone,
+				ctx, eng, nil /* ms */, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &tombstone,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -458,9 +466,8 @@ func TestInitializeEngineErrors(t *testing.T) {
 	stopper.AddCloser(eng)
 
 	// Bootstrap should fail if engine has no cluster version yet.
-	if err := InitEngine(ctx, eng, testIdent); !testutils.IsError(err, `no cluster version`) {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	err := InitEngine(ctx, eng, testIdent)
+	require.ErrorContains(t, err, "no cluster version")
 
 	require.NoError(t, WriteClusterVersion(ctx, eng, clusterversion.TestingClusterVersion))
 
@@ -472,14 +479,22 @@ func TestInitializeEngineErrors(t *testing.T) {
 	store := NewStore(ctx, cfg, eng, &roachpb.NodeDescriptor{NodeID: 1})
 
 	// Can't init as haven't bootstrapped.
-	if err := store.Start(ctx, stopper); !errors.HasType(err, (*NotBootstrappedError)(nil)) {
-		t.Errorf("unexpected error initializing un-bootstrapped store: %+v", err)
-	}
+	err = store.Start(ctx, stopper)
+	require.ErrorIs(t, err, &NotBootstrappedError{})
 
 	// Bootstrap should fail on non-empty engine.
-	if err := InitEngine(ctx, eng, testIdent); !testutils.IsError(err, `cannot be bootstrapped`) {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	err = InitEngine(ctx, eng, testIdent)
+	require.ErrorContains(t, err, "cannot be bootstrapped")
+
+	// Bootstrap should fail on MVCC range key in engine.
+	require.NoError(t, eng.PutMVCCRangeKey(storage.MVCCRangeKey{
+		StartKey:  roachpb.Key("a"),
+		EndKey:    roachpb.Key("b"),
+		Timestamp: hlc.MinTimestamp,
+	}, storage.MVCCValue{}))
+
+	err = InitEngine(ctx, eng, testIdent)
+	require.ErrorContains(t, err, "found mvcc range key")
 }
 
 // create a Replica and add it to the store. Note that replicas
@@ -668,7 +683,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 		t.Fatal("replica was not marked as destroyed")
 	}
 
-	if _, err = repl1.checkExecutionCanProceed(ctx, &roachpb.BatchRequest{}, nil /* g */); !errors.Is(err, expErr) {
+	if _, err = repl1.checkExecutionCanProceedBeforeStorageSnapshot(ctx, &roachpb.BatchRequest{}, nil /* g */); !errors.Is(err, expErr) {
 		t.Fatalf("expected error %s, but got %v", expErr, err)
 	}
 }
@@ -912,8 +927,8 @@ func TestStoreObservedTimestamp(t *testing.T) {
 
 	for _, test := range testCases {
 		func() {
-			manual := hlc.NewManualClock(123)
-			cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+			manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+			cfg := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 				func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 					if bytes.Equal(filterArgs.Req.Header().Key, badKey) {
@@ -931,7 +946,7 @@ func TestStoreObservedTimestamp(t *testing.T) {
 			pArgs := putArgs(test.key, []byte("value"))
 			assignSeqNumsForReqs(txn, &pArgs)
 			pReply, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, &pArgs)
-			test.check(manual.UnixNano(), store.NodeID(), pReply, pErr)
+			test.check(manual.Now().UnixNano(), store.NodeID(), pReply, pErr)
 		}()
 	}
 }
@@ -1079,14 +1094,14 @@ func TestStoreSendUpdateTime(t *testing.T) {
 	defer stopper.Stop(ctx)
 	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 	args := getArgs([]byte("a"))
-	reqTS := store.cfg.Clock.Now().Add(store.cfg.Clock.MaxOffset().Nanoseconds(), 0).WithSynthetic(false)
-	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Timestamp: reqTS}, &args)
+	now := hlc.ClockTimestamp(store.cfg.Clock.Now().Add(store.cfg.Clock.MaxOffset().Nanoseconds(), 0))
+	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Now: now}, &args)
 	if pErr != nil {
 		t.Fatal(pErr)
 	}
 	ts := store.cfg.Clock.Now()
-	if ts.WallTime != reqTS.WallTime || ts.Logical <= reqTS.Logical {
-		t.Errorf("expected store clock to advance to %s; got %s", reqTS, ts)
+	if ts.WallTime != now.WallTime || ts.Logical <= now.Logical {
+		t.Errorf("expected store clock to advance to %s; got %s", now, ts)
 	}
 }
 
@@ -1127,26 +1142,10 @@ func TestStoreSendWithClockOffset(t *testing.T) {
 	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 	args := getArgs([]byte("a"))
 	// Set args timestamp to exceed max offset.
-	reqTS := store.cfg.Clock.Now().Add(store.cfg.Clock.MaxOffset().Nanoseconds()+1, 0).WithSynthetic(false)
-	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Timestamp: reqTS}, &args)
+	now := hlc.ClockTimestamp(store.cfg.Clock.Now().Add(store.cfg.Clock.MaxOffset().Nanoseconds()+1, 0))
+	_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{Now: now}, &args)
 	if !testutils.IsPError(pErr, "remote wall time is too far ahead") {
 		t.Errorf("unexpected error: %v", pErr)
-	}
-}
-
-// TestStoreSendBadRange passes a bad range.
-func TestStoreSendBadRange(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
-	args := getArgs([]byte("0"))
-	if _, pErr := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-		RangeID: 2, // no such range
-	}, &args); pErr == nil {
-		t.Error("expected invalid range")
 	}
 }
 
@@ -1169,7 +1168,8 @@ func splitTestRange(store *Store, splitKey roachpb.RKey, t *testing.T) *Replica 
 }
 
 // TestStoreSendOutOfRange passes a key not contained
-// within the range's key range.
+// within the range's key range and not present in any
+// adjacent ranges on a store.
 func TestStoreSendOutOfRange(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1178,24 +1178,25 @@ func TestStoreSendOutOfRange(t *testing.T) {
 	defer stopper.Stop(ctx)
 	store, _ := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 
-	splitKey := roachpb.RKey("b")
-	repl2 := splitTestRange(store, splitKey, t)
-
-	// Range 1 is from KeyMin to "b", so reading "b" from range 1 should
-	// fail because it's just after the range boundary.
-	args := getArgs([]byte("b"))
+	// key 'a' isn't in Range 1000 and Range 1000 doesn't exist
+	// adjacent on this store
+	args := getArgs([]byte("a"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
-		RangeID: 1,
+		RangeID: 1000, // doesn't exist
 	}, &args); err == nil {
 		t.Error("expected key to be out of range")
 	}
 
-	// Range 2 is from "b" to KeyMax, so reading "a" from range 2 should
-	// fail because it's before the start of the range.
-	args = getArgs([]byte("a"))
+	splitKey := roachpb.RKey("b")
+	repl2 := splitTestRange(store, splitKey, t)
+
+	// Range 2 is from "b" to KeyMax, so reading "a"-"c" from range 2 should
+	// fail because it's before the start of the range and straddles multiple ranges
+	// so it cannot be server side retried.
+	scanArgs := scanArgs([]byte("a"), []byte("c"))
 	if _, err := kv.SendWrappedWith(ctx, store.TestSender(), roachpb.Header{
 		RangeID: repl2.RangeID,
-	}, &args); err == nil {
+	}, scanArgs); err == nil {
 		t.Error("expected key to be out of range")
 	}
 }
@@ -1277,69 +1278,6 @@ func TestStoreReplicasByKey(t *testing.T) {
 	}
 }
 
-// TestStoreSetRangesMaxBytes creates a set of ranges via splitting
-// and then sets the config zone to a custom max bytes value to
-// verify the ranges' max bytes are updated appropriately.
-func TestStoreSetRangesMaxBytes(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	cfg := TestStoreConfig(nil)
-	cfg.TestingKnobs.DisableMergeQueue = true
-	store := createTestStoreWithConfig(ctx, t, stopper,
-		testStoreOpts{
-			// This test was written before test stores could start with more than one
-			// range and was not adapted.
-			createSystemRanges: false,
-		},
-		&cfg)
-
-	baseID := keys.TestingUserDescID(0)
-	testData := []struct {
-		repl        *Replica
-		expMaxBytes int64
-	}{
-		{store.LookupReplica(roachpb.RKeyMin),
-			store.cfg.DefaultSpanConfig.RangeMaxBytes},
-		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID)), t),
-			1 << 20},
-		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID+1)), t),
-			store.cfg.DefaultSpanConfig.RangeMaxBytes},
-		{splitTestRange(store, roachpb.RKey(keys.SystemSQLCodec.TablePrefix(baseID+2)), t),
-			2 << 20},
-	}
-
-	// Set zone configs.
-	zoneA := zonepb.DefaultZoneConfig()
-	zoneA.RangeMaxBytes = proto.Int64(1 << 20)
-	config.TestingSetZoneConfig(config.SystemTenantObjectID(baseID), zoneA)
-
-	zoneB := zonepb.DefaultZoneConfig()
-	zoneB.RangeMaxBytes = proto.Int64(2 << 20)
-	config.TestingSetZoneConfig(config.SystemTenantObjectID(baseID+2), zoneB)
-
-	// Despite faking the zone configs, we still need to have a system config
-	// entry so that the store picks up the new zone configs. This new system
-	// config needs to be non-empty so that it differs from the initial value
-	// which triggers the system config callback to be run.
-	sysCfg := &config.SystemConfigEntries{}
-	sysCfg.Values = []roachpb.KeyValue{{Key: roachpb.Key("a")}}
-	if err := store.Gossip().AddInfoProto(gossip.KeySystemConfig, sysCfg, 0); err != nil {
-		t.Fatal(err)
-	}
-
-	testutils.SucceedsSoon(t, func() error {
-		for _, test := range testData {
-			if mb := test.repl.GetMaxBytes(); mb != test.expMaxBytes {
-				return errors.Errorf("range max bytes values did not change to %d; got %d", test.expMaxBytes, mb)
-			}
-		}
-		return nil
-	})
-}
-
 // TestStoreResolveWriteIntent adds a write intent and then verifies
 // that a put returns success and aborts intent's txn in the event the
 // pushee has lower priority. Otherwise, verifies that the put blocks
@@ -1348,15 +1286,15 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	manual := hlc.NewManualClock(123)
-	cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, 1000*time.Nanosecond))
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	cfg := TestStoreConfig(hlc.NewClock(manual, 1000*time.Nanosecond /* maxOffset */))
 	cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 			pr, ok := filterArgs.Req.(*roachpb.PushTxnRequest)
 			if !ok || pr.PusherTxn.Name != "test" {
 				return nil
 			}
-			if exp, act := manual.UnixNano(), pr.PushTo.WallTime; exp > act {
+			if exp, act := manual.Now().UnixNano(), pr.PushTo.WallTime; exp > act {
 				return roachpb.NewError(fmt.Errorf("expected PushTo > WallTime, but got %d < %d:\n%+v", act, exp, pr))
 			}
 			return nil
@@ -1386,7 +1324,7 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		manual.Increment(100)
+		manual.Advance(100)
 		// Now, try a put using the pusher's txn.
 		h.Txn = pusher
 		resultCh := make(chan *roachpb.Error, 1)
@@ -1956,9 +1894,9 @@ func TestStoreReadInconsistent(t *testing.T) {
 	}
 }
 
-// TestStoreScanResumeTSCache verifies that the timestamp cache is
-// properly updated when scans and reverse scans return partial
-// results and a resume span.
+// TestStoreScanResumeTSCache verifies that the timestamp cache is properly
+// updated when scans, reverse scan, and get requests return partial results
+// and a resume span.
 func TestStoreScanResumeTSCache(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -1969,9 +1907,9 @@ func TestStoreScanResumeTSCache(t *testing.T) {
 	store, manualClock := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
 
 	// Write three keys at time t0.
-	t0 := 1 * time.Second
-	manualClock.Set(t0.Nanoseconds())
-	h := roachpb.Header{Timestamp: makeTS(t0.Nanoseconds(), 0)}
+	t0 := timeutil.Unix(1, 0)
+	manualClock.MustAdvanceTo(t0)
+	h := roachpb.Header{Timestamp: makeTS(t0.UnixNano(), 0)}
 	for _, keyStr := range []string{"a", "b", "c"} {
 		key := roachpb.Key(keyStr)
 		putArgs := putArgs(key, []byte("value"))
@@ -1983,9 +1921,9 @@ func TestStoreScanResumeTSCache(t *testing.T) {
 	// Scan the span at t1 with max keys and verify the expected resume span.
 	span := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("d")}
 	sArgs := scanArgs(span.Key, span.EndKey)
-	t1 := 2 * time.Second
-	manualClock.Set(t1.Nanoseconds())
-	h.Timestamp = makeTS(t1.Nanoseconds(), 0)
+	t1 := timeutil.Unix(2, 0)
+	manualClock.MustAdvanceTo(t1)
+	h.Timestamp = makeTS(t1.UnixNano(), 0)
 	h.MaxSpanRequestKeys = 2
 	reply, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, sArgs)
 	if pErr != nil {
@@ -2002,18 +1940,18 @@ func TestStoreScanResumeTSCache(t *testing.T) {
 
 	// Verify the timestamp cache has been set for "b".Next(), but not for "c".
 	rTS, _ := store.tsCache.GetMax(roachpb.Key("b").Next(), nil)
-	if a, e := rTS, makeTS(t1.Nanoseconds(), 0); a != e {
+	if a, e := rTS, makeTS(t1.UnixNano(), 0); a != e {
 		t.Errorf("expected timestamp cache for \"b\".Next() set to %s; got %s", e, a)
 	}
 	rTS, _ = store.tsCache.GetMax(roachpb.Key("c"), nil)
-	if a, lt := rTS, makeTS(t1.Nanoseconds(), 0); lt.LessEq(a) {
+	if a, lt := rTS, makeTS(t1.UnixNano(), 0); lt.LessEq(a) {
 		t.Errorf("expected timestamp cache for \"c\" set less than %s; got %s", lt, a)
 	}
 
 	// Reverse scan the span at t1 with max keys and verify the expected resume span.
-	t2 := 3 * time.Second
-	manualClock.Set(t2.Nanoseconds())
-	h.Timestamp = makeTS(t2.Nanoseconds(), 0)
+	t2 := timeutil.Unix(3, 0)
+	manualClock.MustAdvanceTo(t2)
+	h.Timestamp = makeTS(t2.UnixNano(), 0)
 	rsArgs := revScanArgs(span.Key, span.EndKey)
 	reply, pErr = kv.SendWrappedWith(ctx, store.TestSender(), h, rsArgs)
 	if pErr != nil {
@@ -2030,12 +1968,118 @@ func TestStoreScanResumeTSCache(t *testing.T) {
 
 	// Verify the timestamp cache has been set for "a".Next(), but not for "a".
 	rTS, _ = store.tsCache.GetMax(roachpb.Key("a").Next(), nil)
-	if a, e := rTS, makeTS(t2.Nanoseconds(), 0); a != e {
+	if a, e := rTS, makeTS(t2.UnixNano(), 0); a != e {
 		t.Errorf("expected timestamp cache for \"a\".Next() set to %s; got %s", e, a)
 	}
 	rTS, _ = store.tsCache.GetMax(roachpb.Key("a"), nil)
-	if a, lt := rTS, makeTS(t2.Nanoseconds(), 0); lt.LessEq(a) {
+	if a, lt := rTS, makeTS(t2.UnixNano(), 0); lt.LessEq(a) {
 		t.Errorf("expected timestamp cache for \"a\" set less than %s; got %s", lt, a)
+	}
+
+	// Scan the span using 3 Get requests at t3 with max keys and verify the
+	// expected resume spans. The two Get requests that are evaluated should be
+	// accounted for in the timestamp cache, but the third request which is not
+	// evaluated due to the key limit should not be accounted for.
+	t3 := timeutil.Unix(4, 0)
+	manualClock.MustAdvanceTo(t3)
+	h.Timestamp = makeTS(t3.UnixNano(), 0)
+	ba := roachpb.BatchRequest{}
+	ba.Header = h
+	ba.Add(getArgsString("a"), getArgsString("b"), getArgsString("c"))
+	br, pErr := store.TestSender().Send(ctx, ba)
+	require.Nil(t, pErr)
+	require.Len(t, br.Responses, 3)
+	for i, ru := range br.Responses {
+		resp := ru.GetGet()
+		if i < 2 {
+			require.NotNil(t, resp.Value)
+			require.Nil(t, resp.ResumeSpan)
+		} else {
+			require.Nil(t, resp.Value)
+			require.NotNil(t, resp.ResumeSpan)
+		}
+	}
+
+	// Verify the timestamp cache has been set for "a" and "b", but not for "c".
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("a"), nil)
+	require.Equal(t, makeTS(t3.UnixNano(), 0), rTS)
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("b"), nil)
+	require.Equal(t, makeTS(t3.UnixNano(), 0), rTS)
+	rTS, _ = store.tsCache.GetMax(roachpb.Key("c"), nil)
+	require.Equal(t, makeTS(t2.UnixNano(), 0), rTS)
+}
+
+// TestStoreSkipLockedTSCache verifies that the timestamp cache is properly
+// updated when get, scan, and reverse scan requests use the SkipLocked wait
+// policy.
+func TestStoreSkipLockedTSCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	for _, tc := range []struct {
+		name string
+		reqs []roachpb.Request
+	}{
+		{"get", []roachpb.Request{getArgsString("a"), getArgsString("b"), getArgsString("c")}},
+		{"scan", []roachpb.Request{scanArgsString("a", "d")}},
+		{"revscan", []roachpb.Request{revScanArgsString("a", "d")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			stopper := stop.NewStopper()
+			defer stopper.Stop(ctx)
+			store, manualClock := createTestStore(ctx, t, testStoreOpts{createSystemRanges: true}, stopper)
+
+			// Write three keys at time t0.
+			t0 := timeutil.Unix(1, 0)
+			manualClock.MustAdvanceTo(t0)
+			h := roachpb.Header{Timestamp: makeTS(t0.UnixNano(), 0)}
+			for _, keyStr := range []string{"a", "b", "c"} {
+				putArgs := putArgs(roachpb.Key(keyStr), []byte("value"))
+				_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), h, &putArgs)
+				require.Nil(t, pErr)
+			}
+
+			// Lock the middle key at t1.
+			t1 := timeutil.Unix(2, 0)
+			manualClock.MustAdvanceTo(t1)
+			lockedKey := roachpb.Key("b")
+			txn := roachpb.MakeTransaction("locker", lockedKey, 0, makeTS(t1.UnixNano(), 0), 0, 0)
+			txnH := roachpb.Header{Txn: &txn}
+			putArgs := putArgs(lockedKey, []byte("newval"))
+			_, pErr := kv.SendWrappedWith(ctx, store.TestSender(), txnH, &putArgs)
+			require.Nil(t, pErr)
+
+			// Read the span at t2 using a SkipLocked wait policy.
+			t2 := timeutil.Unix(3, 0)
+			manualClock.MustAdvanceTo(t2)
+			ba := roachpb.BatchRequest{}
+			ba.Timestamp = makeTS(t2.UnixNano(), 0)
+			ba.WaitPolicy = lock.WaitPolicy_SkipLocked
+			ba.Add(tc.reqs...)
+			br, pErr := store.TestSender().Send(ctx, ba)
+			require.Nil(t, pErr)
+
+			// Validate the response keys. The locked key should not be included.
+			var respKeys []string
+			for i, ru := range br.Responses {
+				req, resp := ba.Requests[i].GetInner(), ru.GetInner()
+				require.NoError(t, roachpb.ResponseKeyIterate(req, resp, func(k roachpb.Key) {
+					respKeys = append(respKeys, string(k))
+				}))
+			}
+			sort.Strings(respKeys) // normalize reverse scan
+			require.Equal(t, []string{"a", "c"}, respKeys)
+
+			// Verify the timestamp cache has been set for "a" and "c", but not for "b".
+			t2TS := makeTS(t2.UnixNano(), 0)
+			rTS, _ := store.tsCache.GetMax(roachpb.Key("a"), nil)
+			require.True(t, rTS.EqOrdering(t2TS))
+			rTS, _ = store.tsCache.GetMax(roachpb.Key("b"), nil)
+			require.True(t, rTS.Less(t2TS))
+			rTS, _ = store.tsCache.GetMax(roachpb.Key("c"), nil)
+			require.True(t, rTS.EqOrdering(t2TS))
+		})
 	}
 }
 
@@ -2169,6 +2213,7 @@ func TestStoreScanInconsistentResolvesIntents(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var intercept atomic.Value
+	intercept.Store(uuid.Nil)
 	cfg := TestStoreConfig(nil)
 	cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
@@ -2254,7 +2299,7 @@ func TestStoreScanIntentsFromTwoTxns(t *testing.T) {
 	// Now, expire the transactions by moving the clock forward. This will
 	// result in the subsequent scan operation pushing both transactions
 	// in a single batch.
-	manualClock.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
+	manualClock.Advance(time.Duration(txnwait.TxnLivenessThreshold.Load()) + 1)
 
 	// Scan the range and verify empty result (expired txn is aborted,
 	// cleaning up intents).
@@ -2275,8 +2320,8 @@ func TestStoreScanMultipleIntents(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	var resolveCount int32
-	manual := hlc.NewManualClock(123)
-	cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	cfg := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
 	cfg.TestingKnobs.EvalKnobs.TestingEvalFilter =
 		func(filterArgs kvserverbase.FilterArgs) *roachpb.Error {
 			if _, ok := filterArgs.Req.(*roachpb.ResolveIntentRequest); ok {
@@ -2307,7 +2352,7 @@ func TestStoreScanMultipleIntents(t *testing.T) {
 	// Now, expire the transactions by moving the clock forward. This will
 	// result in the subsequent scan operation pushing both transactions
 	// in a single batch.
-	manual.Increment(txnwait.TxnLivenessThreshold.Nanoseconds() + 1)
+	manual.Advance(time.Duration(txnwait.TxnLivenessThreshold.Load()) + 1)
 
 	// Query the range with a single scan, which should cause all intents
 	// to be resolved.
@@ -2410,6 +2455,10 @@ func (fq *fakeRangeQueue) MaybeAddAsync(context.Context, replicaInQueue, hlc.Clo
 	// Do nothing
 }
 
+func (fq *fakeRangeQueue) AddAsync(context.Context, replicaInQueue, float64) {
+	// Do nothing
+}
+
 func (fq *fakeRangeQueue) MaybeRemove(rangeID roachpb.RangeID) {
 	fq.maybeRemovedRngs <- rangeID
 }
@@ -2420,6 +2469,10 @@ func (fq *fakeRangeQueue) Name() string {
 
 func (fq *fakeRangeQueue) NeedsLease() bool {
 	return false
+}
+
+func (fq *fakeRangeQueue) SetDisabled(disabled bool) {
+	// Do nothing.
 }
 
 // TestMaybeRemove tests that MaybeRemove is called when a range is removed.
@@ -2711,7 +2764,7 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 
 	uninitDesc := roachpb.RangeDescriptor{RangeID: repl1.Desc().RangeID}
 	if err := stateloader.WriteInitialRangeState(
-		ctx, s.Engine(), uninitDesc, roachpb.Version{},
+		ctx, s.Engine(), uninitDesc, 2, roachpb.Version{},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2733,9 +2786,9 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	// Wrap the snapshot in a minimal header. The request will be dropped
 	// because the Raft log index and term are less than the hard state written
 	// above.
-	req := &SnapshotRequest_Header{
+	req := &kvserverpb.SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{Desc: repl1.Desc()},
-		RaftMessageRequest: RaftMessageRequest{
+		RaftMessageRequest: kvserverpb.RaftMessageRequest{
 			RangeID: 1,
 			ToReplica: roachpb.ReplicaDescriptor{
 				NodeID:    1,
@@ -2798,15 +2851,15 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 }
 
 type fakeSnapshotStream struct {
-	nextResp *SnapshotResponse
+	nextResp *kvserverpb.SnapshotResponse
 	nextErr  error
 }
 
-func (c fakeSnapshotStream) Recv() (*SnapshotResponse, error) {
+func (c fakeSnapshotStream) Recv() (*kvserverpb.SnapshotResponse, error) {
 	return c.nextResp, c.nextErr
 }
 
-func (c fakeSnapshotStream) Send(request *SnapshotRequest) error {
+func (c fakeSnapshotStream) Send(request *kvserverpb.SnapshotRequest) error {
 	return nil
 }
 
@@ -2814,9 +2867,11 @@ type fakeStorePool struct {
 	failedThrottles int
 }
 
-func (sp *fakeStorePool) throttle(reason throttleReason, why string, toStoreID roachpb.StoreID) {
+func (sp *fakeStorePool) Throttle(
+	reason storepool.ThrottleReason, why string, toStoreID roachpb.StoreID,
+) {
 	switch reason {
-	case throttleFailed:
+	case storepool.ThrottleFailed:
 		sp.failedThrottles++
 	default:
 		panic("unknown reason")
@@ -2834,8 +2889,9 @@ func TestSendSnapshotThrottling(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
+	tr := tracing.NewTracer()
 
-	header := SnapshotRequest_Header{
+	header := kvserverpb.SnapshotRequest_Header{
 		State: kvserverpb.ReplicaState{
 			Desc: &roachpb.RangeDescriptor{RangeID: 1},
 		},
@@ -2847,7 +2903,9 @@ func TestSendSnapshotThrottling(t *testing.T) {
 		sp := &fakeStorePool{}
 		expectedErr := errors.New("")
 		c := fakeSnapshotStream{nil, expectedErr}
-		err := sendSnapshot(ctx, st, c, sp, header, nil, newBatch, nil)
+		err := sendSnapshot(
+			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
+		)
 		if sp.failedThrottles != 1 {
 			t.Fatalf("expected 1 failed throttle, but found %d", sp.failedThrottles)
 		}
@@ -2859,11 +2917,13 @@ func TestSendSnapshotThrottling(t *testing.T) {
 	// Test that an errored snapshot causes a fail throttle.
 	{
 		sp := &fakeStorePool{}
-		resp := &SnapshotResponse{
-			Status: SnapshotResponse_ERROR,
+		resp := &kvserverpb.SnapshotResponse{
+			Status: kvserverpb.SnapshotResponse_ERROR,
 		}
 		c := fakeSnapshotStream{resp, nil}
-		err := sendSnapshot(ctx, st, c, sp, header, nil, newBatch, nil)
+		err := sendSnapshot(
+			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
+		)
 		if sp.failedThrottles != 1 {
 			t.Fatalf("expected 1 failed throttle, but found %d", sp.failedThrottles)
 		}
@@ -2871,6 +2931,78 @@ func TestSendSnapshotThrottling(t *testing.T) {
 			t.Fatalf("expected error, found nil")
 		}
 	}
+}
+
+// TestSendSnapshotConcurrency tests the sending of concurrent snapshots and
+// verifies they are only sent "2 at a time". This is not intended to test the
+// prioritization of the snapshots as that is covered by the multi-queue
+// testing.
+func TestSendSnapshotConcurrency(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	tc := testContext{}
+	tc.Start(ctx, t, stopper)
+	s := tc.store
+
+	// Checking this now makes sure that if the defaults change this test will also.
+	require.Equal(t, 2, s.snapshotSendQueue.Len())
+	cleanup1, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+		SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+		SenderQueuePriority: 1,
+	}, 1)
+	require.Nil(t, err)
+	require.Equal(t, 1, s.snapshotSendQueue.Len())
+	cleanup2, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+		SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+		SenderQueuePriority: 1,
+	}, 1)
+	require.Nil(t, err)
+	require.Equal(t, 0, s.snapshotSendQueue.Len())
+	// At this point both the first two tasks will be holding reservations and
+	// waiting for cleanup, a third task will block.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		before := timeutil.Now()
+		cleanup3, err := s.reserveSendSnapshot(ctx, &kvserverpb.DelegateSnapshotRequest{
+			SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+			SenderQueuePriority: 1,
+		}, 1)
+		after := timeutil.Now()
+		cleanup3()
+		wg.Done()
+		require.Nil(t, err)
+		require.GreaterOrEqual(t, after.Sub(before), 10*time.Millisecond)
+	}()
+
+	// This task will not block for more than a few MS, but we want to wait for
+	// it to complete to make sure it frees the permit.
+	go func() {
+		deadlineCtx, cancel := context.WithTimeout(ctx, 1*time.Millisecond)
+		defer cancel()
+
+		// This will time out since the deadline is set artificially low. Make sure
+		// the permit is released.
+		_, err := s.reserveSendSnapshot(deadlineCtx, &kvserverpb.DelegateSnapshotRequest{
+			SenderQueueName:     kvserverpb.SnapshotRequest_REPLICATE_QUEUE,
+			SenderQueuePriority: 1,
+		}, 1)
+		wg.Done()
+		require.NotNil(t, err)
+	}()
+
+	// Wait a little time before calling signaling the first two as complete.
+	time.Sleep(100 * time.Millisecond)
+	cleanup1()
+	cleanup2()
+
+	// Wait until all cleanup run before checking the number of permits.
+	wg.Wait()
+	require.Equal(t, 2, s.snapshotSendQueue.Len())
 }
 
 func TestReserveSnapshotThrottling(t *testing.T) {
@@ -2884,7 +3016,7 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	tc.Start(ctx, t, stopper)
 	s := tc.store
 
-	cleanupNonEmpty1, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupNonEmpty1, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2893,9 +3025,15 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	if n := s.ReservationCount(); n != 1 {
 		t.Fatalf("expected 1 reservation, but found %d", n)
 	}
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
+		"unexpected snapshot queue length")
+	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
+		"unexpected snapshots in progress")
+	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
+		"unexpected snapshots in progress")
 
 	// Ensure we allow a concurrent empty snapshot.
-	cleanupEmpty, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{})
+	cleanupEmpty, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2904,6 +3042,12 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	if n := s.ReservationCount(); n != 1 {
 		t.Fatalf("expected 1 reservation, but found %d", n)
 	}
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
+		"unexpected snapshot queue length")
+	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
+		"unexpected snapshots in progress")
+	require.Equal(t, int64(2), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
+		"unexpected snapshots in progress")
 	cleanupEmpty()
 
 	if n := s.ReservationCount(); n != 1 {
@@ -2917,18 +3061,38 @@ func TestReserveSnapshotThrottling(t *testing.T) {
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		if atomic.LoadInt32(&boom) == 0 {
+			if s.Metrics().RangeSnapshotRecvQueueLength.Value() != int64(1) {
+				t.Errorf("unexpected snapshot queue length; expected: %d, got: %d", 1,
+					s.Metrics().RangeSnapshotRecvQueueLength.Value())
+			}
+			if s.Metrics().RangeSnapshotRecvInProgress.Value() != int64(1) {
+				t.Errorf("unexpected snapshots in progress; expected: %d, got: %d", 1,
+					s.Metrics().RangeSnapshotRecvInProgress.Value())
+			}
 			cleanupNonEmpty1()
+		} else {
+			t.Errorf("next snapshot acquired reservation before previous called cleanup()")
 		}
 	}()
 
-	cleanupNonEmpty3, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupNonEmpty3, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	atomic.StoreInt32(&boom, 1)
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvQueueLength.Value(),
+		"unexpected snapshot queue length")
+	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvInProgress.Value(),
+		"unexpected snapshots in progress")
+	require.Equal(t, int64(1), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
+		"unexpected snapshots in progress")
 	cleanupNonEmpty3()
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvInProgress.Value(),
+		"unexpected snapshots in progress")
+	require.Equal(t, int64(0), s.Metrics().RangeSnapshotRecvTotalInProgress.Value(),
+		"unexpected snapshots in progress")
 
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
@@ -2955,16 +3119,16 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	desc.Capacity.Available = 1
 	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
 
-	s.cfg.StorePool.detailsMu.Lock()
-	s.cfg.StorePool.getStoreDetailLocked(desc.StoreID).desc = desc
-	s.cfg.StorePool.detailsMu.Unlock()
+	s.cfg.StorePool.DetailsMu.Lock()
+	s.cfg.StorePool.GetStoreDetailLocked(desc.StoreID).Desc = desc
+	s.cfg.StorePool.DetailsMu.Unlock()
 
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
 	}
 
 	// A snapshot should be allowed.
-	cleanupAccepted, err := s.reserveSnapshot(ctx, &SnapshotRequest_Header{
+	cleanupAccepted, err := s.reserveReceiveSnapshot(ctx, &kvserverpb.SnapshotRequest_Header{
 		RangeSize: 1,
 	})
 	if err != nil {
@@ -2979,9 +3143,9 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	// available disk space should be rejected.
 	desc.Capacity.Available = desc.Capacity.Capacity / 2
 	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
-	s.cfg.StorePool.detailsMu.Lock()
-	s.cfg.StorePool.getStoreDetailLocked(desc.StoreID).desc = desc
-	s.cfg.StorePool.detailsMu.Unlock()
+	s.cfg.StorePool.DetailsMu.Lock()
+	s.cfg.StorePool.GetStoreDetailLocked(desc.StoreID).Desc = desc
+	s.cfg.StorePool.DetailsMu.Unlock()
 
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
@@ -3023,7 +3187,7 @@ func TestReserveSnapshotQueueTimeoutAvoidsStarvation(t *testing.T) {
 	defer stopper.Stop(ctx)
 	tsc := TestStoreConfig(nil)
 	// Set the concurrency to 1 explicitly, in case the default ever changes.
-	tsc.concurrentSnapshotApplyLimit = 1
+	tsc.SnapshotApplyLimit = 1
 	tc := testContext{}
 	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
 	s := tc.store
@@ -3038,7 +3202,7 @@ func TestReserveSnapshotQueueTimeoutAvoidsStarvation(t *testing.T) {
 				if err := func() error {
 					snapCtx, cancel := context.WithTimeout(ctx, timeout)
 					defer cancel()
-					cleanup, err := s.reserveSnapshot(snapCtx, &SnapshotRequest_Header{RangeSize: 1})
+					cleanup, err := s.reserveReceiveSnapshot(snapCtx, &kvserverpb.SnapshotRequest_Header{RangeSize: 1})
 					if err != nil {
 						if errors.Is(err, context.DeadlineExceeded) {
 							return nil
@@ -3081,13 +3245,13 @@ func TestSnapshotRateLimit(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	testCases := []struct {
-		priority      SnapshotRequest_Priority
+		priority      kvserverpb.SnapshotRequest_Priority
 		expectedLimit rate.Limit
 		expectedErr   string
 	}{
-		{SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
-		{SnapshotRequest_RECOVERY, 32 << 20, ""},
-		{SnapshotRequest_REBALANCE, 32 << 20, ""},
+		{kvserverpb.SnapshotRequest_UNKNOWN, 0, "unknown snapshot priority"},
+		{kvserverpb.SnapshotRequest_RECOVERY, 32 << 20, ""},
+		{kvserverpb.SnapshotRequest_REBALANCE, 32 << 20, ""},
 	}
 	for _, c := range testCases {
 		t.Run(c.priority.String(), func(t *testing.T) {
@@ -3119,9 +3283,37 @@ func TestManuallyEnqueueUninitializedReplica(t *testing.T) {
 		StoreID:   tc.store.StoreID(),
 		ReplicaID: 7,
 	})
-	_, _, err := tc.store.ManuallyEnqueue(ctx, "replicaGC", repl, true)
+	_, _, err := tc.store.Enqueue(
+		ctx, "replicaGC", repl, true /* skipShouldQueue */, false, /* async */
+	)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not enqueueing uninitialized replica")
+}
+
+// TestStoreGetOrCreateReplicaWritesRaftReplicaID tests that an uninitialized
+// replica has a RaftReplicaID.
+func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	tc := testContext{}
+	tc.Start(ctx, t, stopper)
+
+	repl, created, err := tc.store.getOrCreateReplica(
+		ctx, 42, 7, &roachpb.ReplicaDescriptor{
+			NodeID:    tc.store.NodeID(),
+			StoreID:   tc.store.StoreID(),
+			ReplicaID: 7,
+		})
+	require.NoError(t, err)
+	require.True(t, created)
+	replicaID, found, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.Engine())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, roachpb.RaftReplicaID{ReplicaID: 7}, replicaID)
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

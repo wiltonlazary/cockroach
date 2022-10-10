@@ -54,7 +54,25 @@ func (t Timestamp) LessEq(s Timestamp) bool {
 	return t.WallTime < s.WallTime || (t.WallTime == s.WallTime && t.Logical <= s.Logical)
 }
 
+// Compare returns -1 if this timestamp is lesser than the given timestamp, 1 if
+// it is greater, and 0 if they are equal.
+func (t Timestamp) Compare(s Timestamp) int {
+	if t.WallTime > s.WallTime {
+		return 1
+	} else if t.WallTime < s.WallTime {
+		return -1
+	} else if t.Logical > s.Logical {
+		return 1
+	} else if t.Logical < s.Logical {
+		return -1
+	} else {
+		return 0
+	}
+}
+
 // String implements the fmt.Stringer interface.
+// Outputs: seconds.nanos,logical[?]
+// ? is added if synthetic is set.
 func (t Timestamp) String() string {
 	// The following code was originally written as
 	//   fmt.Sprintf("%d.%09d,%d", t.WallTime/1e9, t.WallTime%1e9, t.Logical).
@@ -176,8 +194,15 @@ func (t Timestamp) AsOfSystemTime() string {
 }
 
 // IsEmpty returns true if t is an empty Timestamp.
+// gcassert:inline
 func (t Timestamp) IsEmpty() bool {
-	return t == Timestamp{}
+	return t.WallTime == 0 && t.Logical == 0 && !t.Synthetic
+}
+
+// IsSet returns true if t is not an empty Timestamp.
+// gcassert:inline
+func (t Timestamp) IsSet() bool {
+	return !t.IsEmpty()
 }
 
 // Add returns a timestamp with the WallTime and Logical components increased.
@@ -274,6 +299,15 @@ func (t Timestamp) FloorPrev() Timestamp {
 	panic("cannot take the previous value to a zero timestamp")
 }
 
+// WallNext adds 1 to the WallTime and resets Logical.
+func (t Timestamp) WallNext() Timestamp {
+	return Timestamp{
+		WallTime:  t.WallTime + 1,
+		Logical:   0,
+		Synthetic: t.Synthetic,
+	}
+}
+
 // WallPrev subtracts 1 from the WallTime and resets Logical.
 func (t Timestamp) WallPrev() Timestamp {
 	return Timestamp{
@@ -356,16 +390,19 @@ func (LegacyTimestamp) SafeValue() {}
 // ClockTimestamp is a Timestamp with the added capability of being able to
 // update a peer's HLC clock. It possesses this capability because the clock
 // timestamp itself is guaranteed to have come from an HLC clock somewhere in
-// the system. As such, a clock timestamp is an promise that some node in the
+// the system. As such, a clock timestamp is a promise that some node in the
 // system has a clock with a reading equal to or above its value.
 //
 // ClockTimestamp is the statically typed version of a Timestamp with its
 // Synthetic flag set to false.
 type ClockTimestamp Timestamp
 
-// TryToClockTimestamp attempts to downcast a Timestamp into a ClockTimestamp.
-// Returns the result and a boolean indicating whether the cast succeeded.
-func (t Timestamp) TryToClockTimestamp() (ClockTimestamp, bool) {
+// DeprecatedTryToClockTimestamp attempts to downcast a Timestamp into a
+// ClockTimestamp. Returns the result and a boolean indicating whether the cast
+// succeeded.
+// TODO(nvanbenschoten): remove this in v23.1 when we remove the synthetic
+// timestamp bit.
+func (t Timestamp) DeprecatedTryToClockTimestamp() (ClockTimestamp, bool) {
 	if t.Synthetic {
 		return ClockTimestamp{}, false
 	}

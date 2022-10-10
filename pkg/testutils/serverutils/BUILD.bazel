@@ -1,9 +1,11 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "serverutils",
     srcs = [
         "test_cluster_shim.go",
+        "test_cluster_utils.go",
         "test_server_shim.go",
         "test_tenant_shim.go",
     ],
@@ -11,15 +13,22 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
+        "//pkg/config",
         "//pkg/kv",
         "//pkg/kv/kvserver/liveness/livenesspb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/security",
+        "//pkg/security/username",
+        "//pkg/server/serverpb",
         "//pkg/server/status",
         "//pkg/settings/cluster",
+        "//pkg/sql/catalog",
         "//pkg/storage",
+        "//pkg/testutils",
+        "//pkg/testutils/skip",
         "//pkg/testutils/sqlutils",
+        "//pkg/util/envutil",
         "//pkg/util/hlc",
         "//pkg/util/httputil",
         "//pkg/util/log",
@@ -29,3 +38,5 @@ go_library(
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
+
+get_x_data(name = "get_x_data")

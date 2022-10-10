@@ -12,7 +12,9 @@ package geo
 
 import (
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
@@ -62,6 +64,9 @@ func TestParseCartesianBoundingBox(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 				require.Equal(t, tc.expected, ret)
+				// Test Repr/AppendFormat round trip.
+				require.Equal(t, strings.ToUpper(tc.s), ret.Repr())
+				require.Equal(t, strings.ToUpper(tc.s), string(ret.AppendFormat(nil)))
 			}
 		})
 	}
@@ -184,6 +189,22 @@ func TestBoundingBoxFromGeomT(t *testing.T) {
 		t.Run(fmt.Sprintf("%s: %#v", tc.soType, tc.g), func(t *testing.T) {
 			bbox, err := boundingBoxFromGeomT(tc.g, tc.soType)
 			require.NoError(t, err)
+			// If bbox is within a small epsilon of expected, use the same values.
+			if bbox != nil && tc.expected != nil {
+				const epsilon = 0.000001
+				if math.Abs(bbox.LoX-tc.expected.LoX) < epsilon {
+					bbox.LoX = tc.expected.LoX
+				}
+				if math.Abs(bbox.HiX-tc.expected.HiX) < epsilon {
+					bbox.HiX = tc.expected.HiX
+				}
+				if math.Abs(bbox.LoY-tc.expected.LoY) < epsilon {
+					bbox.LoY = tc.expected.LoY
+				}
+				if math.Abs(bbox.HiY-tc.expected.HiY) < epsilon {
+					bbox.HiY = tc.expected.HiY
+				}
+			}
 			require.Equal(t, tc.expected, bbox)
 		})
 	}

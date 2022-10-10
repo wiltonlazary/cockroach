@@ -23,20 +23,19 @@ import (
 // Any filters are created as close to the scan as possible, and index joins can
 // be used to scan a non-covering index. For example, in order to construct:
 //
-//   (IndexJoin
-//     (Select (Scan $scanPrivate) $filters)
-//     $indexJoinPrivate
-//   )
+//	(IndexJoin
+//	  (Select (Scan $scanPrivate) $filters)
+//	  $indexJoinPrivate
+//	)
 //
 // make the following calls:
 //
-//   var sb indexScanBuilder
-//   sb.Init(c, tabID)
-//   sb.SetScan(scanPrivate)
-//   sb.AddSelect(filters)
-//   sb.AddIndexJoin(cols)
-//   expr := sb.Build()
-//
+//	var sb indexScanBuilder
+//	sb.Init(c, tabID)
+//	sb.SetScan(scanPrivate)
+//	sb.AddSelect(filters)
+//	sb.AddIndexJoin(cols)
+//	expr := sb.Build()
 type indexScanBuilder struct {
 	c                     *CustomFuncs
 	f                     *norm.Factory
@@ -163,6 +162,9 @@ func (b *indexScanBuilder) AddSelectAfterSplit(
 // AddIndexJoin wraps the input expression with an IndexJoin expression that
 // produces the given set of columns by lookup in the primary index.
 func (b *indexScanBuilder) AddIndexJoin(cols opt.ColSet) {
+	if b.scanPrivate.Flags.NoIndexJoin {
+		panic(errors.AssertionFailedf("attempt to create an index join with NoIndexJoin flag"))
+	}
 	if b.hasIndexJoin() {
 		panic(errors.AssertionFailedf("cannot call AddIndexJoin twice"))
 	}
@@ -170,8 +172,9 @@ func (b *indexScanBuilder) AddIndexJoin(cols opt.ColSet) {
 		panic(errors.AssertionFailedf("cannot call AddIndexJoin after an outer filter has been added"))
 	}
 	b.indexJoinPrivate = memo.IndexJoinPrivate{
-		Table: b.tabID,
-		Cols:  cols,
+		Table:   b.tabID,
+		Cols:    cols,
+		Locking: b.scanPrivate.Locking,
 	}
 }
 

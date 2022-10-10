@@ -1,0 +1,1598 @@
+# LogicTest: local
+
+# Tests that verify we create and use table statistics forecasts correctly.
+
+# Verify that we create and use statistics forecasts for a simple table that
+# grows at a constant rate.
+
+statement ok
+CREATE TABLE g (a INT PRIMARY KEY) WITH (sql_stats_automatic_collection_enabled = false)
+
+statement ok
+ALTER TABLE g INJECT STATISTICS '[
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "1988-08-05 00:00:00.000000",
+          "distinct_count": 3,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 3
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "1988-08-06 00:00:00.000000",
+          "distinct_count": 6,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "3"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "4"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "5"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 6
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "1988-08-07 00:00:00.000000",
+          "distinct_count": 9,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "3"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "4"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "5"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "6"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "7"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "8"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 9
+      }
+]'
+
+query TTTIIII
+SELECT statistics_name, column_names, created, row_count, distinct_count, null_count, avg_size
+FROM [SHOW STATISTICS FOR TABLE g WITH FORECAST]
+ORDER BY created
+----
+__auto__      {a}  1988-08-05 00:00:00 +0000 +0000  3   3   0  1
+__auto__      {a}  1988-08-06 00:00:00 +0000 +0000  6   6   0  1
+__auto__      {a}  1988-08-07 00:00:00 +0000 +0000  9   9   0  1
+__forecast__  {a}  1988-08-08 00:00:00 +0000 +0000  12  12  0  1
+
+query T
+EXPLAIN SELECT * FROM g WHERE a >= 9 AND a < 12
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (25% of the table; stats collected <hidden> ago; using stats forecast)
+  table: g@g_pkey
+  spans: [/9 - /11]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM g WHERE a >= 0 AND a < 100
+----
+scan g
+ ├── columns: a:1
+ ├── constraint: /1: [/0 - /99]
+ ├── cardinality: [0 - 100]
+ ├── stats: [rows=12, distinct(1)=10, null(1)=0]
+ │   histogram(1)=  0 1.3333 0 0.66667 0 0.66667 0 1.3333 0 1.3333 0 0.66667 0 0.66667 0 1.3333 0 1.3333 0 0.66667 0 0.66667 0 1.3333
+ │                <---- 0 ------- 1 ------- 2 ------ 3 ------ 4 ------- 5 ------- 6 ------ 7 ------ 8 ------- 9 ------ 10 ------ 11 -
+ ├── cost: 21.13
+ ├── key: (1)
+ └── distribution: test
+
+# Verify that we create and use statistics forecasts for a simple table that
+# shrinks at a constant rate.
+
+statement ok
+CREATE TABLE s (b INT PRIMARY KEY) WITH (sql_stats_automatic_collection_enabled = false)
+
+statement ok
+ALTER TABLE s INJECT STATISTICS '[
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "1988-08-05 00:00:00.000000",
+          "distinct_count": 9,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "3"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "4"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "5"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "6"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "7"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "8"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 9
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "1988-08-06 00:00:00.000000",
+          "distinct_count": 6,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "3"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "4"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "5"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 6
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "1988-08-07 00:00:00.000000",
+          "distinct_count": 3,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "0"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              },
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 3
+      }
+]'
+
+query TTTIIII
+SELECT statistics_name, column_names, created, row_count, distinct_count, null_count, avg_size
+FROM [SHOW STATISTICS FOR TABLE s WITH FORECAST]
+ORDER BY created
+----
+__auto__      {b}  1988-08-05 00:00:00 +0000 +0000  9  9  0  1
+__auto__      {b}  1988-08-06 00:00:00 +0000 +0000  6  6  0  1
+__auto__      {b}  1988-08-07 00:00:00 +0000 +0000  3  3  0  1
+__forecast__  {b}  1988-08-08 00:00:00 +0000 +0000  0  0  0  1
+
+query T
+SELECT jsonb_pretty(stat)
+FROM (
+SELECT jsonb_array_elements(statistics) AS stat
+FROM [SHOW STATISTICS USING JSON FOR TABLE s WITH FORECAST]
+)
+WHERE stat->>'name' = '__forecast__'
+----
+{
+    "avg_size": 1,
+    "columns": [
+        "b"
+    ],
+    "created_at": "1988-08-08 00:00:00",
+    "distinct_count": 0,
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "name": "__forecast__",
+    "null_count": 0,
+    "row_count": 0
+}
+
+query T
+EXPLAIN SELECT * FROM s WHERE b >= 0 AND b < 12
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 1 (100% of the table; stats collected <hidden> ago; using stats forecast)
+  table: s@s_pkey
+  spans: [/0 - /11]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM s WHERE b >= 0 AND b < 100
+----
+scan s
+ ├── columns: b:1
+ ├── constraint: /1: [/0 - /99]
+ ├── cardinality: [0 - 100]
+ ├── stats: [rows=1, distinct(1)=1, null(1)=0]
+ │   histogram(1)=
+ ├── cost: 10.02
+ ├── key: (1)
+ └── distribution: test
+
+# Verify that we create and use statistics forecasts for a simple table that
+# changes at a constant rate.
+
+statement ok
+CREATE TABLE c (h TIMESTAMPTZ PRIMARY KEY) WITH (sql_stats_automatic_collection_enabled = false)
+
+statement ok
+ALTER TABLE c INJECT STATISTICS '[
+      {
+          "avg_size": 7,
+          "columns": [
+              "h"
+          ],
+          "created_at": "1988-08-05 00:00:00.000000",
+          "distinct_count": 24,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1988-08-04 00:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-04 06:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-04 12:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-04 18:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 0,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-05 00:00:00+00:00"
+              }
+          ],
+          "histo_col_type": "TIMESTAMPTZ",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 24
+      },
+      {
+          "avg_size": 7,
+          "columns": [
+              "h"
+          ],
+          "created_at": "1988-08-06 00:00:00.000000",
+          "distinct_count": 24,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1988-08-05 00:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-05 06:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-05 12:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-05 18:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 0,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-06 00:00:00+00:00"
+              }
+          ],
+          "histo_col_type": "TIMESTAMPTZ",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 24
+      },
+      {
+          "avg_size": 7,
+          "columns": [
+              "h"
+          ],
+          "created_at": "1988-08-07 00:00:00.000000",
+          "distinct_count": 24,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 1,
+                  "num_range": 0,
+                  "upper_bound": "1988-08-06 00:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-06 06:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-06 12:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 1,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-06 18:00:00+00:00"
+              },
+              {
+                  "distinct_range": 5,
+                  "num_eq": 0,
+                  "num_range": 5,
+                  "upper_bound": "1988-08-07 00:00:00+00:00"
+              }
+          ],
+          "histo_col_type": "TIMESTAMPTZ",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 24
+      }
+]'
+
+query TTTIIII
+SELECT statistics_name, column_names, created, row_count, distinct_count, null_count, avg_size
+FROM [SHOW STATISTICS FOR TABLE c WITH FORECAST]
+ORDER BY created
+----
+__auto__      {h}  1988-08-05 00:00:00 +0000 +0000  24  24  0  7
+__auto__      {h}  1988-08-06 00:00:00 +0000 +0000  24  24  0  7
+__auto__      {h}  1988-08-07 00:00:00 +0000 +0000  24  24  0  7
+__forecast__  {h}  1988-08-08 00:00:00 +0000 +0000  24  24  0  7
+
+query T
+EXPLAIN SELECT * FROM c WHERE h >= '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 24 (100% of the table; stats collected <hidden> ago; using stats forecast)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00+00:00' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM c WHERE h >= '1988-08-07'
+----
+scan c
+ ├── columns: h:1
+ ├── constraint: /1: [/'1988-08-07 00:00:00+00:00' - ]
+ ├── stats: [rows=24, distinct(1)=24, null(1)=0]
+ │   histogram(1)=  0               1               5               1               5               1               5               1               5               0
+ │                <--- '1988-08-07 00:00:00+00:00' --- '1988-08-07 06:00:00+00:00' --- '1988-08-07 12:00:00+00:00' --- '1988-08-07 18:00:00+00:00' --- '1988-08-08 00:00:00+00:00'
+ ├── cost: 39.7
+ ├── key: (1)
+ └── distribution: test
+
+# Test for issue 86344.
+
+statement ok
+CREATE TABLE x (a INT PRIMARY KEY) WITH (sql_stats_automatic_collection_enabled = false);
+
+statement ok
+ALTER TABLE x INJECT STATISTICS '[
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2020-03-13 00:00:00.000000",
+          "distinct_count": 4,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "4"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "7"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "10"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 4
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2020-03-14 00:00:00.000000",
+          "distinct_count": 4,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "7"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "10"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "13"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 4
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2020-03-15 00:00:00.000000",
+          "distinct_count": 4,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "10"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "13"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "16"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 4
+      }
+]';
+
+query T
+SELECT jsonb_pretty(stat->'histo_buckets')
+FROM (
+  SELECT jsonb_array_elements(statistics) AS stat
+  FROM [SHOW STATISTICS USING JSON FOR TABLE x WITH FORECAST]
+)
+WHERE stat->>'name' = '__forecast__';
+----
+[
+    {
+        "distinct_range": 0,
+        "num_eq": 0,
+        "num_range": 0,
+        "upper_bound": "13"
+    },
+    {
+        "distinct_range": 2,
+        "num_eq": 0,
+        "num_range": 2,
+        "upper_bound": "16"
+    },
+    {
+        "distinct_range": 2,
+        "num_eq": 0,
+        "num_range": 2,
+        "upper_bound": "19"
+    }
+]
+
+# Test that we can disable forecasts for individual tables.
+
+statement ok
+CREATE TABLE d (d DATE PRIMARY KEY)
+WITH (sql_stats_automatic_collection_enabled = false, sql_stats_forecasts_enabled = false)
+
+statement ok
+ALTER TABLE d INJECT STATISTICS '[
+      {
+          "avg_size": 3,
+          "columns": [
+              "d"
+          ],
+          "created_at": "1999-12-21 00:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "1999-12-16"
+              },
+              {
+                  "distinct_range": 1,
+                  "num_eq": 0,
+                  "num_range": 1,
+                  "upper_bound": "1999-12-21"
+              }
+          ],
+          "histo_col_type": "DATE",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 1
+      },
+      {
+          "avg_size": 3,
+          "columns": [
+              "d"
+          ],
+          "created_at": "1999-12-26 00:00:00.000000",
+          "distinct_count": 2,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "1999-12-16"
+              },
+              {
+                  "distinct_range": 2,
+                  "num_eq": 0,
+                  "num_range": 2,
+                  "upper_bound": "1999-12-26"
+              }
+          ],
+          "histo_col_type": "DATE",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 2
+      },
+      {
+          "avg_size": 3,
+          "columns": [
+              "d"
+          ],
+          "created_at": "1999-12-31 00:00:00.000000",
+          "distinct_count": 3,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 0,
+                  "num_range": 0,
+                  "upper_bound": "1999-12-16"
+              },
+              {
+                  "distinct_range": 3,
+                  "num_eq": 0,
+                  "num_range": 3,
+                  "upper_bound": "1999-12-31"
+              }
+          ],
+          "histo_col_type": "DATE",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 3
+      }
+]'
+
+query TTTIIII
+SELECT statistics_name, column_names, created, row_count, distinct_count, null_count, avg_size
+FROM [SHOW STATISTICS FOR TABLE d WITH FORECAST]
+ORDER BY created
+----
+__auto__      {d}  1999-12-21 00:00:00 +0000 +0000  1  1  0  3
+__auto__      {d}  1999-12-26 00:00:00 +0000 +0000  2  2  0  3
+__auto__      {d}  1999-12-31 00:00:00 +0000 +0000  3  3  0  3
+__forecast__  {d}  2000-01-05 00:00:00 +0000 +0000  4  4  0  3
+
+query T
+SELECT jsonb_pretty(stat->'histo_buckets')
+FROM (
+  SELECT jsonb_array_elements(statistics) AS stat
+  FROM [SHOW STATISTICS USING JSON FOR TABLE d WITH FORECAST]
+)
+WHERE stat->>'name' = '__forecast__';
+----
+[
+    {
+        "distinct_range": 0,
+        "num_eq": 0,
+        "num_range": 0,
+        "upper_bound": "1999-12-16"
+    },
+    {
+        "distinct_range": 4,
+        "num_eq": 0,
+        "num_range": 4,
+        "upper_bound": "2000-01-05"
+    }
+]
+
+query T
+EXPLAIN SELECT * FROM d WHERE d >= '1999-12-16'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: d@d_pkey
+  spans: [/'1999-12-16' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM d WHERE d >= '1999-12-16'
+----
+scan d
+ ├── columns: d:1
+ ├── constraint: /1: [/'1999-12-16' - ]
+ ├── stats: [rows=3, distinct(1)=3, null(1)=0]
+ │   histogram(1)=  0       0        3       0
+ │                <--- '1999-12-16' --- '1999-12-31'
+ ├── cost: 17.11
+ ├── key: (1)
+ └── distribution: test
+
+# Test that optimizer_use_forecasts can be used to enable and disable forecasts.
+
+statement ok
+SET optimizer_use_forecasts = off
+
+query T
+EXPLAIN SELECT * FROM g WHERE a > 8
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: g@g_pkey
+  spans: [/9 - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM g WHERE a > 8
+----
+scan g
+ ├── columns: a:1
+ ├── constraint: /1: [/9 - ]
+ ├── stats: [rows=1.8e-09, distinct(1)=1.8e-09, null(1)=0]
+ │   histogram(1)=
+ ├── cost: 14.02
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM s WHERE b < 3
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: s@s_pkey
+  spans: [ - /2]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM s WHERE b < 3
+----
+scan s
+ ├── columns: b:1
+ ├── constraint: /1: [ - /2]
+ ├── stats: [rows=3, distinct(1)=3, null(1)=0]
+ │   histogram(1)=  0  1  0  1  0  1
+ │                <--- 0 --- 1 --- 2
+ ├── cost: 17.05
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM c WHERE h > '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00.000001+00:00' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM c WHERE h > '1988-08-07'
+----
+scan c
+ ├── columns: h:1
+ ├── constraint: /1: [/'1988-08-07 00:00:00.000001+00:00' - ]
+ ├── stats: [rows=4.8e-09, distinct(1)=4.8e-09, null(1)=0]
+ │   histogram(1)=
+ ├── cost: 14.02
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM x WHERE a > 16
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: x@x_pkey
+  spans: [/17 - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM x WHERE a > 16
+----
+scan x
+ ├── columns: a:1
+ ├── constraint: /1: [/17 - ]
+ ├── stats: [rows=8e-10, distinct(1)=8e-10, null(1)=0]
+ │   histogram(1)=
+ ├── cost: 14.02
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM d WHERE d >= '1999-12-16'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: d@d_pkey
+  spans: [/'1999-12-16' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM d WHERE d >= '1999-12-16'
+----
+scan d
+ ├── columns: d:1
+ ├── constraint: /1: [/'1999-12-16' - ]
+ ├── stats: [rows=3, distinct(1)=3, null(1)=0]
+ │   histogram(1)=  0       0        3       0
+ │                <--- '1999-12-16' --- '1999-12-31'
+ ├── cost: 17.11
+ ├── key: (1)
+ └── distribution: test
+
+statement ok
+RESET optimizer_use_forecasts
+
+query T
+EXPLAIN SELECT * FROM g WHERE a > 8
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (22% of the table; stats collected <hidden> ago; using stats forecast)
+  table: g@g_pkey
+  spans: [/9 - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM g WHERE a > 8
+----
+scan g
+ ├── columns: a:1
+ ├── constraint: /1: [/9 - ]
+ ├── stats: [rows=2.666667, distinct(1)=2.33333, null(1)=0]
+ │   histogram(1)=  0 0.66667 0 0.66667 0 1.3333
+ │                <----- 9 ------ 10 ------ 11 -
+ ├── cost: 16.7133333
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM s WHERE b < 3
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 1 (100% of the table; stats collected <hidden> ago; using stats forecast)
+  table: s@s_pkey
+  spans: [ - /2]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM s WHERE b < 3
+----
+scan s
+ ├── columns: b:1
+ ├── constraint: /1: [ - /2]
+ ├── stats: [rows=1, distinct(1)=1, null(1)=0]
+ │   histogram(1)=
+ ├── cost: 15.03
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM c WHERE h > '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 23 (96% of the table; stats collected <hidden> ago; using stats forecast)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00.000001+00:00' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM c WHERE h > '1988-08-07'
+----
+scan c
+ ├── columns: h:1
+ ├── constraint: /1: [/'1988-08-07 00:00:00.000001+00:00' - ]
+ ├── stats: [rows=23, distinct(1)=23, null(1)=0]
+ │   histogram(1)=  0               0               5               1               5               1               5               1               5               0
+ │                <--- '1988-08-07 00:00:00+00:00' --- '1988-08-07 06:00:00+00:00' --- '1988-08-07 12:00:00+00:00' --- '1988-08-07 18:00:00+00:00' --- '1988-08-08 00:00:00+00:00'
+ ├── cost: 38.63
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM x WHERE a > 16
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 2 (50% of the table; stats collected <hidden> ago; using stats forecast)
+  table: x@x_pkey
+  spans: [/17 - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM x WHERE a > 16
+----
+scan x
+ ├── columns: a:1
+ ├── constraint: /1: [/17 - ]
+ ├── stats: [rows=2, distinct(1)=2, null(1)=0]
+ │   histogram(1)=  0  0   2  0
+ │                <--- 16 --- 19
+ ├── cost: 16.04
+ ├── key: (1)
+ └── distribution: test
+
+query T
+EXPLAIN SELECT * FROM d WHERE d >= '1999-12-16'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: d@d_pkey
+  spans: [/'1999-12-16' - ]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM d WHERE d >= '1999-12-16'
+----
+scan d
+ ├── columns: d:1
+ ├── constraint: /1: [/'1999-12-16' - ]
+ ├── stats: [rows=3, distinct(1)=3, null(1)=0]
+ │   histogram(1)=  0       0        3       0
+ │                <--- '1999-12-16' --- '1999-12-31'
+ ├── cost: 17.11
+ ├── key: (1)
+ └── distribution: test
+
+# Test that sql.stats.forecasts.enabled can be used to enable and disable
+# generation of forecasts in the stats cache.
+
+statement ok
+SET CLUSTER SETTING sql.stats.forecasts.enabled = false
+
+query T
+EXPLAIN SELECT * FROM g WHERE a > 8
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: g@g_pkey
+  spans: [/9 - ]
+
+query T
+EXPLAIN SELECT * FROM s WHERE b < 3
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: s@s_pkey
+  spans: [ - /2]
+
+query T
+EXPLAIN SELECT * FROM c WHERE h > '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00.000001+00:00' - ]
+
+query T
+EXPLAIN SELECT * FROM x WHERE a > 16
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+  table: x@x_pkey
+  spans: [/17 - ]
+
+query T
+EXPLAIN SELECT * FROM d WHERE d >= '1999-12-16'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: d@d_pkey
+  spans: [/'1999-12-16' - ]
+
+# Test that we can enable forecasts for individual tables even if
+# sql.stats.forecasts.enabled is false.
+
+statement ok
+ALTER TABLE c SET (sql_stats_forecasts_enabled = true)
+
+query T
+EXPLAIN SELECT * FROM c WHERE h > '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 23 (96% of the table; stats collected <hidden> ago; using stats forecast)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00.000001+00:00' - ]
+
+# Now check that we resume using forecasts when sql.stats.forecasts.enabled is
+# reset.
+
+statement ok
+RESET CLUSTER SETTING sql.stats.forecasts.enabled
+
+query T
+EXPLAIN SELECT * FROM g WHERE a > 8
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (22% of the table; stats collected <hidden> ago; using stats forecast)
+  table: g@g_pkey
+  spans: [/9 - ]
+
+query T
+EXPLAIN SELECT * FROM s WHERE b < 3
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 1 (100% of the table; stats collected <hidden> ago; using stats forecast)
+  table: s@s_pkey
+  spans: [ - /2]
+
+query T
+EXPLAIN SELECT * FROM c WHERE h > '1988-08-07'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 23 (96% of the table; stats collected <hidden> ago; using stats forecast)
+  table: c@c_pkey
+  spans: [/'1988-08-07 00:00:00.000001+00:00' - ]
+
+query T
+EXPLAIN SELECT * FROM x WHERE a > 16
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 2 (50% of the table; stats collected <hidden> ago; using stats forecast)
+  table: x@x_pkey
+  spans: [/17 - ]
+
+query T
+EXPLAIN SELECT * FROM d WHERE d >= '1999-12-16'
+----
+distribution: local
+vectorized: true
+·
+• scan
+  estimated row count: 3 (100% of the table; stats collected <hidden> ago)
+  table: d@d_pkey
+  spans: [/'1999-12-16' - ]
+
+# Check that EXPLAIN output respects optimizer_use_forecasts (#88177).
+
+statement ok
+CREATE TABLE t (
+  a INT,
+  b INT,
+  INDEX (a) STORING (b),
+  INDEX (b) STORING (a)
+) WITH (sql_stats_automatic_collection_enabled = false)
+
+statement ok
+ALTER TABLE t INJECT STATISTICS '[
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2022-09-19 19:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "1"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2022-09-19 20:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "2"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a"
+          ],
+          "created_at": "2022-09-19 21:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "3"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "2022-09-19 19:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "10"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "2022-09-19 20:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "11"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "b"
+          ],
+          "created_at": "2022-09-19 21:00:00.000000",
+          "distinct_count": 1,
+          "histo_buckets": [
+              {
+                  "distinct_range": 0,
+                  "num_eq": 100,
+                  "num_range": 0,
+                  "upper_bound": "12"
+              }
+          ],
+          "histo_col_type": "INT8",
+          "histo_version": 2,
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a",
+              "b"
+          ],
+          "created_at": "2022-09-19 19:00:00.000000",
+          "distinct_count": 1,
+          "histo_col_type": "",
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a",
+              "b"
+          ],
+          "created_at": "2022-09-19 20:00:00.000000",
+          "distinct_count": 1,
+          "histo_col_type": "",
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      },
+      {
+          "avg_size": 1,
+          "columns": [
+              "a",
+              "b"
+          ],
+          "created_at": "2022-09-19 21:00:00.000000",
+          "distinct_count": 1,
+          "histo_col_type": "",
+          "name": "__auto__",
+          "null_count": 0,
+          "row_count": 100
+      }
+]'
+
+query T
+SELECT jsonb_pretty(stat)
+FROM (
+  SELECT jsonb_array_elements(statistics) AS stat
+  FROM [SHOW STATISTICS USING JSON FOR TABLE t WITH FORECAST]
+)
+WHERE stat->>'name' = '__forecast__'
+----
+{
+    "avg_size": 1,
+    "columns": [
+        "a"
+    ],
+    "created_at": "2022-09-19 22:00:00",
+    "distinct_count": 1,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 100,
+            "num_range": 0,
+            "upper_bound": "4"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "name": "__forecast__",
+    "null_count": 0,
+    "row_count": 100
+}
+{
+    "avg_size": 1,
+    "columns": [
+        "a",
+        "b"
+    ],
+    "created_at": "2022-09-19 22:00:00",
+    "distinct_count": 1,
+    "histo_col_type": "",
+    "name": "__forecast__",
+    "null_count": 0,
+    "row_count": 100
+}
+{
+    "avg_size": 1,
+    "columns": [
+        "b"
+    ],
+    "created_at": "2022-09-19 22:00:00",
+    "distinct_count": 1,
+    "histo_buckets": [
+        {
+            "distinct_range": 0,
+            "num_eq": 100,
+            "num_range": 0,
+            "upper_bound": "13"
+        }
+    ],
+    "histo_col_type": "INT8",
+    "histo_version": 2,
+    "name": "__forecast__",
+    "null_count": 0,
+    "row_count": 100
+}
+
+statement ok
+SET enable_zigzag_join = off
+
+query T
+EXPLAIN SELECT * FROM t WHERE a = 3 AND b = 13
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ estimated row count: 0
+│ filter: b = 13
+│
+└── • scan
+      estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago; using stats forecast)
+      table: t@t_a_idx
+      spans: [/3 - /3]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM t WHERE a = 3 AND b = 13
+----
+select
+ ├── columns: a:1 b:2
+ ├── stats: [rows=2e-08, distinct(1)=2e-08, null(1)=0, distinct(2)=2e-08, null(2)=0]
+ │   histogram(1)=
+ │   histogram(2)=  0 2e-08
+ │                <--- 13 -
+ ├── cost: 14.05
+ ├── fd: ()-->(1,2)
+ ├── distribution: test
+ ├── scan t@t_a_idx
+ │    ├── columns: a:1 b:2
+ │    ├── constraint: /1/3: [/3 - /3]
+ │    ├── stats: [rows=2e-08, distinct(1)=2e-08, null(1)=0]
+ │    │   histogram(1)=
+ │    ├── cost: 14.02
+ │    ├── fd: ()-->(1)
+ │    └── distribution: test
+ └── filters
+      └── b:2 = 13 [outer=(2), constraints=(/2: [/13 - /13]; tight), fd=()-->(2)]
+
+statement ok
+SET optimizer_use_forecasts = off
+
+query T
+EXPLAIN SELECT * FROM t WHERE a = 3 AND b = 13
+----
+distribution: local
+vectorized: true
+·
+• filter
+│ estimated row count: 0
+│ filter: a = 3
+│
+└── • scan
+      estimated row count: 0 (<0.01% of the table; stats collected <hidden> ago)
+      table: t@t_b_idx
+      spans: [/13 - /13]
+
+query T
+EXPLAIN (OPT, VERBOSE) SELECT * FROM t WHERE a = 3 AND b = 13
+----
+select
+ ├── columns: a:1 b:2
+ ├── stats: [rows=2e-08, distinct(1)=2e-08, null(1)=0, distinct(2)=2e-08, null(2)=0]
+ │   histogram(1)=  0 2e-08
+ │                <---- 3 -
+ │   histogram(2)=
+ ├── cost: 14.05
+ ├── fd: ()-->(1,2)
+ ├── distribution: test
+ ├── scan t@t_b_idx
+ │    ├── columns: a:1 b:2
+ │    ├── constraint: /2/3: [/13 - /13]
+ │    ├── stats: [rows=2e-08, distinct(2)=2e-08, null(2)=0]
+ │    │   histogram(2)=
+ │    ├── cost: 14.02
+ │    ├── fd: ()-->(2)
+ │    └── distribution: test
+ └── filters
+      └── a:1 = 3 [outer=(1), constraints=(/1: [/3 - /3]; tight), fd=()-->(1)]
+
+statement ok
+RESET enable_zigzag_join
+
+statement ok
+RESET optimizer_use_forecasts

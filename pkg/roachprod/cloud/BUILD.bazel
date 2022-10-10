@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -30,9 +31,12 @@ go_library(
 go_test(
     name = "cloud_test",
     srcs = ["cloud_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":cloud"],
     deps = [
         "@com_github_aws_aws_sdk_go_v2_service_ec2//types",
         "@com_github_stretchr_testify//assert",
     ],
 )
+
+get_x_data(name = "get_x_data")

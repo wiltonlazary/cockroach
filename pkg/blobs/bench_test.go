@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,7 +47,7 @@ func writeLargeFile(t testing.TB, file string, size int64) {
 		t.Fatal(err)
 	}
 	content := make([]byte, size)
-	err = ioutil.WriteFile(file, content, 0600)
+	err = os.WriteFile(file, content, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func BenchmarkStreamingReadFile(b *testing.B) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 
@@ -96,7 +96,7 @@ func benchmarkStreamingReadFile(b *testing.B, tc *benchmarkTestCase) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if _, err := io.Copy(w, reader); err != nil {
+		if _, err := io.Copy(w, ioctx.ReaderCtxAdapter(ctx, reader)); err != nil {
 			b.Fatal(errors.CombineErrors(err, w.Close()))
 		}
 		if err := w.Close(); err != nil {
@@ -119,7 +119,7 @@ func BenchmarkStreamingWriteFile(b *testing.B) {
 	defer cleanUpFn()
 
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	rpcContext.TestingAllowNamedRPCToAnonymousServer = true
 

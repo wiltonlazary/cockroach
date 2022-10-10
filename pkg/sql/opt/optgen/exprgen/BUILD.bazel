@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -13,6 +14,7 @@ go_library(
     deps = [
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
+        "//pkg/sql/opt/distribution",
         "//pkg/sql/opt/memo",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/optgen/lang",
@@ -32,6 +34,7 @@ go_test(
     name = "exprgen_test",
     size = "small",
     srcs = ["expr_gen_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     deps = [
         "//pkg/sql/opt/testutils/opttester",
@@ -40,3 +43,5 @@ go_test(
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],
 )
+
+get_x_data(name = "get_x_data")

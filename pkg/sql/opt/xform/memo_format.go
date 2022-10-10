@@ -16,6 +16,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cycle"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/util/treeprinter"
@@ -29,6 +30,9 @@ const (
 	// FmtPretty performs a breadth-first topological sort on the memo groups,
 	// and shows the root group at the top of the memo.
 	FmtPretty FmtFlags = iota
+	// FmtCycle formats a memo like FmtPretty, but attempts to detect a cycle in
+	// the memo and include it in the formatted output.
+	FmtCycle
 )
 
 type group struct {
@@ -71,8 +75,8 @@ func (mf *memoFormatter) format() string {
 		desc = "optimized"
 	}
 	tpRoot := tp.Childf(
-		"memo (%s, ~%dKB, required=%s)",
-		desc, mf.o.mem.MemoryEstimate()/1024, m.RootProps(),
+		"memo (%s, ~%dKB, required=%s%s)",
+		desc, mf.o.mem.MemoryEstimate()/1024, m.RootProps(), mf.formatCycles(),
 	)
 
 	for i, e := range mf.groups {
@@ -212,7 +216,8 @@ func (mf *memoFormatter) populateStates() {
 }
 
 // formatGroup prints out (to mf.buf) all members of the group); e.g:
-//    (limit G2 G3 ordering=-1) (scan a,rev,cols=(1,3),lim=10(rev))
+//
+//	(limit G2 G3 ordering=-1) (scan a,rev,cols=(1,3),lim=10(rev))
 func (mf *memoFormatter) formatGroup(first memo.RelExpr) {
 	for member := first; member != nil; member = member.NextExpr() {
 		if member != first {
@@ -223,7 +228,8 @@ func (mf *memoFormatter) formatGroup(first memo.RelExpr) {
 }
 
 // formatExpr prints out (to mf.buf) a single expression; e.g:
-//    (filters G6 G7)
+//
+//	(filters G6 G7)
 func (mf *memoFormatter) formatExpr(e opt.Expr) {
 	fmt.Fprintf(mf.buf, "(%s", e.Op())
 	for i := 0; i < e.ChildCount(); i++ {
@@ -268,7 +274,7 @@ func (mf *memoFormatter) formatPrivate(e opt.Expr, physProps *physical.Required)
 
 	// Start by using private expression formatting.
 	m := mf.o.mem
-	nf := memo.MakeExprFmtCtxBuffer(mf.buf, memo.ExprFmtHideAll, m, nil /* catalog */)
+	nf := memo.MakeExprFmtCtxBuffer(mf.o.ctx, mf.buf, memo.ExprFmtHideAll, m, nil /* catalog */)
 	memo.FormatPrivate(&nf, private, physProps)
 
 	// Now append additional information that's useful in the memo case.
@@ -316,4 +322,58 @@ func firstExpr(expr opt.Expr) opt.Expr {
 		return rel.FirstExpr()
 	}
 	return expr
+}
+
+func (mf *memoFormatter) formatCycles() string {
+	m := mf.o.mem
+	var cd cycle.Detector
+
+	if mf.flags != FmtCycle {
+		return ""
+	}
+
+	addExpr := func(from cycle.Vertex, e opt.Expr) {
+		for i := 0; i < e.ChildCount(); i++ {
+			child := e.Child(i)
+			if opt.IsListItemOp(child) {
+				child = child.Child(0)
+			}
+			to := cycle.Vertex(mf.group(child))
+			cd.AddEdge(from, to)
+		}
+	}
+
+	addGroup := func(from cycle.Vertex, first memo.RelExpr) {
+		for member := first; member != nil; member = member.NextExpr() {
+			addExpr(from, member)
+		}
+	}
+
+	// Add an edge to the cycle detector from a group to each of the groups it
+	// references.
+	for i, e := range mf.groups {
+		from := cycle.Vertex(i)
+		rel, ok := e.first.(memo.RelExpr)
+		if !ok {
+			addExpr(from, e.first)
+			continue
+		}
+		addGroup(from, rel)
+	}
+
+	// Search for a cycle from the root expression group.
+	root := cycle.Vertex(mf.group(m.RootExpr()))
+	if cyclePath, ok := cd.FindCycleStartingAtVertex(root); ok {
+		mf.buf.Reset()
+		mf.buf.WriteString(", cycle=[")
+		for i, group := range cyclePath {
+			if i > 0 {
+				mf.buf.WriteString("->")
+			}
+			fmt.Fprintf(mf.buf, "G%d", group+1)
+		}
+		mf.buf.WriteString("]")
+		return mf.buf.String()
+	}
+	return ""
 }

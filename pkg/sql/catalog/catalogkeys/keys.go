@@ -16,8 +16,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -36,12 +37,17 @@ var DefaultUserDBs = []string{
 	DefaultDatabaseName, PgDatabaseName,
 }
 
-// MinNonDefaultUserDescriptorID returns the smallest possible user-created
-// descriptor ID after a cluster is bootstrapped.
-func MinNonDefaultUserDescriptorID(idChecker keys.SystemIDChecker) uint32 {
-	// Each default DB comes with a public schema descriptor.
-	numDefaultDescs := len(DefaultUserDBs) * 2
-	return keys.MinUserDescriptorID(idChecker) + uint32(numDefaultDescs)
+// IndexColumnEncodingDirection converts a direction from the proto to an
+// encoding.Direction.
+func IndexColumnEncodingDirection(dir catpb.IndexColumn_Direction) (encoding.Direction, error) {
+	switch dir {
+	case catpb.IndexColumn_ASC:
+		return encoding.Ascending, nil
+	case catpb.IndexColumn_DESC:
+		return encoding.Descending, nil
+	default:
+		return 0, errors.Errorf("invalid direction: %s", dir)
+	}
 }
 
 // IndexKeyValDirs returns the corresponding encoding.Directions for all the
@@ -58,7 +64,7 @@ func IndexKeyValDirs(index catalog.Index) []encoding.Direction {
 	dirs = append(dirs, encoding.Ascending, encoding.Ascending)
 
 	for colIdx := 0; colIdx < index.NumKeyColumns(); colIdx++ {
-		d, err := index.GetKeyColumnDirection(colIdx).ToEncodingDirection()
+		d, err := IndexColumnEncodingDirection(index.GetKeyColumnDirection(colIdx))
 		if err != nil {
 			panic(err)
 		}
@@ -71,14 +77,14 @@ func IndexKeyValDirs(index catalog.Index) []encoding.Direction {
 // PrettyKey pretty-prints the specified key, skipping over the first `skip`
 // fields. The pretty printed key looks like:
 //
-//   /Table/<tableID>/<indexID>/...
+//	/Table/<tableID>/<indexID>/...
 //
 // We always strip off the /Table prefix and then `skip` more fields. Note that
 // this assumes that the fields themselves do not contain '/', but that is
 // currently true for the fields we care about stripping (the table and index
 // ID).
 func PrettyKey(valDirs []encoding.Direction, key roachpb.Key, skip int) string {
-	p := key.StringWithDirs(valDirs, 0 /* maxLen */)
+	p := key.StringWithDirs(valDirs)
 	for i := 0; i <= skip; i++ {
 		n := strings.IndexByte(p[1:], '/')
 		if n == -1 {

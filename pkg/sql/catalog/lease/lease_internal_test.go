@@ -25,8 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -161,7 +161,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var tables []catalog.TableDescriptor
 	var expiration hlc.Timestamp
@@ -279,7 +279,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 	futureTime := s.Clock().Now().Add(500*time.Millisecond.Nanoseconds(), 0).WithSynthetic(true)
 
 	getLatestDesc := func() catalog.TableDescriptor {
@@ -384,7 +384,7 @@ CREATE TEMP TABLE t2 (temp int);
 	}
 
 	for _, tableName := range []string{"t", "t2"} {
-		tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", tableName)
+		tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "defaultdb", tableName)
 		lease := leaseManager.names.get(
 			context.Background(),
 			tableDesc.GetParentID(),
@@ -418,7 +418,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Rename.
 	if _, err := db.Exec("ALTER TABLE t.test RENAME TO t.test2;"); err != nil {
@@ -473,7 +473,7 @@ CREATE TABLE t.%s (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
 
 	// Check the assumptions this tests makes: that there is a cache entry
 	// (with a valid lease).
@@ -528,7 +528,7 @@ CREATE TABLE t.%s (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", tableName)
 
 	// Populate the name cache.
 	if _, err := db.Exec("SELECT * FROM t.test;"); err != nil {
@@ -593,7 +593,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Check that we cannot get the table by a different name.
 	if leaseManager.names.get(
@@ -635,7 +635,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	// Populate the name cache.
 	ctx := context.Background()
@@ -741,7 +741,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var wg sync.WaitGroup
 	numRoutines := 10
@@ -791,7 +791,7 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 		t.Fatal(err)
 	}
 
-	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
+	tableDesc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
 
 	var wg sync.WaitGroup
 	numRoutines := 10
@@ -815,21 +815,21 @@ CREATE TABLE t.test (k CHAR PRIMARY KEY, v CHAR);
 // case through descriptorState.acquire(), the second through
 // descriptorState.acquireFreshestFromStore()) and a release of the lease that was
 // just acquired. Precisely:
-// 1. Thread 1 calls either acquireFreshestFromStore() or acquire().
-// 2. Thread 1 releases the lock on descriptorState and starts acquisition of a lease
-//    from the store, blocking until it's finished.
-// 3. Thread 2 calls acquire(). The lease has not been acquired yet, so it
-//    also enters the acquisition code path (calling DoChan).
-// 4. Thread 2 proceeds to release the lock on descriptorState waiting for the
-//    in-flight acquisition.
-// 4. The lease is acquired from the store and the waiting routines are
-//    unblocked.
-// 5. Thread 2 unblocks first, and releases the new lease, for whatever reason.
-// 5. Thread 1 wakes up. At this point, a naive implementation would use the
-//    newly acquired lease, which would be incorrect. The test checks that
-//    acquireFreshestFromStore() or acquire() notices, after re-acquiring the
-//    descriptorState lock, that the new lease has been released and acquires a new
-//    one.
+//  1. Thread 1 calls either acquireFreshestFromStore() or acquire().
+//  2. Thread 1 releases the lock on descriptorState and starts acquisition of a lease
+//     from the store, blocking until it's finished.
+//  3. Thread 2 calls acquire(). The lease has not been acquired yet, so it
+//     also enters the acquisition code path (calling DoChan).
+//  4. Thread 2 proceeds to release the lock on descriptorState waiting for the
+//     in-flight acquisition.
+//  4. The lease is acquired from the store and the waiting routines are
+//     unblocked.
+//  5. Thread 2 unblocks first, and releases the new lease, for whatever reason.
+//  5. Thread 1 wakes up. At this point, a naive implementation would use the
+//     newly acquired lease, which would be incorrect. The test checks that
+//     acquireFreshestFromStore() or acquire() notices, after re-acquiring the
+//     descriptorState lock, that the new lease has been released and acquires a new
+//     one.
 func TestLeaseAcquireAndReleaseConcurrently(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 

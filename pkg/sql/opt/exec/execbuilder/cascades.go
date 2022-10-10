@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/xform"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -29,28 +30,28 @@ import (
 // We walk through a simple example of a cascade to illustrate the flow around
 // executing cascades:
 //
-//   CREATE TABLE parent (p INT PRIMARY KEY);
-//   CREATE TABLE child (
-//     c INT PRIMARY KEY,
-//     p INT NOT NULL REFERENCES parent(p) ON DELETE CASCADE
-//   );
+//	CREATE TABLE parent (p INT PRIMARY KEY);
+//	CREATE TABLE child (
+//	  c INT PRIMARY KEY,
+//	  p INT NOT NULL REFERENCES parent(p) ON DELETE CASCADE
+//	);
 //
-//   DELETE FROM parent WHERE p > 1;
+//	DELETE FROM parent WHERE p > 1;
 //
 // The optimizer expression for this query is:
 //
-//   delete parent
-//    ├── columns: <none>
-//    ├── fetch columns: p:2
-//    ├── input binding: &1
-//    ├── cascades
-//    │    └── fk_p_ref_parent
-//    └── select
-//         ├── columns: p:2!null
-//         ├── scan parent
-//         │    └── columns: p:2!null
-//         └── filters
-//              └── p:2 > 1
+//	delete parent
+//	 ├── columns: <none>
+//	 ├── fetch columns: p:2
+//	 ├── input binding: &1
+//	 ├── cascades
+//	 │    └── fk_p_ref_parent
+//	 └── select
+//	      ├── columns: p:2!null
+//	      ├── scan parent
+//	      │    └── columns: p:2!null
+//	      └── filters
+//	           └── p:2 > 1
 //
 // Note that at this time, the cascading query in the child table was not built.
 // The expression above does contain a reference to a memo.CascadeBuilder which
@@ -76,28 +77,28 @@ import (
 //  2. We invoke the memo.CascadeBuilder to optbuild the cascading query. At this
 //     point, the new memo will contain the following expression:
 //
-//      delete child
-//       ├── columns: <none>
-//       ├── fetch columns: c:4 child.p:5
-//       └── semi-join (hash)
-//            ├── columns: c:4!null child.p:5!null
-//            ├── scan child
-//            │    └── columns: c:4!null child.p:5!null
-//            ├── with-scan &1
-//            │    ├── columns: p:6!null
-//            │    └── mapping:
-//            │         └──  parent.p:1 => p:6
-//            └── filters
-//                  └── child.p:5 = p:6
+//     delete child
+//     ├── columns: <none>
+//     ├── fetch columns: c:4 child.p:5
+//     └── semi-join (hash)
+//     ├── columns: c:4!null child.p:5!null
+//     ├── scan child
+//     │    └── columns: c:4!null child.p:5!null
+//     ├── with-scan &1
+//     │    ├── columns: p:6!null
+//     │    └── mapping:
+//     │         └──  parent.p:1 => p:6
+//     └── filters
+//     └── child.p:5 = p:6
 //
-//    Notes:
+//     Notes:
 //     - normally, a WithScan can only refer to an ancestor mutation or With
-//       operator. In this case we are creating a reference "out of the void".
-//       This works just fine; we can consider adding a special dummy root
-//       operator but so far it hasn't been necessary;
+//     operator. In this case we are creating a reference "out of the void".
+//     This works just fine; we can consider adding a special dummy root
+//     operator but so far it hasn't been necessary;
 //     - the binding &1 column ID has changed: it used to be 2, it is now 1.
-//       This is because we are starting with a fresh memo. We need to take into
-//       account this remapping when referring to the foreign key columns.
+//     This is because we are starting with a fresh memo. We need to take into
+//     account this remapping when referring to the foreign key columns.
 //
 //  3. We optimize the newly built expression.
 //
@@ -107,7 +108,6 @@ import (
 // After PlanFn is called, the resulting plan is executed. Note that this plan
 // could itself have more exec.Cascades; these are queued and handled in the
 // same way.
-//
 type cascadeBuilder struct {
 	b              *Builder
 	mutationBuffer exec.Node
@@ -159,7 +159,7 @@ func (cb *cascadeBuilder) setupCascade(cascade *memo.FKCascade) exec.Cascade {
 		PlanFn: func(
 			ctx context.Context,
 			semaCtx *tree.SemaContext,
-			evalCtx *tree.EvalContext,
+			evalCtx *eval.Context,
 			execFactory exec.Factory,
 			bufferRef exec.Node,
 			numBufferedRows int,
@@ -181,7 +181,7 @@ func (cb *cascadeBuilder) setupCascade(cascade *memo.FKCascade) exec.Cascade {
 func (cb *cascadeBuilder) planCascade(
 	ctx context.Context,
 	semaCtx *tree.SemaContext,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	execFactory exec.Factory,
 	cascade *memo.FKCascade,
 	bufferRef exec.Node,
@@ -190,7 +190,7 @@ func (cb *cascadeBuilder) planCascade(
 ) (exec.Plan, error) {
 	// 1. Set up a brand new memo in which to plan the cascading query.
 	var o xform.Optimizer
-	o.Init(evalCtx, cb.b.catalog)
+	o.Init(ctx, evalCtx, cb.b.catalog)
 	factory := o.Factory()
 	md := factory.Metadata()
 
@@ -241,7 +241,7 @@ func (cb *cascadeBuilder) planCascade(
 			Min: uint32(numBufferedRows),
 			Max: uint32(numBufferedRows),
 		}
-		bindingProps.Stats = props.Statistics{
+		*bindingProps.Statistics() = props.Statistics{
 			Available: true,
 			RowCount:  float64(numBufferedRows),
 		}
@@ -279,7 +279,7 @@ func (cb *cascadeBuilder) planCascade(
 		// Construct a new memo that is copied from the memo created above, but with
 		// placeholders assigned. Stable operators can be constant-folded at this
 		// time.
-		preparedMemo := o.DetachMemo()
+		preparedMemo := o.DetachMemo(ctx)
 		factory.FoldingControl().AllowStableFolds()
 		if err := factory.AssignPlaceholders(preparedMemo); err != nil {
 			return nil, errors.Wrap(err, "while assigning placeholders in cascade expression")
@@ -293,7 +293,7 @@ func (cb *cascadeBuilder) planCascade(
 	}
 
 	// 5. Execbuild the optimized expression.
-	eb := New(execFactory, &o, factory.Memo(), cb.b.catalog, optimizedExpr, evalCtx, allowAutoCommit)
+	eb := New(ctx, execFactory, &o, factory.Memo(), cb.b.catalog, optimizedExpr, evalCtx, allowAutoCommit)
 	if bufferRef != nil {
 		// Set up the With binding.
 		eb.addBuiltWithExpr(cascadeInputWithID, bufferColMap, bufferRef)

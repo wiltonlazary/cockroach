@@ -147,6 +147,21 @@ percentage of physical memory (e.g. .25). If left unspecified, defaults to 25% o
 physical memory.`,
 	}
 
+	TSDBMem = FlagInfo{
+		Name: "max-tsdb-memory",
+		Description: `
+Maximum memory capacity available to store temporary data for use by the
+time-series database to display metrics in the DB Console. Accepts numbers
+interpreted as bytes, size suffixes (e.g. 1GB and 1GiB) or a
+percentage of physical memory (e.g. 0.01). If left unspecified, defaults to
+1% of physical memory or 64MiB whichever is greater. It maybe necessary to
+manually increase this value on a cluster with hundreds of nodes where
+individual nodes have very limited memory available. This can constrain
+the ability of the DB Console to process time-series queries used to render
+metrics for the entire cluster. This capacity constraint does not affect
+SQL query execution.`,
+	}
+
 	SQLTempStorage = FlagInfo{
 		Name: "max-disk-temp-storage",
 		Description: `
@@ -273,6 +288,12 @@ This flag is incompatible with --execute / -e.`,
 Repeat the SQL statement(s) specified with --execute
 with the specified period. The client will stop watching
 if an execution of the SQL statement(s) fail.`,
+	}
+
+	NoLineEditor = FlagInfo{
+		Name: "no-line-editor",
+		Description: `
+Force disable the interactive line editor. Can help during testing.`,
 	}
 
 	EchoSQL = FlagInfo{
@@ -428,8 +449,6 @@ in a later version.`,
 The address/hostname and port to listen on for intra-cluster
 communication, for example --listen-addr=myhost:26257 or
 --listen-addr=:26257 (listen on all interfaces).
-Unless --sql-addr is also specified, this address is also
-used to accept SQL client connections.
 <PRE>
 
 </PRE>
@@ -447,7 +466,15 @@ example [::1]:26257 or [fe80::f6f2:::]:26257.
 If --advertise-addr is left unspecified, the node will also announce
 this address for use by other nodes. It is strongly recommended to use
 --advertise-addr in cloud and container deployments or any setup where
-NAT is present between cluster nodes.`,
+NAT is present between cluster nodes.
+<PRE>
+
+</PRE>
+Unless --sql-addr is also specified, this address is also
+used to accept SQL client connections. Using --listen-addr
+to specify the SQL address without --sql-addr is a deprecated
+feature.
+`,
 	}
 
 	ServerHost = FlagInfo{
@@ -500,8 +527,6 @@ forwarding is set up on an intermediate firewall/router.`,
 		Description: `
 The hostname or IP address to bind to for SQL clients, for example
 --sql-addr=myhost:26257 or --sql-addr=:26257 (listen on all interfaces).
-If left unspecified, the address specified by --listen-addr will be
-used for both RPC and SQL connections.
 <PRE>
 
 </PRE>
@@ -521,7 +546,14 @@ to use the same port number but separate host addresses.
 
 </PRE>
 An IPv6 address can also be specified with the notation [...], for
-example [::1]:26257 or [fe80::f6f2:::]:26257.`,
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
+If --sql-addr is left unspecified, the address specified by
+--listen-addr will be used for both RPC and SQL connections.
+This default behavior is deprecated; we recommend always
+setting --sql-addr.`,
 	}
 
 	SQLAdvertiseAddr = FlagInfo{
@@ -557,6 +589,33 @@ If left unspecified, the address part defaults to the setting of
 --listen-addr. The port number defaults to 8080.
 An IPv6 address can also be specified with the notation [...], for
 example [::1]:8080 or [fe80::f6f2:::]:8080.`,
+	}
+
+	HTTPAdvertiseAddr = FlagInfo{
+		Name: "advertise-http-addr",
+		Description: `
+The HTTP address/hostname and port to advertise to nodes in the cluster
+for reporting the DB Console address and proxying of HTTP connections.
+It must resolve and be routable from other nodes in the cluster for
+proxying to work in DB Console.
+<PRE>
+
+</PRE>
+If left unspecified, it defaults to the host setting of --advertise-addr
+and the port of --http-addr, which is 8080 by default. If advertise-addr
+is left unspecified, it defaults to the setting of http-addr. If the
+flag is unspecified as well as fallbacks, it defaults to the hostname as
+reported by the OS.
+<PRE>
+
+</PRE>
+An IPv6 address can also be specified with the notation [...], for
+example [::1]:26257 or [fe80::f6f2:::]:26257.
+<PRE>
+
+</PRE>
+The port number should be the same as in --http-addr unless port
+forwarding is set up on an intermediate firewall/router.`,
 	}
 
 	UnencryptedLocalhostHTTP = FlagInfo{
@@ -719,6 +778,14 @@ Note: that --external-io-disable-http or --external-io-disable-implicit-credenti
 		Description: `Certificate and key files are overwritten if they exist.`,
 	}
 
+	TenantScope = FlagInfo{
+		Name: "tenant-scope",
+		Description: `Assign a tenant scope to the certificate.
+This will allow for the certificate to only be used specifically for a particular
+tenant. This flag is optional, when omitted, the certificate is scoped to the
+system tenant.`,
+	}
+
 	GeneratePKCS8Key = FlagInfo{
 		Name:        "also-generate-pkcs8-key",
 		Description: `Also write the key in pkcs8 format to <certs-dir>/client.<username>.key.pk8.`,
@@ -876,6 +943,17 @@ memory that the store may consume, for example:
 
   --store=type=mem,size=20GiB
   --store=type=mem,size=90%
+
+</PRE>
+Optionally, to configure admission control enforcement to prevent disk
+bandwidth saturation, the "provisioned-rate" field can be specified with
+the "disk-name" and an optional "bandwidth". The bandwidth is used to override
+the value of the cluster setting, kv.store.admission.provisioned_bandwidth.
+For example:
+<PRE>
+
+  --store=provisioned-rate=disk-name=nvme1n1
+  --store=provisioned-rate=disk-name=sdb:bandwidth=250MiB/s
 
 </PRE>
 Commas are forbidden in all values, since they are used to separate fields.
@@ -1050,9 +1128,9 @@ Base64-encoded Descriptor to use as the table when decoding KVs.`,
 	FilterKeys = FlagInfo{
 		Name: "type",
 		Description: `
-Only show certain types of keys: values, intents, txns. If omitted all keys
-types are shown. Showing transactions will also implicitly limit key range
-to local keys if keys are not specified explicitly.`,
+Only show certain types of keys: values, intents, txns, or rangekeys. If
+omitted, all key types are shown. txns will also implicitly limit the key range
+to local keys, unless specified`,
 	}
 
 	DrainWait = FlagInfo{
@@ -1242,7 +1320,13 @@ and the system tenant using the \connect command.`,
 	DemoNoLicense = FlagInfo{
 		Name: "disable-demo-license",
 		Description: `
-If set, disable cockroach demo from attempting to obtain a temporary license.`,
+If set, disable enterprise features.`,
+	}
+
+	DemoEnableRangefeeds = FlagInfo{
+		Name: "auto-enable-rangefeeds",
+		Description: `
+If set to false, overrides the default demo behavior of enabling rangefeeds.`,
 	}
 
 	UseEmptyDatabase = FlagInfo{
@@ -1427,10 +1511,23 @@ this flag is applied.`,
 	ZipRedactLogs = FlagInfo{
 		Name: "redact-logs",
 		Description: `
-Redact text that may contain confidential data or PII from retrieved
-log entries. Note that this flag only operates on log entries;
-other items retrieved by the zip command may still consider
-confidential data or PII.
+DEPRECATED: Redact text that may contain confidential data or PII from 
+retrieved log entries.
+<PRE>
+
+</PRE>
+Note that this flag is being deprecated in favor of the --redact flag.
+Setting this flag will be interpreted in the same way as setting the
+--redact flag.
+`,
+	}
+
+	ZipRedact = FlagInfo{
+		Name: "redact",
+		Description: `
+Redact anything that may contain confidential data or PII from retrieved
+debug data. An exception is made for range key data, as this data is
+necessary to support CockroachDB.
 `,
 	}
 
@@ -1518,6 +1615,12 @@ default configuration, you can use the 'cockroach debug check-log-config' sub-co
 		Description: `File name to read the logging configuration from.
 This has the same effect as passing the content of the file via
 the --log flag.`,
+	}
+
+	LogConfigVars = FlagInfo{
+		Name: "log-config-vars",
+		Description: `Environment variables that will be expanded if
+present in the body of the logging configuration.`,
 	}
 
 	DeprecatedStderrThreshold = FlagInfo{

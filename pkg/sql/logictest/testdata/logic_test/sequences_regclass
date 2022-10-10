@@ -48,8 +48,7 @@ foo  CREATE TABLE public.foo (
      j INT8 NOT NULL DEFAULT nextval('public.test_seq'::REGCLASS),
      k INT8 NOT NULL DEFAULT nextval('public.foo_k_seq'::REGCLASS),
      l INT8 NOT NULL DEFAULT currval('diff_db.public.test_seq'::REGCLASS),
-     CONSTRAINT foo_pkey PRIMARY KEY (i ASC),
-     FAMILY "primary" (i, j, k, l)
+     CONSTRAINT foo_pkey PRIMARY KEY (i ASC)
 )
 
 statement ok
@@ -477,7 +476,7 @@ CREATE MATERIALIZED VIEW v5 AS SELECT currval('view_seq'), i FROM t3
 query TT
 SHOW CREATE VIEW v5
 ----
-v5  CREATE VIEW public.v5 (
+v5  CREATE MATERIALIZED VIEW public.v5 (
     currval,
     i,
     rowid

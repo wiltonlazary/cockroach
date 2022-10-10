@@ -19,15 +19,16 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -37,11 +38,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestBuildDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer utilccl.TestingEnableEnterprise()()
+
 	ctx := context.Background()
 
 	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
@@ -50,38 +54,51 @@ func TestBuildDataDriven(t *testing.T) {
 			dependenciesWrapper func(*testing.T, serverutils.TestServerInterface, *sqlutils.SQLRunner, func(scbuild.Dependencies))
 		}{
 			{
-				"sql_dependencies",
-				func(t *testing.T, s serverutils.TestServerInterface, tdb *sqlutils.SQLRunner, fn func(scbuild.Dependencies)) {
+				name: "sql_dependencies",
+				dependenciesWrapper: func(t *testing.T, s serverutils.TestServerInterface, tdb *sqlutils.SQLRunner, fn func(scbuild.Dependencies)) {
 					sctestutils.WithBuilderDependenciesFromTestServer(s, fn)
 				},
 			},
 			{
-				"test_dependencies",
-				func(t *testing.T, s serverutils.TestServerInterface, tdb *sqlutils.SQLRunner, fn func(scbuild.Dependencies)) {
+				name: "test_dependencies",
+				dependenciesWrapper: func(t *testing.T, s serverutils.TestServerInterface, tdb *sqlutils.SQLRunner, fn func(scbuild.Dependencies)) {
 					// Create test dependencies and execute the schema changer.
 					// The schema changer test dependencies do not hold any reference to the
 					// test cluster, here the SQLRunner is only used to populate the mocked
 					// catalog state.
-					fn(sctestdeps.NewTestDependencies(
-						sctestdeps.WithDescriptors(sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb)),
-						sctestdeps.WithNamespace(sctestdeps.ReadNamespaceFromDB(t, tdb)),
-						sctestdeps.WithCurrentDatabase(sctestdeps.ReadCurrentDatabaseFromDB(t, tdb)),
-						sctestdeps.WithSessionData(sctestdeps.ReadSessionDataFromDB(t, tdb, func(
-							sd *sessiondata.SessionData,
-						) {
-							// For setting up a builder inside tests we will ensure that the new schema
-							// changer will allow non-fully implemented operations.
-							sd.NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
-						}))))
+					descriptorCatalog := sctestdeps.ReadDescriptorsFromDB(ctx, t, tdb).Catalog
+					fn(
+						sctestdeps.NewTestDependencies(
+							sctestdeps.WithDescriptors(descriptorCatalog),
+							sctestdeps.WithNamespace(sctestdeps.ReadNamespaceFromDB(t, tdb).Catalog),
+							sctestdeps.WithCurrentDatabase(sctestdeps.ReadCurrentDatabaseFromDB(t, tdb)),
+							sctestdeps.WithSessionData(
+								sctestdeps.ReadSessionDataFromDB(
+									t,
+									tdb,
+									func(sd *sessiondata.SessionData) {
+										// For setting up a builder inside tests we will ensure that the new schema
+										// changer will allow non-fully implemented operations.
+										sd.NewSchemaChangerMode = sessiondatapb.UseNewSchemaChangerUnsafe
+										sd.ApplicationName = ""
+									},
+								),
+							),
+							sctestdeps.WithComments(sctestdeps.ReadCommentsFromDB(t, tdb)),
+							sctestdeps.WithZoneConfigs(sctestdeps.ReadZoneConfigsFromDB(t, tdb, descriptorCatalog)),
+						),
+					)
 				},
 			},
 		} {
 			t.Run(depsType.name, func(t *testing.T) {
-				s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+				s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+					DisableDefaultTestTenant: true,
+				})
 				defer s.Stopper().Stop(ctx)
 				tdb := sqlutils.MakeSQLRunner(sqlDB)
 				datadriven.RunTest(t, path, func(t *testing.T, d *datadriven.TestData) string {
-					return run(ctx, t, d, s, tdb, depsType.dependenciesWrapper)
+					return run(ctx, t, depsType.name, d, s, tdb, depsType.dependenciesWrapper)
 				})
 			})
 		}
@@ -91,53 +108,44 @@ func TestBuildDataDriven(t *testing.T) {
 func run(
 	ctx context.Context,
 	t *testing.T,
+	depsTypeName string,
 	d *datadriven.TestData,
 	s serverutils.TestServerInterface,
 	tdb *sqlutils.SQLRunner,
 	withDependencies func(*testing.T, serverutils.TestServerInterface, *sqlutils.SQLRunner, func(scbuild.Dependencies)),
 ) string {
 	switch d.Cmd {
-	case "create-table", "create-view", "create-type", "create-sequence", "create-schema", "create-database":
+	case "setup":
 		stmts, err := parser.Parse(d.Input)
 		require.NoError(t, err)
-		require.Len(t, stmts, 1)
-		tableName := ""
-		switch node := stmts[0].AST.(type) {
-		case *tree.CreateTable:
-			tableName = node.Table.String()
-		case *tree.CreateSequence:
-			tableName = node.Name.String()
-		case *tree.CreateView:
-			tableName = node.Name.String()
-		case *tree.CreateType:
-			tableName = ""
-		case *tree.CreateSchema:
-			tableName = ""
-		case *tree.CreateDatabase:
-			tableName = ""
-		default:
-			t.Fatal("not a supported CREATE statement")
-		}
-		tdb.Exec(t, d.Input)
-
-		if len(tableName) > 0 {
-			var tableID descpb.ID
-			tdb.QueryRow(t, fmt.Sprintf(`SELECT '%s'::REGCLASS::INT`, tableName)).Scan(&tableID)
-			if tableID == 0 {
-				t.Fatalf("failed to read ID of new table %s", tableName)
+		for _, stmt := range stmts {
+			tableName := sctestutils.TableNameFromStmt(stmt)
+			tdb.Exec(t, stmt.SQL)
+			if len(tableName) > 0 {
+				var tableID descpb.ID
+				tdb.QueryRow(t, fmt.Sprintf(`SELECT '%s'::REGCLASS::INT`, tableName)).Scan(&tableID)
+				if tableID == 0 {
+					d.Fatalf(t, "failed to read ID of new table %s", tableName)
+				}
+				t.Logf("created relation with id %d", tableID)
 			}
-			t.Logf("created relation with id %d", tableID)
 		}
-
 		return ""
 	case "build":
+		if a := d.CmdArgs; len(a) > 0 && a[0].Key == "skip" {
+			for _, v := range a[0].Vals {
+				if v == depsTypeName {
+					return d.Expected
+				}
+			}
+		}
 		var output scpb.CurrentState
 		withDependencies(t, s, tdb, func(deps scbuild.Dependencies) {
 			stmts, err := parser.Parse(d.Input)
 			require.NoError(t, err)
 			for i := range stmts {
 				output, err = scbuild.Build(ctx, deps, output, stmts[i].AST)
-				require.NoError(t, err)
+				require.NoErrorf(t, err, "%s: %s", d.Pos, stmts[i].SQL)
 			}
 		})
 		return marshalState(t, output)
@@ -146,14 +154,14 @@ func run(
 		withDependencies(t, s, tdb, func(deps scbuild.Dependencies) {
 			stmts, err := parser.Parse(d.Input)
 			require.NoError(t, err)
-			require.Len(t, stmts, 1)
+			require.NotEmpty(t, stmts)
 
-			stmt := stmts[0]
-			alter, ok := stmt.AST.(*tree.AlterTable)
-			require.Truef(t, ok, "not an ALTER TABLE statement: %s", stmt.SQL)
-
-			_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, alter)
-			require.Truef(t, scerrors.HasNotImplemented(err), "expected unimplemented, got %v", err)
+			for _, stmt := range stmts {
+				_, err = scbuild.Build(ctx, deps, scpb.CurrentState{}, stmt.AST)
+				expected := scerrors.NotImplementedError(nil)
+				require.Errorf(t, err, "%s: expected %T instead of success for", stmt.SQL, expected)
+				require.Truef(t, scerrors.HasNotImplemented(err), "%s: expected %T instead of %v", stmt.SQL, expected, err)
+			}
 		})
 		return ""
 
@@ -178,27 +186,75 @@ func indentText(input string, tab string) string {
 
 // marshalState marshals a scpb.CurrentState to YAML.
 func marshalState(t *testing.T, state scpb.CurrentState) string {
-	var sortedEntries []string
+	var sortedEntries nodeEntries
 	for i, status := range state.Current {
 		node := screl.Node{
 			Target:        &state.Targets[i],
 			CurrentStatus: status,
 		}
-		yaml, err := sctestutils.ProtoToYAML(node.Target.Element())
-		require.NoError(t, err)
+
 		entry := strings.Builder{}
 		entry.WriteString("- ")
 		entry.WriteString(screl.NodeString(&node))
 		entry.WriteString("\n")
-		entry.WriteString(indentText("details:\n", "  "))
-		entry.WriteString(indentText(yaml, "    "))
-		sortedEntries = append(sortedEntries, entry.String())
+		entry.WriteString(indentText(string(formatElementForDisplay(t, node.Element())), "  "))
+		sortedEntries = append(sortedEntries, nodeEntry{
+			node:  node,
+			entry: entry.String(),
+		})
 	}
 	// Sort the output buffer of state for determinism.
 	result := strings.Builder{}
-	sort.Strings(sortedEntries)
+	sort.Sort(sortedEntries)
 	for _, entry := range sortedEntries {
-		result.WriteString(entry)
+		result.WriteString(entry.entry)
 	}
 	return result.String()
+}
+
+type nodeEntry struct {
+	node  screl.Node
+	entry string
+}
+
+type nodeEntries []nodeEntry
+
+func (n nodeEntries) Len() int { return len(n) }
+
+func (n nodeEntries) Less(i, j int) bool {
+	less, _ := screl.Schema.CompareOn([]rel.Attr{
+		screl.DescID, screl.ColumnID, screl.IndexID, screl.ConstraintID,
+		screl.ColumnFamilyID, screl.ReferencedDescID,
+	}, &n[i].node, &n[j].node)
+	return less
+}
+
+func (n nodeEntries) Swap(i, j int) { n[i], n[j] = n[j], n[i] }
+
+var _ sort.Interface = nodeEntries{}
+
+func formatElementForDisplay(t *testing.T, e scpb.Element) []byte {
+	marshaled, err := sctestutils.ProtoToYAML(
+		e, false /* emitDefaults */, nil, /* rewrites */
+	)
+	require.NoError(t, err)
+	dec := yaml.NewDecoder(strings.NewReader(marshaled))
+	dec.KnownFields(true)
+	var n yaml.Node
+	require.NoError(t, dec.Decode(&n))
+	walkYaml(&n, func(node *yaml.Node) { node.Style = yaml.FlowStyle })
+	data, err := yaml.Marshal(&n)
+	require.NoError(t, err)
+	return data
+}
+
+func walkYaml(root *yaml.Node, f func(node *yaml.Node)) {
+	var walk func(node *yaml.Node)
+	walk = func(node *yaml.Node) {
+		f(node)
+		for _, child := range node.Content {
+			walk(child)
+		}
+	}
+	walk(root)
 }

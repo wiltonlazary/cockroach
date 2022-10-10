@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -48,14 +49,15 @@ func aggregations(aggTestSpecs []aggTestSpec) []execinfrapb.AggregatorSpec_Aggre
 }
 
 // TODO(irfansharif): Add tests to verify the following aggregation functions:
-//      AVG
-//      BOOL_AND
-//      BOOL_OR
-//      CONCAT_AGG
-//      JSON_AGG
-//      JSONB_AGG
-//      STDDEV
-//      VARIANCE
+//
+//	AVG
+//	BOOL_AND
+//	BOOL_OR
+//	CONCAT_AGG
+//	JSON_AGG
+//	JSONB_AGG
+//	STDDEV
+//	VARIANCE
 func TestAggregator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -418,12 +420,13 @@ func BenchmarkAggregation(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, aggFunc := range aggFuncs {
@@ -443,7 +446,7 @@ func BenchmarkAggregation(b *testing.B) {
 			b.SetBytes(int64(8 * numRows * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+				d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -472,18 +475,19 @@ func BenchmarkCountRows(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	b.SetBytes(int64(8 * numRows * numCols))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+		d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post, disposer)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -499,12 +503,13 @@ func BenchmarkGrouping(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	spec := &execinfrapb.AggregatorSpec{
 		GroupCols: []uint32{0},
@@ -516,7 +521,7 @@ func BenchmarkGrouping(b *testing.B) {
 	b.SetBytes(int64(8 * numRows * numCols))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+		d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post, disposer)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -550,12 +555,13 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, aggFunc := range aggFuncs {
@@ -577,7 +583,7 @@ func benchmarkAggregationWithGrouping(b *testing.B, numOrderedCols int) {
 			b.SetBytes(int64(8 * intPow(groupSize, len(groupedCols)+1) * numCols))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				d, err := newAggregator(flowCtx, 0 /* processorID */, spec, input, post, disposer)
+				d, err := newAggregator(ctx, flowCtx, 0 /* processorID */, spec, input, post, disposer)
 				if err != nil {
 					b.Fatal(err)
 				}

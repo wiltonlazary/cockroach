@@ -16,7 +16,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -26,15 +25,18 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cli/clierror"
+	"github.com/cockroachdb/cockroach/pkg/cli/cliflagcfg"
 	"github.com/cockroachdb/cockroach/pkg/cli/cliflags"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/kr/pretty"
@@ -50,6 +52,7 @@ func TestingReset() {
 // TestCLI wraps a test server and is used by tests to make assertions about the output of CLI commands.
 type TestCLI struct {
 	*server.TestServer
+	tenant      serverutils.TestTenantInterface
 	certsDir    string
 	cleanupFunc func() error
 	prevStderr  *os.File
@@ -75,11 +78,16 @@ type TestCLIParams struct {
 
 	// The store specifications for the in-memory server.
 	StoreSpecs []base.StoreSpec
+
 	// The locality tiers for the in-memory server.
 	Locality roachpb.Locality
 
 	// NoNodelocal, if true, disables node-local external I/O storage.
 	NoNodelocal bool
+
+	// TenantArgs will be used to initialize the test tenant. This should
+	// be set when the test needs to run in multitenant mode.
+	TenantArgs *base.TestTenantArgs
 }
 
 // testTempFilePrefix is a sentinel marker to be used as the prefix of a
@@ -93,9 +101,15 @@ const testTempFilePrefix = "test-temp-prefix-"
 // from the uniquely generated (temp directory) file path.
 const testUserfileUploadTempDirPrefix = "test-userfile-upload-temp-dir-"
 
-func (c *TestCLI) fail(err interface{}) {
+func (c *TestCLI) fail(err error) {
 	if c.t != nil {
 		defer c.logScope.Close(c.t)
+		if strings.Contains(err.Error(), serverutils.RequiresCCLBinaryMessage) {
+			if c.TestServer != nil {
+				c.TestServer.Stopper().Stop(context.Background())
+			}
+			skip.IgnoreLint(c.t, serverutils.TenantSkipCCLBinaryMessage)
+		}
 		c.t.Fatal(err)
 	} else {
 		panic(err)
@@ -110,7 +124,7 @@ func NewCLITest(params TestCLIParams) TestCLI {
 func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerArgs)) TestCLI {
 	c := TestCLI{t: params.T}
 
-	certsDir, err := ioutil.TempDir("", "cli-test")
+	certsDir, err := os.MkdirTemp("", "cli-test")
 	if err != nil {
 		c.fail(err)
 	}
@@ -155,7 +169,16 @@ func newCLITestWithArgs(params TestCLIParams, argsFn func(args *base.TestServerA
 		log.Infof(context.Background(), "SQL listener at %s", c.ServingSQLAddr())
 	}
 
-	baseCfg.User = security.NodeUserName()
+	if params.TenantArgs != nil {
+		if c.TestServer == nil {
+			c.fail(errors.AssertionFailedf("multitenant mode for CLI requires a DB server, try setting `NoServer` argument to false"))
+		}
+		if c.Insecure() {
+			params.TenantArgs.ForceInsecure = true
+		}
+		c.tenant, _ = serverutils.StartTenant(c.t, c.TestServer, *params.TenantArgs)
+	}
+	baseCfg.User = username.NodeUserName()
 
 	// Ensure that CLI error messages and anything meant for the
 	// original stderr is redirected to stdout, where it can be
@@ -203,6 +226,13 @@ func (c *TestCLI) RestartServer(params TestCLIParams) {
 	c.TestServer = s.(*server.TestServer)
 	log.Infof(context.Background(), "restarted server at %s / %s",
 		c.ServingRPCAddr(), c.ServingSQLAddr())
+	if params.TenantArgs != nil {
+		if c.Insecure() {
+			params.TenantArgs.ForceInsecure = true
+		}
+		c.tenant, _ = serverutils.StartTenant(c.t, c.TestServer, *params.TenantArgs)
+		log.Infof(context.Background(), "restarted tenant SQL only server at %s", c.tenant.SQLAddr())
+	}
 }
 
 // Cleanup cleans up after the test, stopping the server if necessary.
@@ -300,10 +330,24 @@ func isSQLCommand(args []string) (bool, error) {
 		return false, err
 	}
 	// We use --echo-sql as a marker of SQL-only commands.
-	if f := flagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
+	if f := cliflagcfg.FlagSetForCmd(cmd).Lookup(cliflags.EchoSQL.Name); f != nil {
 		return true, nil
 	}
 	return false, nil
+}
+
+func (c TestCLI) getRPCAddr() string {
+	if c.tenant != nil {
+		return c.tenant.RPCAddr()
+	}
+	return c.ServingRPCAddr()
+}
+
+func (c TestCLI) getSQLAddr() string {
+	if c.tenant != nil {
+		return c.tenant.SQLAddr()
+	}
+	return c.ServingSQLAddr()
 }
 
 // RunWithArgs add args according to TestCLI cfg.
@@ -313,11 +357,11 @@ func (c TestCLI) RunWithArgs(origArgs []string) {
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
-			addr := c.ServingRPCAddr()
+			addr := c.getRPCAddr()
 			if isSQL, err := isSQLCommand(origArgs); err != nil {
 				return err
 			} else if isSQL {
-				addr = c.ServingSQLAddr()
+				addr = c.getSQLAddr()
 			}
 			h, p, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -331,6 +375,7 @@ func (c TestCLI) RunWithArgs(origArgs []string) {
 				args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 			}
 		}
+
 		args = append(args, origArgs[1:]...)
 
 		// `nodelocal upload` and `userfile upload -r` CLI tests create unique temp
@@ -376,7 +421,7 @@ func (c TestCLI) RunWithCAArgs(origArgs []string) {
 	if err := func() error {
 		args := append([]string(nil), origArgs[:1]...)
 		if c.TestServer != nil {
-			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, security.EmbeddedCAKey)))
+			args = append(args, fmt.Sprintf("--ca-key=%s", filepath.Join(c.certsDir, certnames.EmbeddedCAKey)))
 			args = append(args, fmt.Sprintf("--certs-dir=%s", c.certsDir))
 		}
 		args = append(args, origArgs[1:]...)

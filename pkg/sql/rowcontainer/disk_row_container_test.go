@@ -25,11 +25,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
@@ -42,7 +44,7 @@ import (
 func compareRows(
 	lTypes []*types.T,
 	l, r rowenc.EncDatumRow,
-	e *tree.EvalContext,
+	e *eval.Context,
 	d *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
 ) (int, error) {
@@ -64,6 +66,7 @@ func compareRows(
 
 func TestDiskRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -106,7 +109,8 @@ func TestDiskRowContainer(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
+	defer evalCtx.Stop(ctx)
 	diskMonitor := mon.NewMonitor(
 		"test-disk",
 		mon.DiskResource,
@@ -116,7 +120,7 @@ func TestDiskRowContainer(t *testing.T) {
 		math.MaxInt64,
 		st,
 	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 	t.Run("EncodeDecode", func(t *testing.T) {
 		for i := 0; i < 100; i++ {
@@ -335,7 +339,7 @@ func TestDiskRowContainer(t *testing.T) {
 // 0), hence it also returns the actual returned count (to remind the caller).
 func makeUniqueRows(
 	t *testing.T,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rng *rand.Rand,
 	numRows int,
 	types []*types.T,
@@ -367,6 +371,7 @@ func makeUniqueRows(
 
 func TestDiskRowContainerDiskFull(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -386,7 +391,7 @@ func TestDiskRowContainerDiskFull(t *testing.T) {
 		math.MaxInt64,
 		st,
 	)
-	monitor.Start(ctx, nil, mon.MakeStandaloneBudget(0 /* capacity */))
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(0 /* capacity */))
 
 	d := MakeDiskRowContainer(
 		monitor,
@@ -405,11 +410,12 @@ func TestDiskRowContainerDiskFull(t *testing.T) {
 
 func TestDiskRowContainerFinalIterator(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
 	alloc := &tree.DatumAlloc{}
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.DefaultTestTempStorageConfig(st), base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -425,7 +431,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 		math.MaxInt64,
 		st,
 	)
-	diskMonitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
 	d := MakeDiskRowContainer(diskMonitor, types.OneIntCol, nil /* ordering */, tempEngine)
@@ -535,6 +541,7 @@ func TestDiskRowContainerFinalIterator(t *testing.T) {
 
 func TestDiskRowContainerUnsafeReset(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
@@ -553,7 +560,7 @@ func TestDiskRowContainerUnsafeReset(t *testing.T) {
 		math.MaxInt64,
 		st,
 	)
-	monitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	monitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 
 	d := MakeDiskRowContainer(monitor, types.OneIntCol, nil /* ordering */, tempEngine)
 	defer d.Close(ctx)

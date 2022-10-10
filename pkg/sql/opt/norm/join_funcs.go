@@ -16,8 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // ----------------------------------------------------------------------
@@ -46,12 +46,12 @@ func (c *CustomFuncs) ConstructNonLeftJoin(
 	case opt.FullJoinOp:
 		return c.f.ConstructRightJoin(left, right, on, private)
 	}
-	panic(errors.AssertionFailedf("unexpected join operator: %v", log.Safe(joinOp)))
+	panic(errors.AssertionFailedf("unexpected join operator: %v", redact.Safe(joinOp)))
 }
 
 // SimplifyNotNullEquality simplifies an expression of the following form:
 //
-//   (Is | IsNot (Eq) (True | False | Null))
+//	(Is | IsNot (Eq) (True | False | Null))
 //
 // in the case where the Eq expression is guaranteed to never result in null.
 // The testOp argument must be IsOp or IsNotOp, and the constOp argument must be
@@ -137,7 +137,10 @@ func (c *CustomFuncs) canMapJoinOpEquivalenceGroup(
 	found := 0
 	for i := range filters {
 		fd := &filters[i].ScalarProps().FuncDeps
-		filterEqCols := fd.ComputeEquivClosure(fd.EquivReps())
+
+		// Note that EquivReps creates a new ColSet, so it is safe to modify it
+		// in-place with ComputeEquivClosureNoCopy.
+		filterEqCols := fd.ComputeEquivClosureNoCopy(fd.EquivReps())
 		if filterEqCols.Intersects(leftCols) && filterEqCols.Intersects(rightCols) &&
 			filterEqCols.SubsetOf(eqCols) {
 			found++
@@ -186,15 +189,14 @@ func (c *CustomFuncs) MapJoinOpEqualities(
 // there is a single condition with one left column and one right column.
 // For example, consider this query:
 //
-//   SELECT * FROM a, b WHERE a.x = b.x AND a.x = a.y AND a.y = b.y
+//	SELECT * FROM a, b WHERE a.x = b.x AND a.x = a.y AND a.y = b.y
 //
 // It has an equivalence group {a.x, a.y, b.x, b.y}. The columns a.x and a.y
 // are on the left side, and b.x and b.y are on the right side. Initially there
 // are two conditions that cross both sides. After mapping, the query would be
 // converted to:
 //
-//   SELECT * FROM a, b WHERE a.x = a.y AND b.x = b.y AND a.x = b.x
-//
+//	SELECT * FROM a, b WHERE a.x = a.y AND b.x = b.y AND a.x = b.x
 func (c *CustomFuncs) mapJoinOpEquivalenceGroup(
 	filters memo.FiltersExpr,
 	col opt.ColumnID,
@@ -207,7 +209,10 @@ func (c *CustomFuncs) mapJoinOpEquivalenceGroup(
 	newFilters := make(memo.FiltersExpr, 0, len(filters))
 	for i := range filters {
 		fd := &filters[i].ScalarProps().FuncDeps
-		filterEqCols := fd.ComputeEquivClosure(fd.EquivReps())
+
+		// Note that EquivReps creates a new ColSet, so it is safe to modify it
+		// in-place with ComputeEquivClosureNoCopy.
+		filterEqCols := fd.ComputeEquivClosureNoCopy(fd.EquivReps())
 		if !filterEqCols.Empty() && filterEqCols.SubsetOf(eqCols) {
 			continue
 		}
@@ -267,7 +272,7 @@ func (c *CustomFuncs) mapJoinOpEquivalenceGroup(
 //
 // For example, consider this query:
 //
-//   SELECT * FROM a INNER JOIN b ON a.x=b.x AND a.x + b.y = 5
+//	SELECT * FROM a INNER JOIN b ON a.x=b.x AND a.x + b.y = 5
 //
 // Since there is an equality predicate on a.x=b.x, it is possible to map
 // a.x + b.y = 5 to b.x + b.y = 5, and that allows the filter to be pushed down
@@ -319,7 +324,7 @@ func (c *CustomFuncs) CanMapJoinOpFilter(
 //
 // For example, consider this query:
 //
-//   SELECT * FROM a INNER JOIN b ON a.x=b.x AND a.x + b.y = 5
+//	SELECT * FROM a INNER JOIN b ON a.x=b.x AND a.x + b.y = 5
 //
 // If MapJoinOpFilter is called with src as a.x + b.y = 5 and dst as (Scan b),
 // it returns b.x + b.y = 5. MapJoinOpFilter should not be called with the
@@ -390,16 +395,16 @@ func (c *CustomFuncs) MapJoinOpFilter(
 // In general, replacing composite columns with "equivalent" (equal) columns
 // might change the result of an expression. For example, consider this query:
 //
-//   SELECT * FROM
-//     (VALUES (1.0)) AS t1(x),
-//     (VALUES (1.00)) AS t2(y)
-//   WHERE x=y AND x::text = '1.0';
+//	SELECT * FROM
+//	  (VALUES (1.0)) AS t1(x),
+//	  (VALUES (1.00)) AS t2(y)
+//	WHERE x=y AND x::text = '1.0';
 //
 // It should return the following result:
 //
-//     x  |  y
-//   -----+------
-//    1.0 | 1.00
+//	  x  |  y
+//	-----+------
+//	 1.0 | 1.00
 //
 // But if we use the equality predicate x=y to map x to y and infer an
 // additional filter y::text = '1.0', the query would return nothing.
@@ -459,19 +464,20 @@ func (c *CustomFuncs) JoinFiltersMatchAllLeftRows(
 	return multiplicity.JoinFiltersMatchAllLeftRows()
 }
 
-// CanExtractJoinEquality returns true if:
+// CanExtractJoinComparison returns true if:
 //   - one of a, b is bound by the left columns;
 //   - the other is bound by the right columns;
 //   - a and b are not "bare" variables;
 //   - a and b contain no correlated subqueries;
 //   - neither a or b are constants.
+//   - the comparison is either an equality or an inequality.
 //
-// Such an equality can be converted to a column equality by pushing down
+// Such a comparison can be converted to a column comparison by pushing down
 // expressions as projections.
-func (c *CustomFuncs) CanExtractJoinEquality(
+func (c *CustomFuncs) CanExtractJoinComparison(
 	a, b opt.ScalarExpr, leftCols, rightCols opt.ColSet,
 ) bool {
-	// Disallow simple equality between variables.
+	// Disallow simple comparison between variables.
 	if a.Op() == opt.VariableOp && b.Op() == opt.VariableOp {
 		return false
 	}
@@ -495,18 +501,18 @@ func (c *CustomFuncs) CanExtractJoinEquality(
 
 	if (leftProps.OuterCols.SubsetOf(leftCols) && rightProps.OuterCols.SubsetOf(rightCols)) ||
 		(leftProps.OuterCols.SubsetOf(rightCols) && rightProps.OuterCols.SubsetOf(leftCols)) {
-		// The equality is of the form:
-		//   expression(leftCols) = expression(rightCols)
+		// The comparison is of the form:
+		//   expression(leftCols) op expression(rightCols)
 		return true
 	}
 	return false
 }
 
-// ExtractJoinEquality takes an equality FiltersItem that was identified via a
-// call to CanExtractJoinEquality, and converts it to an equality on "bare"
-// variables, by pushing down more complicated expressions as projections. See
-// the ExtractJoinEqualities rule.
-func (c *CustomFuncs) ExtractJoinEquality(
+// ExtractJoinComparison takes an equality or inequality FiltersItem that was
+// identified via a call to CanExtractJoinComparison, and converts it to an
+// equality or inequality on "bare" variables, by pushing down more complicated
+// expressions as projections. See the ExtractJoinComparisons rule.
+func (c *CustomFuncs) ExtractJoinComparison(
 	joinOp opt.Operator,
 	left, right memo.RelExpr,
 	filters memo.FiltersExpr,
@@ -516,18 +522,21 @@ func (c *CustomFuncs) ExtractJoinEquality(
 	leftCols := c.OutputCols(left)
 	rightCols := c.OutputCols(right)
 
-	eq := item.Condition.(*memo.EqExpr)
-	a, b := eq.Left, eq.Right
+	cmp := item.Condition
+	condLeft := cmp.Child(0).(opt.ScalarExpr)
+	a, b := cmp.Child(0).(opt.ScalarExpr), cmp.Child(1).(opt.ScalarExpr)
+	op := cmp.Op()
 
-	var eqLeftProps props.Shared
-	memo.BuildSharedProps(eq.Left, &eqLeftProps, c.f.evalCtx)
-	if eqLeftProps.OuterCols.SubsetOf(rightCols) {
+	var cmpLeftProps props.Shared
+	memo.BuildSharedProps(condLeft, &cmpLeftProps, c.f.evalCtx)
+	if cmpLeftProps.OuterCols.SubsetOf(rightCols) {
 		a, b = b, a
+		op = opt.CommuteEqualityOrInequalityOp(op)
 	}
 
 	var leftProj, rightProj projectBuilder
-	leftProj.init(c.f)
-	rightProj.init(c.f)
+	leftProj.init(c, leftCols)
+	rightProj.init(c, rightCols)
 
 	newFilters := make(memo.FiltersExpr, len(filters))
 	for i := range filters {
@@ -537,22 +546,29 @@ func (c *CustomFuncs) ExtractJoinEquality(
 		}
 
 		newFilters[i] = c.f.ConstructFiltersItem(
-			c.f.ConstructEq(leftProj.add(a), rightProj.add(b)),
+			c.f.DynamicConstruct(op, leftProj.add(a), rightProj.add(b)).(opt.ScalarExpr),
 		)
-	}
-	if leftProj.empty() && rightProj.empty() {
-		panic(errors.AssertionFailedf("no equalities to extract"))
 	}
 
 	join := c.f.ConstructJoin(
 		joinOp,
-		leftProj.buildProject(left, leftCols),
-		rightProj.buildProject(right, rightCols),
+		leftProj.buildProject(left),
+		rightProj.buildProject(right),
 		newFilters,
 		private,
 	)
 
-	// Project away the synthesized columns.
+	if leftProj.empty() && rightProj.empty() {
+		// If no new projections were created, then there are no synthesized
+		// columns to project away, so we can return the join. This is possible
+		// when projections that are added to left and right are identical to
+		// computed columns that are already output left and right. There's no
+		// need to re-project these expressions, so projectBuilder will simply
+		// pass them through.
+		return join
+	}
+
+	// Otherwise, project away the synthesized columns.
 	outputCols := leftCols
 	if joinOp != opt.SemiJoinOp && joinOp != opt.AntiJoinOp {
 		// Semi/Anti join only produce the left side columns. All other join types

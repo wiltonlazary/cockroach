@@ -94,12 +94,6 @@ func TestBatchRequestString(t *testing.T) {
 		act := ba.String()
 		require.Equal(t, exp, act)
 	}
-
-	{
-		exp := `Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›),... 76 skipped ..., Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), Get [‹/Min›,‹/Min›), EndTxn(abort) [‹/Min›], [txn: 6ba7b810], [wait-policy: Error], [can-forward-ts], [bounded-staleness, min_ts_bound: 0.000000001,0, min_ts_bound_strict, max_ts_bound: 0.000000002,0]`
-		act := redact.Sprint(ba)
-		require.EqualValues(t, exp, act)
-	}
 }
 
 func TestKeyString(t *testing.T) {
@@ -150,15 +144,30 @@ func TestSpansString(t *testing.T) {
 
 func TestReplicaUnavailableError(t *testing.T) {
 	ctx := context.Background()
-	var _ = (*roachpb.ReplicaUnavailableError)(nil)
 	rDesc := roachpb.ReplicaDescriptor{NodeID: 1, StoreID: 2, ReplicaID: 3}
 	var set roachpb.ReplicaSet
 	set.AddReplica(rDesc)
 	desc := roachpb.NewRangeDescriptor(123, roachpb.RKeyMin, roachpb.RKeyMax, set)
 
-	var err = roachpb.NewReplicaUnavailableError(desc, rDesc)
+	errSlowProposal := errors.New("slow proposal")
+	var err = roachpb.NewReplicaUnavailableError(errSlowProposal, desc, rDesc)
 	err = errors.DecodeError(ctx, errors.EncodeError(ctx, err))
+	// Sanity check that Unwrap() was implemented.
+	require.True(t, errors.Is(err, errSlowProposal), "%+v", err)
+	require.True(t, errors.HasType(err, (*roachpb.ReplicaUnavailableError)(nil)), "%+v", err)
 
 	s := fmt.Sprintf("%s\n%s", err, redact.Sprint(err))
 	echotest.Require(t, s, filepath.Join("testdata", "replica_unavailable_error.txt"))
+}
+
+func TestAmbiguousResultError(t *testing.T) {
+	ctx := context.Background()
+
+	wrapped := errors.Errorf("boom with a %s", redact.Unsafe("secret"))
+	var err error = roachpb.NewAmbiguousResultError(wrapped)
+	err = errors.DecodeError(ctx, errors.EncodeError(ctx, err))
+	require.True(t, errors.Is(err, wrapped), "%+v", err)
+
+	s := fmt.Sprintf("%s\n%s", err, redact.Sprint(err))
+	echotest.Require(t, s, filepath.Join("testdata", "ambiguous_result_error.txt"))
 }

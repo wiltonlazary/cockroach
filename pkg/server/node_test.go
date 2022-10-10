@@ -26,10 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -265,7 +267,7 @@ func TestCorruptedClusterID(t *testing.T) {
 		StoreID:   1,
 	}
 	if err := storage.MVCCPutProto(
-		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, nil /* txn */, &sIdent,
+		ctx, e, nil /* ms */, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &sIdent,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +428,7 @@ func TestNodeStatusWritten(t *testing.T) {
 	}
 
 	// Wait for full replication of initial ranges.
-	initialRanges, err := ExpectedInitialRangeCount(kvDB, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig, ts.sqlServer.execCfg.SystemIDChecker)
+	initialRanges, err := ExpectedInitialRangeCount(keys.SystemSQLCodec, &ts.cfg.DefaultZoneConfig, &ts.cfg.DefaultSystemZoneConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,4 +681,193 @@ func TestNodeBatchRequestMetricsInc(t *testing.T) {
 	require.GreaterOrEqual(t, n.metrics.BatchCount.Count(), bCurr)
 	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Get].Count(), getCurr)
 	require.GreaterOrEqual(t, n.metrics.MethodCounts[roachpb.Put].Count(), putCurr)
+}
+
+func TestGetTenantWeights(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	specs := []base.StoreSpec{
+		{InMemory: true},
+		{InMemory: true},
+	}
+	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		StoreSpecs: specs,
+	})
+	defer s.Stopper().Stop(ctx)
+	// Wait until both stores are started properly.
+	testutils.SucceedsSoon(t, func() error {
+		var n int
+		err := s.GetStores().(*kvserver.Stores).VisitStores(func(s *kvserver.Store) error {
+			if !s.IsStarted() {
+				return fmt.Errorf("not started: %s", s)
+			}
+			n++
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if exp := len(specs); exp != n {
+			return fmt.Errorf("found only %d of %d stores", n, exp)
+		}
+		return nil
+	})
+	// At this point, all ranges have the SystemTenantID. Create a split using
+	// another tenant, which will cause that tenant to have a weight of 1 in the
+	// relevant store(s).
+	const otherTenantID = 5
+	prefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(otherTenantID))
+	require.NoError(t, s.DB().AdminSplit(ctx, prefix, hlc.MaxTimestamp))
+	// The range can have replicas on multiple stores, so wait for the split to
+	// be applied everywhere.
+	stores := s.GetStores().(*kvserver.Stores)
+	testutils.SucceedsSoon(t, func() error {
+		return stores.VisitStores(func(s *kvserver.Store) error {
+			r := s.LookupReplica(roachpb.RKey(prefix))
+			if r != nil && !r.Desc().StartKey.Equal(prefix) {
+				return errors.Errorf("waiting for split")
+			}
+			return nil
+		})
+	})
+	// Unfortunately, the non-determinism of replica distribution can make this
+	// test more complicated than the code it is trying to test, if we were to
+	// validate exact counts. So we do some simple validation instead.
+	weights := s.Node().(*Node).GetTenantWeights()
+	// Both tenants have overall non-zero counts.
+	require.Less(t, uint32(0), weights.Node[roachpb.SystemTenantID.ToUint64()])
+	require.Less(t, uint32(0), weights.Node[otherTenantID])
+	// There are two stores.
+	require.Equal(t, 2, len(weights.Stores))
+	// The sum of the values in the stores is equal to the node-level value.
+	checkSum := func(tenantID uint64) {
+		require.Equal(t, weights.Node[tenantID], weights.Stores[0].Weights[tenantID]+
+			weights.Stores[1].Weights[tenantID])
+	}
+	checkSum(roachpb.SystemTenantID.ToUint64())
+	checkSum(otherTenantID)
+}
+
+func TestDiskStatsMap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	ctx := context.Background()
+
+	// Specs for two stores, one of which overrides the cluster-level
+	// provisioned bandwidth.
+	specs := []base.StoreSpec{
+		{
+			ProvisionedRateSpec: base.ProvisionedRateSpec{
+				DiskName: "foo",
+				// ProvisionedBandwidth is 0 so the cluster setting will be used.
+				ProvisionedBandwidth: 0,
+			},
+		},
+		{
+			ProvisionedRateSpec: base.ProvisionedRateSpec{
+				DiskName:             "bar",
+				ProvisionedBandwidth: 200,
+			},
+		},
+	}
+	// Engines.
+	engines := []storage.Engine{
+		storage.NewDefaultInMemForTesting(),
+		storage.NewDefaultInMemForTesting(),
+	}
+	defer func() {
+		for i := range engines {
+			engines[i].Close()
+		}
+	}()
+	// "foo" has store-id 10, "bar" has store-id 5.
+	engineIDs := []roachpb.StoreID{10, 5}
+	for i := range engines {
+		ident := roachpb.StoreIdent{StoreID: engineIDs[i]}
+		require.NoError(t, storage.MVCCBlindPutProto(ctx, engines[i], nil, keys.StoreIdentKey(),
+			hlc.Timestamp{}, hlc.ClockTimestamp{}, &ident, nil))
+	}
+	var dsm diskStatsMap
+	clusterProvisionedBW := int64(150)
+
+	// diskStatsMap contains nothing, so does not populate anything.
+	stats, err := dsm.tryPopulateAdmissionDiskStats(ctx, clusterProvisionedBW, nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, len(stats))
+
+	// diskStatsMap initialized with these two stores.
+	require.NoError(t, dsm.initDiskStatsMap(specs, engines))
+
+	// diskStatsFunc returns stats for these two stores, and an unknown store.
+	diskStatsFunc := func(context.Context) ([]status.DiskStats, error) {
+		return []status.DiskStats{
+			{
+				Name:       "baz",
+				ReadBytes:  100,
+				WriteBytes: 200,
+			},
+			{
+				Name:       "foo",
+				ReadBytes:  500,
+				WriteBytes: 1000,
+			},
+			{
+				Name:       "bar",
+				ReadBytes:  2000,
+				WriteBytes: 2500,
+			},
+		}, nil
+	}
+	stats, err = dsm.tryPopulateAdmissionDiskStats(ctx, clusterProvisionedBW, diskStatsFunc)
+	require.NoError(t, err)
+	// The stats for the two stores are as expected.
+	require.Equal(t, 2, len(stats))
+	for i := range engineIDs {
+		ds, ok := stats[engineIDs[i]]
+		require.True(t, ok)
+		var expectedDS admission.DiskStats
+		switch engineIDs[i] {
+		// "foo"
+		case 10:
+			expectedDS = admission.DiskStats{
+				BytesRead: 500, BytesWritten: 1000, ProvisionedBandwidth: clusterProvisionedBW}
+		// "bar"
+		case 5:
+			expectedDS = admission.DiskStats{
+				BytesRead: 2000, BytesWritten: 2500, ProvisionedBandwidth: 200}
+		}
+		require.Equal(t, expectedDS, ds)
+	}
+
+	// disk stats are only retrieved for "foo".
+	diskStatsFunc = func(context.Context) ([]status.DiskStats, error) {
+		return []status.DiskStats{
+			{
+				Name:       "foo",
+				ReadBytes:  3500,
+				WriteBytes: 4500,
+			},
+		}, nil
+	}
+	stats, err = dsm.tryPopulateAdmissionDiskStats(ctx, clusterProvisionedBW, diskStatsFunc)
+	require.NoError(t, err)
+	require.Equal(t, 2, len(stats))
+	for i := range engineIDs {
+		ds, ok := stats[engineIDs[i]]
+		require.True(t, ok)
+		var expectedDS admission.DiskStats
+		switch engineIDs[i] {
+		// "foo"
+		case 10:
+			expectedDS = admission.DiskStats{
+				BytesRead: 3500, BytesWritten: 4500, ProvisionedBandwidth: clusterProvisionedBW}
+		// "bar". The read and write bytes are 0.
+		case 5:
+			expectedDS = admission.DiskStats{
+				BytesRead: 0, BytesWritten: 0, ProvisionedBandwidth: 200}
+		}
+		require.Equal(t, expectedDS, ds)
+	}
 }

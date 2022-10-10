@@ -25,6 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/build/bazel"
 	"github.com/cockroachdb/cockroach/pkg/docs"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 )
 
@@ -95,7 +97,7 @@ func ensureInit(
 		)
 	})
 	if geosOnce.err != nil && errDisplay == EnsureInitErrorDisplayPublic {
-		return nil, errors.Newf("geos: this operation is not available")
+		return nil, pgerror.Newf(pgcode.System, "geos: this operation is not available")
 	}
 	return geosOnce.geos, geosOnce.err
 }
@@ -132,8 +134,18 @@ func findLibraryDirectories(flagLibraryDirectoryValue string, crdbBinaryLoc stri
 	}
 	// Account for the libraries to be in a bazel runfile path.
 	if bazel.BuiltWithBazel() {
-		if p, err := bazel.Runfile(path.Join("c-deps", "libgeos", "lib")); err == nil {
-			locs = append(locs, p)
+		pathsToCheck := []string{
+			path.Join("c-deps", "libgeos_foreign", "lib"),
+			path.Join("external", "archived_cdep_libgeos_linux", "lib"),
+			path.Join("external", "archived_cdep_libgeos_linuxarm", "lib"),
+			path.Join("external", "archived_cdep_libgeos_macos", "lib"),
+			path.Join("external", "archived_cdep_libgeos_macosarm", "lib"),
+			path.Join("external", "archived_cdep_libgeos_windows", "bin"),
+		}
+		for _, path := range pathsToCheck {
+			if p, err := bazel.Runfile(path); err == nil {
+				locs = append(locs, p)
+			}
 		}
 	}
 	locs = append(
@@ -215,10 +227,13 @@ func wrapGEOSInitError(err error) error {
 	case "windows":
 		page = "windows"
 	}
-	return errors.WithHintf(
-		err,
-		"Ensure you have the spatial libraries installed as per the instructions in %s",
-		docs.URL("install-cockroachdb-"+page),
+	return pgerror.WithCandidateCode(
+		errors.WithHintf(
+			err,
+			"Ensure you have the spatial libraries installed as per the instructions in %s",
+			docs.URL("install-cockroachdb-"+page),
+		),
+		pgcode.ConfigFile,
 	)
 }
 

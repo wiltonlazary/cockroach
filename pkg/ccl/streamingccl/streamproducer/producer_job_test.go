@@ -22,10 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -88,8 +89,10 @@ func (c coordinatedResumer) Resume(ctx context.Context, execCtx interface{}) err
 
 // OnFailOrCancel is called after the job reaches 'reverting' status
 // and notifies watcher after it finishes.
-func (c coordinatedResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
-	err := c.resumer.OnFailOrCancel(ctx, execCtx)
+func (c coordinatedResumer) OnFailOrCancel(
+	ctx context.Context, execCtx interface{}, jobErr error,
+) error {
+	err := c.resumer.OnFailOrCancel(ctx, execCtx, jobErr)
 	c.revertingFinished <- struct{}{}
 	return err
 }
@@ -101,6 +104,9 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 	ctx := context.Background()
 	clusterArgs := base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
+			// Test fails within a test tenant. More investigation
+			// is required. Tracked with #76378.
+			DisableDefaultTestTenant: true,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			},
@@ -115,10 +121,10 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 	sql.Exec(t, "SET CLUSTER SETTING stream_replication.stream_liveness_track_frequency = '1ms'")
 	registry := source.JobRegistry().(*jobs.Registry)
 	ptp := source.DistSQLServer().(*distsql.ServerImpl).ServerConfig.ProtectedTimestampProvider
-	timeout, username := 1*time.Second, security.MakeSQLUsernameFromPreNormalizedString("user")
+	timeout, usr := 1*time.Second, username.MakeSQLUsernameFromPreNormalizedString("user")
 
-	registerConstructor := func(initialTime time.Time) (*timeutil.ManualTime, func(), func(), func()) {
-		mt := timeutil.NewManualTime(initialTime)
+	registerConstructor := func() (*timeutil.ManualTime, func(), func(), func()) {
+		mt := timeutil.NewManualTime(timeutil.Now())
 		waitJobFinishReverting := make(chan struct{})
 		in, out := make(chan struct{}, 1), make(chan struct{}, 1)
 		jobs.RegisterConstructor(jobspb.TypeStreamReplication, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
@@ -131,7 +137,7 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 				resumer:           r,
 				revertingFinished: waitJobFinishReverting,
 			}
-		})
+		}, jobs.UsesTenantCostControl)
 		return mt,
 			func() {
 				in <- struct{}{} // Signals the timer that a new time is assigned to time source
@@ -175,18 +181,23 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 		{ // Job times out at the beginning
 			ts := hlc.Timestamp{WallTime: timeutil.Now().UnixNano()}
 			ptsID := uuid.MakeV4()
-			jr := makeProducerJobRecord(registry, 10, timeout, username, ptsID)
+			jr := makeProducerJobRecord(registry, 10, timeout, usr, ptsID)
 			defer jobs.ResetConstructors()()
-			_, _, _, waitJobFinishReverting := registerConstructor(expirationTime(jr).Add(1 * time.Millisecond))
 
+			mt, timeGiven, waitForTimeRequest, waitJobFinishReverting := registerConstructor()
 			require.NoError(t, runJobWithProtectedTimestamp(ptsID, ts, jr))
+
+			// Coordinate the job to get a new time.
+			waitForTimeRequest()
+			mt.AdvanceTo(expirationTime(jr).Add(1 * time.Millisecond))
+			timeGiven()
 
 			waitJobFinishReverting()
 
 			sql.CheckQueryResultsRetry(t, jobsQuery(jr.JobID), [][]string{{"failed"}})
 			// Ensures the protected timestamp record is released.
 			_, err := getPTSRecord(ptsID)
-			require.Error(t, err, "protected timestamp record does not exist")
+			require.True(t, testutils.IsError(err, "protected timestamp record does not exist"), err)
 
 			var status streampb.StreamReplicationStatus
 			require.NoError(t, source.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -203,12 +214,17 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			ts := hlc.Timestamp{WallTime: ptsTime.UnixNano()}
 			ptsID := uuid.MakeV4()
 
-			jr := makeProducerJobRecord(registry, 20, timeout, username, ptsID)
+			jr := makeProducerJobRecord(registry, 20, timeout, usr, ptsID)
 			defer jobs.ResetConstructors()()
-			mt, timeGiven, waitForTimeRequest, waitJobFinishReverting := registerConstructor(expirationTime(jr).Add(-5 * time.Millisecond))
-
+			mt, timeGiven, waitForTimeRequest, waitJobFinishReverting :=
+				registerConstructor()
 			require.NoError(t, runJobWithProtectedTimestamp(ptsID, ts, jr))
+
+			// Coordinate the job to get a new time.
 			waitForTimeRequest()
+			mt.AdvanceTo(expirationTime(jr).Add(-5 * time.Millisecond))
+			timeGiven()
+
 			sql.CheckQueryResults(t, jobsQuery(jr.JobID), [][]string{{"running"}})
 
 			updatedFrontier := hlc.Timestamp{
@@ -222,8 +238,7 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			expire := expirationTime(jr).Add(10 * time.Millisecond)
 			require.NoError(t, source.DB().Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 				streamStatus, err = updateReplicationStreamProgress(
-					ctx, expire,
-					ptp, registry, streaming.StreamID(jr.JobID), updatedFrontier, txn)
+					ctx, expire, ptp, registry, streaming.StreamID(jr.JobID), updatedFrontier, txn)
 				return err
 			}))
 			require.Equal(t, streampb.StreamReplicationStatus_STREAM_ACTIVE, streamStatus.StreamStatus)
@@ -234,7 +249,8 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			// Ensure the timestamp is updated on the PTS record
 			require.Equal(t, updatedFrontier, r.Timestamp)
 
-			// Reset the time to be after the timeout
+			// Coordinate the job to get a new time. Reset the time to be after the timeout.
+			waitForTimeRequest()
 			mt.AdvanceTo(expire.Add(12 * time.Millisecond))
 			timeGiven()
 			waitJobFinishReverting()
@@ -243,7 +259,8 @@ func TestStreamReplicationProducerJob(t *testing.T) {
 			require.True(t, status == "reverting" || status == "failed")
 			// Ensures the protected timestamp record is released.
 			_, err = getPTSRecord(ptsID)
-			require.Error(t, err, "protected timestamp record does not exist")
+			// need to change
+			require.True(t, testutils.IsError(err, "protected timestamp record does not exist"), err)
 		}
 	})
 }

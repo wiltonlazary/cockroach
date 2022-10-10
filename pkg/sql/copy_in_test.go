@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -296,7 +296,7 @@ func TestCopyBinary(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(security.RootUser))
+		t, s.ServingSQLAddr(), "StartServer" /* prefix */, url.User(username.RootUser))
 	defer cleanupGoDB()
 	conn, err := pgx.Connect(ctx, pgURL.String())
 	if err != nil {
@@ -403,6 +403,89 @@ func TestCopyError(t *testing.T) {
 	}
 	if err := txn.Rollback(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCopyTrace verifies copy works with tracing turned on.
+func TestCopyTrace(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	for _, strings := range [][]string{
+		{`SET CLUSTER SETTING sql.trace.log_statement_execute = true`},
+		{`SET CLUSTER SETTING sql.telemetry.query_sampling.enabled = true`},
+		{`SET CLUSTER SETTING sql.log.unstructured_entries.enabled = true`, `SET CLUSTER SETTING sql.trace.log_statement_execute = true`},
+		{`SET CLUSTER SETTING sql.log.admin_audit.enabled = true`},
+	} {
+		t.Run(strings[0], func(t *testing.T) {
+			params, _ := tests.CreateTestServerParams()
+			s, db, _ := serverutils.StartServer(t, params)
+			defer s.Stopper().Stop(context.Background())
+
+			_, err := db.Exec(`
+		CREATE TABLE t (
+			i INT PRIMARY KEY
+		);
+	`)
+			require.NoError(t, err)
+
+			for _, str := range strings {
+				_, err = db.Exec(str)
+				require.NoError(t, err)
+			}
+
+			// We have to start a new connection every time to exercise all possible paths.
+			t.Run("success", func(t *testing.T) {
+				db := serverutils.OpenDBConn(
+					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				require.NoError(t, err)
+				txn, err := db.Begin()
+				const val = 2
+				require.NoError(t, err)
+				{
+					stmt, err := txn.Prepare(pq.CopyIn("t", "i"))
+					require.NoError(t, err)
+					_, err = stmt.Exec(val)
+					require.NoError(t, err)
+					require.NoError(t, stmt.Close())
+				}
+				require.NoError(t, txn.Commit())
+
+				var i int
+				require.NoError(t, db.QueryRow("SELECT i FROM t").Scan(&i))
+				require.Equal(t, val, i)
+			})
+
+			t.Run("error in statement", func(t *testing.T) {
+				db := serverutils.OpenDBConn(
+					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				txn, err := db.Begin()
+				require.NoError(t, err)
+				{
+					_, err := txn.Prepare(pq.CopyIn("xxx", "yyy"))
+					require.Error(t, err)
+					require.ErrorContains(t, err, `relation "xxx" does not exist`)
+				}
+				require.NoError(t, txn.Rollback())
+			})
+
+			t.Run("error during copy", func(t *testing.T) {
+				db := serverutils.OpenDBConn(
+					t, s.ServingSQLAddr(), params.UseDatabase, params.Insecure, s.Stopper())
+				txn, err := db.Begin()
+				require.NoError(t, err)
+				{
+					stmt, err := txn.Prepare(pq.CopyIn("t", "i"))
+					require.NoError(t, err)
+					_, err = stmt.Exec("bob")
+					require.NoError(t, err)
+					err = stmt.Close()
+					require.Error(t, err)
+					require.ErrorContains(t, err, `could not parse "bob" as type int`)
+				}
+				require.NoError(t, txn.Rollback())
+			})
+		})
 	}
 }
 

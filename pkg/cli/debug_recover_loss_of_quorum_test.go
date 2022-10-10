@@ -17,6 +17,8 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,9 +38,10 @@ import (
 // This is done by running three node cluster with disk backed storage,
 // stopping it and verifying content of collected replica info file.
 // This check verifies that:
-//   we successfully iterate requested stores,
-//   data is written in expected location,
-//   data contains info only about stores requested.
+//
+//	we successfully iterate requested stores,
+//	data is written in expected location,
+//	data contains info only about stores requested.
 func TestCollectInfoFromMultipleStores(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -111,6 +115,18 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 	s.Exec(t, "set cluster setting cluster.organization='remove dead replicas test'")
 	defer tcBefore.Stopper().Stop(ctx)
 
+	// We use scratch range to test special case for pending update on the
+	// descriptor which has to be cleaned up before recovery could proceed.
+	// For that we'll ensure it is not empty and then put an intent. After
+	// recovery, we'll check that the range is still accessible for writes as
+	// normal.
+	sk := tcBefore.ScratchRange(t)
+	require.NoError(t,
+		tcBefore.Server(0).DB().Put(ctx, testutils.MakeKey(sk, []byte{1}), "value"),
+		"failed to write value to scratch range")
+
+	createIntentOnRangeDescriptor(ctx, t, tcBefore, sk)
+
 	node1ID := tcBefore.Servers[0].NodeID()
 	// Now that stores are prepared and replicated we can shut down cluster
 	// and perform store manipulations.
@@ -176,7 +192,8 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 	adminClient := serverpb.NewAdminClient(grpcConn)
 
 	require.NoError(t, runDecommissionNodeImpl(
-		ctx, adminClient, nodeDecommissionWaitNone, []roachpb.NodeID{roachpb.NodeID(2), roachpb.NodeID(3)}),
+		ctx, adminClient, nodeDecommissionWaitNone,
+		[]roachpb.NodeID{roachpb.NodeID(2), roachpb.NodeID(3)}, tcAfter.Server(0).NodeID()),
 		"Failed to decommission removed nodes")
 
 	for i := 0; i < len(tcAfter.Servers); i++ {
@@ -200,4 +217,100 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 	var replicas string
 	r.Scan(&replicas)
 	require.Equal(t, "{1,4,5}", replicas, "Replicas after loss of quorum recovery")
+
+	// Validate that rangelog is updated by recovery records after cluster restarts.
+	testutils.SucceedsSoon(t, func() error {
+		r := s.QueryRow(t,
+			`select count(*) from system.rangelog where "eventType" = 'unsafe_quorum_recovery'`)
+		var recoveries int
+		r.Scan(&recoveries)
+		if recoveries != len(plan.Updates) {
+			return errors.Errorf("found %d recovery events while expecting %d", recoveries,
+				len(plan.Updates))
+		}
+		return nil
+	})
+
+	// We were using scratch range to test cleanup of pending transaction on
+	// rangedescriptor key. We want to verify that after recovery, range is still
+	// writable e.g. recovery succeeded.
+	require.NoError(t,
+		tcAfter.Server(0).DB().Put(ctx, testutils.MakeKey(sk, []byte{1}), "value2"),
+		"failed to write value to scratch range after recovery")
+}
+
+func createIntentOnRangeDescriptor(
+	ctx context.Context, t *testing.T, tcBefore *testcluster.TestCluster, sk roachpb.Key,
+) {
+	txn := kv.NewTxn(ctx, tcBefore.Servers[0].DB(), 1)
+	var desc roachpb.RangeDescriptor
+	// Pick one of the predefined split points.
+	rdKey := keys.RangeDescriptorKey(roachpb.RKey(sk))
+	if err := txn.GetProto(ctx, rdKey, &desc); err != nil {
+		t.Fatal(err)
+	}
+	desc.NextReplicaID++
+	if err := txn.Put(ctx, rdKey, &desc); err != nil {
+		t.Fatal(err)
+	}
+
+	// At this point the intent has been written to Pebble but this
+	// write was not synced (only the raft log append was synced). We
+	// need to force another sync, but we're far from the storage
+	// layer here so the easiest thing to do is simply perform a
+	// second write. This will force the first write to be persisted
+	// to disk (the second write may or may not make it to disk due to
+	// timing).
+	desc.NextReplicaID++
+	if err := txn.Put(ctx, rdKey, &desc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestJsonSerialization verifies that all fields serialized in JSON could be
+// read back. This specific test addresses issues where default naming scheme
+// may not work in combination with other tags correctly. e.g. repeated used
+// with omitempty seem to use camelcase unless explicitly specified.
+func TestJsonSerialization(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	nr := loqrecoverypb.NodeReplicaInfo{
+		Replicas: []loqrecoverypb.ReplicaInfo{
+			{
+				NodeID:  1,
+				StoreID: 2,
+				Desc: roachpb.RangeDescriptor{
+					RangeID:  3,
+					StartKey: roachpb.RKey(keys.MetaMin),
+					EndKey:   roachpb.RKey(keys.MetaMax),
+					InternalReplicas: []roachpb.ReplicaDescriptor{
+						{
+							NodeID:    1,
+							StoreID:   2,
+							ReplicaID: 3,
+							Type:      roachpb.VOTER_INCOMING,
+						},
+					},
+					NextReplicaID: 4,
+					Generation:    7,
+				},
+				RaftAppliedIndex:   13,
+				RaftCommittedIndex: 19,
+				RaftLogDescriptorChanges: []loqrecoverypb.DescriptorChangeInfo{
+					{
+						ChangeType: 1,
+						Desc:       &roachpb.RangeDescriptor{},
+						OtherDesc:  &roachpb.RangeDescriptor{},
+					},
+				},
+			},
+		},
+	}
+	jsonpb := protoutil.JSONPb{Indent: "  "}
+	data, err := jsonpb.Marshal(nr)
+	require.NoError(t, err)
+
+	var nrFromJSON loqrecoverypb.NodeReplicaInfo
+	require.NoError(t, jsonpb.Unmarshal(data, &nrFromJSON))
+	require.Equal(t, nr, nrFromJSON, "objects before and after serialization")
 }

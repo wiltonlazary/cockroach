@@ -12,9 +12,7 @@ package jobs
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -22,10 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
@@ -138,23 +135,6 @@ func TestScheduleControl(t *testing.T) {
 		th.sqlDB.Exec(t, "DROP SCHEDULES "+querySchedules)
 		require.Equal(t, 0, len(th.sqlDB.QueryStr(t, querySchedules)))
 	})
-
-	t.Run("pause-non-privileged-user", func(t *testing.T) {
-		scheduleID := makeSchedule("one-schedule", "@daily")
-
-		th.sqlDB.Exec(t, `CREATE USER testuser`)
-		pgURL, cleanupFunc := sqlutils.PGUrl(
-			t, th.server.ServingSQLAddr(), "NonPrivileged-testuser",
-			url.User("testuser"),
-		)
-		defer cleanupFunc()
-		testuser, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		defer testuser.Close()
-
-		_, err = testuser.Exec("PAUSE SCHEDULE $1", scheduleID)
-		require.EqualError(t, err, "pq: only users with the admin role are allowed to PAUSE SCHEDULES")
-	})
 }
 
 func TestJobsControlForSchedules(t *testing.T) {
@@ -176,11 +156,11 @@ func TestJobsControlForSchedules(t *testing.T) {
 				return nil
 			},
 		}
-	})
+	}, UsesTenantCostControl)
 
 	record := Record{
 		Description: "fake job",
-		Username:    security.TestUserName(),
+		Username:    username.TestUserName(),
 		Details:     jobspb.ImportDetails{},
 		Progress:    jobspb.ImportProgress{},
 	}
@@ -252,7 +232,7 @@ func TestJobsControlForSchedules(t *testing.T) {
 				context.Background(),
 				"test-num-effected",
 				nil,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				jobControl,
 			)
 			require.NoError(t, err)
@@ -289,11 +269,11 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 				return nil
 			},
 		}
-	})
+	}, UsesTenantCostControl)
 
 	record := Record{
 		Description: "fake job",
-		Username:    security.TestUserName(),
+		Username:    username.TestUserName(),
 		Details:     jobspb.ImportDetails{},
 		Progress:    jobspb.ImportProgress{},
 	}
@@ -333,7 +313,7 @@ func TestFilterJobsControlForSchedules(t *testing.T) {
 				context.Background(),
 				"test-num-effected",
 				nil,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				jobControl,
 			)
 			require.NoError(t, err)
@@ -367,7 +347,7 @@ func TestJobControlByType(t *testing.T) {
 			context.Background(),
 			"test-invalid-type",
 			nil,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			invalidTypeQuery,
 		)
 		require.Error(t, err)
@@ -394,7 +374,7 @@ func TestJobControlByType(t *testing.T) {
 					return nil
 				},
 			}
-		})
+		}, UsesTenantCostControl)
 	}
 
 	for _, jobType := range allJobTypes {
@@ -426,7 +406,7 @@ func TestJobControlByType(t *testing.T) {
 						for i := 0; i < numJobsPerStatus; i++ {
 							record := Record{
 								Description: "fake job",
-								Username:    security.TestUserName(),
+								Username:    username.TestUserName(),
 								Details:     jobInfo.jobDetails,
 								Progress:    jobInfo.jobProgress,
 							}
@@ -447,7 +427,7 @@ func TestJobControlByType(t *testing.T) {
 					context.Background(),
 					"test-num-effected",
 					nil,
-					sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+					sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 					commandQuery,
 				)
 				require.NoError(t, err)

@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexeccmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 )
 
@@ -46,7 +46,7 @@ type defaultCmp_KINDSelOp struct {
 }
 
 var _ colexecop.Operator = &defaultCmp_KINDSelOp{}
-var _ execinfra.Releasable = &defaultCmp_KINDSelOp{}
+var _ execreleasable.Releasable = &defaultCmp_KINDSelOp{}
 
 func (d *defaultCmp_KINDSelOp) Next() coldata.Batch {
 	for {
@@ -75,10 +75,10 @@ func (d *defaultCmp_KINDSelOp) Next() coldata.Batch {
 			// is no need to check whether hasSel is true.
 			// {{if .HasConst}}
 			//gcassert:bce
-			res, err := d.adapter.Eval(leftColumn[i], d.constArg)
+			res, err := d.adapter.Eval(d.Ctx, leftColumn[i], d.constArg)
 			// {{else}}
 			//gcassert:bce
-			res, err := d.adapter.Eval(leftColumn[i], rightColumn[i])
+			res, err := d.adapter.Eval(d.Ctx, leftColumn[i], rightColumn[i])
 			// {{end}}
 			if err != nil {
 				colexecerror.ExpectedError(err)

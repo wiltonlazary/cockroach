@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
@@ -18,6 +19,7 @@ go_test(
     name = "testfilter_test",
     size = "small",
     srcs = ["main_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":testfilter_lib"],
     deps = [
@@ -26,3 +28,5 @@ go_test(
         "@com_github_cockroachdb_datadriven//:datadriven",
     ],
 )
+
+get_x_data(name = "get_x_data")

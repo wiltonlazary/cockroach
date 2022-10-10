@@ -91,9 +91,9 @@ func TestSimpleProjectOp(t *testing.T) {
 // TestSimpleProjectOpWithUnorderedSynchronizer sets up the following
 // structure:
 //
-//  input 1 --
-//            | --> unordered synchronizer --> simpleProjectOp --> constInt64Op
-//  input 2 --
+//	input 1 --
+//	          | --> unordered synchronizer --> simpleProjectOp --> constInt64Op
+//	input 2 --
 //
 // and makes sure that the output is as expected. The idea is to test
 // simpleProjectOp in case when it receives multiple "different internally"
@@ -121,7 +121,7 @@ func TestSimpleProjectOpWithUnorderedSynchronizer(t *testing.T) {
 			for i := range parallelUnorderedSynchronizerInputs {
 				parallelUnorderedSynchronizerInputs[i].Root = inputs[i]
 			}
-			input = colexec.NewParallelUnorderedSynchronizer(parallelUnorderedSynchronizerInputs, &wg)
+			input = colexec.NewParallelUnorderedSynchronizer(testAllocator, parallelUnorderedSynchronizerInputs, &wg)
 			input = colexecbase.NewSimpleProjectOp(input, len(inputTypes), []uint32{0})
 			return colexecbase.NewConstOp(testAllocator, input, types.Int, constVal, 1)
 		})

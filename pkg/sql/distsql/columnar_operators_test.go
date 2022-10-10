@@ -25,9 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecwindow"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -89,16 +92,49 @@ var aggregateFuncToNumArguments = map[execinfrapb.AggregatorSpec_Func]int{
 	execinfrapb.RegrAvgy:                2,
 	execinfrapb.TransitionRegrAggregate: 2,
 	execinfrapb.FinalCovarPop:           1,
+	execinfrapb.FinalRegrSxx:            1,
+	execinfrapb.FinalRegrSxy:            1,
+	execinfrapb.FinalRegrSyy:            1,
+	execinfrapb.FinalRegrAvgx:           1,
+	execinfrapb.FinalRegrAvgy:           1,
+	execinfrapb.FinalRegrIntercept:      1,
+	execinfrapb.FinalRegrR2:             1,
+	execinfrapb.FinalRegrSlope:          1,
+	execinfrapb.FinalCovarSamp:          1,
+	execinfrapb.FinalCorr:               1,
+	execinfrapb.FinalSqrdiff:            3,
 }
 
 // TestAggregateFuncToNumArguments ensures that all aggregate functions are
 // present in the map above.
 func TestAggregateFuncToNumArguments(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	for aggFn, aggFnName := range execinfrapb.AggregatorSpec_Func_name {
-		if _, found := aggregateFuncToNumArguments[execinfrapb.AggregatorSpec_Func(aggFn)]; !found {
-			t.Fatalf("didn't find number of arguments for %s", aggFnName)
+
+	checkForOverload := func(t *testing.T, expected int, overloads []tree.Overload) {
+		for _, overload := range overloads {
+			if overload.Types.Length() == expected {
+				return
+			}
 		}
+		t.Fatalf("expected %d inputs, but no matching overload found", expected)
+	}
+	check := func(t *testing.T, fn execinfrapb.AggregatorSpec_Func) {
+		n, ok := aggregateFuncToNumArguments[fn]
+		require.Truef(t, ok, "didn't find number of arguments for %s", fn)
+		_, overloads := builtinsregistry.GetBuiltinProperties(strings.ToLower(fn.String()))
+		checkForOverload(t, n, overloads)
+	}
+
+	fns := make([]execinfrapb.AggregatorSpec_Func, 0,
+		len(execinfrapb.AggregatorSpec_Func_name))
+	for fn := range execinfrapb.AggregatorSpec_Func_name {
+		fns = append(fns, execinfrapb.AggregatorSpec_Func(fn))
+	}
+	sort.Slice(fns, func(i, j int) bool { return fns[i] < fns[j] })
+	for _, fn := range fns {
+		t.Run(fn.String(), func(t *testing.T) {
+			check(t, fn)
+		})
 	}
 }
 
@@ -107,7 +143,7 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 
 	rng, seed := randutil.NewTestRand()
@@ -224,7 +260,8 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 									execinfrapb.StMakeline,
 									execinfrapb.StExtent,
 									execinfrapb.StUnion,
-									execinfrapb.StCollect:
+									execinfrapb.StCollect,
+									execinfrapb.ArrayAgg:
 									for _, typ := range aggFnInputTypes {
 										if typ.Family() == types.TupleFamily || (typ.Family() == types.ArrayFamily && typ.ArrayContents().Family() == types.TupleFamily) {
 											invalid = true
@@ -238,7 +275,7 @@ func TestAggregatorAgainstProcessor(t *testing.T) {
 								for _, typ := range aggFnInputTypes {
 									hasJSONColumn = hasJSONColumn || typ.Family() == types.JsonFamily
 								}
-								if _, outputType, err := execinfrapb.GetAggregateInfo(aggFn, aggFnInputTypes...); err == nil {
+								if _, outputType, err := execagg.GetAggregateInfo(aggFn, aggFnInputTypes...); err == nil {
 									outputTypes[i] = outputType
 									break
 								}
@@ -347,7 +384,7 @@ func TestDistinctAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	var da tree.DatumAlloc
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
 	rng, seed := randutil.NewTestRand()
@@ -476,7 +513,7 @@ func TestSorterAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 
 	rng, seed := randutil.NewTestRand()
@@ -513,15 +550,15 @@ func TestSorterAgainstProcessor(t *testing.T) {
 					sorterSpec := &execinfrapb.SorterSpec{
 						OutputOrdering: execinfrapb.Ordering{Columns: orderingCols},
 					}
-					var limit, offset uint64
+					var offset uint64
 					if topK > 0 {
 						offset = uint64(rng.Intn(int(topK)))
-						limit = topK - offset
+						sorterSpec.Limit = int64(topK - offset)
 					}
 					pspec := &execinfrapb.ProcessorSpec{
 						Input:       []execinfrapb.InputSyncSpec{{ColumnTypes: inputTypes}},
 						Core:        execinfrapb.ProcessorCoreUnion{Sorter: sorterSpec},
-						Post:        execinfrapb.PostProcessSpec{Limit: limit, Offset: offset},
+						Post:        execinfrapb.PostProcessSpec{Offset: offset},
 						ResultTypes: inputTypes,
 					}
 					args := verifyColOperatorArgs{
@@ -551,7 +588,7 @@ func TestSortChunksAgainstProcessor(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	var da tree.DatumAlloc
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 
 	rng, seed := randutil.NewTestRand()
@@ -625,7 +662,7 @@ func TestSortChunksAgainstProcessor(t *testing.T) {
 func TestHashJoinerAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
 	type hjTestSpec struct {
@@ -820,7 +857,7 @@ func TestMergeJoinerAgainstProcessor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	var da tree.DatumAlloc
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	defer evalCtx.Stop(context.Background())
 
 	type mjTestSpec struct {
@@ -1165,7 +1202,7 @@ func TestWindowFunctionsAgainstProcessor(t *testing.T) {
 					}
 					windowerSpec.WindowFns[0].Frame = generateWindowFrame(t, rng, &ordering, inputTypes)
 
-					_, outputType, err := execinfrapb.GetWindowFunctionInfo(fun, argTypes...)
+					_, outputType, err := execagg.GetWindowFunctionInfo(fun, argTypes...)
 					require.NoError(t, err)
 					pspec := &execinfrapb.ProcessorSpec{
 						Input:       []execinfrapb.InputSyncSpec{{ColumnTypes: inputTypes}},

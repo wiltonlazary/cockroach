@@ -14,7 +14,9 @@ import (
 	"math"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/testutils/zerofields"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func makeTS(walltime int64, logical int32) Timestamp {
@@ -23,6 +25,38 @@ func makeTS(walltime int64, logical int32) Timestamp {
 
 func makeSynTS(walltime int64, logical int32) Timestamp {
 	return makeTS(walltime, logical).WithSynthetic(true)
+}
+
+func TestCompare(t *testing.T) {
+	w0l0 := Timestamp{}
+	w1l1 := Timestamp{WallTime: 1, Logical: 1}
+	w1l2 := Timestamp{WallTime: 1, Logical: 2}
+	w2l1 := Timestamp{WallTime: 2, Logical: 1}
+	w2l2 := Timestamp{WallTime: 2, Logical: 2}
+
+	testcases := map[string]struct {
+		a      Timestamp
+		b      Timestamp
+		expect int
+	}{
+		"empty eq empty": {w0l0, w0l0, 0},
+		"empty lt set":   {w0l0, w1l1, -1},
+		"set gt empty":   {w1l1, w0l0, 1},
+		"set eq set":     {w1l1, w1l1, 0},
+
+		"wall lt":         {w1l1, w2l1, -1},
+		"wall gt":         {w2l1, w1l1, 1},
+		"logical lt":      {w1l1, w1l2, -1},
+		"logical gt":      {w1l2, w1l1, 1},
+		"both lt":         {w1l1, w2l2, -1},
+		"both gt":         {w2l2, w1l1, 1},
+		"wall precedence": {w2l1, w1l2, 1},
+	}
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.expect, tc.a.Compare(tc.b))
+		})
+	}
 }
 
 func TestEqOrdering(t *testing.T) {
@@ -94,6 +128,10 @@ func TestIsEmpty(t *testing.T) {
 	assert.False(t, a.IsEmpty())
 	a = makeSynTS(0, 0)
 	assert.False(t, a.IsEmpty())
+
+	nonZero := makeTS(1, 1)
+	nonZero.Synthetic = true
+	require.NoError(t, zerofields.NoZeroField(nonZero), "please update IsEmpty as well")
 }
 
 func TestTimestampNext(t *testing.T) {
@@ -111,6 +149,21 @@ func TestTimestampNext(t *testing.T) {
 	}
 	for _, c := range testCases {
 		assert.Equal(t, c.expNext, c.ts.Next())
+	}
+}
+
+func TestTimestampWallNext(t *testing.T) {
+	testCases := []struct {
+		ts, expWallNext Timestamp
+	}{
+		{makeTS(2, 0), makeTS(3, 0)},
+		{makeTS(1, 2), makeTS(2, 0)},
+		{makeTS(1, 1), makeTS(2, 0)},
+		{makeTS(1, 0), makeTS(2, 0)},
+		{makeSynTS(1, 2), makeSynTS(2, 0)},
+	}
+	for _, c := range testCases {
+		assert.Equal(t, c.expWallNext, c.ts.WallNext())
 	}
 }
 
@@ -356,4 +409,24 @@ func BenchmarkTimestampStringSynthetic(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = ts.String()
 	}
+}
+
+func BenchmarkTimestampIsEmpty(b *testing.B) {
+	cases := map[string]Timestamp{
+		"empty":    {},
+		"walltime": {WallTime: 1664364012528805328},
+		"all":      {WallTime: 1664364012528805328, Logical: 65535, Synthetic: true},
+	}
+
+	var result bool
+
+	for name, ts := range cases {
+		b.Run(name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				result = ts.IsEmpty()
+			}
+		})
+	}
+
+	_ = result // make sure compiler doesn't optimize away the call
 }

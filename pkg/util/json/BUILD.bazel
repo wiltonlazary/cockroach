@@ -1,4 +1,6 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "json",
@@ -18,10 +20,11 @@ go_library(
     deps = [
         "//pkg/geo",
         "//pkg/geo/geopb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/keysbase",
         "//pkg/sql/inverted",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
+        "//pkg/util",
         "//pkg/util/encoding",
         "//pkg/util/syncutil",
         "//pkg/util/unique",
@@ -37,6 +40,7 @@ go_test(
         "encode_test.go",
         "json_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":json"],
     deps = [
@@ -51,3 +55,10 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+disallowed_imports_test(
+    "json",
+    ["//pkg/roachpb"],
+)
+
+get_x_data(name = "get_x_data")

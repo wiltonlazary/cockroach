@@ -165,6 +165,7 @@ func TestFixture(t *testing.T) {
 
 func TestImportFixture(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	ctx := context.Background()
 
 	defer func(oldRefreshInterval, oldAsOf time.Duration) {
@@ -174,7 +175,12 @@ func TestImportFixture(t *testing.T) {
 	stats.DefaultRefreshInterval = time.Millisecond
 	stats.DefaultAsOfTime = 10 * time.Millisecond
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t,
+		// Need to disable the test tenant until we have a fix for #75449.
+		base.TestServerArgs{
+			DisableDefaultTestTenant: true,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
@@ -185,6 +191,10 @@ func TestImportFixture(t *testing.T) {
 	if err := gen.Flags().Parse([]string{"--" + flag}); err != nil {
 		t.Fatalf(`%+v`, err)
 	}
+	// Wait for the `ensureAllTables` unconditional auto stats to run before
+	// starting the test, so we don't hit a timing window where 2 sets of auto
+	// stats are collected.
+	time.Sleep(2 * time.Second)
 
 	const filesPerNode = 1
 
@@ -214,7 +224,13 @@ func TestImportFixtureCSVServer(t *testing.T) {
 	ts := httptest.NewServer(workload.CSVMux(workload.Registered()))
 	defer ts.Close()
 
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{UseDatabase: `d`})
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			UseDatabase: `d`,
+			// Test fails within a test tenant due to #75449.
+			DisableDefaultTestTenant: true,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(db)
 

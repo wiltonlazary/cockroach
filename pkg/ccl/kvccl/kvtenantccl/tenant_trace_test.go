@@ -18,14 +18,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,21 +49,24 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 		visibleString   = "tenant-can-see-this"
 	)
 
-	recCh := make(chan tracing.Recording, 1)
+	recCh := make(chan tracingpb.Recording, 1)
 
 	args := base.TestServerArgs{
+		// Test hangs within a tenant. More investigation is required.
+		// Tracked with #76378.
+		DisableDefaultTestTenant: true,
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
 					TestingEvalFilter: func(args kvserverbase.FilterArgs) *roachpb.Error {
 						log.Eventf(args.Ctx, "%v", sensitiveString)
-						log.Eventf(args.Ctx, "%v", log.Safe(visibleString))
+						log.Eventf(args.Ctx, "%v", redact.Safe(visibleString))
 						return nil
 					},
 				},
 			},
 			SQLExecutor: &sql.ExecutorTestingKnobs{
-				WithStatementTrace: func(trace tracing.Recording, stmt string) {
+				WithStatementTrace: func(trace tracingpb.Recording, stmt string) {
 					if stmt == testStmt {
 						recCh <- trace
 					}
@@ -113,7 +116,6 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 
 		require.NotEmpty(t, trace)
 		var found bool
-		var foundRedactedMarker bool
 		for _, rs := range trace {
 			for _, s := range rs.Logs {
 				if strings.Contains(s.Msg().StripMarkers(), sensitiveString) {
@@ -124,9 +126,6 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 				}
 				if strings.Contains(s.Msg().StripMarkers(), visibleString) {
 					found = true
-				}
-				if strings.Contains(s.Msg().StripMarkers(), string(server.TraceRedactedMarker)) {
-					foundRedactedMarker = true
 				}
 			}
 		}
@@ -139,15 +138,11 @@ func testTenantTracesAreRedactedImpl(t *testing.T, redactable bool) {
 			// trace.
 			require.True(t, found, "did not see expected trace message '%q':\n%s",
 				visibleString, trace)
-			require.False(t, foundRedactedMarker, "unexpectedly found '%q':\n%s",
-				string(server.TraceRedactedMarker), trace)
 		} else {
 			// Otherwise, expect the opposite: not even safe information makes it through,
 			// because it gets replaced with foundRedactedMarker.
 			require.False(t, found, "unexpectedly saw message '%q':\n%s",
 				visibleString, trace)
-			require.False(t, foundRedactedMarker, "unexpectedly found '%q':\n%s",
-				string(server.TraceRedactedMarker), trace)
 		}
 	})
 }

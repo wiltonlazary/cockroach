@@ -84,6 +84,8 @@ type timeSeriesMaintenanceQueue struct {
 	mem            *mon.BytesMonitor
 }
 
+var _ queueImpl = &timeSeriesMaintenanceQueue{}
+
 // newTimeSeriesMaintenanceQueue returns a new instance of
 // timeSeriesMaintenanceQueue.
 func newTimeSeriesMaintenanceQueue(
@@ -161,6 +163,11 @@ func (q *timeSeriesMaintenanceQueue) process(
 	return true, nil
 }
 
+func (*timeSeriesMaintenanceQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (q *timeSeriesMaintenanceQueue) timer(duration time.Duration) time.Duration {
 	// An interval between replicas to space consistency checks out over
 	// the check interval.
@@ -176,5 +183,9 @@ func (q *timeSeriesMaintenanceQueue) timer(duration time.Duration) time.Duration
 }
 
 func (*timeSeriesMaintenanceQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*timeSeriesMaintenanceQueue) updateChan() <-chan time.Time {
 	return nil
 }

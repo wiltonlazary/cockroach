@@ -45,7 +45,9 @@ func WriteInitialReplicaState(
 	desc roachpb.RangeDescriptor,
 	lease roachpb.Lease,
 	gcThreshold hlc.Timestamp,
+	gcHint roachpb.GCHint,
 	replicaVersion roachpb.Version,
+	gcHintsAllowed bool,
 ) (enginepb.MVCCStats, error) {
 	rsl := Make(desc.RangeID)
 	var s kvserverpb.ReplicaState
@@ -54,12 +56,14 @@ func WriteInitialReplicaState(
 		Index: raftInitialLogIndex,
 	}
 	s.RaftAppliedIndex = s.TruncatedState.Index
+	s.RaftAppliedIndexTerm = s.TruncatedState.Term
 	s.Desc = &roachpb.RangeDescriptor{
 		RangeID: desc.RangeID,
 	}
 	s.Stats = &ms
 	s.Lease = &lease
 	s.GCThreshold = &gcThreshold
+	s.GCHint = &gcHint
 	if (replicaVersion != roachpb.Version{}) {
 		s.Version = &replicaVersion
 	}
@@ -76,13 +80,19 @@ func WriteInitialReplicaState(
 		log.Fatalf(ctx, "expected trivial GCthreshold, but found %+v", existingGCThreshold)
 	}
 
+	if existingGCHint, err := rsl.LoadGCHint(ctx, readWriter); err != nil {
+		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading GCHint")
+	} else if !existingGCHint.IsEmpty() {
+		return enginepb.MVCCStats{}, errors.AssertionFailedf("expected trivial GCHint, but found %+v", existingGCHint)
+	}
+
 	if existingVersion, err := rsl.LoadVersion(ctx, readWriter); err != nil {
 		return enginepb.MVCCStats{}, errors.Wrap(err, "error reading Version")
 	} else if (existingVersion != roachpb.Version{}) {
 		log.Fatalf(ctx, "expected trivial version, but found %+v", existingVersion)
 	}
 
-	newMS, err := rsl.Save(ctx, readWriter, s)
+	newMS, err := rsl.Save(ctx, readWriter, s, gcHintsAllowed)
 	if err != nil {
 		return enginepb.MVCCStats{}, err
 	}
@@ -96,19 +106,27 @@ func WriteInitialRangeState(
 	ctx context.Context,
 	readWriter storage.ReadWriter,
 	desc roachpb.RangeDescriptor,
+	replicaID roachpb.ReplicaID,
 	replicaVersion roachpb.Version,
 ) error {
 	initialLease := roachpb.Lease{}
 	initialGCThreshold := hlc.Timestamp{}
+	initialGCHint := roachpb.GCHint{}
 	initialMS := enginepb.MVCCStats{}
 
 	if _, err := WriteInitialReplicaState(
-		ctx, readWriter, initialMS, desc, initialLease, initialGCThreshold,
-		replicaVersion,
+		ctx, readWriter, initialMS, desc, initialLease, initialGCThreshold, initialGCHint,
+		replicaVersion, true, /* 22.2: GCHintInReplicaState */
 	); err != nil {
 		return err
 	}
-	if err := Make(desc.RangeID).SynthesizeRaftState(ctx, readWriter); err != nil {
+	sl := Make(desc.RangeID)
+	if err := sl.SynthesizeRaftState(ctx, readWriter); err != nil {
+		return err
+	}
+	// Maintain the invariant that any replica (uninitialized or initialized),
+	// with persistent state, has a RaftReplicaID.
+	if err := sl.SetRaftReplicaID(ctx, readWriter, replicaID); err != nil {
 		return err
 	}
 	return nil

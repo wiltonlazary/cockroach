@@ -28,6 +28,17 @@ func CPU(n int) Option {
 	return nodeCPUOption(n)
 }
 
+type nodeHighMemOption bool
+
+func (o nodeHighMemOption) apply(spec *ClusterSpec) {
+	spec.HighMem = bool(o)
+}
+
+// HighMem requests nodes with additional memory per CPU.
+func HighMem(enabled bool) Option {
+	return nodeHighMemOption(enabled)
+}
+
 type volumeSizeOption int
 
 func (o volumeSizeOption) apply(spec *ClusterSpec) {
@@ -166,6 +177,17 @@ func (*preferSSDOption) apply(spec *ClusterSpec) {
 // PreferSSD prefers using local SSD, when possible.
 func PreferSSD() Option {
 	return &preferSSDOption{}
+}
+
+type terminateOnMigrationOption struct{}
+
+func (o terminateOnMigrationOption) apply(spec *ClusterSpec) {
+	spec.TerminateOnMigration = true
+}
+
+// TerminateOnMigration ensures VM is terminated in case GCE triggers a live migration.
+func TerminateOnMigration() Option {
+	return &terminateOnMigrationOption{}
 }
 
 type setFileSystem struct {

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,7 +8,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/kv/kvbase",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/util/grpcutil",
         "//pkg/util/log",
@@ -24,10 +25,11 @@ go_test(
     name = "nodedialer_test",
     size = "small",
     srcs = ["nodedialer_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":nodedialer"],
     deps = [
         "//pkg/clusterversion",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/settings/cluster",
         "//pkg/testutils",
@@ -36,6 +38,7 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
+        "//pkg/util/timeutil",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_circuitbreaker//:circuitbreaker",
         "@com_github_cockroachdb_errors//:errors",
@@ -44,3 +47,5 @@ go_test(
         "@org_golang_google_grpc//:go_default_library",
     ],
 )
+
+get_x_data(name = "get_x_data")

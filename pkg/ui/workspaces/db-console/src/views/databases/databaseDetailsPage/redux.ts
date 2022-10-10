@@ -12,7 +12,11 @@ import { RouteComponentProps } from "react-router";
 import { createSelector } from "reselect";
 import { LocalSetting } from "src/redux/localsettings";
 import _ from "lodash";
-import { DatabaseDetailsPageData, ViewMode } from "@cockroachlabs/cluster-ui";
+import {
+  DatabaseDetailsPageData,
+  util,
+  ViewMode,
+} from "@cockroachlabs/cluster-ui";
 
 import { cockroach } from "src/js/protos";
 import {
@@ -30,11 +34,9 @@ import {
   selectIsMoreThanOneNode,
 } from "src/redux/nodes";
 import { getNodesByRegionString } from "../utils";
-const {
-  DatabaseDetailsRequest,
-  TableDetailsRequest,
-  TableStatsRequest,
-} = cockroach.server.serverpb;
+
+const { DatabaseDetailsRequest, TableDetailsRequest, TableStatsRequest } =
+  cockroach.server.serverpb;
 
 function normalizeRoles(raw: string[]): string[] {
   const rolePrecedence: Record<string, number> = {
@@ -132,7 +134,6 @@ export const mapStateToProps = createSelector(
         const numIndexes = _.uniq(
           _.map(details?.data?.indexes, index => index.name),
         ).length;
-
         return {
           name: table,
           details: {
@@ -143,6 +144,16 @@ export const mapStateToProps = createSelector(
             userCount: roles.length,
             roles: roles,
             grants: grants,
+            statsLastUpdated: details?.data?.stats_last_created_at
+              ? util.TimestampToMoment(details?.data?.stats_last_created_at)
+              : null,
+            hasIndexRecommendations:
+              details?.data?.has_index_recommendations || false,
+            totalBytes: FixLong(
+              details?.data?.data_total_bytes || 0,
+            ).toNumber(),
+            liveBytes: FixLong(details?.data?.data_live_bytes || 0).toNumber(),
+            livePercentage: details?.data?.data_live_percentage || 0,
           },
           stats: {
             loading: !!stats?.inFlight,

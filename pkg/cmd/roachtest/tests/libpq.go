@@ -25,7 +25,7 @@ import (
 )
 
 var libPQReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var libPQSupportedTag = "v1.10.0"
+var libPQSupportedTag = "v1.10.5"
 
 func registerLibPQ(r registry.Registry) {
 	runLibPQ := func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -70,7 +70,7 @@ func registerLibPQ(r registry.Registry) {
 		// Install go-junit-report to convert test results to .xml format we know
 		// how to work with.
 		err = repeatRunE(ctx, t, c, node, "install go-junit-report",
-			fmt.Sprintf("GOPATH=%s go get -u github.com/jstemmer/go-junit-report", goPath),
+			fmt.Sprintf("GOPATH=%s go install github.com/jstemmer/go-junit-report@latest", goPath),
 		)
 		require.NoError(t, err)
 
@@ -134,7 +134,7 @@ func registerLibPQ(r registry.Registry) {
 
 		parseAndSummarizeJavaORMTestsResults(
 			ctx, t, c, node, "lib/pq" /* ormName */, []byte(resultsPath),
-			blocklistName, expectedFailures, ignoreList, version, latestTag,
+			blocklistName, expectedFailures, ignoreList, version, libPQSupportedTag,
 		)
 	}
 

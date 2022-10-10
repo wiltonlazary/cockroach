@@ -109,10 +109,14 @@ func verifyStats(t *testing.T, tc *testcluster.TestCluster, storeIdxSlice ...int
 		checkGauge(t, idString, m.LiveBytes, realStats.LiveBytes)
 		checkGauge(t, idString, m.KeyBytes, realStats.KeyBytes)
 		checkGauge(t, idString, m.ValBytes, realStats.ValBytes)
+		checkGauge(t, idString, m.RangeKeyBytes, realStats.RangeKeyBytes)
+		checkGauge(t, idString, m.RangeValBytes, realStats.RangeValBytes)
 		checkGauge(t, idString, m.IntentBytes, realStats.IntentBytes)
 		checkGauge(t, idString, m.LiveCount, realStats.LiveCount)
 		checkGauge(t, idString, m.KeyCount, realStats.KeyCount)
 		checkGauge(t, idString, m.ValCount, realStats.ValCount)
+		checkGauge(t, idString, m.RangeKeyCount, realStats.RangeKeyCount)
+		checkGauge(t, idString, m.RangeValCount, realStats.RangeValCount)
 		checkGauge(t, idString, m.IntentCount, realStats.IntentCount)
 		checkGauge(t, idString, m.SysBytes, realStats.SysBytes)
 		checkGauge(t, idString, m.SysCount, realStats.SysCount)
@@ -132,10 +136,16 @@ func verifyStats(t *testing.T, tc *testcluster.TestCluster, storeIdxSlice ...int
 	}
 }
 
-func verifyRocksDBStats(t *testing.T, s *kvserver.Store) {
+func verifyStorageStats(t *testing.T, s *kvserver.Store) {
 	if err := s.ComputeMetrics(context.Background(), 0); err != nil {
 		t.Fatal(err)
 	}
+
+	// TODO(jackson): Adjust TestStoreMetrics to reliably construct multiple
+	// levels within the LSM so that we can assert non-zero bloom filter
+	// statistics. At the time of writing, the engines in TestStoreMetrics
+	// sometimes contain files only in L6, which do not use bloom filters except
+	// when explicitly opted into.
 
 	m := s.Metrics()
 	testcases := []struct {
@@ -146,8 +156,8 @@ func verifyRocksDBStats(t *testing.T, s *kvserver.Store) {
 		{m.RdbBlockCacheMisses, 0},
 		{m.RdbBlockCacheUsage, 0},
 		{m.RdbBlockCachePinnedUsage, 0},
-		{m.RdbBloomFilterPrefixChecked, 20},
-		{m.RdbBloomFilterPrefixUseful, 20},
+		{m.RdbBloomFilterPrefixChecked, 0},
+		{m.RdbBloomFilterPrefixUseful, 0},
 		{m.RdbMemtableTotalSize, 5000},
 		{m.RdbFlushes, 1},
 		{m.RdbCompactions, 0},
@@ -310,10 +320,14 @@ func TestStoreMetrics(t *testing.T) {
 	verifyStats(t, tc, 1)
 
 	// Add some data to the "right" range.
-	dataKey := key.Next()
-	if _, err := tc.GetFirstStoreFromServer(t, 0).DB().Inc(ctx, dataKey, 5); err != nil {
-		t.Fatal(err)
-	}
+	rangeKeyStart, rangeKeyEnd := key, key.Next()
+	err := tc.GetFirstStoreFromServer(t, 0).DB().DelRangeUsingTombstone(ctx, rangeKeyStart, rangeKeyEnd)
+	require.NoError(t, err)
+
+	dataKey := rangeKeyEnd.Next()
+	_, err = tc.GetFirstStoreFromServer(t, 0).DB().Inc(ctx, dataKey, 5)
+	require.NoError(t, err)
+
 	tc.WaitForValues(t, dataKey, []int64{5, 5, 5})
 
 	// Verify all stats on stores after addition.
@@ -356,8 +370,8 @@ func TestStoreMetrics(t *testing.T) {
 	// Verify all stats on all stores after range is removed.
 	verifyStats(t, tc, 1, 2)
 
-	verifyRocksDBStats(t, tc.GetFirstStoreFromServer(t, 1))
-	verifyRocksDBStats(t, tc.GetFirstStoreFromServer(t, 2))
+	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 1))
+	verifyStorageStats(t, tc.GetFirstStoreFromServer(t, 2))
 }
 
 // TestStoreMaxBehindNanosOnlyTracksEpochBasedLeases ensures that the metric

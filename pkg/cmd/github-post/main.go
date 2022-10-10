@@ -23,10 +23,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -48,8 +48,8 @@ type formatter func(context.Context, failure) (issues.IssueFormatter, issues.Pos
 
 func defaultFormatter(ctx context.Context, f failure) (issues.IssueFormatter, issues.PostRequest) {
 	teams := getOwner(ctx, f.packageName, f.testName)
-	repro := fmt.Sprintf("make stressrace TESTS=%s PKG=./pkg/%s TESTTIMEOUT=5m STRESSFLAGS='-timeout 5m' 2>&1",
-		f.testName, trimPkg(f.packageName))
+	repro := fmt.Sprintf("./dev test ./pkg/%s --race --stress -f %s TESTTIMEOUT=5m STRESSFLAGS='-timeout 5m' 2>&1",
+		trimPkg(f.packageName), f.testName)
 
 	var projColID int
 	var mentions []string
@@ -364,7 +364,10 @@ func listFailures(
 				failures[parentTest] = append(failures[parentTest], testEvents...)
 				delete(failures, test)
 			} else {
-				log.Printf("failed parent test %q", test)
+				log.Printf("failed parent test %q (no subtests)", test.name)
+				if _, ok := failures[test]; !ok {
+					return errors.AssertionFailedf("expected %q in 'failures'", test.name)
+				}
 			}
 		}
 		// Sort the failed tests to make the unit tests for this script deterministic.
@@ -417,9 +420,25 @@ func listFailures(
 		if len(slowPassEvents) > 0 && slowPassEvents[0].Elapsed > slowest.Elapsed {
 			slowest = slowPassEvents[0]
 		}
-		if timedOutCulprit == scoped(slowest) {
-			// The test that was running when the timeout hit is the one that ran for
-			// the longest time.
+
+		culpritOwner := fmt.Sprintf("%v", getOwner(ctx, timedOutCulprit.pkg, timedOutCulprit.name))
+		slowEvents := append(slowFailEvents, slowPassEvents...)
+		// The predicate determines if the union of the slow events is owned by the _same_ team(s) as timedOutCulprit.
+		hasSameOwner := func() bool {
+			for _, slowEvent := range slowEvents {
+				scopedEvent := scoped(slowEvent)
+				owner := fmt.Sprintf("%v", getOwner(ctx, scopedEvent.pkg, scopedEvent.name))
+
+				if culpritOwner != owner {
+					log.Printf("%v has a different owner: %s;bailing out...\n", scopedEvent, owner)
+					return false
+				}
+			}
+			return true
+		}
+		if timedOutCulprit == scoped(slowest) || hasSameOwner() {
+			// The test that was running when the timeout hit is either the one that ran for
+			// the longest time or all other tests share the same owner.
 			log.Printf("timeout culprit found: %s\n", timedOutCulprit.name)
 			err := fileIssue(ctx, failure{
 				title:       fmt.Sprintf("%s: %s timed out", trimPkg(timedOutCulprit.pkg), timedOutCulprit.name),
@@ -477,7 +496,7 @@ func genSlowTestsReport(slowPassingTests, slowFailingTests []testEvent) string {
 }
 
 func writeSlowTestsReport(report string) error {
-	return ioutil.WriteFile("artifacts/slow-tests-report.txt", []byte(report), 0644)
+	return os.WriteFile("artifacts/slow-tests-report.txt", []byte(report), 0644)
 }
 
 // getFileLine returns the file (relative to repo root) and line for the given test.
@@ -492,41 +511,62 @@ func getFileLine(
 	subtests := strings.Split(testName, "/")
 	testName = subtests[0]
 	packageName = strings.TrimPrefix(packageName, "github.com/cockroachdb/cockroach/")
-	cmd := exec.Command(`/bin/bash`, `-c`,
-		fmt.Sprintf(`cd "$(git rev-parse --show-toplevel)" && git grep -n 'func %s(' '%s/*_test.go'`,
-			testName, packageName))
-	// This command returns output such as:
-	// ../ccl/storageccl/export_test.go:31:func TestExportCmd(t *testing.T) {
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", "", errors.Wrapf(err, "couldn't find test %s in %s: %s\n",
-			testName, packageName, string(out))
+	for {
+		if !strings.Contains(packageName, "pkg") {
+			return "", "", errors.Newf("could not find test %s", testName)
+		}
+		cmd := exec.Command(`/bin/bash`, `-c`,
+			fmt.Sprintf(`cd "$(git rev-parse --show-toplevel)" && git grep -n 'func %s(' '%s/*_test.go'`,
+				testName, packageName))
+		// This command returns output such as:
+		// ../ccl/storageccl/export_test.go:31:func TestExportCmd(t *testing.T) {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			fmt.Printf("couldn't find test %s in %s: %s %+v\n",
+				testName, packageName, string(out), err)
+			packageName = filepath.Dir(packageName)
+			continue
+		}
+		re := regexp.MustCompile(`(.*):(.*):`)
+		// The first 2 :-delimited fields are the filename and line number.
+		matches := re.FindSubmatch(out)
+		if matches == nil {
+			fmt.Printf("couldn't find filename/line number for test %s in %s: %s %+v\n",
+				testName, packageName, string(out), err)
+			packageName = filepath.Dir(packageName)
+			continue
+		}
+		return string(matches[1]), string(matches[2]), nil
 	}
-	re := regexp.MustCompile(`(.*):(.*):`)
-	// The first 2 :-delimited fields are the filename and line number.
-	matches := re.FindSubmatch(out)
-	if matches == nil {
-		return "", "", errors.Errorf("couldn't find filename/line number for test %s in %s: %s",
-			testName, packageName, string(out))
-	}
-	return string(matches[1]), string(matches[2]), nil
 }
 
 // getOwner looks up the file containing the given test and returns
 // the owning teams. It does not return
 // errors, but instead simply returns what it can.
+// In case no owning team is found, "test-eng" team is returned.
 func getOwner(ctx context.Context, packageName, testName string) (_teams []team.Team) {
 	filename, _, err := getFileLine(ctx, packageName, testName)
 	if err != nil {
-		log.Printf("getting file:line for %s.%s: %s", packageName, testName, err)
-		return nil
+		log.Printf("errror getting file:line for %s.%s: %s", packageName, testName, err)
+		// Let's continue so that we can assign the "catch-all" owner.
 	}
 	co, err := codeowners.DefaultLoadCodeOwners()
 	if err != nil {
 		log.Printf("loading codeowners: %s", err)
 		return nil
 	}
-	return co.Match(filename)
+	match := co.Match(filename)
+
+	if match == nil {
+		// N.B. if no owning team is found, we default to 'test-eng'. This should be a rare exception rather than the rule.
+		testEng := co.GetTeamForAlias("cockroachdb/test-eng")
+		if testEng.Name() == "" {
+			log.Fatalf("test-eng team could not be found in TEAMS.yaml")
+		}
+		log.Printf("assigning %s.%s to 'test-eng' as catch-all", packageName, testName)
+		match = []team.Team{testEng}
+	}
+	return match
 }
 
 func formatPebbleMetamorphicIssue(
@@ -540,9 +580,8 @@ func formatPebbleMetamorphicIssue(
 			s := f.testMessage[i+len(seedHeader):]
 			s = strings.TrimSpace(s)
 			s = strings.TrimSpace(s[:strings.Index(s, "\n")])
-
 			repro = fmt.Sprintf("go test -mod=vendor -tags 'invariants' -exec 'stress -p 1' "+
-				`-timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed %s -ops "uniform:5000-25000"`, s)
+				`-timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed %s -ops "uniform:5000-10000"`, s)
 		}
 	}
 	return issues.UnitTestFormatter, issues.PostRequest{

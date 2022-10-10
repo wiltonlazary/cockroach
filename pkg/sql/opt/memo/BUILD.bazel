@@ -1,4 +1,6 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "memo",
@@ -25,6 +27,7 @@ go_library(
     deps = [
         "//pkg/geo/geoindex",
         "//pkg/sql/catalog/colinfo",
+        "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/inverted",
         "//pkg/sql/opt",
         "//pkg/sql/opt/cat",
@@ -34,8 +37,13 @@ go_library(
         "//pkg/sql/opt/props/physical",
         "//pkg/sql/rowenc/keyside",
         "//pkg/sql/rowenc/valueside",
-        "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/cast",
+        "//pkg/sql/sem/catid",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treewindow",
+        "//pkg/sql/sem/volatility",
+        "//pkg/sql/stats",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/buildutil",
@@ -46,6 +54,7 @@ go_library(
         "//pkg/util/timeutil/pgdate",
         "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -62,8 +71,9 @@ go_test(
         "statistics_builder_test.go",
         "typing_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]) + [
-        "@cockroach//c-deps:libgeos",
+        "//c-deps:libgeos",
         "//pkg/sql/opt/testutils/opttester:testfixtures",
     ],
     embed = [":memo"],
@@ -71,6 +81,7 @@ go_test(
         "//pkg/settings/cluster",
         "//pkg/sql/inverted",
         "//pkg/sql/opt",
+        "//pkg/sql/opt/cat",
         "//pkg/sql/opt/constraint",
         "//pkg/sql/opt/norm",
         "//pkg/sql/opt/optbuilder",
@@ -83,9 +94,13 @@ go_test(
         "//pkg/sql/parser",
         "//pkg/sql/randgen",
         "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/builtins/builtinsregistry",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/types",
         "//pkg/testutils",
+        "//pkg/util",
         "//pkg/util/duration",
         "//pkg/util/leaktest",
         "//pkg/util/timeofday",
@@ -107,3 +122,10 @@ genrule(
     exec_tools = ["//pkg/sql/opt/optgen/cmd/optgen"],
     visibility = ["//visibility:public"],
 )
+
+disallowed_imports_test(
+    "memo",
+    ["//pkg/sql/sem/builtins"],
+)
+
+get_x_data(name = "get_x_data")

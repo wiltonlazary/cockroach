@@ -35,6 +35,11 @@ project
       ├── fetch columns: d_id:14 d_w_id:15 d_name:16 d_street_1:17 d_street_2:18 d_city:19 d_state:20 d_zip:21 d_tax:22 d_ytd:23 d_next_o_id:24
       ├── update-mapping:
       │    └── d_next_o_id_new:27 => d_next_o_id:11
+      ├── return-mapping:
+      │    ├── d_id:14 => d_id:1
+      │    ├── d_w_id:15 => d_w_id:2
+      │    ├── d_tax:22 => d_tax:9
+      │    └── d_next_o_id_new:27 => d_next_o_id:11
       ├── cardinality: [0 - 1]
       ├── volatile, mutations
       ├── key: ()
@@ -442,6 +447,14 @@ project
       ├── fetch columns: w_id:12 w_name:13 w_street_1:14 w_street_2:15 w_city:16 w_state:17 w_zip:18 w_tax:19 w_ytd:20
       ├── update-mapping:
       │    └── w_ytd_cast:24 => w_ytd:9
+      ├── return-mapping:
+      │    ├── w_id:12 => w_id:1
+      │    ├── w_name:13 => w_name:2
+      │    ├── w_street_1:14 => w_street_1:3
+      │    ├── w_street_2:15 => w_street_2:4
+      │    ├── w_city:16 => w_city:5
+      │    ├── w_state:17 => w_state:6
+      │    └── w_zip:18 => w_zip:7
       ├── cardinality: [0 - 1]
       ├── volatile, mutations
       ├── key: ()
@@ -460,7 +473,7 @@ project
            │    └── fd: ()-->(12-20)
            └── projections
                 └── assignment-cast: DECIMAL(12,2) [as=w_ytd_cast:24, outer=(20), immutable]
-                     └── w_ytd:20::DECIMAL + 3860.61
+                     └── w_ytd:20 + 3860.61
 
 opt format=hide-qual
 UPDATE district SET d_ytd = d_ytd + 3860.61 WHERE (d_w_id = 10) AND (d_id = 5)
@@ -477,6 +490,15 @@ project
       ├── fetch columns: d_id:14 d_w_id:15 d_name:16 d_street_1:17 d_street_2:18 d_city:19 d_state:20 d_zip:21 d_tax:22 d_ytd:23 d_next_o_id:24
       ├── update-mapping:
       │    └── d_ytd_cast:28 => d_ytd:10
+      ├── return-mapping:
+      │    ├── d_id:14 => d_id:1
+      │    ├── d_w_id:15 => d_w_id:2
+      │    ├── d_name:16 => d_name:3
+      │    ├── d_street_1:17 => d_street_1:4
+      │    ├── d_street_2:18 => d_street_2:5
+      │    ├── d_city:19 => d_city:6
+      │    ├── d_state:20 => d_state:7
+      │    └── d_zip:21 => d_zip:8
       ├── cardinality: [0 - 1]
       ├── volatile, mutations
       ├── key: ()
@@ -495,7 +517,7 @@ project
            │    └── fd: ()-->(14-24)
            └── projections
                 └── assignment-cast: DECIMAL(12,2) [as=d_ytd_cast:28, outer=(23), immutable]
-                     └── d_ytd:23::DECIMAL + 3860.61
+                     └── d_ytd:23 + 3860.61
 
 opt format=hide-qual
 SELECT c_id
@@ -570,6 +592,25 @@ project
  │    │    ├── c_ytd_payment_cast:52 => c_ytd_payment:18
  │    │    ├── c_payment_cnt_new:49 => c_payment_cnt:19
  │    │    └── c_data_cast:53 => c_data:21
+ │    ├── return-mapping:
+ │    │    ├── c_id:24 => c_id:1
+ │    │    ├── c_d_id:25 => c_d_id:2
+ │    │    ├── c_w_id:26 => c_w_id:3
+ │    │    ├── c_first:27 => c_first:4
+ │    │    ├── c_middle:28 => c_middle:5
+ │    │    ├── c_last:29 => c_last:6
+ │    │    ├── c_street_1:30 => c_street_1:7
+ │    │    ├── c_street_2:31 => c_street_2:8
+ │    │    ├── c_city:32 => c_city:9
+ │    │    ├── c_state:33 => c_state:10
+ │    │    ├── c_zip:34 => c_zip:11
+ │    │    ├── c_phone:35 => c_phone:12
+ │    │    ├── c_since:36 => c_since:13
+ │    │    ├── c_credit:37 => c_credit:14
+ │    │    ├── c_credit_lim:38 => c_credit_lim:15
+ │    │    ├── c_discount:39 => c_discount:16
+ │    │    ├── c_balance_cast:51 => c_balance:17
+ │    │    └── c_data_cast:53 => c_data:21
  │    ├── cardinality: [0 - 1]
  │    ├── volatile, mutations
  │    ├── key: ()
@@ -588,11 +629,11 @@ project
  │         │    └── fd: ()-->(24-44)
  │         └── projections
  │              ├── assignment-cast: DECIMAL(12,2) [as=c_balance_cast:51, outer=(40), immutable]
- │              │    └── c_balance:40::DECIMAL - 3860.61
+ │              │    └── c_balance:40 - 3860.61
  │              ├── assignment-cast: DECIMAL(12,2) [as=c_ytd_payment_cast:52, outer=(41), immutable]
- │              │    └── c_ytd_payment:41::DECIMAL + 3860.61
+ │              │    └── c_ytd_payment:41 + 3860.61
  │              ├── assignment-cast: VARCHAR(500) [as=c_data_cast:53, outer=(24-26,37,44), immutable]
- │              │    └── CASE c_credit:37 WHEN 'BC' THEN left((((((c_id:24::STRING || c_d_id:25::STRING) || c_w_id:26::STRING) || '5') || '10') || '3860.61') || c_data:44::STRING, 500) ELSE c_data:44::STRING END
+ │              │    └── CASE c_credit:37 WHEN 'BC' THEN left((((((c_id:24::STRING || c_d_id:25::STRING) || c_w_id:26::STRING) || '5') || '10') || '3860.61') || c_data:44, 500) ELSE c_data:44::STRING END
  │              └── c_payment_cnt:42 + 1 [as=c_payment_cnt_new:49, outer=(42), immutable]
  └── projections
       └── CASE c_credit:14 WHEN 'BC' THEN left(c_data:21, 200) ELSE '' END [as=case:54, outer=(14,21), immutable]
@@ -825,6 +866,11 @@ project
       ├── fetch columns: o_id:11 o_d_id:12 o_w_id:13 o_c_id:14 o_entry_d:15 o_carrier_id:16 o_ol_cnt:17 o_all_local:18
       ├── update-mapping:
       │    └── o_carrier_id_new:21 => o_carrier_id:6
+      ├── return-mapping:
+      │    ├── o_id:11 => o_id:1
+      │    ├── o_d_id:12 => o_d_id:2
+      │    ├── o_w_id:13 => o_w_id:3
+      │    └── o_c_id:14 => o_c_id:4
       ├── cardinality: [0 - 10]
       ├── volatile, mutations
       ├── key: (2)
@@ -913,7 +959,7 @@ update customer
       │    └── fd: ()-->(26), (24,25)-->(27-44)
       └── projections
            ├── assignment-cast: DECIMAL(12,2) [as=c_balance_cast:49, outer=(25,40), immutable]
-           │    └── c_balance:40::DECIMAL + CASE c_d_id:25 WHEN 6 THEN 57214.780000 WHEN 8 THEN 67755.430000 WHEN 1 THEN 51177.840000 WHEN 2 THEN 73840.700000 WHEN 4 THEN 45906.990000 WHEN 9 THEN 32523.760000 WHEN 10 THEN 20240.200000 WHEN 3 THEN 75299.790000 WHEN 5 THEN 56543.340000 WHEN 7 THEN 67157.940000 ELSE CAST(NULL AS DECIMAL) END
+           │    └── c_balance:40 + CASE c_d_id:25 WHEN 6 THEN 57214.780000 WHEN 8 THEN 67755.430000 WHEN 1 THEN 51177.840000 WHEN 2 THEN 73840.700000 WHEN 4 THEN 45906.990000 WHEN 9 THEN 32523.760000 WHEN 10 THEN 20240.200000 WHEN 3 THEN 75299.790000 WHEN 5 THEN 56543.340000 WHEN 7 THEN 67157.940000 ELSE CAST(NULL AS DECIMAL) END
            └── c_delivery_cnt:43 + 1 [as=c_delivery_cnt_new:47, outer=(43), immutable]
 
 opt format=hide-qual

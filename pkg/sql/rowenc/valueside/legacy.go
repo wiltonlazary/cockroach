@@ -169,7 +169,7 @@ func MarshalLegacy(colType *types.T, val tree.Datum) (roachpb.Value, error) {
 		}
 	case types.OidFamily:
 		if v, ok := val.(*tree.DOid); ok {
-			r.SetInt(int64(v.DInt))
+			r.SetInt(int64(v.Oid))
 			return r, nil
 		}
 	case types.EnumFamily:
@@ -328,13 +328,13 @@ func UnmarshalLegacy(a *tree.DatumAlloc, typ *types.T, value roachpb.Value) (tre
 		if err != nil {
 			return nil, err
 		}
-		return a.NewDOid(tree.MakeDOid(tree.DInt(v))), nil
+		return a.NewDOid(tree.MakeDOid(oid.Oid(v), typ)), nil
 	case types.ArrayFamily:
 		v, err := value.GetBytes()
 		if err != nil {
 			return nil, err
 		}
-		datum, _, err := decodeArray(a, typ.ArrayContents(), v)
+		datum, _, err := decodeArray(a, typ, v)
 		// TODO(yuzefovich): do we want to create a new object via tree.DatumAlloc?
 		return datum, err
 	case types.JsonFamily:

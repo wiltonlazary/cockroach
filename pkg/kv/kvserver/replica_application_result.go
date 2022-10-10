@@ -20,6 +20,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 )
 
 // replica_application_*.go files provide concrete implementations of
@@ -95,6 +97,8 @@ func clearTrivialReplicatedEvalResultFields(r *kvserverpb.ReplicatedEvalResult) 
 		}
 	}
 	r.Delta = enginepb.MVCCStatsDelta{}
+	// Rangefeeds have been disconnected prior to application.
+	r.MVCCHistoryMutation = nil
 }
 
 // prepareLocalResult is performed after the command has been committed to the
@@ -277,9 +281,11 @@ func (r *Replica) handleLeaseResult(
 }
 
 func (r *Replica) handleTruncatedStateResult(
-	ctx context.Context, t *roachpb.RaftTruncatedState,
-) (raftLogDelta int64) {
+	ctx context.Context, t *roachpb.RaftTruncatedState, expectedFirstIndexPreTruncation uint64,
+) (raftLogDelta int64, expectedFirstIndexWasAccurate bool) {
 	r.mu.Lock()
+	expectedFirstIndexWasAccurate =
+		r.mu.state.TruncatedState.Index+1 == expectedFirstIndexPreTruncation
 	r.mu.state.TruncatedState = t
 	r.mu.Unlock()
 
@@ -290,6 +296,9 @@ func (r *Replica) handleTruncatedStateResult(
 	// Truncate the sideloaded storage. Note that this is safe only if the new truncated state
 	// is durably on disk (i.e.) synced. This is true at the time of writing but unfortunately
 	// could rot.
+	// TODO(sumeer): once we remove the legacy caller of
+	// handleTruncatedStateResult, stop calculating the size of the removed
+	// files and the remaining files.
 	log.Eventf(ctx, "truncating sideloaded storage up to (and including) index %d", t.Index)
 	size, _, err := r.raftMu.sideloaded.TruncateTo(ctx, t.Index+1)
 	if err != nil {
@@ -297,7 +306,7 @@ func (r *Replica) handleTruncatedStateResult(
 		// loud error, but keep humming along.
 		log.Errorf(ctx, "while removing sideloaded files during log truncation: %+v", err)
 	}
-	return -size
+	return -size, expectedFirstIndexWasAccurate
 }
 
 func (r *Replica) handleGCThresholdResult(ctx context.Context, thresh *hlc.Timestamp) {
@@ -306,6 +315,12 @@ func (r *Replica) handleGCThresholdResult(ctx context.Context, thresh *hlc.Times
 	}
 	r.mu.Lock()
 	r.mu.state.GCThreshold = thresh
+	r.mu.Unlock()
+}
+
+func (r *Replica) handleGCHintResult(ctx context.Context, hint *roachpb.GCHint) {
+	r.mu.Lock()
+	r.mu.state.GCHint = hint
 	r.mu.Unlock()
 }
 
@@ -319,7 +334,11 @@ func (r *Replica) handleVersionResult(ctx context.Context, version *roachpb.Vers
 }
 
 func (r *Replica) handleComputeChecksumResult(ctx context.Context, cc *kvserverpb.ComputeChecksum) {
-	r.computeChecksumPostApply(ctx, *cc)
+	err := r.computeChecksumPostApply(ctx, *cc)
+	// Don't log errors caused by the store quiescing, they are expected.
+	if err != nil && !errors.Is(err, stop.ErrUnavailable) {
+		log.Errorf(ctx, "failed to start ComputeChecksum task %s: %v", cc.ChecksumID, err)
+	}
 }
 
 func (r *Replica) handleChangeReplicasResult(
@@ -364,17 +383,7 @@ func (r *Replica) handleChangeReplicasResult(
 	return true
 }
 
-func (r *Replica) handleRaftLogDeltaResult(ctx context.Context, delta int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.mu.raftLogSize += delta
-	r.mu.raftLogLastCheckSize += delta
-	// Ensure raftLog{,LastCheck}Size is not negative since it isn't persisted
-	// between server restarts.
-	if r.mu.raftLogSize < 0 {
-		r.mu.raftLogSize = 0
-	}
-	if r.mu.raftLogLastCheckSize < 0 {
-		r.mu.raftLogLastCheckSize = 0
-	}
+// TODO(sumeer): remove method when all truncation is loosely coupled.
+func (r *Replica) handleRaftLogDeltaResult(ctx context.Context, delta int64, isDeltaTrusted bool) {
+	(*raftTruncatorReplica)(r).setTruncationDeltaAndTrusted(delta, isDeltaTrusted)
 }

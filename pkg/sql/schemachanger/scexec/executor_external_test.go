@@ -15,14 +15,16 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
@@ -32,49 +34,56 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps/sctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec/scmutationexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
 type testInfra struct {
 	tc       *testcluster.TestCluster
 	settings *cluster.Settings
-	ie       sqlutil.InternalExecutor
 	db       *kv.DB
 	lm       *lease.Manager
 	tsql     *sqlutils.SQLRunner
 	cf       *descs.CollectionFactory
+	ief      descs.TxnManager
 }
 
 func (ti testInfra) newExecDeps(
 	txn *kv.Txn, descsCollection *descs.Collection,
 ) scexec.Dependencies {
+	const kvTrace = true
+	const schemaChangerJobID = 1
 	return scdeps.NewExecutorDependencies(
+		ti.settings,
 		ti.lm.Codec(),
-		&sessiondata.SessionData{}, /* sessionData */
+		&sessiondata.SessionData{},
 		txn,
-		security.RootUserName(),
+		username.RootUserName(),
 		descsCollection,
-		noopJobRegistry{}, /* jobRegistry */
-		noopBackfiller{},  /* backfiller */
-		scdeps.NewNoOpBackfillTracker(ti.lm.Codec()),
+		noopJobRegistry{},
+		noopBackfiller{},
+		noopMerger{},
+		scdeps.NewNoOpBackfillerTracker(ti.lm.Codec()),
 		scdeps.NewNoopPeriodicProgressFlusher(),
-		noopIndexValidator{},        /* indexValidator */
-		noopPartitioner{},           /* partitioner */
-		noopCommentUpdaterFactory{}, /* commentUpdaterFactory*/
-		noopEventLogger{},           /* eventLogger */
-		1,                           /* schemaChangerJobID */
-		nil,                         /* statements */
+		noopIndexValidator{},
+		scdeps.NewConstantClock(timeutil.Now()),
+		noopMetadataUpdater{},
+		noopEventLogger{},
+		noopStatsReferesher{},
+		&scexec.TestingKnobs{},
+		kvTrace,
+		schemaChangerJobID,
+		nil, /* statements */
 	)
 }
 
@@ -83,10 +92,10 @@ func setupTestInfra(t testing.TB) *testInfra {
 	return &testInfra{
 		tc:       tc,
 		settings: tc.Server(0).ClusterSettings(),
-		ie:       tc.Server(0).InternalExecutor().(sqlutil.InternalExecutor),
 		db:       tc.Server(0).DB(),
 		lm:       tc.Server(0).LeaseManager().(*lease.Manager),
 		cf:       tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).CollectionFactory,
+		ief:      tc.Server(0).ExecutorConfig().(sql.ExecutorConfig).InternalExecutorFactory,
 		tsql:     sqlutils.MakeSQLRunner(tc.ServerConn(0)),
 	}
 }
@@ -95,7 +104,7 @@ func (ti *testInfra) txn(
 	ctx context.Context,
 	f func(ctx context.Context, txn *kv.Txn, descriptors *descs.Collection) error,
 ) error {
-	return ti.cf.Txn(ctx, ti.ie, ti.db, f)
+	return ti.ief.DescsTxn(ctx, ti.db, f)
 }
 
 func TestExecutorDescriptorMutationOps(t *testing.T) {
@@ -137,7 +146,8 @@ func TestExecutorDescriptorMutationOps(t *testing.T) {
 		ti.tsql.Exec(t, `CREATE DATABASE db`)
 		ti.tsql.Exec(t, `
 CREATE TABLE db.t (
-   i INT PRIMARY KEY 
+   i INT PRIMARY KEY,
+   CONSTRAINT check_foo CHECK (i > 0)
 )`)
 
 		tn := tree.MakeTableNameWithSchema("db", tree.PublicSchemaName, "t")
@@ -158,11 +168,11 @@ CREATE TABLE db.t (
 			exDeps := ti.newExecDeps(txn, descriptors)
 			_, orig, err := descriptors.GetImmutableTableByName(ctx, txn, &tn, immFlags)
 			require.NoError(t, err)
-			require.Equal(t, c.orig(), orig)
+			require.Equal(t, c.orig().TableDesc(), orig.TableDesc())
 			require.NoError(t, scexec.ExecuteStage(ctx, exDeps, c.ops()))
 			_, after, err := descriptors.GetImmutableTableByName(ctx, txn, &tn, immFlags)
 			require.NoError(t, err)
-			require.Equal(t, c.exp(), after)
+			require.Equal(t, c.exp().TableDesc(), after.TableDesc())
 			return nil
 		}))
 	}
@@ -170,14 +180,16 @@ CREATE TABLE db.t (
 	indexToAdd := descpb.IndexDescriptor{
 		ID:                2,
 		Name:              tabledesc.IndexNamePlaceholder(2),
-		Version:           descpb.LatestNonPrimaryIndexDescriptorVersion,
+		Version:           descpb.LatestIndexDescriptorVersion,
 		CreatedExplicitly: true,
 		KeyColumnIDs:      []descpb.ColumnID{1},
 		KeyColumnNames:    []string{"i"},
 		StoreColumnNames:  []string{},
-		KeyColumnDirections: []descpb.IndexDescriptor_Direction{
-			descpb.IndexDescriptor_ASC,
+		KeyColumnDirections: []catpb.IndexColumn_Direction{
+			catpb.IndexColumn_ASC,
 		},
+		ConstraintID:                3,
+		UseDeletePreservingEncoding: true,
 	}
 	for _, tc := range []testCase{
 		{
@@ -186,6 +198,7 @@ CREATE TABLE db.t (
 			exp: makeTable(func(mutable *tabledesc.Mutable) {
 				mutable.MaybeIncrementVersion()
 				mutable.NextIndexID++
+				mutable.NextConstraintID++
 				mutable.Mutations = append(mutable.Mutations, descpb.DescriptorMutation{
 					Descriptor_: &descpb.DescriptorMutation_Index{
 						Index: &indexToAdd,
@@ -198,39 +211,37 @@ CREATE TABLE db.t (
 			}),
 			ops: func() []scop.Op {
 				return []scop.Op{
-					&scop.MakeAddedIndexDeleteOnly{
-						TableID:             table.ID,
-						IndexID:             indexToAdd.ID,
-						KeyColumnIDs:        indexToAdd.KeyColumnIDs,
-						KeyColumnDirections: indexToAdd.KeyColumnDirections,
-						SecondaryIndex:      true,
+					&scop.MakeAbsentTempIndexDeleteOnly{
+						Index: scpb.Index{
+							TableID:      table.ID,
+							IndexID:      indexToAdd.ID,
+							ConstraintID: indexToAdd.ConstraintID,
+						},
+						IsSecondaryIndex: true,
+					},
+					&scop.AddColumnToIndex{
+						TableID:   table.ID,
+						ColumnID:  1,
+						IndexID:   indexToAdd.ID,
+						Kind:      scpb.IndexColumn_KEY,
+						Direction: catpb.IndexColumn_ASC,
+						Ordinal:   0,
 					},
 				}
 			},
 		},
 		{
-			name: "add check constraint",
+			name: "remove check constraint",
 			orig: makeTable(nil),
 			exp: makeTable(func(mutable *tabledesc.Mutable) {
 				mutable.MaybeIncrementVersion()
-				mutable.Checks = append(mutable.Checks, &descpb.TableDescriptor_CheckConstraint{
-					Expr:                "i > 1",
-					Name:                "check_foo",
-					Validity:            descpb.ConstraintValidity_Validating,
-					ColumnIDs:           []descpb.ColumnID{1},
-					IsNonNullConstraint: false,
-					Hidden:              false,
-				})
+				mutable.Checks = mutable.Checks[:0]
 			}),
 			ops: func() []scop.Op {
 				return []scop.Op{
-					&scop.AddCheckConstraint{
-						TableID:     table.GetID(),
-						Name:        "check_foo",
-						Expr:        "i > 1",
-						ColumnIDs:   []descpb.ColumnID{1},
-						Unvalidated: false,
-						Hidden:      false,
+					&scop.RemoveCheckConstraint{
+						TableID:      table.GetID(),
+						ConstraintID: 2,
 					},
 				}
 			},
@@ -273,29 +284,26 @@ func TestSchemaChanger(t *testing.T) {
 			}
 			targets := []scpb.Target{
 				scpb.MakeTarget(
-					scpb.Status_PUBLIC,
-					&scpb.PrimaryIndex{
-						TableID:             fooTable.GetID(),
-						IndexID:             2,
-						KeyColumnIDs:        []descpb.ColumnID{1},
-						KeyColumnDirections: []scpb.PrimaryIndex_Direction{scpb.PrimaryIndex_ASC},
-						StoringColumnIDs:    []descpb.ColumnID{2},
-						Unique:              true,
-						Inverted:            false,
+					scpb.ToPublic,
+					&scpb.Column{
+						TableID:        fooTable.GetID(),
+						ColumnID:       2,
+						PgAttributeNum: 2,
 					},
 					metadata,
 				),
 				scpb.MakeTarget(
-					scpb.Status_PUBLIC,
-					&scpb.IndexName{
-						TableID: fooTable.GetID(),
-						IndexID: 2,
-						Name:    "new_primary_key",
+					scpb.ToPublic,
+					&scpb.ColumnType{
+						TableID:    fooTable.GetID(),
+						ColumnID:   2,
+						TypeT:      scpb.TypeT{Type: types.Int},
+						IsNullable: true,
 					},
 					metadata,
 				),
 				scpb.MakeTarget(
-					scpb.Status_PUBLIC,
+					scpb.ToPublic,
 					&scpb.ColumnName{
 						TableID:  fooTable.GetID(),
 						ColumnID: 2,
@@ -304,34 +312,13 @@ func TestSchemaChanger(t *testing.T) {
 					metadata,
 				),
 				scpb.MakeTarget(
-					scpb.Status_PUBLIC,
-					&scpb.Column{
-						TableID:        fooTable.GetID(),
-						ColumnID:       2,
-						Type:           types.Int,
-						Nullable:       true,
-						PgAttributeNum: 2,
-					},
-					metadata,
-				),
-				scpb.MakeTarget(
-					scpb.Status_ABSENT,
-					&scpb.PrimaryIndex{
-						TableID:             fooTable.GetID(),
-						IndexID:             1,
-						KeyColumnIDs:        []descpb.ColumnID{1},
-						KeyColumnDirections: []scpb.PrimaryIndex_Direction{scpb.PrimaryIndex_ASC},
-						Unique:              true,
-						Inverted:            false,
-					},
-					metadata,
-				),
-				scpb.MakeTarget(
-					scpb.Status_ABSENT,
-					&scpb.IndexName{
-						TableID: fooTable.GetID(),
-						IndexID: 1,
-						Name:    "primary",
+					scpb.ToPublic,
+					&scpb.IndexColumn{
+						TableID:       fooTable.GetID(),
+						IndexID:       1,
+						ColumnID:      2,
+						OrdinalInKind: 0,
+						Kind:          scpb.IndexColumn_STORED,
 					},
 					metadata,
 				),
@@ -341,25 +328,18 @@ func TestSchemaChanger(t *testing.T) {
 				scpb.Status_ABSENT,
 				scpb.Status_ABSENT,
 				scpb.Status_ABSENT,
-				scpb.Status_PUBLIC,
-				scpb.Status_PUBLIC,
 			}
 			initial := scpb.CurrentState{
 				TargetState: scpb.TargetState{Statements: stmts, Targets: targets},
 				Current:     current,
 			}
 
-			for _, phase := range []scop.Phase{
-				scop.StatementPhase,
-				scop.PreCommitPhase,
-			} {
-				sc := sctestutils.MakePlan(t, initial, phase)
-				stages := sc.StagesForCurrentPhase()
-				for _, s := range stages {
-					exDeps := ti.newExecDeps(txn, descriptors)
-					require.NoError(t, sc.DecorateErrorWithPlanDetails(scexec.ExecuteStage(ctx, exDeps, s.Ops())))
-					cs = scpb.CurrentState{TargetState: initial.TargetState, Current: s.After}
-				}
+			sc := sctestutils.MakePlan(t, initial, scop.PreCommitPhase)
+			stages := sc.StagesForCurrentPhase()
+			for _, s := range stages {
+				exDeps := ti.newExecDeps(txn, descriptors)
+				require.NoError(t, sc.DecorateErrorWithPlanDetails(scexec.ExecuteStage(ctx, exDeps, s.Ops())))
+				cs = scpb.CurrentState{TargetState: initial.TargetState, Current: s.After}
 			}
 			return nil
 		}))
@@ -380,8 +360,6 @@ func TestSchemaChanger(t *testing.T) {
 			scpb.Status_PUBLIC,
 			scpb.Status_PUBLIC,
 			scpb.Status_PUBLIC,
-			scpb.Status_ABSENT,
-			scpb.Status_ABSENT,
 		}, after.Current)
 		ti.tsql.Exec(t, "INSERT INTO db.foo VALUES (1, 1)")
 	})
@@ -402,11 +380,8 @@ func TestSchemaChanger(t *testing.T) {
 				initial, err := scbuild.Build(ctx, buildDeps, scpb.CurrentState{}, parsed[0].AST.(*tree.AlterTable))
 				require.NoError(t, err)
 
-				for _, phase := range []scop.Phase{
-					scop.StatementPhase,
-					scop.PreCommitPhase,
-				} {
-					sc := sctestutils.MakePlan(t, initial, phase)
+				{
+					sc := sctestutils.MakePlan(t, initial, scop.PreCommitPhase)
 					for _, s := range sc.StagesForCurrentPhase() {
 						exDeps := ti.newExecDeps(txn, descriptors)
 						require.NoError(t, sc.DecorateErrorWithPlanDetails(scexec.ExecuteStage(ctx, exDeps, s.Ops())))
@@ -431,6 +406,10 @@ func TestSchemaChanger(t *testing.T) {
 }
 
 type noopJobRegistry struct{}
+
+func (n noopJobRegistry) CheckPausepoint(name string) error {
+	return nil
+}
 
 func (n noopJobRegistry) UpdateJobWithTxn(
 	ctx context.Context, jobID jobspb.JobID, txn *kv.Txn, useReadLock bool, updateFunc jobs.UpdateFn,
@@ -460,16 +439,31 @@ func (n noopBackfiller) MaybePrepareDestIndexesForBackfill(
 	return progress, nil
 }
 
-func (n noopBackfiller) BackfillIndex(
+func (n noopBackfiller) BackfillIndexes(
 	ctx context.Context,
 	progress scexec.BackfillProgress,
-	writer scexec.BackfillProgressWriter,
+	writer scexec.BackfillerProgressWriter,
+	descriptor catalog.TableDescriptor,
+) error {
+	return nil
+}
+
+type noopMerger struct{}
+
+var _ scexec.Merger = (*noopMerger)(nil)
+
+func (n noopMerger) MergeIndexes(
+	ctx context.Context,
+	progress scexec.MergeProgress,
+	writer scexec.BackfillerProgressWriter,
 	descriptor catalog.TableDescriptor,
 ) error {
 	return nil
 }
 
 type noopIndexValidator struct{}
+
+var _ scexec.IndexValidator = noopIndexValidator{}
 
 func (noopIndexValidator) ValidateForwardIndexes(
 	ctx context.Context,
@@ -489,77 +483,95 @@ func (noopIndexValidator) ValidateInvertedIndexes(
 	return nil
 }
 
-type noopPartitioner struct{}
-
-func (noopPartitioner) AddPartitioning(
-	ctx context.Context,
-	tbl *tabledesc.Mutable,
-	index catalog.Index,
-	partitionFields []string,
-	listPartition []*scpb.ListPartition,
-	rangePartition []*scpb.RangePartitions,
-	allowedNewColumnNames []tree.Name,
-	allowImplicitPartitioning bool,
-) error {
-	return nil
-}
-
 type noopEventLogger struct{}
 
+var _ scexec.EventLogger = noopEventLogger{}
+
 func (noopEventLogger) LogEvent(
-	_ context.Context, _ descpb.ID, _ eventpb.CommonSQLEventDetails, _ eventpb.EventPayload,
+	_ context.Context, _ eventpb.CommonSQLEventDetails, _ logpb.EventPayload,
 ) error {
 	return nil
 }
 
-type noopCommentUpdaterFactory struct {
+func (noopEventLogger) LogEventForSchemaChange(_ context.Context, _ logpb.EventPayload) error {
+	return nil
 }
 
-type noopCommentUpdater struct {
+type noopStatsReferesher struct{}
+
+func (noopStatsReferesher) NotifyMutation(table catalog.TableDescriptor, rowsAffected int) {
 }
 
-func (noopCommentUpdaterFactory) NewCommentUpdater(
-	ctx context.Context, txn *kv.Txn, sessionData *sessiondata.SessionData,
-) scexec.CommentUpdater {
-	return &noopCommentUpdater{}
-}
+type noopMetadataUpdater struct{}
 
-func (noopCommentUpdater) UpsertDescriptorComment(
+var _ scexec.DescriptorMetadataUpdater = noopMetadataUpdater{}
+
+// UpsertDescriptorComment implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) UpsertDescriptorComment(
 	id int64, subID int64, commentType keys.CommentType, comment string,
 ) error {
 	return nil
 }
 
-// DeleteDescriptorComment deletes a comment for a given descriptor.
-func (noopCommentUpdater) DeleteDescriptorComment(
+// DeleteDescriptorComment implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) DeleteDescriptorComment(
 	id int64, subID int64, commentType keys.CommentType,
 ) error {
 	return nil
 }
 
-//UpsertConstraintComment upsersts a comment associated with a constraint.
-func (noopCommentUpdater) UpsertConstraintComment(
-	desc catalog.TableDescriptor,
-	schemaName string,
-	constraintName string,
-	constraintType scpb.ConstraintType,
-	comment string,
+// DeleteAllCommentsForTables implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) DeleteAllCommentsForTables(ids catalog.DescriptorIDSet) error {
+	return nil
+}
+
+// UpsertConstraintComment implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) UpsertConstraintComment(
+	tableID descpb.ID, constraintID descpb.ConstraintID, comment string,
 ) error {
 	return nil
 }
 
-//DeleteConstraintComment deletes a comment associated with a constraint.
-func (noopCommentUpdater) DeleteConstraintComment(
-	desc catalog.TableDescriptor,
-	schemaName string,
-	constraintName string,
-	constraintType scpb.ConstraintType,
+// DeleteConstraintComment implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) DeleteConstraintComment(
+	tableID descpb.ID, constraintID descpb.ConstraintID,
 ) error {
 	return nil
+}
+
+// DeleteDatabaseRoleSettings implements scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) DeleteDatabaseRoleSettings(ctx context.Context, dbID descpb.ID) error {
+	return nil
+}
+
+// SwapDescriptorSubComment implements  scexec.DescriptorMetadataUpdater.
+func (noopMetadataUpdater) SwapDescriptorSubComment(
+	id int64, oldSubID int64, newSubID int64, commentType keys.CommentType,
+) error {
+	return nil
+}
+
+// DeleteScheduleID implements scexec.DescriptorMetadataUpdater
+func (noopMetadataUpdater) DeleteSchedule(ctx context.Context, scheduleID int64) error {
+	return nil
+}
+
+// DeleteZoneConfig implements scexec.DescriptorMetadataUpdater
+func (noopMetadataUpdater) DeleteZoneConfig(
+	ctx context.Context, id descpb.ID,
+) (numAffectedRows int, err error) {
+	return 0, nil
+}
+
+// UpsertZoneConfig implements scexec.DescriptorMetadataUpdater
+func (noopMetadataUpdater) UpsertZoneConfig(
+	ctx context.Context, id descpb.ID, zone *zonepb.ZoneConfig,
+) (numAffectedRows int, err error) {
+	return 0, nil
 }
 
 var _ scexec.Backfiller = noopBackfiller{}
 var _ scexec.IndexValidator = noopIndexValidator{}
-var _ scmutationexec.Partitioner = noopPartitioner{}
 var _ scexec.EventLogger = noopEventLogger{}
-var _ scexec.CommentUpdater = noopCommentUpdater{}
+var _ scexec.StatsRefresher = noopStatsReferesher{}
+var _ scexec.DescriptorMetadataUpdater = noopMetadataUpdater{}

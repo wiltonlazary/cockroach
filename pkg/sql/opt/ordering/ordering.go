@@ -15,8 +15,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // CanProvide returns true if the given operator returns rows that can
@@ -140,12 +140,12 @@ func init() {
 		buildProvidedOrdering: setOpBuildProvided,
 	}
 	funcMap[opt.IndexJoinOp] = funcs{
-		canProvideOrdering:    lookupOrIndexJoinCanProvideOrdering,
+		canProvideOrdering:    indexJoinCanProvideOrdering,
 		buildChildReqOrdering: lookupOrIndexJoinBuildChildReqOrdering,
 		buildProvidedOrdering: indexJoinBuildProvided,
 	}
 	funcMap[opt.LookupJoinOp] = funcs{
-		canProvideOrdering:    lookupOrIndexJoinCanProvideOrdering,
+		canProvideOrdering:    lookupJoinCanProvideOrdering,
 		buildChildReqOrdering: lookupOrIndexJoinBuildChildReqOrdering,
 		buildProvidedOrdering: lookupJoinBuildProvided,
 	}
@@ -340,10 +340,10 @@ func remapProvided(provided opt.Ordering, fds *props.FuncDepSet, outCols opt.Col
 				result = append(result, provided[i])
 			}
 		} else {
-			equivCols := fds.ComputeEquivClosure(opt.MakeColSet(col))
+			equivCols := fds.ComputeEquivClosureNoCopy(opt.MakeColSet(col))
 			remappedCol, ok := equivCols.Intersection(outCols).Next(0)
 			if !ok {
-				panic(errors.AssertionFailedf("no output column equivalent to %d", log.Safe(col)))
+				panic(errors.AssertionFailedf("no output column equivalent to %d", redact.Safe(col)))
 			}
 			if result == nil {
 				result = make(opt.Ordering, i, len(provided))
@@ -400,13 +400,13 @@ func checkRequired(expr memo.RelExpr, required *props.OrderingChoice) {
 
 	// Verify that the ordering only refers to output columns.
 	if !required.SubsetOfCols(rel.OutputCols) {
-		panic(errors.AssertionFailedf("required ordering refers to non-output columns (op %s)", log.Safe(expr.Op())))
+		panic(errors.AssertionFailedf("required ordering refers to non-output columns (op %s)", redact.Safe(expr.Op())))
 	}
 
 	// Verify that columns in a column group are equivalent.
 	for i := range required.Columns {
 		c := &required.Columns[i]
-		if !c.Group.SubsetOf(rel.FuncDeps.ComputeEquivGroup(c.AnyID())) {
+		if !c.Group.SubsetOf(rel.FuncDeps.ComputeEquivGroup(c.AnyID())) && !rel.Cardinality.IsZero() {
 			panic(errors.AssertionFailedf(
 				"ordering column group %s contains non-equivalent columns (op %s)",
 				c.Group, expr.Op(),
@@ -448,7 +448,7 @@ func checkProvided(expr memo.RelExpr, required *props.OrderingChoice, provided o
 	fds := &expr.Relational().FuncDeps
 	if trimmed := trimProvided(provided, required, fds); len(trimmed) != len(provided) {
 		panic(errors.AssertionFailedf(
-			"provided %s can be trimmed to %s (FDs: %s)", log.Safe(provided), log.Safe(trimmed), log.Safe(fds),
+			"provided %s can be trimmed to %s (FDs: %s)", redact.Safe(provided), redact.Safe(trimmed), redact.Safe(fds),
 		))
 	}
 }

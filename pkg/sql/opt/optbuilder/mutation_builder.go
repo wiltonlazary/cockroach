@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -34,7 +35,6 @@ import (
 
 // mutationBuilder is a helper struct that supports building Insert, Update,
 // Upsert, and Delete operators in stages.
-// TODO(andyk): Add support for Delete.
 type mutationBuilder struct {
 	b  *Builder
 	md *opt.Metadata
@@ -59,6 +59,12 @@ type mutationBuilder struct {
 
 	// fetchScope contains the set of columns fetched from the target table.
 	fetchScope *scope
+
+	// insertExpr is the expression that produces the values which will be
+	// inserted into the target table. It is only populated for INSERT
+	// expressions. It is currently used to inline constant insert values into
+	// uniqueness checks.
+	insertExpr memo.RelExpr
 
 	// targetColList is an ordered list of IDs of the table columns into which
 	// values will be inserted, or which will be updated with new values. It is
@@ -236,11 +242,11 @@ func (mb *mutationBuilder) setFetchColIDs(cols []scopeColumn) {
 // buildInputForUpdate constructs a Select expression from the fields in
 // the Update operator, similar to this:
 //
-//   SELECT <cols>
-//   FROM <table>
-//   WHERE <where>
-//   ORDER BY <order-by>
-//   LIMIT <limit>
+//	SELECT <cols>
+//	FROM <table>
+//	WHERE <where>
+//	ORDER BY <order-by>
+//	LIMIT <limit>
 //
 // All columns from the table to update are added to fetchColList.
 // If a FROM clause is defined, we build out each of the table
@@ -282,14 +288,14 @@ func (mb *mutationBuilder) buildInputForUpdate(
 	mb.fetchScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations:       true,
-			includeSystem:          true,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: true,
+			includeSystem:    true,
+			includeInverted:  false,
 		}),
 		indexFlags,
 		noRowLocking,
 		inScope,
+		false, /* disableNotVisibleIndex */
 	)
 
 	// Set list of columns that will be fetched by the input expression.
@@ -369,11 +375,11 @@ func (mb *mutationBuilder) buildInputForUpdate(
 // buildInputForDelete constructs a Select expression from the fields in
 // the Delete operator, similar to this:
 //
-//   SELECT <cols>
-//   FROM <table>
-//   WHERE <where>
-//   ORDER BY <order-by>
-//   LIMIT <limit>
+//	SELECT <cols>
+//	FROM <table>
+//	WHERE <where>
+//	ORDER BY <order-by>
+//	LIMIT <limit>
 //
 // All columns from the table to update are added to fetchColList.
 // TODO(andyk): Do needed column analysis to project fewer columns if possible.
@@ -398,14 +404,14 @@ func (mb *mutationBuilder) buildInputForDelete(
 	mb.fetchScope = mb.b.buildScan(
 		mb.b.addTable(mb.tab, &mb.alias),
 		tableOrdinals(mb.tab, columnKinds{
-			includeMutations:       true,
-			includeSystem:          true,
-			includeInverted:        false,
-			includeVirtualComputed: true,
+			includeMutations: true,
+			includeSystem:    true,
+			includeInverted:  false,
 		}),
 		indexFlags,
 		noRowLocking,
 		inScope,
+		false, /* disableNotVisibleIndex */
 	)
 	mb.outScope = mb.fetchScope
 
@@ -505,7 +511,7 @@ func (mb *mutationBuilder) extractValuesInput(inputRows *tree.Select) *tree.Valu
 // corresponding column. This is only possible when the input is a VALUES
 // clause. For example:
 //
-//   INSERT INTO t (a, b) (VALUES (1, DEFAULT), (DEFAULT, 2))
+//	INSERT INTO t (a, b) (VALUES (1, DEFAULT), (DEFAULT, 2))
 //
 // Here, the two DEFAULT specifiers are replaced by the default value expression
 // for the a and b columns, respectively.
@@ -573,12 +579,12 @@ func (mb *mutationBuilder) replaceDefaultExprs(inRows *tree.Select) (outRows *tr
 // missing columns.
 //
 // Values are synthesized for columns based on checking these rules, in order:
-//   1. If column has a default value specified for it, use that as its value.
-//   2. If column is nullable, use NULL as its value.
-//   3. If column is currently being added or dropped (i.e. a mutation column),
-//      use a default value (0 for INT column, "" for STRING column, etc). Note
-//      that the existing "fetched" value returned by the scan cannot be used,
-//      since it may not have been initialized yet by the backfiller.
+//  1. If column has a default value specified for it, use that as its value.
+//  2. If column is nullable, use NULL as its value.
+//  3. If column is currently being added or dropped (i.e. a mutation column),
+//     use a default value (0 for INT column, "" for STRING column, etc). Note
+//     that the existing "fetched" value returned by the scan cannot be used,
+//     since it may not have been initialized yet by the backfiller.
 //
 // If includeOrdinary is false, then only WriteOnly columns are considered.
 //
@@ -938,7 +944,7 @@ func (mb *mutationBuilder) makeMutationPrivate(needResults bool) *memo.MutationP
 // might mutate the column, or it might be returned by the mutation statement,
 // or it might not be used at all. Columns take priority in this order:
 //
-//   upsert, update, fetch, insert
+//	upsert, update, fetch, insert
 //
 // If an upsert column is available, then it already combines an update/fetch
 // value with an insert value, so it takes priority. If an update column is
@@ -1054,7 +1060,7 @@ func (mb *mutationBuilder) parseDefaultExpr(colID opt.ColumnID) tree.Expr {
 			// Synthesize default value for NOT NULL mutation column so that it can be
 			// set when in the write-only state. This is only used when no other value
 			// is possible (no default value available, NULL not allowed).
-			datum, err := tree.NewDefaultDatum(mb.b.evalCtx, col.DatumType())
+			datum, err := tree.NewDefaultDatum(&mb.b.evalCtx.CollationEnv, col.DatumType())
 			if err != nil {
 				panic(err)
 			}
@@ -1185,10 +1191,11 @@ func getUniqueConstraintOrdinals(tab cat.Table, uc cat.UniqueConstraint) util.Fa
 }
 
 // getExplicitPrimaryKeyOrdinals returns the ordinals of the primary key
-// columns, excluding any implicit partitioning columns in the primary index.
+// columns, excluding any implicit partitioning or hash-shard columns in the
+// primary index.
 func getExplicitPrimaryKeyOrdinals(tab cat.Table) util.FastIntSet {
 	index := tab.Index(cat.PrimaryIndex)
-	skipCols := index.ImplicitPartitioningColumnCount()
+	skipCols := index.ImplicitColumnCount()
 	var keyOrds util.FastIntSet
 	for i, n := skipCols, index.LaxKeyColumnCount(); i < n; i++ {
 		keyOrds.Add(index.Column(i).Ordinal())
@@ -1253,7 +1260,7 @@ func (mb *mutationBuilder) addAssignmentCasts(srcCols opt.OptionalColList) {
 
 		// Check if an assignment cast is available from the inScope column
 		// type to the out type.
-		if !tree.ValidCast(srcType, targetType, tree.CastContextAssignment) {
+		if !cast.ValidCast(srcType, targetType, cast.ContextAssignment) {
 			panic(sqlerrors.NewInvalidAssignmentCastError(srcType, targetType, string(targetCol.ColName())))
 		}
 
@@ -1305,27 +1312,31 @@ const (
 	checkInputScanFetchedVals
 )
 
-// buildCheckInputScan constructs a WithScan that iterates over the input to the
-// mutation operator. Used in expressions that generate rows for checking for FK
-// and uniqueness violations.
+// buildCheckInputScan constructs an expression that produces the new values of
+// rows during a mutation. It is used in expressions that generate rows for
+// checking for FK and uniqueness violations. It returns either a WithScan that
+// iterates over the input to the mutation operator, or a Values expression with
+// constant insert values inlined.
 //
-// The WithScan expression will scan either the new values or the fetched values
-// for the given table ordinals (which correspond to FK or unique columns).
+// If a WithScan expression is returned, it will scan either the new values or
+// the fetched values for the given table ordinals (which correspond to FK or
+// unique columns).
 //
-// Returns a scope containing the WithScan expression and the output columns
-// from the WithScan. The output columns map 1-to-1 to tabOrdinals. Also returns
-// the subset of these columns that can be assumed to be not null (either
-// because they are not null in the mutation input or because they are
+// Returns a scope containing the WithScan or Values expression and the output
+// columns from the WithScan. The output columns map 1-to-1 to tabOrdinals. Also
+// returns the subset of these columns that can be assumed to be not null
+// (either because they are not null in the mutation input or because they are
 // non-nullable table columns).
 //
+// isFK should be true when building inputs for FK checks, and false otherwise.
 func (mb *mutationBuilder) buildCheckInputScan(
-	typ checkInputScanType, tabOrdinals []int,
-) (withScanScope *scope, notNullOutCols opt.ColSet) {
+	typ checkInputScanType, tabOrdinals []int, isFK bool,
+) (outScope *scope, notNullOutCols opt.ColSet) {
 	// inputCols are the column IDs from the mutation input that we are scanning.
 	inputCols := make(opt.ColList, len(tabOrdinals))
 
-	withScanScope = mb.b.allocScope()
-	withScanScope.cols = make([]scopeColumn, len(inputCols))
+	outScope = mb.b.allocScope()
+	outScope.cols = make([]scopeColumn, len(inputCols))
 
 	for i, tabOrd := range tabOrdinals {
 		if typ == checkInputScanNewVals {
@@ -1340,11 +1351,11 @@ func (mb *mutationBuilder) buildCheckInputScan(
 		// Synthesize a new output column for the input column, using the name
 		// of the column in the underlying table. The table's column names are
 		// used because partial unique constraint checks must filter the
-		// WithScan rows with a predicate expression that references the table's
-		// columns.
+		// WithScan or Values rows with a predicate expression that references
+		// the table's columns.
 		tableCol := mb.b.factory.Metadata().Table(mb.tabID).Column(tabOrd)
 		outCol := mb.md.AddColumn(string(tableCol.ColName()), tableCol.DatumType())
-		withScanScope.cols[i] = scopeColumn{
+		outScope.cols[i] = scopeColumn{
 			id:   outCol,
 			name: scopeColName(tableCol.ColName()),
 			typ:  tableCol.DatumType(),
@@ -1359,11 +1370,46 @@ func (mb *mutationBuilder) buildCheckInputScan(
 		}
 	}
 
-	withScanScope.expr = mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
+	// If the check is not an FK check, attempt to inline the insert values in
+	// the check input. This avoids buffering the mutation input and scanning it
+	// with a WithScan. The inlined values may allow for further optimization of
+	// the check.
+	//
+	// TODO(mgartner): We do not currently inline constants for FK checks
+	// because this would break the insert fast path. The fast path can
+	// currently only be planned when FK checks are built with WithScans.
+	if !isFK && mb.insertExpr != nil {
+		// Find the constant columns produced by the insert expression. All
+		// input columns must be constant in order to inline them.
+		constCols := memo.FindInlinableConstants(mb.insertExpr)
+		if inputCols.ToSet().SubsetOf(constCols) {
+			elems := make(memo.ScalarListExpr, len(inputCols))
+			colTypes := make([]*types.T, len(inputCols))
+			for i, colID := range inputCols {
+				elem := memo.ExtractColumnFromProjectOrValues(mb.insertExpr, colID)
+				elems[i] = elem
+				colTypes[i] = elem.DataType()
+			}
+
+			// Create a Values expression as the input to the check.
+			tupleTyp := types.MakeTuple(colTypes)
+			row := mb.b.factory.ConstructTuple(elems, tupleTyp)
+			outScope.expr = mb.b.factory.ConstructValues(memo.ScalarListExpr{row}, &memo.ValuesPrivate{
+				Cols: outScope.colList(),
+				ID:   mb.b.factory.Metadata().NextUniqueID(),
+			})
+
+			return outScope, notNullOutCols
+		}
+	}
+
+	mb.ensureWithID()
+	outScope.expr = mb.b.factory.ConstructWithScan(&memo.WithScanPrivate{
 		With:    mb.withID,
 		InCols:  inputCols,
-		OutCols: withScanScope.colList(),
+		OutCols: outScope.colList(),
 		ID:      mb.b.factory.Metadata().NextUniqueID(),
 	})
-	return withScanScope, notNullOutCols
+
+	return outScope, notNullOutCols
 }

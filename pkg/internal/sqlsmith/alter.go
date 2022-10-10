@@ -17,7 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -99,7 +101,7 @@ func makeCreateSchema(s *Smither) (tree.Statement, bool) {
 }
 
 func makeCreateTable(s *Smither) (tree.Statement, bool) {
-	table := randgen.RandCreateTable(s.rnd, "", 0)
+	table := randgen.RandCreateTable(s.rnd, "", 0, false /* isMultiRegion */)
 	schemaOrd := s.rnd.Intn(len(s.schemas))
 	schema := s.schemas[schemaOrd]
 	table.Table = tree.MakeTableNameWithSchema(tree.Name(s.dbName), schema.SchemaName, s.name("tab"))
@@ -231,7 +233,7 @@ func makeJSONComputedColumn(s *Smither) (tree.Statement, bool) {
 	}
 	col.Computed.Computed = true
 	col.Computed.Expr = tree.NewTypedBinaryExpr(
-		tree.MakeBinaryOperator(tree.JSONFetchText),
+		treebin.MakeBinaryOperator(treebin.JSONFetchText),
 		ref.typedExpr(),
 		randgen.RandDatumSimple(s.rnd, types.String),
 		types.String,
@@ -252,7 +254,19 @@ func makeDropColumn(s *Smither) (tree.Statement, bool) {
 	if !ok {
 		return nil, false
 	}
-	col := tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
+	// Pick a random column to drop while ignoring the system columns since
+	// those cannot be dropped.
+	var col *tree.ColumnTableDef
+	for {
+		col = tableRef.Columns[s.rnd.Intn(len(tableRef.Columns))]
+		var isSystemCol bool
+		for _, systemColDesc := range colinfo.AllSystemColumnDescs {
+			isSystemCol = isSystemCol || string(col.Name) == systemColDesc.Name
+		}
+		if !isSystemCol {
+			break
+		}
+	}
 
 	return &tree.AlterTable{
 		Table: tableRef.TableName.ToUnresolvedObjectName(),
@@ -316,7 +330,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		seen[col.Name] = true
 		// If this is the first column and it's invertible (i.e., JSONB), make an inverted index.
 		if len(cols) == 0 &&
-			colinfo.ColumnTypeIsInvertedIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
+			colinfo.ColumnTypeIsOnlyInvertedIndexable(tree.MustBeStaticallyKnownType(col.Type)) {
 			inverted = true
 			unique = false
 			cols = append(cols, tree.IndexElem{
@@ -349,6 +363,7 @@ func makeCreateIndex(s *Smither) (tree.Statement, bool) {
 		Storing:      storing,
 		Inverted:     inverted,
 		Concurrently: s.coin(),
+		NotVisible:   s.d6() == 1, // NotVisible index is rare 1/6 chance.
 	}, true
 }
 
@@ -374,13 +389,13 @@ func makeCreateType(s *Smither) (tree.Statement, bool) {
 	return randgen.RandCreateType(s.rnd, string(name), letters), true
 }
 
-func rowsToRegionList(rows *gosql.Rows) []string {
+func rowsToRegionList(rows *gosql.Rows) ([]string, error) {
 	// Don't add duplicate regions to the slice.
 	regionsSet := make(map[string]struct{})
 	var region, zone string
 	for rows.Next() {
 		if err := rows.Scan(&region, &zone); err != nil {
-			panic(err)
+			return nil, err
 		}
 		regionsSet[region] = struct{}{}
 	}
@@ -389,7 +404,7 @@ func rowsToRegionList(rows *gosql.Rows) []string {
 	for region := range regionsSet {
 		regions = append(regions, region)
 	}
-	return regions
+	return regions, nil
 }
 
 func getClusterRegions(s *Smither) []string {
@@ -397,15 +412,23 @@ func getClusterRegions(s *Smither) []string {
 	if err != nil {
 		panic(err)
 	}
-	return rowsToRegionList(rows)
+	regions, err := rowsToRegionList(rows)
+	if err != nil {
+		panic(errors.Wrap(err, "Failed to scan SHOW REGIONS FROM CLUSTER into values"))
+	}
+	return regions
 }
 
 func getDatabaseRegions(s *Smither) []string {
-	rows, err := s.db.Query("SHOW REGIONS FROM DATABASE defaultdb")
+	rows, err := s.db.Query("SELECT region, zones FROM [SHOW REGIONS FROM DATABASE defaultdb]")
 	if err != nil {
 		panic(err)
 	}
-	return rowsToRegionList(rows)
+	regions, err := rowsToRegionList(rows)
+	if err != nil {
+		panic(errors.Wrap(err, "Failed to scan SHOW REGIONS FROM DATABASE defaultdb into values"))
+	}
+	return regions
 }
 
 func makeAlterLocality(s *Smither) (tree.Statement, bool) {

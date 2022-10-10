@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//build:STRINGER.bzl", "stringer")
 
@@ -11,16 +12,16 @@ go_library(
         "printer.go",
         "spans.go",
         "sql.go",
-        "system.go",
         ":gen-comment-type-stringer",  #keep
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/keys",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/encoding",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
     ],
 )
 
@@ -32,9 +33,10 @@ go_test(
         "printer_test.go",
         "sql_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":keys"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/testutils",
         "//pkg/util/bitarray",
         "//pkg/util/duration",
@@ -44,6 +46,7 @@ go_test(
         "//pkg/util/uuid",
         "@com_github_cockroachdb_apd_v3//:apd",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_stretchr_testify//require",
     ],
 )
@@ -53,3 +56,5 @@ stringer(
     src = "constants.go",
     typ = "CommentType",
 )
+
+get_x_data(name = "get_x_data")

@@ -70,7 +70,7 @@ func (d *deleteNode) startExec(params runParams) error {
 
 	if d.run.rowsNeeded {
 		d.run.td.rows = rowcontainer.NewRowContainer(
-			params.EvalContext().Mon.MakeBoundAccount(),
+			params.p.Mon().MakeBoundAccount(),
 			colinfo.ColTypeInfoFromResCols(d.columns))
 	}
 	return d.run.td.init(params.ctx, params.p.txn, params.EvalContext(), &params.EvalContext().Settings.SV)
@@ -160,7 +160,7 @@ func (d *deleteNode) processSourceRow(params runParams, sourceVals tree.Datums) 
 		offset := d.run.partialIndexDelValsOffset
 		partialIndexDelVals := sourceVals[offset : offset+n]
 
-		err := pm.Init(tree.Datums{}, partialIndexDelVals, d.run.td.tableDesc())
+		err := pm.Init(nil /*partialIndexPutVals */, partialIndexDelVals, d.run.td.tableDesc())
 		if err != nil {
 			return err
 		}

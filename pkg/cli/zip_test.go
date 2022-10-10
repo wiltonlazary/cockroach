@@ -16,7 +16,7 @@ import (
 	"context"
 	enc_hex "encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -30,8 +30,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -76,7 +77,6 @@ table_name NOT IN (
 	'databases',
 	'forward_dependencies',
 	'index_columns',
-	'interleaved',
 	'lost_descriptors_with_data',
 	'table_columns',
 	'table_row_statistics',
@@ -86,9 +86,12 @@ table_name NOT IN (
 	'session_trace',
 	'session_variables',
 	'tables',
+	'cluster_statement_statistics',
+	'cluster_transaction_statistics',
 	'statement_statistics',
 	'transaction_statistics',
-	'tenant_usage_details'
+	'tenant_usage_details',
+  'pg_catalog_table_is_implemented'
 )
 ORDER BY name ASC`)
 	assert.NoError(t, err)
@@ -99,19 +102,11 @@ ORDER BY name ASC`)
 		assert.NoError(t, rows.Scan(&table))
 		tables = append(tables, table)
 	}
-	tables = append(
-		tables,
-		"system.jobs",
-		"system.descriptor",
-		"system.namespace",
-		"system.scheduled_jobs",
-		"system.settings",
-	)
 	sort.Strings(tables)
 
 	var exp []string
-	exp = append(exp, debugZipTablesPerNode...)
-	for _, t := range debugZipTablesPerCluster {
+	exp = append(exp, zipInternalTablesPerNode.GetTables()...)
+	for _, t := range zipInternalTablesPerCluster.GetTables() {
 		t = strings.TrimPrefix(t, `"".`)
 		exp = append(exp, t)
 	}
@@ -341,6 +336,8 @@ func eraseNonDeterministicZipOutput(out string) string {
 	out = re.ReplaceAllString(out, `dial tcp ...`)
 	re = regexp.MustCompile(`(?m)rpc error: .*$`)
 	out = re.ReplaceAllString(out, `rpc error: ...`)
+	re = regexp.MustCompile(`(?m)failed to connect to .*$`)
+	out = re.ReplaceAllString(out, `failed to connect to ...`)
 
 	// The number of memory profiles previously collected is not deterministic.
 	re = regexp.MustCompile(`(?m)^\[node \d+\] \d+ heap profiles found$`)
@@ -434,7 +431,7 @@ func TestPartialZip(t *testing.T) {
 	// is no risk to see the override bumped due to a gossip update
 	// because this setting is not otherwise set in the test cluster.
 	s := tc.Server(0)
-	kvserver.TimeUntilStoreDead.Override(ctx, &s.ClusterSettings().SV, kvserver.TestTimeUntilStoreDead)
+	storepool.TimeUntilStoreDead.Override(ctx, &s.ClusterSettings().SV, storepool.TestTimeUntilStoreDead)
 
 	// This last case may take a little while to converge. To make this work with datadriven and at the same
 	// time retain the ability to use the `-rewrite` flag, we use a retry loop within that already checks the
@@ -492,11 +489,11 @@ func TestZipRetries(t *testing.T) {
 
 		sqlURL := url.URL{
 			Scheme:   "postgres",
-			User:     url.User(security.RootUser),
+			User:     url.User(username.RootUser),
 			Host:     s.ServingSQLAddr(),
 			RawQuery: "sslmode=disable",
 		}
-		sqlConn := sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard, sqlURL.String())
+		sqlConn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, sqlURL.String())
 		defer func() {
 			if err := sqlConn.Close(); err != nil {
 				t.Fatal(err)

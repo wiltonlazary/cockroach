@@ -24,7 +24,7 @@ import (
 )
 
 var gormReleaseTag = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var gormSupportedTag = "v1.22.2"
+var gormSupportedTag = "v1.23.8"
 
 func registerGORM(r registry.Registry) {
 	runGORM := func(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -72,7 +72,7 @@ func registerGORM(r registry.Registry) {
 		// Install go-junit-report to convert test results to .xml format we know
 		// how to work with.
 		if err := repeatRunE(
-			ctx, t, c, node, "install go-junit-report", fmt.Sprintf("GOPATH=%s go get -u github.com/jstemmer/go-junit-report", goPath),
+			ctx, t, c, node, "install go-junit-report", fmt.Sprintf("GOPATH=%s go install github.com/jstemmer/go-junit-report@latest", goPath),
 		); err != nil {
 			t.Fatal(err)
 		}

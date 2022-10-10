@@ -13,6 +13,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -126,7 +127,6 @@ func registerAutoUpgrade(r registry.Registry) {
 			}
 			c.Put(ctx, t.Cockroach(), "./cockroach", c.Node(i))
 			startOpts := option.DefaultStartOpts()
-			startOpts.RoachtestOpts.DontEncrypt = true
 			c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Node(i))
 			if err := sleep(stageDuration); err != nil {
 				t.Fatal(err)
@@ -150,7 +150,6 @@ func registerAutoUpgrade(r registry.Registry) {
 		}
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.Node(nodes))
 		startOpts := option.DefaultStartOpts()
-		startOpts.RoachtestOpts.DontEncrypt = true
 		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Node(nodes))
 		if err := sleep(stageDuration); err != nil {
 			t.Fatal(err)
@@ -195,7 +194,6 @@ func registerAutoUpgrade(r registry.Registry) {
 
 		// Restart the previously stopped node.
 		startOpts = option.DefaultStartOpts()
-		startOpts.RoachtestOpts.DontEncrypt = true
 		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Node(nodes-1))
 		if err := sleep(stageDuration); err != nil {
 			t.Fatal(err)
@@ -258,6 +256,9 @@ func registerAutoUpgrade(r registry.Registry) {
 		Owner:   registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(5),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
 			pred, err := PredecessorVersion(*t.BuildVersion())
 			if err != nil {
 				t.Fatal(err)

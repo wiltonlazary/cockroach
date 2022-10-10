@@ -22,10 +22,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
@@ -140,9 +141,12 @@ func checkDistAggregationInfo(
 
 	makeTableReader := func(startPK, endPK int, streamID int) execinfrapb.ProcessorSpec {
 		tr := execinfrapb.TableReaderSpec{
-			Table:     *tableDesc.TableDesc(),
-			Spans:     make([]roachpb.Span, 1),
-			ColumnIDs: columnIDs,
+			Spans: make([]roachpb.Span, 1),
+		}
+		if err := rowenc.InitIndexFetchSpec(
+			&tr.FetchSpec, keys.SystemSQLCodec, tableDesc, tableDesc.GetPrimaryIndex(), columnIDs,
+		); err != nil {
+			t.Fatal(err)
 		}
 
 		var err error
@@ -185,7 +189,7 @@ func checkDistAggregationInfo(
 	intermediaryTypes := make([]*types.T, numIntermediary)
 	for i, fn := range info.LocalStage {
 		var err error
-		_, returnTyp, err := execinfrapb.GetAggregateInfo(fn, colTypes...)
+		_, returnTyp, err := execagg.GetAggregateInfo(fn, colTypes...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +208,7 @@ func checkDistAggregationInfo(
 			inputTypes[i] = intermediaryTypes[localIdx]
 		}
 		var err error
-		_, finalOutputTypes[i], err = execinfrapb.GetAggregateInfo(finalInfo.Fn, inputTypes...)
+		_, finalOutputTypes[i], err = execagg.GetAggregateInfo(finalInfo.Fn, inputTypes...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -222,7 +226,7 @@ func checkDistAggregationInfo(
 			t.Fatal(err)
 		}
 		var expr execinfrapb.Expression
-		expr, err = physicalplan.MakeExpression(renderExpr, nil, nil)
+		expr, err = physicalplan.MakeExpression(ctx, renderExpr, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -326,7 +330,7 @@ func checkDistAggregationInfo(
 			t.Fatal(err)
 		}
 		var expr execinfrapb.Expression
-		expr, err = physicalplan.MakeExpression(renderExpr, nil, nil)
+		expr, err = physicalplan.MakeExpression(ctx, renderExpr, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -483,7 +487,7 @@ func TestSingleArgumentDistAggregateFunctions(t *testing.T) {
 	)
 
 	kvDB := tc.Server(0).DB()
-	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	desc := desctestutils.TestingGetPublicTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
 
 	for fn, info := range physicalplan.DistAggregationTable {
 		if fn == execinfrapb.AnyNotNull {
@@ -506,7 +510,7 @@ func TestSingleArgumentDistAggregateFunctions(t *testing.T) {
 				continue
 			}
 			// See if this column works with this function.
-			_, _, err := execinfrapb.GetAggregateInfo(fn, col.GetType())
+			_, _, err := execagg.GetAggregateInfo(fn, col.GetType())
 			if err != nil {
 				continue
 			}
@@ -573,7 +577,7 @@ func TestTwoArgumentRegressionAggregateFunctions(t *testing.T) {
 	)
 
 	kvDB := tc.Server(0).DB()
-	desc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "t")
+	desc := desctestutils.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "test", "public", "t")
 
 	for fn, info := range physicalplan.DistAggregationTable {
 		if !isTwoArgumentFunction(fn) {

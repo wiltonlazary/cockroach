@@ -16,8 +16,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -83,7 +83,7 @@ func GenerateRRNet(bnf []byte, railroadAPITimeout time.Duration) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -105,13 +105,15 @@ func GenerateBNF(addr string, bnfAPITimeout time.Duration) (ebnf []byte, err err
 		if err != nil {
 			return nil, err
 		}
-		b, err = ioutil.ReadAll(resp.Body)
+		b, err = func() ([]byte, error) {
+			defer resp.Body.Close()
+			return io.ReadAll(resp.Body)
+		}()
 		if err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
 	} else {
-		body, err := ioutil.ReadFile(addr)
+		body, err := os.ReadFile(addr)
 		if err != nil {
 			return nil, err
 		}

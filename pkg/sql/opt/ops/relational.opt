@@ -73,9 +73,14 @@ define ScanPrivate {
     # leave this unset (Strength = ForNone), which indicates that no row-level
     # locking will be performed while scanning the table. Stronger locking modes
     # are used by SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial
-    # row retrieval of DELETE and UPDATE statements. The locking item's Targets
-    # list will always be empty when part of a ScanPrivate.
-    Locking LockingItem
+    # row retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the Scan when
+    # handling conflicting locks held by other active transactions. Most scans
+    # leave the policy set to its default (WaitPolicy = Block), but different
+    # wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP LOCKED/NOWAIT
+    # statements to react differently to conflicting locks.
+    Locking Locking
 
     # LocalityOptimized is true if this scan is a child of a
     # LocalityOptimizedSearch operator, indicating that it either contains all
@@ -154,6 +159,14 @@ define ValuesPrivate {
     # cases the column set is sufficient to do this, but various rules make it
     # possible to construct Values expressions with no columns.
     ID UniqueID
+}
+
+# LiteralValues is a version of values where the exprs have already been type checked
+# and are real Datums that don't need evaluation.
+[Relational]
+define LiteralValues {
+    Rows LiteralRows
+    Cols ColList
 }
 
 # Select filters rows from its input result set, based on the boolean filter
@@ -309,6 +322,20 @@ define IndexJoinPrivate {
     # Cols specifies the set of columns that the index join operator projects.
     # This may be a subset of the columns that the table contains.
     Cols ColSet
+
+    # Locking represents the row-level locking mode of the IndexJoin in the
+    # lookup table's primary index. Most index joins leave this unset (Strength
+    # = ForNone), which indicates that no row-level locking will be performed
+    # while joining with the table's index. Stronger locking modes are used by
+    # SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial row
+    # retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the IndexJoin
+    # when handling conflicting locks held by other active transactions. Most
+    # index joins leave the policy set to its default (WaitPolicy = Block), but
+    # different wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP
+    # LOCKED/NOWAIT statements to react differently to conflicting locks.
+    Locking Locking
 }
 
 # LookupJoin represents a join between an input expression and an index. The
@@ -346,6 +373,14 @@ define LookupJoinPrivate {
     # TODO(rytaft): consider removing this field in favor of using LookupExpr
     # in all cases.
     KeyCols ColList
+
+    # DerivedEquivCols is the set of lookup join equijoin columns which are part
+    # of synthesized equality constraints based on another equality join
+    # condition and a computed index key column in the lookup table. Since these
+    # columns are not reducing the selectivity of the join, but are just added to
+    # facilitate index lookups, they should not be used in determining join
+    # selectivity.
+    DerivedEquivCols ColSet
 
     # LookupExpr represents the part of the join condition used to perform
     # the lookup into the index. It should only be set when KeyCols is empty.
@@ -402,9 +437,21 @@ define LookupJoinPrivate {
     # table (and thus each left row matches with at most one table row).
     LookupColsAreTableKey bool
 
-    # IsSecondJoinInPairedJoiner is true if this is the second join of a
-    # paired-joiner used for left joins.
+    # At most one of Is{First,Second}JoinInPairedJoiner can be true.
+    #
+    # IsFirstJoinInPairedJoiner is true if this is the first (i.e., lower in the
+    # plan tree) join of a paired-joiner used for left joins.
+    IsFirstJoinInPairedJoiner bool
+
+    # IsSecondJoinInPairedJoiner is true if this is the second (i.e., higher in
+    # the plan tree) join of a paired-joiner used for left joins.
     IsSecondJoinInPairedJoiner bool
+
+    # ContinuationCol is the column ID of the continuation column when
+    # IsFirstJoinInPairedJoiner is true. The continuation column is a boolean
+    # column that indicates whether an output row is a continuation of a group
+    # corresponding to a single left input row.
+    ContinuationCol ColumnID
 
     # LocalityOptimized is true if this lookup join is part of a locality
     # optimized search strategy. For semi, inner, and left joins, this means
@@ -420,6 +467,20 @@ define LookupJoinPrivate {
     # conditions on the KeyCols. These filters are needed by the statistics code to
     # correctly estimate selectivity.
     ConstFilters FiltersExpr
+
+    # Locking represents the row-level locking mode of the LookupJoin in the
+    # lookup table. Most lookup joins leave this unset (Strength = ForNone),
+    # which indicates that no row-level locking will be performed while joining
+    # with the table. Stronger locking modes are used by SELECT .. FOR [KEY]
+    # UPDATE/SHARE statements and by the initial row retrieval of DELETE and
+    # UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the LookupJoin
+    # when handling conflicting locks held by other active transactions. Most
+    # lookup joins leave the policy set to its default (WaitPolicy = Block), but
+    # different wait policies are used by SELECT .. FOR UPDATE/SHARE SKIP
+    # LOCKED/NOWAIT statements to react differently to conflicting locks.
+    Locking Locking
     _ JoinPrivate
 }
 
@@ -479,6 +540,21 @@ define InvertedJoinPrivate {
     # equality conditions on the PrefixKeyCols. These filters are needed by the
     # statistics code to correctly estimate selectivity.
     ConstFilters FiltersExpr
+
+    # Locking represents the row-level locking mode of the InvertedJoin in the
+    # lookup table. Most inverted joins leave this unset (Strength = ForNone),
+    # which indicates that no row-level locking will be performed while joining
+    # with the table. Stronger locking modes are used by SELECT .. FOR [KEY]
+    # UPDATE/SHARE statements and by the initial row retrieval of DELETE and
+    # UPDATE statements.
+    #
+    # The row-level locking mode also dictates the policy used by the
+    # InvertedJoin when handling conflicting locks held by other active
+    # transactions. Most inverted joins leave the policy set to its default
+    # (WaitPolicy = Block), but different wait policies are used by SELECT ..
+    # FOR UPDATE/SHARE SKIP LOCKED/NOWAIT statements to react differently to
+    # conflicting locks.
+    Locking Locking
     _ JoinPrivate
 }
 
@@ -570,6 +646,22 @@ define ZigzagJoinPrivate {
     FixedVals ScalarListExpr
     LeftFixedCols ColList
     RightFixedCols ColList
+
+    # LeftLocking and RightLocking represent the row-level locking modes of the
+    # scans over the ZigzagJoin's two tables. Most zigzag joins leave these
+    # unset (Strength = ForNone), which indicates that no row-level locking will
+    # be performed while joining the two tables. Stronger locking modes are used
+    # by SELECT .. FOR [KEY] UPDATE/SHARE statements and by the initial row
+    # retrieval of DELETE and UPDATE statements.
+    #
+    # The row-level locking modes also dictates the policy used by the
+    # ZigzagJoin when handling conflicting locks held by other active
+    # transactions. Most zigzag joins leave the policies set to the default
+    # (WaitPolicy = Block), but different wait policies are used by SELECT ..
+    # FOR UPDATE/SHARE SKIP LOCKED/NOWAIT statements to react differently to
+    # conflicting locks.
+    LeftLocking Locking
+    RightLocking Locking
 
     # Cols is the set of columns produced by the zigzag join. This set can
     # contain columns from either side's index.
@@ -1290,14 +1382,4 @@ define FakeRel {
 [Private]
 define FakeRelPrivate {
     Props RelPropsPtr
-}
-
-# NormCycleTestRel is a relational operator for testing that normalization rule
-# cycles are detected by the Factory and a stack overflow is prevented. Two
-# rules for this expression, NormCycleTestRelTrueToFalse and
-# NormCycleTestRelFalseToTrue, create a normalization rule cycle. See the cycle
-# test file for tests that use this expression.
-[Relational]
-define NormCycleTestRel {
-    Scalar ScalarExpr
 }

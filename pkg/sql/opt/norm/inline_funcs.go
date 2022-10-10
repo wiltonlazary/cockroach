@@ -23,23 +23,7 @@ import (
 // value expressions can often be inlined into referencing expressions. Only
 // Project and Values operators synthesize constant value expressions.
 func (c *CustomFuncs) FindInlinableConstants(input memo.RelExpr) opt.ColSet {
-	var cols opt.ColSet
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if opt.IsConstValueOp(item.Element) {
-				cols.Add(item.Col)
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if opt.IsConstValueOp(scalar) {
-				cols.Add(values.Cols[i])
-			}
-		}
-	}
-	return cols
+	return memo.FindInlinableConstants(input)
 }
 
 // InlineProjectionConstants recursively searches each projection expression and
@@ -86,7 +70,7 @@ func (c *CustomFuncs) inlineConstants(
 		switch t := e.(type) {
 		case *memo.VariableExpr:
 			if constCols.Contains(t.Col) {
-				return c.extractColumn(input, t.Col)
+				return memo.ExtractColumnFromProjectOrValues(input, t.Col)
 			}
 			return t
 		}
@@ -95,33 +79,12 @@ func (c *CustomFuncs) inlineConstants(
 	return replace(e)
 }
 
-// extractColumn searches a Project or Values input expression for the column
-// having the given id. It returns the expression for that column.
-func (c *CustomFuncs) extractColumn(input memo.RelExpr, col opt.ColumnID) opt.ScalarExpr {
-	if project, ok := input.(*memo.ProjectExpr); ok {
-		for i := range project.Projections {
-			item := &project.Projections[i]
-			if item.Col == col {
-				return item.Element
-			}
-		}
-	} else if values, ok := input.(*memo.ValuesExpr); ok && len(values.Rows) == 1 {
-		tup := values.Rows[0].(*memo.TupleExpr)
-		for i, scalar := range tup.Elems {
-			if values.Cols[i] == col {
-				return scalar
-			}
-		}
-	}
-	panic(errors.AssertionFailedf("could not find column to extract"))
-}
-
 // HasDuplicateRefs returns true if the target projection expressions or
 // passthrough columns reference any column in the given target set more than
 // one time, or if the projection expressions contain a correlated subquery.
 // For example:
 //
-//   SELECT x+1, x+2, y FROM a
+//	SELECT x+1, x+2, y FROM a
 //
 // HasDuplicateRefs would be true, since the x column is referenced twice.
 //
@@ -226,9 +189,8 @@ func (c *CustomFuncs) VirtualColumns(scanPrivate *memo.ScanPrivate) opt.ColSet {
 // InlinableVirtualColumnFilters returns a new filters expression containing any
 // of the given filters that meet the criteria:
 //
-//   1. The filter has references to any of the columns in virtualColumns.
-//   2. The filter is not a correlated subquery.
-//
+//  1. The filter has references to any of the columns in virtualColumns.
+//  2. The filter is not a correlated subquery.
 func (c *CustomFuncs) InlinableVirtualColumnFilters(
 	filters memo.FiltersExpr, virtualColumns opt.ColSet,
 ) (inlinableFilters memo.FiltersExpr) {
@@ -346,9 +308,12 @@ func (c *CustomFuncs) extractVarEqualsConst(
 
 // CanInlineConstVar returns true if there is an opportunity in the filters to
 // inline a variable restricted to be a constant, as in:
-//   SELECT * FROM foo WHERE a = 4 AND a IN (1, 2, 3, 4).
+//
+//	SELECT * FROM foo WHERE a = 4 AND a IN (1, 2, 3, 4).
+//
 // =>
-//   SELECT * FROM foo WHERE a = 4 AND 4 IN (1, 2, 3, 4).
+//
+//	SELECT * FROM foo WHERE a = 4 AND 4 IN (1, 2, 3, 4).
 func (c *CustomFuncs) CanInlineConstVar(f memo.FiltersExpr) bool {
 	// usedIndices tracks the set of filter indices we've used to infer constant
 	// values, so we don't inline into them.

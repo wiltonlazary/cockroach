@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -22,14 +23,15 @@ import (
 )
 
 type commentOnDatabaseNode struct {
-	n         *tree.CommentOnDatabase
-	dbDesc    catalog.DatabaseDescriptor
-	commenter scexec.CommentUpdater
+	n               *tree.CommentOnDatabase
+	dbDesc          catalog.DatabaseDescriptor
+	metadataUpdater scexec.DescriptorMetadataUpdater
 }
 
 // CommentOnDatabase add comment on a database.
 // Privileges: CREATE on database.
-//   notes: postgres requires CREATE on the database.
+//
+//	notes: postgres requires CREATE on the database.
 func (p *planner) CommentOnDatabase(
 	ctx context.Context, n *tree.CommentOnDatabase,
 ) (planNode, error) {
@@ -52,8 +54,11 @@ func (p *planner) CommentOnDatabase(
 
 	return &commentOnDatabaseNode{n: n,
 		dbDesc: dbDesc,
-		commenter: p.execCfg.CommentUpdaterFactory.NewCommentUpdater(
+		metadataUpdater: descmetadata.NewMetadataUpdater(
 			ctx,
+			p.ExecCfg().InternalExecutorFactory,
+			p.Descriptors(),
+			&p.ExecCfg().Settings.SV,
 			p.txn,
 			p.SessionData(),
 		),
@@ -62,13 +67,13 @@ func (p *planner) CommentOnDatabase(
 
 func (n *commentOnDatabaseNode) startExec(params runParams) error {
 	if n.n.Comment != nil {
-		err := n.commenter.UpsertDescriptorComment(
+		err := n.metadataUpdater.UpsertDescriptorComment(
 			int64(n.dbDesc.GetID()), 0, keys.DatabaseCommentType, *n.n.Comment)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := n.commenter.DeleteDescriptorComment(
+		err := n.metadataUpdater.DeleteDescriptorComment(
 			int64(n.dbDesc.GetID()), 0, keys.DatabaseCommentType)
 		if err != nil {
 			return err

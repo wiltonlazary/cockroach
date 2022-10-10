@@ -12,14 +12,13 @@ package sqlutils
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/securitytest"
 	"github.com/cockroachdb/cockroach/pkg/util/fileutil"
 )
@@ -40,7 +39,8 @@ func PGUrl(t testing.TB, servingAddr, prefix string, user *url.Userinfo) (url.UR
 // copies of the certificates, so the cleanup function must always be called.
 //
 // Args:
-//  prefix: A prefix to be prepended to the temp file names generated, for debugging.
+//
+//	prefix: A prefix to be prepended to the temp file names generated, for debugging.
 func PGUrlE(servingAddr, prefix string, user *url.Userinfo) (url.URL, func(), error) {
 	return PGUrlWithOptionalClientCertsE(servingAddr, prefix, user, true /* withCerts */)
 }
@@ -69,19 +69,19 @@ func PGUrlWithOptionalClientCertsE(
 
 	// TODO(benesch): Audit usage of prefix and replace the following line with
 	// `testutils.TempDir(t)` if prefix can always be `t.Name()`.
-	tempDir, err := ioutil.TempDir("", fileutil.EscapeFilename(prefix))
+	tempDir, err := os.MkdirTemp("", fileutil.EscapeFilename(prefix))
 	if err != nil {
 		return url.URL{}, func() {}, err
 	}
 
 	// This CA is the one used by the SQL client driver to authenticate KV nodes on the host cluster.
-	caPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedCACert)
+	caPath := filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedCACert)
 	tempCAPath, err := securitytest.RestrictedCopy(caPath, tempDir, "ca")
 	if err != nil {
 		return url.URL{}, func() {}, err
 	}
 	// This CA is the one used by the SQL client driver to authenticate SQL tenant servers.
-	tenantCAPath := filepath.Join(security.EmbeddedCertsDir, security.EmbeddedTenantCACert)
+	tenantCAPath := filepath.Join(certnames.EmbeddedCertsDir, certnames.EmbeddedTenantCACert)
 	if err := securitytest.AppendFile(tenantCAPath, tempCAPath); err != nil {
 		return url.URL{}, func() {}, err
 	}
@@ -89,8 +89,8 @@ func PGUrlWithOptionalClientCertsE(
 	options.Add("sslrootcert", tempCAPath)
 
 	if withClientCerts {
-		certPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.crt", user.Username()))
-		keyPath := filepath.Join(security.EmbeddedCertsDir, fmt.Sprintf("client.%s.key", user.Username()))
+		certPath := filepath.Join(certnames.EmbeddedCertsDir, fmt.Sprintf("client.%s.crt", user.Username()))
+		keyPath := filepath.Join(certnames.EmbeddedCertsDir, fmt.Sprintf("client.%s.key", user.Username()))
 
 		// Copy these assets to disk from embedded strings, so this test can
 		// run from a standalone binary.

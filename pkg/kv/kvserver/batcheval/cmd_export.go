@@ -13,6 +13,7 @@ package batcheval
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -85,8 +87,9 @@ func declareKeysExport(
 	header *roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
+	maxOffset time.Duration,
 ) {
-	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans)
+	DefaultDeclareIsolatedKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeGCThresholdKey(header.RangeID)})
 }
 
@@ -99,7 +102,7 @@ func evalExport(
 	h := cArgs.Header
 	reply := resp.(*roachpb.ExportResponse)
 
-	ctx, evalExportSpan := tracing.ChildSpan(ctx, fmt.Sprintf("Export [%s,%s)", args.Key, args.EndKey))
+	ctx, evalExportSpan := tracing.ChildSpan(ctx, "evalExport")
 	defer evalExportSpan.Finish()
 
 	var evalExportTrace types.StringValue
@@ -109,6 +112,17 @@ func evalExport(
 		evalExportTrace.Value = fmt.Sprintf("evaluating Export on remote node %d", cArgs.EvalCtx.NodeID())
 	}
 	evalExportSpan.RecordStructured(&evalExportTrace)
+
+	// Table's marked to be excluded from backup are expected to be configured
+	// with a short GC TTL. Additionally, backup excludes such table's from being
+	// protected from GC when writing ProtectedTimestamp records. The
+	// ExportRequest is likely to find its target data has been GC'ed at this
+	// point, and so if the range being exported is part of such a table, we do
+	// not want to send back any row data to be backed up.
+	if cArgs.EvalCtx.ExcludeDataFromBackup() {
+		log.Infof(ctx, "[%s, %s) is part of a table excluded from backup, returning empty ExportResponse", args.Key, args.EndKey)
+		return result.Result{}, nil
+	}
 
 	if !args.ReturnSST {
 		return result.Result{}, errors.New("ReturnSST is required")
@@ -123,7 +137,10 @@ func evalExport(
 	// BACKUP to correctly note the supported time bounds for RESTORE AS OF SYSTEM
 	// TIME.
 	if args.MVCCFilter == roachpb.MVCCFilter_All {
-		reply.StartTime = cArgs.EvalCtx.GetGCThreshold()
+		reply.StartTime = args.StartTime
+		if args.StartTime.IsEmpty() {
+			reply.StartTime = cArgs.EvalCtx.GetGCThreshold()
+		}
 	}
 
 	var exportAllRevisions bool
@@ -159,8 +176,6 @@ func evalExport(
 		maxIntents = uint64(m)
 	}
 
-	// Time-bound iterators only make sense to use if the start time is set.
-	useTBI := args.EnableTimeBoundIteratorOptimization && !args.StartTime.IsEmpty()
 	// Only use resume timestamp if splitting mid key is enabled.
 	resumeKeyTS := hlc.Timestamp{}
 	if args.SplitMidKey {
@@ -170,19 +185,19 @@ func evalExport(
 	var curSizeOfExportedSSTs int64
 	for start := args.Key; start != nil; {
 		destFile := &storage.MemFile{}
-		summary, resume, resumeTS, err := reader.ExportMVCCToSst(ctx, storage.ExportOptions{
-			StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
-			EndKey:             args.EndKey,
-			StartTS:            args.StartTime,
-			EndTS:              h.Timestamp,
-			ExportAllRevisions: exportAllRevisions,
-			TargetSize:         targetSize,
-			MaxSize:            maxSize,
-			MaxIntents:         maxIntents,
-			StopMidKey:         args.SplitMidKey,
-			UseTBI:             useTBI,
-			ResourceLimiter:    storage.NewResourceLimiter(storage.ResourceLimiterOptions{MaxRunTime: maxRunTime}, timeutil.DefaultTimeSource{}),
-		}, destFile)
+		summary, resume, err := storage.MVCCExportToSST(ctx, cArgs.EvalCtx.ClusterSettings(), reader,
+			storage.MVCCExportOptions{
+				StartKey:           storage.MVCCKey{Key: start, Timestamp: resumeKeyTS},
+				EndKey:             args.EndKey,
+				StartTS:            args.StartTime,
+				EndTS:              h.Timestamp,
+				ExportAllRevisions: exportAllRevisions,
+				TargetSize:         targetSize,
+				MaxSize:            maxSize,
+				MaxIntents:         maxIntents,
+				StopMidKey:         args.SplitMidKey,
+				ResourceLimiter:    storage.NewResourceLimiter(storage.ResourceLimiterOptions{MaxRunTime: maxRunTime}, timeutil.DefaultTimeSource{}),
+			}, destFile)
 		if err != nil {
 			if errors.HasType(err, (*storage.ExceedMaxSizeError)(nil)) {
 				err = errors.WithHintf(err,
@@ -200,20 +215,20 @@ func evalExport(
 		}
 
 		span := roachpb.Span{Key: start}
-		if resume != nil {
-			span.EndKey = resume
+		if resume.Key != nil {
+			span.EndKey = resume.Key
 		} else {
 			span.EndKey = args.EndKey
 		}
 		exported := roachpb.ExportResponse_File{
 			Span:     span,
-			EndKeyTS: resumeTS,
+			EndKeyTS: resume.Timestamp,
 			Exported: summary,
 			SST:      data,
 		}
 		reply.Files = append(reply.Files, exported)
-		start = resume
-		resumeKeyTS = resumeTS
+		start = resume.Key
+		resumeKeyTS = resume.Timestamp
 
 		if h.TargetBytes > 0 {
 			curSizeOfExportedSSTs += summary.DataSize
@@ -244,9 +259,9 @@ func evalExport(
 			// the next SST. In the worst case this could lead to us exceeding our
 			// TargetBytes by SST target size + overage.
 			if reply.NumBytes == h.TargetBytes {
-				if resume != nil {
+				if resume.Key != nil {
 					reply.ResumeSpan = &roachpb.Span{
-						Key:    resume,
+						Key:    resume.Key,
 						EndKey: args.EndKey,
 					}
 					reply.ResumeReason = roachpb.RESUME_BYTE_LIMIT

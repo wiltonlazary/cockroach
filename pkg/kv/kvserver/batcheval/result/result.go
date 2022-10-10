@@ -152,9 +152,12 @@ func (lResult *LocalResult) DetachEndTxns(alwaysOnly bool) []EndTxnIntents {
 //
 // a) changes to be written to disk when applying the command
 // b) changes to the state which may require special handling (i.e. code
-//    execution) on all Replicas
+//
+//	execution) on all Replicas
+//
 // c) data which isn't sent to the followers but the proposer needs for tasks
-//    it must run when the command has applied (such as resolving intents).
+//
+//	it must run when the command has applied (such as resolving intents).
 type Result struct {
 	Local        LocalResult
 	Replicated   kvserverpb.ReplicatedEvalResult
@@ -193,13 +196,16 @@ func coalesceBool(lhs *bool, rhs *bool) {
 func (p *Result) MergeAndDestroy(q Result) error {
 	if q.Replicated.State != nil {
 		if q.Replicated.State.RaftAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify RaftAppliedIndex")
 		}
 		if q.Replicated.State.LeaseAppliedIndex != 0 {
-			return errors.AssertionFailedf("must not specify RaftApplyIndex")
+			return errors.AssertionFailedf("must not specify LeaseAppliedIndex")
 		}
 		if p.Replicated.State == nil {
 			p.Replicated.State = &kvserverpb.ReplicaState{}
+		}
+		if q.Replicated.State.RaftAppliedIndexTerm != 0 {
+			return errors.AssertionFailedf("must not specify RaftAppliedIndexTerm")
 		}
 		if p.Replicated.State.Desc == nil {
 			p.Replicated.State.Desc = q.Replicated.State.Desc
@@ -217,10 +223,12 @@ func (p *Result) MergeAndDestroy(q Result) error {
 
 		if p.Replicated.State.TruncatedState == nil {
 			p.Replicated.State.TruncatedState = q.Replicated.State.TruncatedState
+			p.Replicated.RaftExpectedFirstIndex = q.Replicated.RaftExpectedFirstIndex
 		} else if q.Replicated.State.TruncatedState != nil {
 			return errors.AssertionFailedf("conflicting TruncatedState")
 		}
 		q.Replicated.State.TruncatedState = nil
+		q.Replicated.RaftExpectedFirstIndex = 0
 
 		if q.Replicated.State.GCThreshold != nil {
 			if p.Replicated.State.GCThreshold == nil {
@@ -230,6 +238,13 @@ func (p *Result) MergeAndDestroy(q Result) error {
 			}
 			q.Replicated.State.GCThreshold = nil
 		}
+
+		if p.Replicated.State.GCHint == nil {
+			p.Replicated.State.GCHint = q.Replicated.State.GCHint
+		} else if q.Replicated.State.GCHint != nil {
+			return errors.AssertionFailedf("conflicting GC hint")
+		}
+		q.Replicated.State.GCHint = nil
 
 		if p.Replicated.State.Version == nil {
 			p.Replicated.State.Version = q.Replicated.State.Version
@@ -289,6 +304,14 @@ func (p *Result) MergeAndDestroy(q Result) error {
 		return errors.AssertionFailedf("conflicting AddSSTable")
 	}
 	q.Replicated.AddSSTable = nil
+
+	if p.Replicated.MVCCHistoryMutation == nil {
+		p.Replicated.MVCCHistoryMutation = q.Replicated.MVCCHistoryMutation
+	} else if q.Replicated.MVCCHistoryMutation != nil {
+		p.Replicated.MVCCHistoryMutation.Spans = append(p.Replicated.MVCCHistoryMutation.Spans,
+			q.Replicated.MVCCHistoryMutation.Spans...)
+	}
+	q.Replicated.MVCCHistoryMutation = nil
 
 	if p.Replicated.PrevLeaseProposal == nil {
 		p.Replicated.PrevLeaseProposal = q.Replicated.PrevLeaseProposal

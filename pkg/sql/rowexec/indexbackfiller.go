@@ -67,16 +67,6 @@ var backfillerMaxBufferSize = settings.RegisterByteSizeSetting(
 	"schemachanger.backfiller.max_buffer_size", "the maximum size of the BulkAdder buffer handling index backfills", 512<<20,
 )
 
-var backfillerBufferIncrementSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
-	"schemachanger.backfiller.buffer_increment", "the size by which the BulkAdder attempts to grow its buffer before flushing", 32<<20,
-)
-
-var backillerSSTSize = settings.RegisterByteSizeSetting(
-	settings.TenantWritable,
-	"schemachanger.backfiller.max_sst_size", "target size for ingested files during backfills", 16<<20,
-)
-
 func newIndexBackfiller(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
@@ -88,7 +78,7 @@ func newIndexBackfiller(
 	indexBackfillerMon := execinfra.NewMonitor(ctx, flowCtx.Cfg.BackfillerMonitor,
 		"index-backfill-mon")
 	ib := &indexBackfiller{
-		desc:    flowCtx.TableDescriptor(&spec.Table),
+		desc:    flowCtx.TableDescriptor(ctx, &spec.Table),
 		spec:    spec,
 		flowCtx: flowCtx,
 		output:  output,
@@ -190,15 +180,14 @@ func (ib *indexBackfiller) ingestIndexEntries(
 
 	minBufferSize := backfillerBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV)
 	maxBufferSize := func() int64 { return backfillerMaxBufferSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
-	sstSize := func() int64 { return backillerSSTSize.Get(&ib.flowCtx.Cfg.Settings.SV) }
-	stepSize := backfillerBufferIncrementSize.Get(&ib.flowCtx.Cfg.Settings.SV)
 	opts := kvserverbase.BulkAdderOptions{
-		SSTSize:        sstSize,
-		MinBufferSize:  minBufferSize,
-		MaxBufferSize:  maxBufferSize,
-		StepBufferSize: stepSize,
-		SkipDuplicates: ib.ContainsInvertedIndex(),
-		BatchTimestamp: ib.spec.ReadAsOf,
+		Name:                     ib.desc.GetName() + " backfill",
+		MinBufferSize:            minBufferSize,
+		MaxBufferSize:            maxBufferSize,
+		SkipDuplicates:           ib.ContainsInvertedIndex(),
+		BatchTimestamp:           ib.spec.ReadAsOf,
+		InitialSplitsIfUnordered: int(ib.spec.InitialSplits),
+		WriteAtBatchTimestamp:    ib.spec.WriteAtBatchTimestamp,
 	}
 	adder, err := ib.flowCtx.Cfg.BulkAdder(ctx, ib.flowCtx.Cfg.DB, ib.spec.WriteAsOf, opts)
 	if err != nil {
@@ -352,6 +341,7 @@ func (ib *indexBackfiller) runBackfill(
 
 func (ib *indexBackfiller) Run(ctx context.Context) {
 	opName := "indexBackfillerProcessor"
+	ctx = logtags.AddTag(ctx, "job", ib.spec.JobID)
 	ctx = logtags.AddTag(ctx, opName, int(ib.spec.Table.ID))
 	ctx, span := execinfra.ProcessorSpan(ctx, opName)
 	defer span.Finish()
@@ -362,7 +352,7 @@ func (ib *indexBackfiller) Run(ctx context.Context) {
 	progCh := make(chan execinfrapb.RemoteProducerMetadata_BulkProcessorProgress)
 
 	semaCtx := tree.MakeSemaContext()
-	if err := ib.out.Init(&execinfrapb.PostProcessSpec{}, nil, &semaCtx, ib.flowCtx.NewEvalCtx()); err != nil {
+	if err := ib.out.Init(ctx, &execinfrapb.PostProcessSpec{}, nil, &semaCtx, ib.flowCtx.NewEvalCtx()); err != nil {
 		ib.output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
 		return
 	}
@@ -399,7 +389,7 @@ func (ib *indexBackfiller) wrapDupError(ctx context.Context, orig error) error {
 		return orig
 	}
 
-	desc, err := ib.desc.MakeFirstMutationPublic(catalog.IncludeConstraints)
+	desc, err := ib.desc.MakeFirstMutationPublic()
 	if err != nil {
 		return err
 	}
@@ -442,8 +432,9 @@ func (ib *indexBackfiller) buildIndexEntryBatch(
 
 		// TODO(knz): do KV tracing in DistSQL processors.
 		var err error
-		entries, key, memUsedBuildingBatch, err = ib.BuildIndexEntriesChunk(ctx, txn, ib.desc, sp,
-			ib.spec.ChunkSize, false /*traceKV*/)
+		entries, key, memUsedBuildingBatch, err = ib.BuildIndexEntriesChunk(
+			ctx, txn, ib.desc, sp, ib.spec.ChunkSize, false, /* traceKV */
+		)
 		return err
 	}); err != nil {
 		return nil, nil, 0, err

@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgwirebase"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -58,7 +59,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 
 	ctx := context.Background()
 	sema := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := eval.MakeTestingEvalContext(nil)
 
 	for _, tc := range tests {
 		// Convert the SQL expression to a Datum.
@@ -82,7 +83,7 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 		if err != nil {
 			t.Fatal(err)
 		}
-		d, err := te.Eval(&evalCtx)
+		d, err := eval.Expr(ctx, &evalCtx, te)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -124,8 +125,9 @@ func readEncodingTests(t testing.TB) []*encodingTest {
 // TestEncodings uses testdata/encodings.json to test expected pgwire encodings
 // and ensure they are identical to what Postgres produces. Regenerate that
 // file by:
-//   Starting a postgres server on :5432 then running:
-//   cd pkg/cmd/generate-binary; go run main.go > ../../sql/pgwire/testdata/encodings.json
+//
+//	Starting a postgres server on :5432 then running:
+//	cd pkg/cmd/generate-binary; go run main.go > ../../sql/pgwire/testdata/encodings.json
 func TestEncodings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -151,7 +153,7 @@ func TestEncodings(t *testing.T) {
 
 	conv, loc := makeTestingConvCfg()
 	ctx := context.Background()
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := eval.MakeTestingEvalContext(nil)
 
 	type writeFunc func(tree.Datum, *types.T)
 	type testCase struct {
@@ -270,6 +272,7 @@ func TestEncodings(t *testing.T) {
 				}
 
 				d, err := pgwirebase.DecodeDatum(
+					ctx,
 					&evalCtx,
 					types.OidToType[tc.Oid],
 					code,
@@ -329,10 +332,11 @@ func TestExoticNumericEncodings(t *testing.T) {
 		{apd.New(1234123400, -2), []byte{0, 4, 0, 1, 0, 0, 0, 2, 0x4, 0xd2, 0x4, 0xd2, 0, 0, 0, 0}},
 	}
 
-	evalCtx := tree.MakeTestingEvalContext(nil)
+	evalCtx := eval.MakeTestingEvalContext(nil)
 	for i, c := range testCases {
 		t.Run(fmt.Sprintf("%d_%s", i, c.Value), func(t *testing.T) {
 			d, err := pgwirebase.DecodeDatum(
+				context.Background(),
 				&evalCtx,
 				types.Decimal,
 				pgwirebase.FormatBinary,

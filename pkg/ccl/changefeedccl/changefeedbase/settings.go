@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/errors"
 )
 
@@ -47,7 +48,7 @@ var PerChangefeedMemLimit = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"changefeed.memory.per_changefeed_limit",
 	"controls amount of data that can be buffered per changefeed",
-	1<<30,
+	1<<27, // 128MiB
 )
 
 // SlowSpanLogThreshold controls when we will log slow spans.
@@ -59,11 +60,32 @@ var SlowSpanLogThreshold = settings.RegisterDurationSetting(
 	settings.NonNegativeDuration,
 )
 
+// IdleTimeout controls how long the changefeed will wait for a new KV being
+// emitted before marking itself as idle.
+var IdleTimeout = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.idle_timeout",
+	"a changefeed will mark itself idle if no changes have been emitted for greater than this duration; if 0, the changefeed will never be marked idle",
+	10*time.Minute,
+	settings.NonNegativeDuration,
+)
+
 // FrontierCheckpointFrequency controls the frequency of frontier checkpoints.
 var FrontierCheckpointFrequency = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"changefeed.frontier_checkpoint_frequency",
 	"controls the frequency with which span level checkpoints will be written; if 0, disabled.",
+	10*time.Minute,
+	settings.NonNegativeDuration,
+)
+
+// FrontierHighwaterLagCheckpointThreshold controls the amount the high-water
+// mark is allowed to lag behind the leading edge of the frontier before we
+// begin to attempt checkpointing spans above the high-water mark
+var FrontierHighwaterLagCheckpointThreshold = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.frontier_highwater_lag_checkpoint_threshold",
+	"controls the maximum the high-water mark is allowed to lag behind the leading spans of the frontier before per-span checkpointing is enabled; if 0, checkpointing due to high-water lag is disabled",
 	10*time.Minute,
 	settings.NonNegativeDuration,
 )
@@ -77,8 +99,9 @@ var FrontierCheckpointFrequency = settings.RegisterDurationSetting(
 // So, 1KB per span.  We could be looking at 10MB checkpoint record.
 //
 // The default for this setting was chosen as follows:
-//   * Assume a very long backfill, running for 25 hours (GC TTL default duration).
-//   * Assume we want to have at most 150MB worth of checkpoints in the job record.
+//   - Assume a very long backfill, running for 25 hours (GC TTL default duration).
+//   - Assume we want to have at most 150MB worth of checkpoints in the job record.
+//
 // Therefore, we should write at most 6 MB of checkpoint/hour; OR, based on the default
 // FrontierCheckpointFrequency setting, 1 MB per checkpoint.
 var FrontierCheckpointMaxBytes = settings.RegisterByteSizeSetting(
@@ -96,6 +119,14 @@ var ScanRequestLimit = settings.RegisterIntSetting(
 	"changefeed.backfill.concurrent_scan_requests",
 	"number of concurrent scan requests per node issued during a backfill",
 	0,
+)
+
+// ScanRequestSize is the target size of the scan request response.
+var ScanRequestSize = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.backfill.scan_request_size",
+	"the maximum number of bytes returned by each scan request",
+	16<<20,
 )
 
 // SinkThrottleConfig describes throttling configuration for the sink.
@@ -167,3 +198,57 @@ var EventMemoryMultiplier = settings.RegisterFloatSetting(
 		return nil
 	},
 )
+
+// ProtectTimestampInterval controls the frequency of protected timestamp record updates
+var ProtectTimestampInterval = settings.RegisterDurationSetting(
+	settings.TenantWritable,
+	"changefeed.protect_timestamp_interval",
+	"controls how often the changefeed forwards its protected timestamp to the resolved timestamp",
+	10*time.Minute,
+	settings.PositiveDuration,
+)
+
+// ActiveProtectedTimestampsEnabled enables always having protected timestamps
+// laid down that are periodically advanced to the highwater mark.
+var ActiveProtectedTimestampsEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.active_protected_timestamps.enabled",
+	"if set, rather than only protecting changefeed targets from garbage collection during backfills, data will always be protected up to the changefeed's frontier",
+	true,
+)
+
+// BatchReductionRetryEnabled enables the temporary reduction of batch sizes upon kafka message too large errors
+var BatchReductionRetryEnabled = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.batch_reduction_retry_enabled",
+	"if true, kafka changefeeds upon erroring on an oversized batch will attempt to resend the messages with progressively lower batch sizes",
+	true,
+)
+
+// UseMuxRangeFeed enables the use of MuxRangeFeed RPC.
+var UseMuxRangeFeed = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.mux_rangefeed.enabled",
+	"if true, changefeed uses multiplexing rangefeed RPC",
+	false,
+)
+
+// EventConsumerWorkers specifies the maximum number of workers to use when
+// processing  events.
+var EventConsumerWorkers = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.event_consumer_workers",
+	"the number of workers to use when processing events; 0 or 1 disables",
+	int64(util.ConstantWithMetamorphicTestRange("changefeed.consumer_max_workers", 8, 0, 32)),
+	settings.NonNegativeInt,
+).WithPublic()
+
+// EventConsumerWorkerQueueSize specifies the maximum number of events a worker buffer.
+var EventConsumerWorkerQueueSize = settings.RegisterIntSetting(
+	settings.TenantWritable,
+	"changefeed.event_consumer_worker_queue_size",
+	"if changefeed.event_consumer_workers is enabled, this setting sets the maxmimum number of events"+
+		"which a worker can buffer",
+	int64(util.ConstantWithMetamorphicTestRange("changefeed.event_consumer_worker_queue_size", 16, 0, 16)),
+	settings.NonNegativeInt,
+).WithPublic()

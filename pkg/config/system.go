@@ -20,13 +20,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/systemschema"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
-// SystemTenantObjectID is an identifier for an object (e.g. database or table)
+// ObjectID is an identifier for an object (e.g. database or table)
 // in the system tenant. Each object in the system tenant is capable of being
 // associated with a zone configuration, which describes how and where the
 // object's data is stored in KV. Some objects in the system tenant also serve
@@ -39,10 +38,10 @@ import (
 // the system tenant. Additionally, individual objects in secondary tenants do
 // not serve as Range split boundaries. However, each tenant is guaranteed to be
 // split off into its own range.
-type SystemTenantObjectID uint32
+type ObjectID uint32
 
 type zoneConfigHook func(
-	sysCfg *SystemConfig, objectID SystemTenantObjectID,
+	sysCfg *SystemConfig, codec keys.SQLCodec, objectID ObjectID,
 ) (zone *zonepb.ZoneConfig, placeholder *zonepb.ZoneConfig, cache bool, err error)
 
 var (
@@ -53,7 +52,7 @@ var (
 
 	// testingLargestIDHook is a function used to bypass GetLargestObjectID
 	// in tests.
-	testingLargestIDHook func(checker keys.SystemIDChecker) SystemTenantObjectID
+	testingLargestIDHook func(maxID ObjectID) ObjectID
 )
 
 type zoneEntry struct {
@@ -80,13 +79,16 @@ type zoneEntry struct {
 // saying whether or not it should be considered for splitting at all.
 // A database descriptor or a table view descriptor are examples of IDs
 // that should not be considered for splits.
+// NB: SystemConfig can be updated to only contain system.descriptor and
+// system.zones. We still need SystemConfig for SystemConfigProvider which is
+// used in replication reports and the opt catalog.
 type SystemConfig struct {
 	SystemConfigEntries
 	DefaultZoneConfig *zonepb.ZoneConfig
 	mu                struct {
 		syncutil.RWMutex
-		zoneCache        map[SystemTenantObjectID]zoneEntry
-		shouldSplitCache map[SystemTenantObjectID]bool
+		zoneCache        map[ObjectID]zoneEntry
+		shouldSplitCache map[ObjectID]bool
 	}
 }
 
@@ -94,8 +96,8 @@ type SystemConfig struct {
 func NewSystemConfig(defaultZoneConfig *zonepb.ZoneConfig) *SystemConfig {
 	sc := &SystemConfig{}
 	sc.DefaultZoneConfig = defaultZoneConfig
-	sc.mu.zoneCache = map[SystemTenantObjectID]zoneEntry{}
-	sc.mu.shouldSplitCache = map[SystemTenantObjectID]bool{}
+	sc.mu.zoneCache = map[ObjectID]zoneEntry{}
+	sc.mu.shouldSplitCache = map[ObjectID]bool{}
 	return sc
 }
 
@@ -138,7 +140,7 @@ func (s *SystemConfig) getSystemTenantDesc(key roachpb.Key) *roachpb.Value {
 	}
 
 	testingLock.Lock()
-	_, ok := testingZoneConfig[SystemTenantObjectID(id)]
+	_, ok := testingZoneConfig[ObjectID(id)]
 	testingLock.Unlock()
 
 	if ok {
@@ -149,7 +151,7 @@ func (s *SystemConfig) getSystemTenantDesc(key roachpb.Key) *roachpb.Value {
 		// configs through proper channels.
 		//
 		// Getting here outside tests is impossible.
-		desc := tabledesc.NewBuilder(&descpb.TableDescriptor{}).BuildImmutable().DescriptorProto()
+		desc := &descpb.Descriptor{Union: &descpb.Descriptor_Table{Table: &descpb.TableDescriptor{}}}
 		var val roachpb.Value
 		if err := val.SetProto(desc); err != nil {
 			panic(err)
@@ -199,13 +201,13 @@ func (s *SystemConfig) getIndexBound(key roachpb.Key) int {
 // IDs. If idChecker is nil, returns the largest ID in the config
 // (again, augmented by the pseudo IDs).
 func (s *SystemConfig) GetLargestObjectID(
-	idChecker keys.SystemIDChecker, pseudoIDs []uint32,
-) (SystemTenantObjectID, error) {
+	maxReservedDescID ObjectID, pseudoIDs []uint32,
+) (ObjectID, error) {
 	testingLock.Lock()
 	hook := testingLargestIDHook
 	testingLock.Unlock()
 	if hook != nil {
-		return hook(idChecker), nil
+		return hook(maxReservedDescID), nil
 	}
 
 	// Search for the descriptor table entries within the SystemConfig. lowIndex
@@ -220,22 +222,22 @@ func (s *SystemConfig) GetLargestObjectID(
 	}
 
 	// Determine the largest pseudo table ID equal to or below maxID.
-	maxPseudoID := SystemTenantObjectID(0)
+	maxPseudoID := ObjectID(0)
 	for _, id := range pseudoIDs {
-		objID := SystemTenantObjectID(id)
-		if objID > maxPseudoID && (idChecker == nil || idChecker.IsSystemID(uint32(objID))) {
+		objID := ObjectID(id)
+		if objID > maxPseudoID && (maxReservedDescID == 0 || objID <= maxReservedDescID) {
 			maxPseudoID = objID
 		}
 	}
 
 	// No maximum specified; maximum ID is the last entry in the descriptor
 	// table or the largest pseudo ID, whichever is larger.
-	if idChecker == nil {
+	if maxReservedDescID == 0 {
 		id, err := keys.SystemSQLCodec.DecodeDescMetadataID(s.Values[highIndex-1].Key)
 		if err != nil {
 			return 0, err
 		}
-		objID := SystemTenantObjectID(id)
+		objID := ObjectID(id)
 		if objID < maxPseudoID {
 			objID = maxPseudoID
 		}
@@ -253,7 +255,7 @@ func (s *SystemConfig) GetLargestObjectID(
 		}
 		var id uint32
 		id, err = keys.SystemSQLCodec.DecodeDescMetadataID(searchSlice[i].Key)
-		return !idChecker.IsSystemID(id)
+		return uint32(maxReservedDescID) < id
 	})
 	if err != nil {
 		return 0, err
@@ -266,8 +268,8 @@ func (s *SystemConfig) GetLargestObjectID(
 		if err != nil {
 			return 0, err
 		}
-		if idChecker.IsSystemID(id) {
-			return SystemTenantObjectID(id), nil
+		if id <= uint32(maxReservedDescID) {
+			return ObjectID(id), nil
 		}
 	}
 
@@ -280,45 +282,88 @@ func (s *SystemConfig) GetLargestObjectID(
 	if err != nil {
 		return 0, err
 	}
-	objID := SystemTenantObjectID(id)
+	objID := ObjectID(id)
 	if objID < maxPseudoID {
 		objID = maxPseudoID
 	}
 	return objID, nil
 }
 
-// GetZoneConfigForKey looks up the zone config for the object (table
+// TestingGetSystemTenantZoneConfigForKey looks up the zone config the
+// provided key. This is exposed to facilitate testing the underlying
+// logic.
+func TestingGetSystemTenantZoneConfigForKey(
+	s *SystemConfig, key roachpb.RKey,
+) (ObjectID, *zonepb.ZoneConfig, error) {
+	return s.getZoneConfigForKey(keys.SystemSQLCodec, key)
+}
+
+// getZoneConfigForKey looks up the zone config for the object (table
 // or database, specified by key.id). It is the caller's
 // responsibility to ensure that the range does not need to be split.
-func (s *SystemConfig) GetZoneConfigForKey(key roachpb.RKey) (*zonepb.ZoneConfig, error) {
-	return s.getZoneConfigForKey(DecodeKeyIntoZoneIDAndSuffix(key))
+func (s *SystemConfig) getZoneConfigForKey(
+	codec keys.SQLCodec, key roachpb.RKey,
+) (ObjectID, *zonepb.ZoneConfig, error) {
+	id, suffix := DecodeKeyIntoZoneIDAndSuffix(codec, key)
+	entry, err := s.getZoneEntry(codec, id)
+	if err != nil {
+		return 0, nil, err
+	}
+	if entry.zone != nil {
+		if entry.placeholder != nil {
+			if subzone, _ := entry.placeholder.GetSubzoneForKeySuffix(suffix); subzone != nil {
+				if indexSubzone := entry.placeholder.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
+					subzone.Config.InheritFromParent(&indexSubzone.Config)
+				}
+				subzone.Config.InheritFromParent(entry.zone)
+				return id, &subzone.Config, nil
+			}
+		} else if subzone, _ := entry.zone.GetSubzoneForKeySuffix(suffix); subzone != nil {
+			if indexSubzone := entry.zone.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
+				subzone.Config.InheritFromParent(&indexSubzone.Config)
+			}
+			subzone.Config.InheritFromParent(entry.zone)
+			return id, &subzone.Config, nil
+		}
+		return id, entry.zone, nil
+	}
+	return id, s.DefaultZoneConfig, nil
 }
 
 // GetSpanConfigForKey looks of the span config for the given key. It's part of
-// spanconfig.StoreReader interface.
+// spanconfig.StoreReader interface. Note that it is only usable for the system
+// tenant config.
 func (s *SystemConfig) GetSpanConfigForKey(
 	ctx context.Context, key roachpb.RKey,
 ) (roachpb.SpanConfig, error) {
-	zone, err := s.GetZoneConfigForKey(key)
+	id, zone, err := s.getZoneConfigForKey(keys.SystemSQLCodec, key)
 	if err != nil {
 		return roachpb.SpanConfig{}, err
 	}
-	return zone.AsSpanConfig(), nil
+	spanConfig := zone.AsSpanConfig()
+	if id <= keys.MaxReservedDescID {
+		// We enable rangefeeds for system tables; various internal subsystems
+		// (leveraging system tables) rely on rangefeeds to function. We also do the
+		// same for the tenant pseudo range ID for forwards compatibility with the
+		// span configs infrastructure.
+		spanConfig.RangefeedEnabled = true
+		// We exclude system tables from strict GC enforcement, it's only really
+		// applicable to user tables.
+		spanConfig.GCPolicy.IgnoreStrictEnforcement = true
+	}
+	return spanConfig, nil
 }
 
 // DecodeKeyIntoZoneIDAndSuffix figures out the zone that the key belongs to.
-func DecodeKeyIntoZoneIDAndSuffix(key roachpb.RKey) (id SystemTenantObjectID, keySuffix []byte) {
-	objectID, keySuffix, ok := DecodeSystemTenantObjectID(key)
+func DecodeKeyIntoZoneIDAndSuffix(
+	codec keys.SQLCodec, key roachpb.RKey,
+) (id ObjectID, keySuffix []byte) {
+	objectID, keySuffix, ok := DecodeObjectID(codec, key)
 	if !ok {
 		// Not in the structured data namespace.
 		objectID = keys.RootNamespaceID
-	} else if objectID <= keys.MaxSystemConfigDescID || isPseudoTableID(uint32(objectID)) {
-		// For now, you cannot set the zone config on gossiped tables. The only
-		// way to set a zone config on these tables is to modify config for the
-		// system database as a whole. This is largely because all the
-		// "system config" tables are colocated in the same range by default and
-		// thus couldn't be managed separately.
-		// Furthermore pseudo-table ids should be considered to be a part of the
+	} else if objectID <= keys.SystemDatabaseID || keys.IsPseudoTableID(uint32(objectID)) {
+		// Pseudo-table ids should be considered to be a part of the
 		// system database as they aren't real tables.
 		objectID = keys.SystemDatabaseID
 	}
@@ -340,34 +385,37 @@ func DecodeKeyIntoZoneIDAndSuffix(key roachpb.RKey) (id SystemTenantObjectID, ke
 	return objectID, keySuffix
 }
 
-// isPseudoTableID returns true if id is in keys.PseudoTableIDs.
-func isPseudoTableID(id uint32) bool {
-	for _, pseudoTableID := range keys.PseudoTableIDs {
-		if id == pseudoTableID {
-			return true
-		}
-	}
-	return false
-}
-
 // GetZoneConfigForObject returns the combined zone config for the given object
 // identifier and SQL codec.
+//
 // NOTE: any subzones from the zone placeholder will be automatically merged
 // into the cached zone so the caller doesn't need special-case handling code.
 func (s *SystemConfig) GetZoneConfigForObject(
-	codec keys.SQLCodec, id uint32,
+	codec keys.SQLCodec, id ObjectID,
 ) (*zonepb.ZoneConfig, error) {
-	var sysID SystemTenantObjectID
-	if codec.ForSystemTenant() {
-		sysID = SystemTenantObjectID(id)
-	} else {
-		sysID = keys.TenantsRangesID
-	}
-	entry, err := s.getZoneEntry(sysID)
+	var entry zoneEntry
+	var err error
+	entry, err = s.getZoneEntry(codec, id)
 	if err != nil {
 		return nil, err
 	}
 	return entry.combined, nil
+}
+
+// PurgeZoneConfigCache allocates a new zone config cache in this system config
+// so that tables with stale zone config information could have this info
+// looked up from using the most up-to-date zone config the next time it's
+// requested. Note, this function is only intended to be called during test
+// execution, such as logic tests.
+func (s *SystemConfig) PurgeZoneConfigCache() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.mu.zoneCache) != 0 {
+		s.mu.zoneCache = map[ObjectID]zoneEntry{}
+	}
+	if len(s.mu.shouldSplitCache) != 0 {
+		s.mu.shouldSplitCache = map[ObjectID]bool{}
+	}
 }
 
 // getZoneEntry returns the zone entry for the given system-tenant
@@ -375,7 +423,7 @@ func (s *SystemConfig) GetZoneConfigForObject(
 // directly returned. Otherwise, getZoneEntry will hydrate new
 // zonepb.ZoneConfig(s) from the SystemConfig and install them as an
 // entry in the cache.
-func (s *SystemConfig) getZoneEntry(id SystemTenantObjectID) (zoneEntry, error) {
+func (s *SystemConfig) getZoneEntry(codec keys.SQLCodec, id ObjectID) (zoneEntry, error) {
 	s.mu.RLock()
 	entry, ok := s.mu.zoneCache[id]
 	s.mu.RUnlock()
@@ -385,7 +433,7 @@ func (s *SystemConfig) getZoneEntry(id SystemTenantObjectID) (zoneEntry, error) 
 	testingLock.Lock()
 	hook := ZoneConfigHook
 	testingLock.Unlock()
-	zone, placeholder, cache, err := hook(s, id)
+	zone, placeholder, cache, err := hook(s, codec, id)
 	if err != nil {
 		return zoneEntry{}, err
 	}
@@ -408,34 +456,6 @@ func (s *SystemConfig) getZoneEntry(id SystemTenantObjectID) (zoneEntry, error) 
 		return entry, nil
 	}
 	return zoneEntry{}, nil
-}
-
-func (s *SystemConfig) getZoneConfigForKey(
-	id SystemTenantObjectID, keySuffix []byte,
-) (*zonepb.ZoneConfig, error) {
-	entry, err := s.getZoneEntry(id)
-	if err != nil {
-		return nil, err
-	}
-	if entry.zone != nil {
-		if entry.placeholder != nil {
-			if subzone, _ := entry.placeholder.GetSubzoneForKeySuffix(keySuffix); subzone != nil {
-				if indexSubzone := entry.placeholder.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
-					subzone.Config.InheritFromParent(&indexSubzone.Config)
-				}
-				subzone.Config.InheritFromParent(entry.zone)
-				return &subzone.Config, nil
-			}
-		} else if subzone, _ := entry.zone.GetSubzoneForKeySuffix(keySuffix); subzone != nil {
-			if indexSubzone := entry.zone.GetSubzone(subzone.IndexID, ""); indexSubzone != nil {
-				subzone.Config.InheritFromParent(&indexSubzone.Config)
-			}
-			subzone.Config.InheritFromParent(entry.zone)
-			return &subzone.Config, nil
-		}
-		return entry.zone, nil
-	}
-	return s.DefaultZoneConfig, nil
 }
 
 var staticSplits = []roachpb.RKey{
@@ -520,15 +540,10 @@ func (s *SystemConfig) systemTenantTableBoundarySplitKey(
 		return nil
 	}
 
-	idChecker := keys.DeprecatedSystemIDChecker()
-	startID, _, ok := DecodeSystemTenantObjectID(startKey)
-	if !ok || startID <= keys.MaxSystemConfigDescID {
-		// The start key is either:
-		// - not part of the structured data span
-		// - part of the system span
-		// In either case, start looking for splits at the first ID usable
-		// by the user data span.
-		startID = keys.MaxSystemConfigDescID + 1
+	startID, _, ok := DecodeObjectID(keys.SystemSQLCodec, startKey)
+
+	if !ok || startID <= keys.SystemDatabaseID {
+		startID = keys.SystemDatabaseID
 	}
 
 	// Build key prefixes for sequential table IDs until we reach endKey. Note
@@ -538,12 +553,12 @@ func (s *SystemConfig) systemTenantTableBoundarySplitKey(
 
 	// findSplitKey returns the first possible split key between the given
 	// range of IDs.
-	findSplitKey := func(startID, endID SystemTenantObjectID) roachpb.RKey {
+	findSplitKey := func(startID, endID ObjectID) roachpb.RKey {
 		// endID could be smaller than startID if we don't have user tables.
 		for id := startID; id <= endID; id++ {
 			tableKey := roachpb.RKey(keys.SystemSQLCodec.TablePrefix(uint32(id)))
 			// This logic is analogous to the well-commented static split logic above.
-			if startKey.Less(tableKey) && s.shouldSplitOnSystemTenantObject(id, idChecker) {
+			if startKey.Less(tableKey) && s.shouldSplitOnSystemTenantObject(id) {
 				if tableKey.Less(endKey) {
 					return tableKey
 				}
@@ -577,8 +592,8 @@ func (s *SystemConfig) systemTenantTableBoundarySplitKey(
 
 	// If the startKey falls within the non-system reserved range, compute those
 	// keys first.
-	if idChecker.IsSystemID(uint32(startID)) {
-		endID, err := s.GetLargestObjectID(idChecker, keys.PseudoTableIDs)
+	if uint32(startID) <= keys.MaxReservedDescID {
+		endID, err := s.GetLargestObjectID(keys.MaxReservedDescID, keys.PseudoTableIDs)
 		if err != nil {
 			log.Errorf(ctx, "unable to determine largest reserved object ID from system config: %s", err)
 			return nil
@@ -586,11 +601,11 @@ func (s *SystemConfig) systemTenantTableBoundarySplitKey(
 		if splitKey := findSplitKey(startID, endID); splitKey != nil {
 			return splitKey
 		}
-		startID = SystemTenantObjectID(keys.MinUserDescriptorID(idChecker))
+		startID = ObjectID(keys.MaxReservedDescID + 1)
 	}
 
 	// Find the split key in the system tenant's user space.
-	endID, err := s.GetLargestObjectID(nil /* systemIDChecker */, keys.PseudoTableIDs)
+	endID, err := s.GetLargestObjectID(0 /* maxReservedDescID */, keys.PseudoTableIDs)
 	if err != nil {
 		log.Errorf(ctx, "unable to determine largest object ID from system config: %s", err)
 		return nil
@@ -692,9 +707,7 @@ func (s *SystemConfig) NeedsSplit(ctx context.Context, startKey, endKey roachpb.
 // shouldSplitOnSystemTenantObject checks if the ID is eligible for a split at
 // all. It uses the internal cache to find a value, and tries to find it using
 // the hook if ID isn't found in the cache.
-func (s *SystemConfig) shouldSplitOnSystemTenantObject(
-	id SystemTenantObjectID, idChecker keys.SystemIDChecker,
-) bool {
+func (s *SystemConfig) shouldSplitOnSystemTenantObject(id ObjectID) bool {
 	// Check the cache.
 	{
 		s.mu.RLock()
@@ -706,17 +719,44 @@ func (s *SystemConfig) shouldSplitOnSystemTenantObject(
 	}
 
 	var shouldSplit bool
-	if idChecker.IsSystemID(uint32(id)) {
+	// For legacy reasons, if the ID is <= keys.DeprecatedMaxSystemConfigDescID,
+	// we check if there is a table to split on. There are no pseudo ranges
+	// below keys.DeprecatedMaxSystemConfigDescID.
+	if uint32(id) <= keys.MaxReservedDescID && uint32(id) > keys.DeprecatedMaxSystemConfigDescID {
 		// The ID might be one of the reserved IDs that refer to ranges but not any
 		// actual descriptors.
 		shouldSplit = true
 	} else {
 		desc := s.getSystemTenantDesc(keys.SystemSQLCodec.DescMetadataKey(uint32(id)))
-		shouldSplit = desc != nil && systemschema.ShouldSplitAtDesc(desc)
+		shouldSplit = desc != nil && ShouldSplitAtDesc(desc)
 	}
 	// Populate the cache.
 	s.mu.Lock()
 	s.mu.shouldSplitCache[id] = shouldSplit
 	s.mu.Unlock()
 	return shouldSplit
+}
+
+// ShouldSplitAtDesc determines whether a specific descriptor should be
+// considered for a split. Only plain tables are considered for split.
+func ShouldSplitAtDesc(rawDesc *roachpb.Value) bool {
+	var desc descpb.Descriptor
+	if err := rawDesc.GetProto(&desc); err != nil {
+		return false
+	}
+	switch t := desc.GetUnion().(type) {
+	case *descpb.Descriptor_Table:
+		if t.Table.IsView() && !t.Table.MaterializedView() {
+			return false
+		}
+		return true
+	case *descpb.Descriptor_Database:
+		return false
+	case *descpb.Descriptor_Type:
+		return false
+	case *descpb.Descriptor_Schema:
+		return false
+	default:
+		panic(errors.AssertionFailedf("unexpected descriptor type %#v", &desc))
+	}
 }

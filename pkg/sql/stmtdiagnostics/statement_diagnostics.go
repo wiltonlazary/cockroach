@@ -12,15 +12,14 @@ package stmtdiagnostics
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -36,7 +35,7 @@ import (
 )
 
 var pollingInterval = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.TenantReadOnly,
 	"sql.stmt_diagnostics.poll_interval",
 	"rate at which the stmtdiagnostics.Registry polls for requests, set to zero to disable",
 	10*time.Second)
@@ -54,6 +53,35 @@ var bundleChunkSize = settings.RegisterByteSizeSetting(
 	},
 )
 
+// collectUntilExpiration enables continuous collection of statement bundles for
+// requests that declare a sampling probability and have an expiration
+// timestamp.
+//
+// This setting should be used with some caution, enabling it would start
+// accruing diagnostic bundles that meet a certain latency threshold until the
+// request expires. It's worth nothing that there's no automatic GC of bundles
+// today (best you can do is `cockroach statement-diag delete --all`). This
+// setting also captures multiple bundles for a single diagnostic request which
+// does not fit well with our current scheme of one-bundle-per-completed. What
+// it does internally is refuse to mark a "continuous" request as completed
+// until it has expired, accumulating bundles until that point. The UI
+// integration is incomplete -- only the most recently collected bundle is shown
+// once the request is marked as completed. The full set can be retrieved using
+// `cockroach statement-diag download <bundle-id>`. This setting is primarily
+// intended for low-overhead trace capture during tail latency investigations,
+// experiments, and escalations under supervision.
+//
+// TODO(irfansharif): Longer term we should rip this out in favor of keeping a
+// bounded set of bundles around per-request/fingerprint. See #82896 for more
+// details.
+var collectUntilExpiration = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"sql.stmt_diagnostics.collect_continuously.enabled",
+	"collect diagnostic bundles continuously until request expiration (to be "+
+		"used with care, only has an effect if the diagnostic request has an "+
+		"expiration and a sampling probability set)",
+	false)
+
 // Registry maintains a view on the statement fingerprints
 // on which data is to be collected (i.e. system.statement_diagnostics_requests)
 // and provides utilities for checking a query against this list and satisfying
@@ -65,36 +93,29 @@ type Registry struct {
 		syncutil.Mutex
 		// requests waiting for the right query to come along. The conditional
 		// requests are left in this map until they either are satisfied or
-		// expire (i.e. they never enter ongoing map).
+		// expire (i.e. they never enter unconditionalOngoing map).
 		requestFingerprints map[RequestID]Request
 		// ids of unconditional requests that this node is in the process of
 		// servicing.
-		ongoing map[RequestID]Request
+		unconditionalOngoing map[RequestID]Request
 
 		// epoch is observed before reading system.statement_diagnostics_requests, and then
 		// checked again before loading the tables contents. If the value changed in
 		// between, then the table contents might be stale.
 		epoch int
-	}
-	st     *cluster.Settings
-	ie     sqlutil.InternalExecutor
-	db     *kv.DB
-	gossip gossip.OptionalGossip
 
-	// gossipUpdateChan is used to notify the polling loop that a diagnostics
-	// request has been added. The gossip callback will not block sending on this
-	// channel.
-	gossipUpdateChan chan RequestID
-	// gossipCancelChan is used to notify the polling loop that a diagnostics
-	// request has been canceled. The gossip callback will not block sending on
-	// this channel.
-	gossipCancelChan chan RequestID
+		rand *rand.Rand
+	}
+	st *cluster.Settings
+	ie sqlutil.InternalExecutor
+	db *kv.DB
 }
 
 // Request describes a statement diagnostics request along with some conditional
 // information.
 type Request struct {
 	fingerprint         string
+	samplingProbability float64
 	minExecutionLatency time.Duration
 	expiresAt           time.Time
 }
@@ -107,30 +128,33 @@ func (r *Request) isConditional() bool {
 	return r.minExecutionLatency != 0
 }
 
+// continueCollecting returns true if we want to continue collecting bundles for
+// this request.
+func (r *Request) continueCollecting(st *cluster.Settings) bool {
+	return collectUntilExpiration.Get(&st.SV) && // continuous collection must be enabled
+		r.samplingProbability != 0 && !r.expiresAt.IsZero() && // conditions for continuous collection must be set
+		!r.isExpired(timeutil.Now()) // the request must not have expired yet
+}
+
 // NewRegistry constructs a new Registry.
-func NewRegistry(
-	ie sqlutil.InternalExecutor, db *kv.DB, gw gossip.OptionalGossip, st *cluster.Settings,
-) *Registry {
+func NewRegistry(ie sqlutil.InternalExecutor, db *kv.DB, st *cluster.Settings) *Registry {
 	r := &Registry{
-		ie:               ie,
-		db:               db,
-		gossip:           gw,
-		gossipUpdateChan: make(chan RequestID, 1),
-		gossipCancelChan: make(chan RequestID, 1),
-		st:               st,
+		ie: ie,
+		db: db,
+		st: st,
 	}
-	// Some tests pass a nil gossip, and gossip is not available on SQL tenant
-	// servers.
-	g, ok := gw.Optional(47893)
-	if ok && g != nil {
-		g.RegisterCallback(gossip.KeyGossipStatementDiagnosticsRequest, r.gossipNotification)
-	}
+	r.mu.rand = rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	return r
 }
 
 // Start will start the polling loop for the Registry.
 func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) {
 	ctx, _ = stopper.WithCancelOnQuiesce(ctx)
+
+	// Since background statement diagnostics collection is not under user
+	// control, exclude it from cost accounting and control.
+	ctx = multitenant.WithTenantCostControlExemption(ctx)
+
 	// NB: The only error that should occur here would be if the server were
 	// shutting down so let's swallow it.
 	_ = stopper.RunAsyncTask(ctx, "stmt-diag-poll", r.poll)
@@ -175,17 +199,6 @@ func (r *Registry) poll(ctx context.Context) {
 		select {
 		case <-pollIntervalChanged:
 			continue // go back around and maybe reset the timer
-		case reqID := <-r.gossipUpdateChan:
-			if r.findRequest(reqID) {
-				continue // request already exists, don't do anything
-			}
-			// Poll the data.
-		case reqID := <-r.gossipCancelChan:
-			r.cancelRequest(reqID)
-			// No need to poll the data (unlike above) because we don't have to
-			// read anything of the system table to remove the request from the
-			// registry.
-			continue
 		case <-timer.C:
 			timer.Read = true
 		case <-ctx.Done():
@@ -193,11 +206,6 @@ func (r *Registry) poll(ctx context.Context) {
 		}
 		poll()
 	}
-}
-
-// TODO(yuzefovich): remove this in 22.2.
-func (r *Registry) isMinExecutionLatencySupported(ctx context.Context) bool {
-	return r.st.Version.IsActive(ctx, clusterversion.AlterSystemStmtDiagReqs)
 }
 
 // RequestID is the ID of a diagnostics request, corresponding to the id
@@ -215,6 +223,7 @@ func (r *Registry) addRequestInternalLocked(
 	ctx context.Context,
 	id RequestID,
 	queryFingerprint string,
+	samplingProbability float64,
 	minExecutionLatency time.Duration,
 	expiresAt time.Time,
 ) {
@@ -227,15 +236,10 @@ func (r *Registry) addRequestInternalLocked(
 	}
 	r.mu.requestFingerprints[id] = Request{
 		fingerprint:         queryFingerprint,
+		samplingProbability: samplingProbability,
 		minExecutionLatency: minExecutionLatency,
 		expiresAt:           expiresAt,
 	}
-}
-
-func (r *Registry) findRequest(requestID RequestID) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.findRequestLocked(requestID)
 }
 
 // findRequestLocked returns whether the request already exists. If the request
@@ -250,7 +254,7 @@ func (r *Registry) findRequestLocked(requestID RequestID) bool {
 		}
 		return true
 	}
-	_, ok = r.mu.ongoing[requestID]
+	_, ok = r.mu.unconditionalOngoing[requestID]
 	return ok
 }
 
@@ -260,54 +264,60 @@ func (r *Registry) cancelRequest(requestID RequestID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.mu.requestFingerprints, requestID)
-	delete(r.mu.ongoing, requestID)
+	delete(r.mu.unconditionalOngoing, requestID)
 }
 
 // InsertRequest is part of the StmtDiagnosticsRequester interface.
 func (r *Registry) InsertRequest(
 	ctx context.Context,
 	stmtFingerprint string,
+	samplingProbability float64,
 	minExecutionLatency time.Duration,
 	expiresAfter time.Duration,
 ) error {
-	_, err := r.insertRequestInternal(ctx, stmtFingerprint, minExecutionLatency, expiresAfter)
+	_, err := r.insertRequestInternal(ctx, stmtFingerprint, samplingProbability, minExecutionLatency, expiresAfter)
 	return err
 }
 
 func (r *Registry) insertRequestInternal(
 	ctx context.Context,
 	stmtFingerprint string,
+	samplingProbability float64,
 	minExecutionLatency time.Duration,
 	expiresAfter time.Duration,
 ) (RequestID, error) {
-	g, err := r.gossip.OptionalErr(48274)
-	if err != nil {
-		return 0, err
+	isSamplingProbabilitySupported := r.st.Version.IsActive(ctx, clusterversion.SampledStmtDiagReqs)
+	if !isSamplingProbabilitySupported && samplingProbability != 0 {
+		return 0, errors.New(
+			"sampling probability only supported after 22.2 version migrations have completed",
+		)
 	}
-
-	if !r.isMinExecutionLatencySupported(ctx) {
-		if minExecutionLatency != 0 || expiresAfter != 0 {
-			return 0, errors.New(
-				"conditional statement diagnostics are only supported " +
-					"after 22.1 version migrations have completed",
-			)
+	if samplingProbability != 0 {
+		if samplingProbability < 0 || samplingProbability > 1 {
+			return 0, errors.Newf(
+				"expected sampling probability in range [0.0, 1.0], got %f",
+				samplingProbability)
+		}
+		if minExecutionLatency == 0 {
+			return 0, errors.Newf(
+				"got non-zero sampling probability %f and empty min exec latency",
+				minExecutionLatency)
 		}
 	}
 
 	var reqID RequestID
 	var expiresAt time.Time
-	err = r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+	err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Check if there's already a pending request for this fingerprint.
-		var extraConditions string
-		if r.isMinExecutionLatencySupported(ctx) {
-			extraConditions = " AND (expires_at IS NULL OR expires_at > now())"
-		}
 		row, err := r.ie.QueryRowEx(ctx, "stmt-diag-check-pending", txn,
 			sessiondata.InternalExecutorOverride{
-				User: security.RootUserName(),
+				User: username.RootUserName(),
 			},
-			fmt.Sprintf("SELECT count(1) FROM system.statement_diagnostics_requests "+
-				"WHERE completed = false AND statement_fingerprint = $1%s", extraConditions),
+			`SELECT count(1) FROM system.statement_diagnostics_requests
+				WHERE
+					completed = false AND
+					statement_fingerprint = $1 AND
+					(expires_at IS NULL OR expires_at > now())`,
 			stmtFingerprint)
 		if err != nil {
 			return err
@@ -325,9 +335,13 @@ func (r *Registry) insertRequestInternal(
 
 		now := timeutil.Now()
 		insertColumns := "statement_fingerprint, requested_at"
-		qargs := make([]interface{}, 2, 4)
+		qargs := make([]interface{}, 2, 5)
 		qargs[0] = stmtFingerprint // statement_fingerprint
 		qargs[1] = now             // requested_at
+		if samplingProbability != 0 {
+			insertColumns += ", sampling_probability"
+			qargs = append(qargs, samplingProbability) // sampling_probability
+		}
 		if minExecutionLatency != 0 {
 			insertColumns += ", min_execution_latency"
 			qargs = append(qargs, minExecutionLatency) // min_execution_latency
@@ -345,7 +359,7 @@ func (r *Registry) insertRequestInternal(
 			insertColumns + ") VALUES (" + valuesClause + ") RETURNING id;"
 		row, err = r.ie.QueryRowEx(
 			ctx, "stmt-diag-insert-request", txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			stmt, qargs...,
 		)
 		if err != nil {
@@ -364,109 +378,78 @@ func (r *Registry) insertRequestInternal(
 	// Manually insert the request in the (local) registry. This lets this node
 	// pick up the request quickly if the right query comes around, without
 	// waiting for the poller.
-	r.mu.Lock()
-	r.mu.epoch++
-	r.addRequestInternalLocked(ctx, reqID, stmtFingerprint, minExecutionLatency, expiresAt)
-	r.mu.Unlock()
-
-	// Notify all the other nodes that they have to poll.
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, uint64(reqID))
-	if err := g.AddInfo(gossip.KeyGossipStatementDiagnosticsRequest, buf, 0 /* ttl */); err != nil {
-		log.Warningf(ctx, "error notifying of diagnostics request: %s", err)
-	}
+	func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.mu.epoch++
+		r.addRequestInternalLocked(ctx, reqID, stmtFingerprint, samplingProbability, minExecutionLatency, expiresAt)
+	}()
 
 	return reqID, nil
 }
 
 // CancelRequest is part of the server.StmtDiagnosticsRequester interface.
-func (r *Registry) CancelRequest(ctx context.Context, stmtFingerprint string) error {
-	g, err := r.gossip.OptionalErr(48274)
-	if err != nil {
-		return err
-	}
-
-	if !r.isMinExecutionLatencySupported(ctx) {
-		// If conditional diagnostics are not supported for this cluster yet,
-		// then we cannot cancel the request.
-		return errors.New(
-			"statement diagnostics can only be canceled after 22.1 version migrations have completed",
-		)
-	}
-
+func (r *Registry) CancelRequest(ctx context.Context, requestID int64) error {
 	row, err := r.ie.QueryRowEx(ctx, "stmt-diag-cancel-request", nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
+			User: username.RootUserName(),
 		},
 		// Rather than deleting the row from the table, we choose to mark the
 		// request as "expired" by setting `expires_at` into the past. This will
 		// allow any queries that are currently being traced for this request to
 		// write their collected bundles.
-		fmt.Sprintf("UPDATE system.statement_diagnostics_requests SET expires_at = '1970-01-01' "+
-			"WHERE completed = false AND statement_fingerprint = '%s' "+
-			"AND (expires_at IS NULL OR expires_at > now()) RETURNING id;", stmtFingerprint),
+		"UPDATE system.statement_diagnostics_requests SET expires_at = '1970-01-01' "+
+			"WHERE completed = false AND id = $1 "+
+			"AND (expires_at IS NULL OR expires_at > now()) RETURNING id;",
+		requestID,
 	)
 	if err != nil {
 		return err
 	}
+
 	if row == nil {
 		// There is no pending diagnostics request with the given fingerprint.
-		return errors.Newf("no pending request found for the fingerprint: %s", stmtFingerprint)
+		return errors.Newf("no pending request found for the fingerprint: %s", requestID)
 	}
-	reqID := RequestID(tree.MustBeDInt(row[0]))
 
+	reqID := RequestID(requestID)
 	r.cancelRequest(reqID)
-
-	// Notify all the other nodes that this request has been canceled.
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, uint64(reqID))
-	if err := g.AddInfo(gossip.KeyGossipStatementDiagnosticsRequestCancellation, buf, 0 /* ttl */); err != nil {
-		log.Warningf(ctx, "error notifying of diagnostics request cancellation: %s", err)
-	}
 
 	return nil
 }
 
-// IsExecLatencyConditionMet returns true if the completed request's execution
-// latency satisfies the request's condition. If false is returned, it inlines
-// the logic of RemoveOngoing.
-func (r *Registry) IsExecLatencyConditionMet(
-	requestID RequestID, req Request, execLatency time.Duration,
-) bool {
-	if req.minExecutionLatency <= execLatency {
-		return true
-	}
-	// This is a conditional request and the condition is not satisfied, so we
-	// only need to remove the request if it has expired.
-	if req.isExpired(timeutil.Now()) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		delete(r.mu.requestFingerprints, requestID)
-	}
-	return false
+// IsConditionSatisfied returns whether the completed request satisfies its
+// condition.
+func (r *Registry) IsConditionSatisfied(req Request, execLatency time.Duration) bool {
+	return req.minExecutionLatency <= execLatency
 }
 
-// RemoveOngoing removes the given request from the list of ongoing queries.
-func (r *Registry) RemoveOngoing(requestID RequestID, req Request) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if req.isConditional() {
-		if req.isExpired(timeutil.Now()) {
+// MaybeRemoveRequest checks whether the request needs to be removed from the
+// local Registry and removes it if so. Note that the registries on other nodes
+// will learn about it via polling of the system table.
+func (r *Registry) MaybeRemoveRequest(requestID RequestID, req Request, execLatency time.Duration) {
+	// We should remove the request from the registry if its condition is
+	// satisfied unless we want to continue collecting bundles for this request.
+	shouldRemove := r.IsConditionSatisfied(req, execLatency) && !req.continueCollecting(r.st)
+	// Always remove the expired requests.
+	if shouldRemove || req.isExpired(timeutil.Now()) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if req.isConditional() {
 			delete(r.mu.requestFingerprints, requestID)
+		} else {
+			delete(r.mu.unconditionalOngoing, requestID)
 		}
-	} else {
-		delete(r.mu.ongoing, requestID)
 	}
 }
 
 // ShouldCollectDiagnostics checks whether any data should be collected for the
 // given query, which is the case if the registry has a request for this
-// statement's fingerprint; in this case ShouldCollectDiagnostics will return
-// true again on this node for the same diagnostics request only for conditional
-// requests.
+// statement's fingerprint (and assuming probability conditions hold); in this
+// case ShouldCollectDiagnostics will return true again on this node for the
+// same diagnostics request only for conditional requests.
 //
-// If shouldCollect is true, RemoveOngoing needs to be called (which is inlined
-// by IsExecLatencyConditionMet when that returns false).
+// If shouldCollect is true, MaybeRemoveRequest needs to be called.
 func (r *Registry) ShouldCollectDiagnostics(
 	ctx context.Context, fingerprint string,
 ) (shouldCollect bool, reqID RequestID, req Request) {
@@ -491,17 +474,21 @@ func (r *Registry) ShouldCollectDiagnostics(
 	}
 
 	if reqID == 0 {
-		return false, 0, req
+		return false, 0, Request{}
 	}
 
 	if !req.isConditional() {
-		if r.mu.ongoing == nil {
-			r.mu.ongoing = make(map[RequestID]Request)
+		if r.mu.unconditionalOngoing == nil {
+			r.mu.unconditionalOngoing = make(map[RequestID]Request)
 		}
-		r.mu.ongoing[reqID] = req
+		r.mu.unconditionalOngoing[reqID] = req
 		delete(r.mu.requestFingerprints, reqID)
 	}
-	return true, reqID, req
+
+	if req.samplingProbability == 0 || r.mu.rand.Float64() < req.samplingProbability {
+		return true, reqID, req
+	}
+	return false, 0, Request{}
 }
 
 // InsertStatementDiagnostics inserts a trace into system.statement_diagnostics.
@@ -517,16 +504,34 @@ func (r *Registry) ShouldCollectDiagnostics(
 func (r *Registry) InsertStatementDiagnostics(
 	ctx context.Context,
 	requestID RequestID,
+	req Request,
 	stmtFingerprint string,
 	stmt string,
 	bundle []byte,
 	collectionErr error,
 ) (CollectedInstanceID, error) {
 	var diagID CollectedInstanceID
+	if ctx.Err() != nil {
+		// The only two possible errors on the context are the context
+		// cancellation or the context deadline being exceeded. The former seems
+		// more likely, and the cancellation is most likely to have occurred due
+		// to a statement timeout, so we still want to proceed with saving the
+		// statement bundle. Thus, we override the canceled context, but first
+		// we'll log the error as a warning.
+		log.Warningf(
+			ctx, "context has an error when saving the bundle, proceeding "+
+				"with the background one (with deadline of 10 seconds): %v", ctx.Err(),
+		)
+		// We want to be conservative, so we add a deadline of 10 seconds on top
+		// of the background context.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second) // nolint:context
+		defer cancel()
+	}
 	err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		if requestID != 0 {
 			row, err := r.ie.QueryRowEx(ctx, "stmt-diag-check-completed", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				"SELECT count(1) FROM system.statement_diagnostics_requests WHERE id = $1 AND completed = false",
 				requestID)
 			if err != nil {
@@ -562,7 +567,7 @@ func (r *Registry) InsertStatementDiagnostics(
 			// Insert the chunk into system.statement_bundle_chunks.
 			row, err := r.ie.QueryRowEx(
 				ctx, "stmt-bundle-chunks-insert", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				"INSERT INTO system.statement_bundle_chunks(description, data) VALUES ($1, $2) RETURNING id",
 				"statement diagnostics bundle",
 				tree.NewDBytes(tree.DBytes(chunk)),
@@ -581,10 +586,10 @@ func (r *Registry) InsertStatementDiagnostics(
 
 		collectionTime := timeutil.Now()
 
-		// Insert the trace into system.statement_diagnostics.
+		// Insert the collection metadata into system.statement_diagnostics.
 		row, err := r.ie.QueryRowEx(
 			ctx, "stmt-diag-insert", txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 			"INSERT INTO system.statement_diagnostics "+
 				"(statement_fingerprint, statement, collected_at, bundle_chunks, error) "+
 				"VALUES ($1, $2, $3, $4, $5) RETURNING id",
@@ -599,12 +604,28 @@ func (r *Registry) InsertStatementDiagnostics(
 		diagID = CollectedInstanceID(*row[0].(*tree.DInt))
 
 		if requestID != 0 {
-			// Mark the request from system.statement_diagnostics_request as completed.
+			// Link the request from system.statement_diagnostics_request to the
+			// diagnostic ID we just collected, marking it as completed if we're
+			// able.
+			shouldMarkCompleted := true
+			if collectUntilExpiration.Get(&r.st.SV) {
+				// Two other conditions need to hold true for us to continue
+				// capturing future traces, i.e. not mark this request as
+				// completed.
+				// - Requests need to be of the sampling sort (also implies
+				//   there's a latency threshold) -- a crude measure to prevent
+				//   against unbounded collection;
+				// - Requests need to have an expiration set -- same reason as
+				// above.
+				if req.samplingProbability > 0 && !req.expiresAt.IsZero() {
+					shouldMarkCompleted = false
+				}
+			}
 			_, err := r.ie.ExecEx(ctx, "stmt-diag-mark-completed", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				"UPDATE system.statement_diagnostics_requests "+
-					"SET completed = true, statement_diagnostics_id = $1 WHERE id = $2",
-				diagID, requestID)
+					"SET completed = $1, statement_diagnostics_id = $2 WHERE id = $3",
+				shouldMarkCompleted, diagID, requestID)
 			if err != nil {
 				return err
 			}
@@ -613,7 +634,7 @@ func (r *Registry) InsertStatementDiagnostics(
 			// This is necessary because the UI uses this table to discover completed
 			// diagnostics.
 			_, err := r.ie.ExecEx(ctx, "stmt-diag-add-completed", txn,
-				sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+				sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 				"INSERT INTO system.statement_diagnostics_requests"+
 					" (completed, statement_fingerprint, statement_diagnostics_id, requested_at)"+
 					" VALUES (true, $1, $2, $3)",
@@ -634,7 +655,8 @@ func (r *Registry) InsertStatementDiagnostics(
 // updates r.mu.requests accordingly.
 func (r *Registry) pollRequests(ctx context.Context) error {
 	var rows []tree.Datums
-	isMinExecutionLatencySupported := r.isMinExecutionLatencySupported(ctx)
+	isSamplingProbabilitySupported := r.st.Version.IsActive(ctx, clusterversion.SampledStmtDiagReqs)
+
 	// Loop until we run the query without straddling an epoch increment.
 	for {
 		r.mu.Lock()
@@ -642,17 +664,17 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 		r.mu.Unlock()
 
 		var extraColumns string
-		var extraConditions string
-		if isMinExecutionLatencySupported {
-			extraColumns = ", min_execution_latency, expires_at"
-			extraConditions = " AND (expires_at IS NULL OR expires_at > now())"
+		if isSamplingProbabilitySupported {
+			extraColumns = ", sampling_probability"
 		}
 		it, err := r.ie.QueryIteratorEx(ctx, "stmt-diag-poll", nil, /* txn */
 			sessiondata.InternalExecutorOverride{
-				User: security.RootUserName(),
+				User: username.RootUserName(),
 			},
-			fmt.Sprintf("SELECT id, statement_fingerprint%s FROM system.statement_diagnostics_requests "+
-				"WHERE completed = false%s", extraColumns, extraConditions))
+			fmt.Sprintf(`SELECT id, statement_fingerprint, min_execution_latency, expires_at%s
+				FROM system.statement_diagnostics_requests
+				WHERE completed = false AND (expires_at IS NULL OR expires_at > now())`, extraColumns),
+		)
 		if err != nil {
 			return err
 		}
@@ -684,16 +706,26 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 		stmtFingerprint := string(*row[1].(*tree.DString))
 		var minExecutionLatency time.Duration
 		var expiresAt time.Time
-		if isMinExecutionLatencySupported {
-			if minExecLatency, ok := row[2].(*tree.DInterval); ok {
-				minExecutionLatency = time.Duration(minExecLatency.Nanos())
-			}
-			if e, ok := row[3].(*tree.DTimestampTZ); ok {
-				expiresAt = e.Time
+		var samplingProbability float64
+
+		if minExecLatency, ok := row[2].(*tree.DInterval); ok {
+			minExecutionLatency = time.Duration(minExecLatency.Nanos())
+		}
+		if e, ok := row[3].(*tree.DTimestampTZ); ok {
+			expiresAt = e.Time
+		}
+		if isSamplingProbabilitySupported {
+			if prob, ok := row[4].(*tree.DFloat); ok {
+				samplingProbability = float64(*prob)
+				if samplingProbability < 0 || samplingProbability > 1 {
+					log.Warningf(ctx, "malformed sampling probability for request %d: %f (expected in range [0, 1]), resetting to 1.0",
+						id, samplingProbability)
+					samplingProbability = 1.0
+				}
 			}
 		}
 		ids.Add(int(id))
-		r.addRequestInternalLocked(ctx, id, stmtFingerprint, minExecutionLatency, expiresAt)
+		r.addRequestInternalLocked(ctx, id, stmtFingerprint, samplingProbability, minExecutionLatency, expiresAt)
 	}
 
 	// Remove all other requests.
@@ -703,27 +735,4 @@ func (r *Registry) pollRequests(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// gossipNotification is called in response to a gossip update informing us that
-// we need to poll.
-func (r *Registry) gossipNotification(s string, value roachpb.Value) {
-	switch s {
-	case gossip.KeyGossipStatementDiagnosticsRequest:
-		select {
-		case r.gossipUpdateChan <- RequestID(binary.LittleEndian.Uint64(value.RawBytes)):
-		default:
-			// Don't pile up on these requests and don't block gossip.
-		}
-	case gossip.KeyGossipStatementDiagnosticsRequestCancellation:
-		select {
-		case r.gossipCancelChan <- RequestID(binary.LittleEndian.Uint64(value.RawBytes)):
-		default:
-			// Don't pile up on these requests and don't block gossip.
-		}
-	default:
-		// We don't expect any other notifications. Perhaps in a future version
-		// we added other keys with the same prefix.
-		return
-	}
 }

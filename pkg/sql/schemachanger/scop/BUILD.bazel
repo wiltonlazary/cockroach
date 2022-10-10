@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 load("//build:STRINGER.bzl", "stringer")
 
@@ -5,6 +6,7 @@ go_library(
     name = "scop",
     srcs = [
         "backfill.go",
+        "metadata.go",
         "mutation.go",
         "ops.go",
         "phase.go",
@@ -22,7 +24,6 @@ go_library(
         "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/schemachanger/scpb",
-        "//pkg/sql/types",
     ],
 )
 
@@ -47,6 +48,10 @@ genrule(
     exec_tools = [
         ":gen-visitors",
     ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 genrule(
@@ -59,6 +64,10 @@ genrule(
     exec_tools = [
         ":gen-visitors",
     ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
 
 genrule(
@@ -70,6 +79,10 @@ genrule(
        """,
     exec_tools = [
         ":gen-visitors",
+    ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
     ],
 )
 
@@ -84,3 +97,5 @@ stringer(
     src = "phase.go",
     typ = "Phase",
 )
+
+get_x_data(name = "get_x_data")

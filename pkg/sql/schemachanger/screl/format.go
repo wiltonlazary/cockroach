@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"reflect"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/rel"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -62,6 +63,12 @@ func FormatElement(w redact.SafeWriter, e scpb.Element) (err error) {
 	w.SafeString(":{")
 	var written int
 	if err := Schema.IterateAttributes(e, func(attr rel.Attr, value interface{}) error {
+		switch attr {
+		case TemporaryIndexID, SourceIndexID:
+			if value == descpb.IndexID(0) {
+				return nil
+			}
+		}
 		if written > 0 {
 			w.SafeString(", ")
 		}

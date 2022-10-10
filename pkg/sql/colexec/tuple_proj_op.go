@@ -16,7 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -45,16 +45,15 @@ func NewTupleProjOp(
 
 type tupleProjOp struct {
 	colexecop.OneInputHelper
-
 	allocator         *colmem.Allocator
 	converter         *colconv.VecToDatumConverter
-	tupleContentsIdxs []int
 	outputType        *types.T
+	tupleContentsIdxs []int
 	outputIdx         int
 }
 
 var _ colexecop.Operator = &tupleProjOp{}
-var _ execinfra.Releasable = &tupleProjOp{}
+var _ execreleasable.Releasable = &tupleProjOp{}
 
 func (t *tupleProjOp) Next() coldata.Batch {
 	batch := t.Input.Next()
@@ -64,11 +63,6 @@ func (t *tupleProjOp) Next() coldata.Batch {
 	}
 	t.converter.ConvertBatchAndDeselect(batch)
 	projVec := batch.ColVec(t.outputIdx)
-	if projVec.MaybeHasNulls() {
-		// We need to make sure that there are no left over null values in the
-		// output vector.
-		projVec.Nulls().UnsetNulls()
-	}
 
 	t.allocator.PerformOperation([]coldata.Vec{projVec}, func() {
 		// Preallocate the tuples and their underlying datums in a contiguous

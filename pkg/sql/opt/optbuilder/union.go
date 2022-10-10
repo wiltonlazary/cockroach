@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -115,7 +116,6 @@ func (b *Builder) buildSetOp(
 // Throws an error if the scopes don't have the same number of columns, or when
 // column types don't match 1-1 or can't be cast to a single output type. The
 // error messages use clauseTag.
-//
 func (b *Builder) typeCheckSetOp(
 	leftScope, rightScope *scope, clauseTag string,
 ) (setOpTypes []*types.T, leftCastsNeeded, rightCastsNeeded bool) {
@@ -159,12 +159,12 @@ func determineUnionType(left, right *types.T, clauseTag string) *types.T {
 			// If the right type is "larger", use it.
 			src, tgt = left, right
 		}
-		if !tree.ValidCast(src, tgt, tree.CastContextExplicit) {
+		if !cast.ValidCast(src, tgt, cast.ContextExplicit) {
 			// Error if no cast exists from src to tgt.
 			// TODO(#75103): For legacy reasons, we check for a valid cast in
-			// the most permissive context, CastContextExplicit. To be
+			// the most permissive context, cast.ContextExplicit. To be
 			// consistent with Postgres, we should check for a valid cast in the
-			// most restrictive context, CastContextImplicit.
+			// most restrictive context, cast.ContextImplicit.
 			panic(pgerror.Newf(
 				pgcode.DatatypeMismatch,
 				"%v types %s and %s cannot be matched", clauseTag, left, right,

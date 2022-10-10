@@ -26,8 +26,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/sql"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/diagutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -43,37 +43,42 @@ import (
 // database and a testing diagnostics reporting server. The test implements the
 // following data-driven commands:
 //
-//  - exec
+//   - exec
 //
-//    Executes SQL statements against the database. Outputs no results on
-//    success. In case of error, outputs the error message.
+//     Executes SQL statements against the database. Outputs no results on
+//     success. In case of error, outputs the error message.
 //
-//  - feature-allowlist
+//   - feature-allowlist
 //
-//    The input for this command is not SQL, but a list of regular expressions.
-//    Tests that follow (until the next feature-allowlist command) will only
-//    output counters that match a regexp in this allow list.
+//     The input for this command is not SQL, but a list of regular expressions.
+//     Tests that follow (until the next feature-allowlist command) will only
+//     output counters that match a regexp in this allow list.
 //
-//  - feature-usage, feature-counters
+//   - feature-usage, feature-counters
 //
-//    Executes SQL statements and then outputs the feature counters from the
-//    allowlist that have been reported to the diagnostic server. The first
-//    variant outputs only the names of the counters that changed; the second
-//    variant outputs the counts as well. It is necessary to use
-//    feature-allowlist before these commands to avoid test flakes (e.g. because
-//    of counters that are changed by looking up descriptors).
-//    TODO(yuzefovich): counters currently don't really work because they are
-//    reset before executing every statement by reporter.ReportDiagnostics.
+//     Executes SQL statements and then outputs the feature counters from the
+//     allowlist that have been reported to the diagnostic server. The first
+//     variant outputs only the names of the counters that changed; the second
+//     variant outputs the counts as well. It is necessary to use
+//     feature-allowlist before these commands to avoid test flakes (e.g. because
+//     of counters that are changed by looking up descriptors).
+//     TODO(yuzefovich): counters currently don't really work because they are
+//     reset before executing every statement by reporter.ReportDiagnostics.
 //
-//  - schema
+//   - schema
 //
-//    Outputs reported schema information.
+//     Outputs reported schema information.
 //
-//  - sql-stats
+//   - sql-stats
 //
-//    Executes SQL statements and then outputs information about reported sql
-//    statement statistics.
+//     Executes SQL statements and then outputs information about reported sql
+//     statement statistics.
 //
+//   - rewrite
+//
+//     Installs a rule to rewrite all matches of the regexp in the first
+//     line to the string in the second line. This is useful to eliminate
+//     non-determinism in the output.
 func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bool) {
 	// Note: these tests cannot be run in parallel (with each other or with other
 	// tests) because telemetry counters are global.
@@ -84,6 +89,21 @@ func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bo
 		var test telemetryTest
 		test.Start(t, serverArgs)
 		defer test.Close()
+
+		if testTenant || test.cluster.StartedDefaultTestTenant() {
+			// TODO(andyk): Re-enable these tests once tenant clusters fully
+			// support the features they're using.
+			switch path {
+			case "testdata/telemetry/execution",
+				// Index & multiregion are disabled because it requires
+				// multi-region syntax to be enabled for secondary tenants.
+				"testdata/telemetry/multiregion",
+				"testdata/telemetry/index",
+				"testdata/telemetry/planning",
+				"testdata/telemetry/sql-stats":
+				skip.WithIssue(t, 47893, "tenant clusters do not support SQL features used by this test")
+			}
+		}
 
 		// Run test against physical CRDB cluster.
 		t.Run("server", func(t *testing.T) {
@@ -97,15 +117,6 @@ func TelemetryTest(t *testing.T, serverArgs []base.TestServerArgs, testTenant bo
 		if testTenant {
 			// Run test against logical tenant cluster.
 			t.Run("tenant", func(t *testing.T) {
-				// TODO(andyk): Re-enable these tests once tenant clusters fully
-				// support the features they're using.
-				switch path {
-				case "testdata/telemetry/execution",
-					"testdata/telemetry/planning",
-					"testdata/telemetry/sql-stats":
-					skip.WithIssue(t, 47893, "tenant clusters do not support SQL features used by this test")
-				}
-
 				datadriven.RunTest(t, path, func(t *testing.T, td *datadriven.TestData) string {
 					sqlServer := test.server.SQLServer().(*sql.Server)
 					reporter := test.tenant.DiagnosticsReporter().(*diagnostics.Reporter)
@@ -126,6 +137,14 @@ type telemetryTest struct {
 	tenantDB       *gosql.DB
 	tempDirCleanup func()
 	allowlist      featureAllowlist
+	rewrites       []rewrite
+}
+
+// rewrite is used to rewrite portions of the output.
+// It can be used to remove non-deterministic output.
+type rewrite struct {
+	pattern     *regexp.Regexp
+	replacement string
 }
 
 func (tt *telemetryTest) Start(t *testing.T, serverArgs []base.TestServerArgs) {
@@ -174,7 +193,17 @@ func (tt *telemetryTest) RunTest(
 	db *gosql.DB,
 	reportDiags func(ctx context.Context),
 	sqlServer *sql.Server,
-) string {
+) (out string) {
+	defer func() {
+		if out == "" {
+			return
+		}
+		for _, r := range tt.rewrites {
+			in := out
+			out = r.pattern.ReplaceAllString(out, r.replacement)
+			tt.t.Log(r.pattern, r.replacement, in == out, r.pattern.MatchString(out), out)
+		}
+	}()
 	ctx := context.Background()
 	switch td.Cmd {
 	case "exec":
@@ -255,6 +284,21 @@ func (tt *telemetryTest) RunTest(
 		last := tt.diagSrv.LastRequestData()
 		buf.WriteString(formatSQLStats(last.SqlStats))
 		return buf.String()
+
+	case "rewrite":
+		lines := strings.Split(td.Input, "\n")
+		if len(lines) != 2 {
+			td.Fatalf(tt.t, "rewrite: expected two lines")
+		}
+		pattern, err := regexp.Compile(lines[0])
+		if err != nil {
+			td.Fatalf(tt.t, "rewrite: invalid pattern: %v", err)
+		}
+		tt.rewrites = append(tt.rewrites, rewrite{
+			pattern:     pattern,
+			replacement: lines[1],
+		})
+		return ""
 
 	default:
 		td.Fatalf(tt.t, "unknown command %s", td.Cmd)

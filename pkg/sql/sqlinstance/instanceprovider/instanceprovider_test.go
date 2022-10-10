@@ -43,9 +43,7 @@ func TestInstanceProvider(t *testing.T) {
 		*stop.Stopper, *slinstance.Instance, *slstorage.FakeStorage, *hlc.Clock,
 	) {
 		timeSource := timeutil.NewTestTimeSource()
-		clock := hlc.NewClock(func() int64 {
-			return timeSource.Now().UnixNano()
-		}, base.DefaultMaxClockOffset)
+		clock := hlc.NewClock(timeSource, base.DefaultMaxClockOffset)
 		settings := cluster.MakeTestingClusterSettingsWithVersions(
 			clusterversion.TestingBinaryVersion,
 			clusterversion.TestingBinaryMinSupportedVersion,
@@ -67,6 +65,7 @@ func TestInstanceProvider(t *testing.T) {
 		defer stopper.Stop(ctx)
 		instanceProvider := instanceprovider.NewTestInstanceProvider(stopper, slInstance, addr)
 		slInstance.Start(ctx)
+		instanceProvider.InitAndWaitForTest(ctx)
 		instanceID, sessionID, err := instanceProvider.Instance(ctx)
 		require.NoError(t, err)
 		require.Equal(t, expectedInstanceID, instanceID)
@@ -103,6 +102,7 @@ func TestInstanceProvider(t *testing.T) {
 		instanceProvider := instanceprovider.NewTestInstanceProvider(stopper, slInstance, "addr")
 		slInstance.Start(ctx)
 		instanceProvider.ShutdownSQLInstanceForTest(ctx)
+		instanceProvider.InitAndWaitForTest(ctx)
 		_, _, err := instanceProvider.Instance(ctx)
 		require.Error(t, err)
 		require.Equal(t, "instance never initialized", err.Error())

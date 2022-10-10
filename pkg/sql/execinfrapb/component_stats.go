@@ -11,7 +11,6 @@
 package execinfrapb
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -20,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/dustin/go-humanize"
 	"github.com/gogo/protobuf/types"
@@ -59,15 +57,15 @@ func FlowComponentID(instanceID base.SQLInstanceID, flowID FlowID) ComponentID {
 	}
 }
 
-// FlowIDTagKey is the key used for flow id tags in tracing spans.
 const (
-	FlowIDTagKey = tracing.TagPrefix + "flowid"
+	// FlowIDTagKey is the key used for flow id tags in tracing spans.
+	FlowIDTagKey = "cockroach.flowid"
 
 	// StreamIDTagKey is the key used for stream id tags in tracing spans.
-	StreamIDTagKey = tracing.TagPrefix + "streamid"
+	StreamIDTagKey = "cockroach.streamid"
 
 	// ProcessorIDTagKey is the key used for processor id tags in tracing spans.
-	ProcessorIDTagKey = tracing.TagPrefix + "processorid"
+	ProcessorIDTagKey = "cockroach.processorid"
 )
 
 // StatsForQueryPlan returns the statistics as a list of strings that can be
@@ -150,6 +148,9 @@ func (s *ComponentStats) formatStats(fn func(suffix string, value interface{})) 
 	}
 	if s.KV.BytesRead.HasValue() {
 		fn("KV bytes read", humanize.IBytes(s.KV.BytesRead.Value()))
+	}
+	if s.KV.BatchRequestsIssued.HasValue() {
+		fn("KV gRPC calls", humanizeutil.Count(s.KV.BatchRequestsIssued.Value()))
 	}
 	if s.KV.NumInterfaceSteps.HasValue() {
 		fn("MVCC step count (ext/int)",
@@ -249,6 +250,9 @@ func (s *ComponentStats) Union(other *ComponentStats) *ComponentStats {
 	if !result.KV.BytesRead.HasValue() {
 		result.KV.BytesRead = other.KV.BytesRead
 	}
+	if !result.KV.BatchRequestsIssued.HasValue() {
+		result.KV.BatchRequestsIssued = other.KV.BatchRequestsIssued
+	}
 
 	// Exec stats.
 	if !result.Exec.ExecTime.HasValue() {
@@ -340,6 +344,10 @@ func (s *ComponentStats) MakeDeterministic() {
 		// BytesRead is overridden to a useful value for tests.
 		s.KV.BytesRead.Set(8 * s.KV.TuplesRead.Value())
 	}
+	if s.KV.BatchRequestsIssued.HasValue() {
+		// BatchRequestsIssued is overridden to a useful value for tests.
+		s.KV.BatchRequestsIssued.Set(s.KV.TuplesRead.Value())
+	}
 
 	// Exec.
 	timeVal(&s.Exec.ExecTime)
@@ -402,7 +410,7 @@ func ExtractStatsFromSpans(
 
 // ExtractNodesFromSpans extracts a list of node ids from a set of tracing
 // spans.
-func ExtractNodesFromSpans(ctx context.Context, spans []tracingpb.RecordedSpan) util.FastIntSet {
+func ExtractNodesFromSpans(spans []tracingpb.RecordedSpan) util.FastIntSet {
 	var nodes util.FastIntSet
 	// componentStats is only used to check whether a structured payload item is
 	// of ComponentStats type.

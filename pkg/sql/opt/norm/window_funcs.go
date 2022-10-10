@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -53,17 +54,18 @@ func (c *CustomFuncs) MakeSegmentedOrdering(
 // precisely the property that lets us push limit operators below window
 // functions:
 //
-//		(Limit (Window $input) n) = (Window (Limit $input n))
+//	(Limit (Window $input) n) = (Window (Limit $input n))
 //
 // Note that the frame affects whether a given window function is prefix-safe or not.
 // rank() is prefix-safe under any frame, but avg():
-//  * is not prefix-safe under RANGE BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW
-//    (the default), because we might cut off mid-peer group. If we can
-//    guarantee that the ordering is over a key, then this becomes safe.
-//  * is not prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO UNBOUNDED
-//    FOLLOWING, because it needs to look at the entire partition.
-//  * is prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW,
-//    because it only needs to look at the rows up to any given row.
+//   - is not prefix-safe under RANGE BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW
+//     (the default), because we might cut off mid-peer group. If we can
+//     guarantee that the ordering is over a key, then this becomes safe.
+//   - is not prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO UNBOUNDED
+//     FOLLOWING, because it needs to look at the entire partition.
+//   - is prefix-safe under ROWS BETWEEN UNBOUNDED PRECEDING TO CURRENT ROW,
+//     because it only needs to look at the rows up to any given row.
+//
 // (We don't currently handle this case).
 //
 // This function is best-effort. It's OK to report a function not as
@@ -152,7 +154,7 @@ func (c *CustomFuncs) DerefOrderingChoice(result *props.OrderingChoice) props.Or
 // OffsetFollowing.
 func (c *CustomFuncs) HasRangeFrameWithOffset(w memo.WindowsExpr) bool {
 	for i := range w {
-		if w[i].Frame.Mode == tree.RANGE && w[i].Frame.HasOffset() {
+		if w[i].Frame.Mode == treewindow.RANGE && w[i].Frame.HasOffset() {
 			return true
 		}
 	}
@@ -176,10 +178,10 @@ func (c *CustomFuncs) MakeRowNumberWindowFunc() (fn memo.WindowsExpr, outputCol 
 	outputCol = c.mem.Metadata().AddColumn("row_num", types.Int)
 	private := &memo.WindowsItemPrivate{
 		Frame: memo.WindowFrame{
-			Mode:           tree.RANGE,
-			StartBoundType: tree.UnboundedPreceding,
-			EndBoundType:   tree.CurrentRow,
-			FrameExclusion: tree.NoExclusion,
+			Mode:           treewindow.RANGE,
+			StartBoundType: treewindow.UnboundedPreceding,
+			EndBoundType:   treewindow.CurrentRow,
+			FrameExclusion: treewindow.NoExclusion,
 		},
 		Col: outputCol,
 	}

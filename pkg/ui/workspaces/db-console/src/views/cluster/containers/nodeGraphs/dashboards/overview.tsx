@@ -12,11 +12,7 @@ import React from "react";
 import _ from "lodash";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
-import {
-  Metric,
-  Axis,
-  AxisUnits,
-} from "src/views/shared/components/metricQuery";
+import { Metric, Axis } from "src/views/shared/components/metricQuery";
 
 import {
   GraphDashboardProps,
@@ -24,14 +20,16 @@ import {
   storeIDsForNode,
 } from "./dashboardUtils";
 import { CapacityGraphTooltip } from "src/views/cluster/containers/nodeGraphs/dashboards/graphTooltips";
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
-export default function(props: GraphDashboardProps) {
+export default function (props: GraphDashboardProps) {
   const {
     nodeIDs,
-    nodesSummary,
     nodeSources,
     storeSources,
     tooltipSelection,
+    nodeDisplayNameByID,
+    storeIDsByNodeID,
   } = props;
 
   return [
@@ -85,7 +83,7 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.sql.service.latency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -126,8 +124,8 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={nid}
             name="cr.store.replicas"
-            title={nodeDisplayName(nodesSummary, nid)}
-            sources={storeIDsForNode(nodesSummary, nid)}
+            title={nodeDisplayName(nodeDisplayNameByID, nid)}
+            sources={storeIDsForNode(storeIDsByNodeID, nid)}
           />
         ))}
       </Axis>

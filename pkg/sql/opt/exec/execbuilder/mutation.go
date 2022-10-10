@@ -57,7 +57,7 @@ func (b *Builder) buildMutationInput(
 		}
 	}
 
-	input, err = b.ensureColumns(input, colList, inputExpr.ProvidedPhysical().Ordering)
+	input, err = b.ensureColumns(input, inputExpr, colList, inputExpr.ProvidedPhysical().Ordering)
 	if err != nil {
 		return execPlan{}, err
 	}
@@ -146,7 +146,10 @@ func (b *Builder) tryBuildFastPathInsert(ins *memo.InsertExpr) (_ execPlan, ok b
 	//     that we send, not a number of rows. We use this as a guideline only,
 	//     and there is no guarantee that we won't produce a bigger batch.)
 	values, ok := ins.Input.(*memo.ValuesExpr)
-	if !ok || values.ChildCount() > mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) || values.Relational().HasSubquery {
+	if !ok ||
+		values.ChildCount() > mutations.MaxBatchSize(false /* forceProductionMaxBatchSize */) ||
+		values.Relational().HasSubquery ||
+		values.Relational().HasUDF {
 		return execPlan{}, false, nil
 	}
 
@@ -889,11 +892,11 @@ func (b *Builder) buildFKCascades(withID opt.WithID, cascades memo.FKCascades) e
 // Mutations can commit the transaction as part of the same KV request,
 // potentially taking advantage of the 1PC optimization. This is not ok to do in
 // general; a sufficient set of conditions is:
-//   1. There is a single mutation in the query.
-//   2. The mutation is the root operator, or it is directly under a Project
-//      with no side-effecting expressions. An example of why we can't allow
-//      side-effecting expressions: if the projection encounters a
-//      division-by-zero error, the mutation shouldn't have been committed.
+//  1. There is a single mutation in the query.
+//  2. The mutation is the root operator, or it is directly under a Project
+//     with no side-effecting expressions. An example of why we can't allow
+//     side-effecting expressions: if the projection encounters a
+//     division-by-zero error, the mutation shouldn't have been committed.
 //
 // An extra condition relates to how the FK checks are run. If they run before
 // the mutation (via the insert fast path), auto commit is possible. If they run
@@ -920,11 +923,16 @@ func (b *Builder) canAutoCommit(rel memo.RelExpr) bool {
 		// Allow Project on top, as long as the expressions are not side-effecting.
 		proj := rel.(*memo.ProjectExpr)
 		for i := 0; i < len(proj.Projections); i++ {
-			if !proj.Projections[i].ScalarProps().VolatilitySet.IsLeakProof() {
+			if !proj.Projections[i].ScalarProps().VolatilitySet.IsLeakproof() {
 				return false
 			}
 		}
 		return b.canAutoCommit(proj.Input)
+
+	case opt.DistributeOp:
+		// Distribute is currently a no-op, so check whether the input can
+		// auto-commit.
+		return b.canAutoCommit(rel.(*memo.DistributeExpr).Input)
 
 	default:
 		return false
@@ -934,7 +942,7 @@ func (b *Builder) canAutoCommit(rel memo.RelExpr) bool {
 // forUpdateLocking is the row-level locking mode used by mutations during their
 // initial row scan, when such locking is deemed desirable. The locking mode is
 // equivalent that used by a SELECT ... FOR UPDATE statement.
-var forUpdateLocking = &tree.LockingItem{Strength: tree.ForUpdate}
+var forUpdateLocking = opt.Locking{Strength: tree.ForUpdate}
 
 // shouldApplyImplicitLockingToMutationInput determines whether or not the
 // builder should apply a FOR UPDATE row-level locking mode to the initial row
@@ -971,9 +979,9 @@ func (b *Builder) shouldApplyImplicitLockingToMutationInput(mutExpr memo.RelExpr
 // existing rows) then this method determines whether the builder should perform
 // the following transformation:
 //
-//   UPDATE t = SELECT FROM t + INSERT INTO t
-//   =>
-//   UPDATE t = SELECT FROM t FOR UPDATE + INSERT INTO t
+//	UPDATE t = SELECT FROM t + INSERT INTO t
+//	=>
+//	UPDATE t = SELECT FROM t FOR UPDATE + INSERT INTO t
 //
 // The transformation is conditional on the UPDATE expression tree matching a
 // pattern. Specifically, the FOR UPDATE locking mode is only used during the

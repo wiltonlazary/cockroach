@@ -15,10 +15,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -145,7 +145,15 @@ func main() {
 	replaceFile(fileName, testName, issueNum)
 
 	// Update the package's BUILD.bazel.
-	if err := spawn("make", "bazel-generate"); err != nil {
+	devPath, err := exec.LookPath("./dev")
+	if err != nil {
+		fmt.Printf("./dev not found, trying dev\n")
+		devPath, err = exec.LookPath("dev")
+		if err != nil {
+			log.Fatal(errors.Wrapf(err, "no path found for dev"))
+		}
+	}
+	if err := spawn(devPath, "generate", "bazel"); err != nil {
 		log.Fatal(errors.Wrap(err, "failed to run bazel"))
 	}
 
@@ -202,7 +210,7 @@ Release note: None
 }
 
 func replaceFile(fileName, testName string, issueNum int) {
-	fileContents, err := ioutil.ReadFile(fileName)
+	fileContents, err := os.ReadFile(fileName)
 	if err != nil {
 		log.Fatal(errors.Wrapf(err, "failed to read file: %s", fileName))
 	}
@@ -252,7 +260,7 @@ func replaceFile(fileName, testName string, issueNum int) {
 		lines[insertLineIdx:]...,
 	)
 
-	if err := ioutil.WriteFile(fileName, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
+	if err := os.WriteFile(fileName, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
 		log.Fatal(errors.Wrapf(err, "failed to write file %s", fileContents))
 	}
 

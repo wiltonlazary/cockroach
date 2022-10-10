@@ -23,6 +23,7 @@ package colexec
 
 import (
 	"context"
+	"math/bits"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldataext"
@@ -103,14 +104,14 @@ func newSingleSorter_WITH_NULLS(t *types.T, dir execinfrapb.Ordering_Column_Dire
 // {{range .WidthOverloads}}
 
 type sort_TYPE_DIR_HANDLES_NULLSOp struct {
-	sortCol _GOTYPESLICE
 	// {{if .CanAbbreviate}}
 	allocator          *colmem.Allocator
 	abbreviatedSortCol []uint64
 	// {{end}}
 	nulls         *coldata.Nulls
-	order         []int
 	cancelChecker colexecutils.CancelChecker
+	sortCol       _GOTYPESLICE
+	order         []int
 }
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) init(
@@ -140,13 +141,10 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) reset() {
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sort() {
 	n := s.sortCol.Len()
-	s.quickSort(0, n, maxDepth(n))
+	s.pdqsort(0, n, bits.Len(uint(n)))
 }
 
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(partitions []int) {
-	if len(partitions) < 1 {
-		colexecerror.InternalError(errors.AssertionFailedf("invalid partitions list %v", partitions))
-	}
 	order := s.order
 	for i, partitionStart := range partitions {
 		var partitionEnd int
@@ -157,7 +155,7 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(partitions []int) {
 		}
 		s.order = order[partitionStart:partitionEnd]
 		n := partitionEnd - partitionStart
-		s.quickSort(0, n, maxDepth(n))
+		s.pdqsort(0, n, bits.Len(uint(n)))
 	}
 }
 
@@ -168,8 +166,9 @@ func (s *sort_TYPE_DIR_HANDLES_NULLSOp) sortPartitions(partitions []int) {
 // {{$isInt := or (eq .VecMethod "Int16") (eq .VecMethod "Int32")}}
 // {{$isInt = or ($isInt) (eq .VecMethod "Int64")}}
 // {{if and ($isInt) (not $nulls)}}
-//gcassert:inline
 // {{end}}
+//
+//gcassert:inline
 func (s *sort_TYPE_DIR_HANDLES_NULLSOp) Less(i, j int) bool {
 	// {{if $nulls}}
 	n1 := s.nulls.MaybeHasNulls() && s.nulls.NullAt(s.order[i])

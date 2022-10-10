@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/errors"
 )
@@ -25,7 +26,7 @@ type ComputedColumnRewritesMap map[string]tree.Expr
 
 // ParseComputedColumnRewrites parses a string of the form:
 //
-//   (before expression) -> (after expression) [, (before expression) -> (after expression) ...]
+//	(before expression) -> (after expression) [, (before expression) -> (after expression) ...]
 //
 // into a ComputedColumnRewritesMap.
 //
@@ -45,7 +46,7 @@ func ParseComputedColumnRewrites(val string) (ComputedColumnRewritesMap, error) 
 	result := make(ComputedColumnRewritesMap, len(set.Values))
 	for _, v := range set.Values {
 		binExpr, ok := v.(*tree.BinaryExpr)
-		if !ok || binExpr.Operator.Symbol != tree.JSONFetchVal {
+		if !ok || binExpr.Operator.Symbol != treebin.JSONFetchVal {
 			return nil, errors.Newf("invalid column rewrites expression (expected -> operator)")
 		}
 		left, ok := binExpr.Left.(*tree.ParenExpr)

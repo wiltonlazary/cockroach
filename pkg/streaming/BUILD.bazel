@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -7,9 +8,12 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/ccl/streamingccl/streampb",
+        "//pkg/jobs/jobspb",
         "//pkg/kv",
-        "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/eval",
         "//pkg/util/hlc",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
+
+get_x_data(name = "get_x_data")

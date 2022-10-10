@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 const envKVFlags = "ROACHTEST_KV_FLAGS"
@@ -55,8 +56,10 @@ func registerKV(r registry.Registry) {
 		disableLoadSplits        bool
 		encryption               bool
 		sequential               bool
-		admissionControlDisabled bool
+		globalMVCCRangeTombstone bool
 		concMultiplier           int
+		ssds                     int
+		raid0                    bool
 		duration                 time.Duration
 		tracing                  bool // `trace.debug.enable`
 		tags                     []string
@@ -80,8 +83,14 @@ func registerKV(r registry.Registry) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, nodes))
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(nodes+1))
 		startOpts := option.DefaultStartOpts()
-		startOpts.RoachprodOpts.EncryptedStores = opts.encryption
-		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Range(1, nodes))
+		if opts.ssds > 1 && !opts.raid0 {
+			startOpts.RoachprodOpts.StoreCount = opts.ssds
+		}
+		settings := install.MakeClusterSettings()
+		if opts.globalMVCCRangeTombstone {
+			settings.Env = append(settings.Env, "COCKROACH_GLOBAL_MVCC_RANGE_TOMBSTONE=true")
+		}
+		c.Start(ctx, t.L(), startOpts, settings, c.Range(1, nodes))
 
 		db := c.Conn(ctx, t.L(), 1)
 		defer db.Close()
@@ -95,7 +104,6 @@ func registerKV(r registry.Registry) {
 				t.Fatalf("failed to enable tracing: %v", err)
 			}
 		}
-		SetAdmissionControl(ctx, t, c, !opts.admissionControlDisabled)
 
 		t.Status("running workload")
 		m := c.NewMonitor(ctx, c.Range(1, nodes))
@@ -145,7 +153,7 @@ func registerKV(r registry.Registry) {
 				envFlags = " " + e
 			}
 
-			cmd := fmt.Sprintf("./workload run kv --init"+
+			cmd := fmt.Sprintf("./workload run kv --tolerate-errors --init"+
 				histograms+concurrency+splits+duration+readPercent+batchSize+blockSize+sequential+envFlags+
 				" {pgurl:1-%d}", nodes)
 			c.Run(ctx, c.Node(nodes+1), cmd)
@@ -171,10 +179,10 @@ func registerKV(r registry.Registry) {
 		{nodes: 3, cpus: 8, readPercent: 95, splits: -1 /* no splits */},
 		{nodes: 3, cpus: 32, readPercent: 0},
 		{nodes: 3, cpus: 32, readPercent: 95},
-		{nodes: 3, cpus: 32, readPercent: 0, admissionControlDisabled: true},
-		{nodes: 3, cpus: 32, readPercent: 95, admissionControlDisabled: true},
 		{nodes: 3, cpus: 32, readPercent: 0, splits: -1 /* no splits */},
 		{nodes: 3, cpus: 32, readPercent: 95, splits: -1 /* no splits */},
+		{nodes: 3, cpus: 32, readPercent: 0, globalMVCCRangeTombstone: true},
+		{nodes: 3, cpus: 32, readPercent: 95, globalMVCCRangeTombstone: true},
 
 		// Configs with large block sizes.
 		{nodes: 3, cpus: 8, readPercent: 0, blockSize: 1 << 12 /* 4 KB */},
@@ -185,10 +193,6 @@ func registerKV(r registry.Registry) {
 		{nodes: 3, cpus: 8, readPercent: 95, blockSize: 1 << 16 /* 64 KB */},
 		{nodes: 3, cpus: 32, readPercent: 0, blockSize: 1 << 16 /* 64 KB */},
 		{nodes: 3, cpus: 32, readPercent: 95, blockSize: 1 << 16 /* 64 KB */},
-		{nodes: 3, cpus: 32, readPercent: 0, blockSize: 1 << 16, /* 64 KB */
-			admissionControlDisabled: true},
-		{nodes: 3, cpus: 32, readPercent: 95, blockSize: 1 << 16, /* 64 KB */
-			admissionControlDisabled: true},
 
 		// Configs with large batch sizes.
 		{nodes: 3, cpus: 8, readPercent: 0, batchSize: 16},
@@ -198,6 +202,11 @@ func registerKV(r registry.Registry) {
 		{nodes: 3, cpus: 96, readPercent: 0},
 		{nodes: 3, cpus: 96, readPercent: 95},
 		{nodes: 4, cpus: 96, readPercent: 50, batchSize: 64},
+
+		// Configs for comparing single store and multi store clusters.
+		{nodes: 4, cpus: 8, readPercent: 95},
+		{nodes: 4, cpus: 8, readPercent: 95, ssds: 8},
+		{nodes: 4, cpus: 8, readPercent: 95, ssds: 8, raid0: true},
 
 		// Configs with encryption.
 		{nodes: 1, cpus: 8, readPercent: 0, encryption: true},
@@ -245,11 +254,17 @@ func registerKV(r registry.Registry) {
 		if opts.sequential {
 			nameParts = append(nameParts, "seq")
 		}
-		if opts.admissionControlDisabled {
-			nameParts = append(nameParts, "no-admission")
+		if opts.globalMVCCRangeTombstone {
+			nameParts = append(nameParts, "mvcc-range-keys=global")
 		}
 		if opts.concMultiplier != 0 { // support legacy test name which didn't include this multiplier
 			nameParts = append(nameParts, fmt.Sprintf("conc=%d", opts.concMultiplier))
+		}
+		if opts.ssds > 1 {
+			nameParts = append(nameParts, fmt.Sprintf("ssds=%d", opts.ssds))
+		}
+		if opts.raid0 {
+			nameParts = append(nameParts, "raid0")
 		}
 		if opts.disableLoadSplits {
 			nameParts = append(nameParts, "no-load-splitting")
@@ -257,18 +272,29 @@ func registerKV(r registry.Registry) {
 		if opts.tracing {
 			nameParts = append(nameParts, "tracing")
 		}
-		owner := registry.OwnerKV
+		owner := registry.OwnerTestEng
 		if opts.owner != "" {
 			owner = opts.owner
 		}
+		encryption := registry.EncryptionAlwaysDisabled
+		if opts.encryption {
+			encryption = registry.EncryptionAlwaysEnabled
+		}
+		cSpec := r.MakeClusterSpec(opts.nodes+1, spec.CPU(opts.cpus), spec.SSD(opts.ssds), spec.RAID0(opts.raid0))
+		var skip string
+		if opts.ssds != 0 && cSpec.Cloud != spec.GCE {
+			skip = fmt.Sprintf("multi-store tests are not supported on cloud %s", cSpec.Cloud)
+		}
 		r.Add(registry.TestSpec{
+			Skip:    skip,
 			Name:    strings.Join(nameParts, "/"),
 			Owner:   owner,
-			Cluster: r.MakeClusterSpec(opts.nodes+1, spec.CPU(opts.cpus)),
+			Cluster: cSpec,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runKV(ctx, t, c, opts)
 			},
-			Tags: opts.tags,
+			Tags:              opts.tags,
+			EncryptionSupport: encryption,
 		})
 	}
 }
@@ -371,13 +397,14 @@ func registerKVQuiescenceDead(r registry.Registry) {
 			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
 
-			WaitFor3XReplication(t, db)
+			err := WaitFor3XReplication(ctx, t, db)
+			require.NoError(t, err)
 
 			qps := func(f func()) float64 {
 
 				numInserts := func() float64 {
 					var v float64
-					if err := db.QueryRowContext(
+					if err = db.QueryRowContext(
 						ctx, `SELECT value FROM crdb_internal.node_metrics WHERE name = 'sql.insert.count'`,
 					).Scan(&v); err != nil {
 						t.Fatal(err)
@@ -402,8 +429,13 @@ func registerKVQuiescenceDead(r registry.Registry) {
 			qpsAllUp := qps(func() {
 				run(kv+" --seed 1 {pgurl:1}", true)
 			})
-			// Gracefully shut down third node (doesn't matter whether it's graceful or not).
-			c.Run(ctx, c.Node(nodes), "./cockroach quit --insecure --host=:{pgport:3}")
+			// Graceful shut down third node.
+			gracefulOpts := option.DefaultStopOpts()
+			gracefulOpts.RoachprodOpts.Sig = 15 // SIGTERM
+			gracefulOpts.RoachprodOpts.Wait = true
+			gracefulOpts.RoachprodOpts.MaxWait = 30
+			c.Stop(ctx, t.L(), gracefulOpts, c.Node(nodes))
+			// If graceful shutdown fails within 30 seconds, proceed with hard shutdown.
 			c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(nodes))
 			// Measure qps with node down (i.e. without quiescence).
 			qpsOneDown := qps(func() {
@@ -446,7 +478,8 @@ func registerKVGracefulDraining(r registry.Registry) {
 			db := c.Conn(ctx, t.L(), 1)
 			defer db.Close()
 
-			WaitFor3XReplication(t, db)
+			err := WaitFor3XReplication(ctx, t, db)
+			require.NoError(t, err)
 
 			t.Status("initializing workload")
 
@@ -574,7 +607,15 @@ func registerKVGracefulDraining(r registry.Registry) {
 						}
 					}
 					m.ExpectDeath()
-					c.Run(ctx, c.Node(nodes), "./cockroach quit --insecure --host=:{pgport:3}")
+					// Graceful drain: send SIGTERM, which should be sufficient
+					// to stop the node, followed by a non-graceful SIGKILL a
+					// bit later to clean up should the process have become
+					// stuck.
+					stopOpts := option.DefaultStopOpts()
+					stopOpts.RoachprodOpts.Sig = 15
+					stopOpts.RoachprodOpts.Wait = true
+					stopOpts.RoachprodOpts.MaxWait = 30
+					c.Stop(ctx, t.L(), stopOpts, c.Node(nodes))
 					c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(nodes))
 					t.Status("letting workload run with one node down")
 					select {
@@ -753,16 +794,17 @@ func registerKVRangeLookups(r registry.Registry) {
 				conns[i].Close()
 			}
 		}()
-		WaitFor3XReplication(t, conns[0])
+		err := WaitFor3XReplication(ctx, t, conns[0])
+		require.NoError(t, err)
 
 		m := c.NewMonitor(ctx, c.Range(1, nodes))
 		m.Go(func(ctx context.Context) error {
 			defer close(doneWorkload)
+			defer close(doneInit)
 			cmd := "./workload init kv --splits=1000 {pgurl:1}"
-			if err := c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
+			if err = c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
 				return err
 			}
-			close(doneInit)
 			concurrency := ifLocal(c, "", " --concurrency="+fmt.Sprint(nodes*64))
 			duration := " --duration=10m"
 			readPercent := " --read-percent=50"
@@ -772,7 +814,7 @@ func registerKVRangeLookups(r registry.Registry) {
 				concurrency+duration+readPercent+
 				" {pgurl:1-%d}", nodes)
 			start := timeutil.Now()
-			if err := c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
+			if err = c.RunE(ctx, c.Node(nodes+1), cmd); err != nil {
 				return err
 			}
 			end := timeutil.Now()
@@ -853,82 +895,4 @@ func registerKVRangeLookups(r registry.Registry) {
 			},
 		})
 	}
-}
-
-func registerKVMultiStoreWithOverload(r registry.Registry) {
-	runKV := func(ctx context.Context, t test.Test, c cluster.Cluster) {
-		nodes := c.Spec().NodeCount - 1
-		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, nodes))
-		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(nodes+1))
-		startOpts := option.DefaultStartOpts()
-		startOpts.RoachprodOpts.StoreCount = 2
-		c.Start(ctx, t.L(), startOpts, install.MakeClusterSettings(), c.Range(1, nodes))
-
-		db := c.Conn(ctx, t.L(), 1)
-		defer db.Close()
-		// db1 on store1 and db2 on store2. Writes to db2 will overload store2 and
-		// cause admission control to maintain health by queueing these
-		// operations. This will not affect reads and writes to db1.
-		for _, name := range []string{"db1", "db2"} {
-			constraint := "store1"
-			if name == "db2" {
-				constraint = "store2"
-			}
-			if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s", name)); err != nil {
-				t.Fatalf("failed to create %s: %v", name, err)
-			}
-			if _, err := db.ExecContext(ctx, fmt.Sprintf(
-				"ALTER DATABASE %s CONFIGURE ZONE USING constraints = '[+%s]', "+
-					"voter_constraints = '[+%s]', num_voters = 1", name, constraint, constraint)); err != nil {
-				t.Fatalf("failed to configure zone for %s: %v", name, err)
-			}
-		}
-		// Defensive, since admission control is enabled by default. This test can
-		// fail if admission control is disabled.
-		SetAdmissionControl(ctx, t, c, true)
-		if _, err := db.ExecContext(ctx,
-			"SET CLUSTER SETTING kv.range_split.by_load_enabled = 'false'"); err != nil {
-			t.Fatalf("failed to disable load based splitting: %v", err)
-		}
-		t.Status("running workload")
-		dur := 20 * time.Minute
-		duration := " --duration=" + ifLocal(c, "10s", dur.String())
-		histograms := " --histograms=" + t.PerfArtifactsDir() + "/stats.json"
-		m1 := c.NewMonitor(ctx, c.Range(1, nodes))
-		m1.Go(func(ctx context.Context) error {
-			dbRegular := " --db=db1"
-			concurrencyRegular := ifLocal(c, "", " --concurrency=8")
-			readPercentRegular := " --read-percent=95"
-			cmdRegular := fmt.Sprintf("./workload run kv --init"+
-				dbRegular+histograms+concurrencyRegular+duration+readPercentRegular+
-				" {pgurl:1-%d}", nodes)
-			c.Run(ctx, c.Node(nodes+1), cmdRegular)
-			return nil
-		})
-		m2 := c.NewMonitor(ctx, c.Range(1, nodes))
-		m2.Go(func(ctx context.Context) error {
-			dbOverload := " --db=db2"
-			concurrencyOverload := ifLocal(c, "", " --concurrency=64")
-			readPercentOverload := " --read-percent=0"
-			bs := 1 << 16 /* 64KB */
-			blockSizeOverload := fmt.Sprintf(" --min-block-bytes=%d --max-block-bytes=%d",
-				bs, bs)
-			cmdOverload := fmt.Sprintf("./workload run kv --init"+
-				dbOverload+histograms+concurrencyOverload+duration+readPercentOverload+blockSizeOverload+
-				" {pgurl:1-%d}", nodes)
-			c.Run(ctx, c.Node(nodes+1), cmdOverload)
-			return nil
-		})
-		m1.Wait()
-		m2.Wait()
-	}
-
-	r.Add(registry.TestSpec{
-		Name:    "kv/multi-store-with-overload",
-		Owner:   registry.OwnerKV,
-		Cluster: r.MakeClusterSpec(2, spec.CPU(8), spec.SSD(2)),
-		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-			runKV(ctx, t, c)
-		},
-	})
 }

@@ -12,12 +12,16 @@ package physical
 
 import (
 	"bytes"
+	"context"
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 )
 
 // Distribution represents the physical distribution of data for a relational
@@ -107,8 +111,14 @@ func (d *Distribution) FromLocality(locality roachpb.Locality) {
 // FromIndexScan sets the Distribution that results from scanning the given
 // index with the given constraint c (c can be nil).
 func (d *Distribution) FromIndexScan(
-	evalCtx *tree.EvalContext, index cat.Index, c *constraint.Constraint,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	tabMeta *opt.TableMeta,
+	ord cat.IndexOrdinal,
+	c *constraint.Constraint,
 ) {
+	tab := tabMeta.Table
+	index := tab.Index(ord)
 	if index.Table().IsVirtualTable() {
 		// Virtual tables do not have zone configurations.
 		return
@@ -153,8 +163,44 @@ func (d *Distribution) FromIndexScan(
 		}
 	}
 
+	// Populate the distribution for GLOBAL tables and REGIONAL BY TABLE.
 	if len(regions) == 0 {
-		regions = getRegionsFromZone(index.Zone())
+		regionsPopulated := false
+
+		if tab.IsGlobalTable() {
+			// Global tables can always be treated as local to the gateway region.
+			gatewayRegion, found := evalCtx.Locality.Find("region")
+			if found {
+				regions = make(map[string]struct{})
+				regions[gatewayRegion] = struct{}{}
+				regionsPopulated = true
+			}
+		} else if homeRegion, ok := tab.HomeRegion(); ok {
+			regions = make(map[string]struct{})
+			regions[homeRegion] = struct{}{}
+			regionsPopulated = true
+		} else {
+			// Use the leaseholder region(s), which should be the same as the home
+			// region of REGIONAL BY TABLE tables.
+			regions = getRegionsFromZone(index.Zone())
+			regionsPopulated = regions != nil
+		}
+		if !regionsPopulated {
+			// If the above methods failed to find a distribution, then the
+			// distribution is all regions in the database.
+			regionsNames, ok := tabMeta.GetRegionsInDatabase(ctx, evalCtx.Planner)
+			if !ok && evalCtx.SessionData().EnforceHomeRegion {
+				err := pgerror.New(pgcode.QueryHasNoHomeRegion,
+					"Query has no home region. Try accessing only tables defined in multi-region databases.")
+				panic(err)
+			}
+			if ok {
+				regions = make(map[string]struct{})
+				for _, regionName := range regionsNames {
+					regions[string(regionName)] = struct{}{}
+				}
+			}
+		}
 	}
 
 	// Convert to a slice and sort regions.
@@ -165,24 +211,39 @@ func (d *Distribution) FromIndexScan(
 	sort.Strings(d.Regions)
 }
 
+// GetSingleRegion returns the single region name of the distribution,
+// if there is exactly one.
+func (d *Distribution) GetSingleRegion() (region string, ok bool) {
+	if d == nil {
+		return "", false
+	}
+	if len(d.Regions) == 1 {
+		return d.Regions[0], true
+	}
+	return "", false
+}
+
+// IsLocal returns true if this distribution matches
+// the gateway region of the connection.
+func (d *Distribution) IsLocal(evalCtx *eval.Context) bool {
+	if d == nil {
+		return false
+	}
+	gatewayRegion, foundLocalRegion := evalCtx.Locality.Find("region")
+	if foundLocalRegion {
+		if distributionRegion, ok := d.GetSingleRegion(); ok {
+			return distributionRegion == gatewayRegion
+		}
+	}
+	return false
+}
+
 // getRegionsFromZone returns the regions of the given zone config, if any. It
 // attempts to find the smallest set of regions likely to hold the leaseholder.
 func getRegionsFromZone(zone cat.Zone) map[string]struct{} {
 	// First find any regional replica constraints. If there is exactly one, we
 	// can return early.
-	var regions map[string]struct{}
-	for i, n := 0, zone.ReplicaConstraintsCount(); i < n; i++ {
-		replicaConstraint := zone.ReplicaConstraints(i)
-		for j, m := 0, replicaConstraint.ConstraintCount(); j < m; j++ {
-			constraint := replicaConstraint.Constraint(j)
-			if region, ok := getRegionFromConstraint(constraint); ok {
-				if regions == nil {
-					regions = make(map[string]struct{})
-				}
-				regions[region] = struct{}{}
-			}
-		}
-	}
+	regions := getReplicaRegionsFromZone(zone)
 	if len(regions) == 1 {
 		return regions
 	}
@@ -237,4 +298,23 @@ func getRegionFromConstraint(constraint cat.Constraint) (region string, ok bool)
 	}
 	// The region is prohibited.
 	return "", false /* ok */
+}
+
+// getReplicaRegionsFromZone returns the replica regions of the given zone
+// config, if any.
+func getReplicaRegionsFromZone(zone cat.Zone) map[string]struct{} {
+	var regions map[string]struct{}
+	for i, n := 0, zone.ReplicaConstraintsCount(); i < n; i++ {
+		replicaConstraint := zone.ReplicaConstraints(i)
+		for j, m := 0, replicaConstraint.ConstraintCount(); j < m; j++ {
+			constraint := replicaConstraint.Constraint(j)
+			if region, ok := getRegionFromConstraint(constraint); ok {
+				if regions == nil {
+					regions = make(map[string]struct{})
+				}
+				regions[region] = struct{}{}
+			}
+		}
+	}
+	return regions
 }

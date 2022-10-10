@@ -9,53 +9,57 @@
 package kvfollowerreadsccl
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/asof"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/errors"
 )
 
-func checkBoundedStalenessEnabled(ctx *tree.EvalContext) error {
-	st := ctx.Settings
+func checkBoundedStalenessEnabled(evalCtx *eval.Context) error {
+	st := evalCtx.Settings
 	return utilccl.CheckEnterpriseEnabled(
 		st,
-		ctx.ClusterID,
+		evalCtx.ClusterID,
 		sql.ClusterOrganization.Get(&st.SV),
 		"bounded staleness",
 	)
 }
 
-func evalMaxStaleness(ctx *tree.EvalContext, d duration.Duration) (time.Time, error) {
-	if err := checkBoundedStalenessEnabled(ctx); err != nil {
+func evalMaxStaleness(
+	ctx context.Context, evalCtx *eval.Context, d duration.Duration,
+) (time.Time, error) {
+	if err := checkBoundedStalenessEnabled(evalCtx); err != nil {
 		return time.Time{}, err
 	}
 	if d.Compare(duration.FromInt64(0)) < 0 {
 		return time.Time{}, pgerror.Newf(
 			pgcode.InvalidParameterValue,
 			"interval duration for %s must be greater or equal to 0",
-			tree.WithMaxStalenessFunctionName,
+			asof.WithMaxStalenessFunctionName,
 		)
 	}
-	return duration.Add(ctx.GetStmtTimestamp(), d.Mul(-1)), nil
+	return duration.Add(evalCtx.GetStmtTimestamp(), d.Mul(-1)), nil
 }
 
-func evalMinTimestamp(ctx *tree.EvalContext, t time.Time) (time.Time, error) {
-	if err := checkBoundedStalenessEnabled(ctx); err != nil {
+func evalMinTimestamp(ctx context.Context, evalCtx *eval.Context, t time.Time) (time.Time, error) {
+	if err := checkBoundedStalenessEnabled(evalCtx); err != nil {
 		return time.Time{}, err
 	}
 	t = t.Round(time.Microsecond)
-	if stmtTimestamp := ctx.GetStmtTimestamp().Round(time.Microsecond); t.After(stmtTimestamp) {
+	if stmtTimestamp := evalCtx.GetStmtTimestamp().Round(time.Microsecond); t.After(stmtTimestamp) {
 		return time.Time{}, errors.WithDetailf(
 			pgerror.Newf(
 				pgcode.InvalidParameterValue,
 				"timestamp for %s must be less than or equal to statement_timestamp()",
-				tree.WithMinTimestampFunctionName,
+				asof.WithMinTimestampFunctionName,
 			),
 			"statement timestamp: %d, min_timestamp: %d",
 			stmtTimestamp.UnixNano(),

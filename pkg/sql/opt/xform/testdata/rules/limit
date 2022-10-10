@@ -338,6 +338,36 @@ top-k
       └── filters
            └── (u:2 > 1) AND (u:2 < 10) [outer=(2), constraints=(/2: [/2 - /9]; tight)]
 
+# Ensure that the limit is not pushed down when using SKIP LOCKED.
+# We can push down a limit hint, though.
+opt expect-not=PushLimitIntoIndexJoin
+SELECT * FROM kuv WHERE k = 1 ORDER BY u LIMIT 5 FOR UPDATE SKIP LOCKED
+----
+limit
+ ├── columns: k:1!null u:2 v:3
+ ├── internal-ordering: +2 opt(1)
+ ├── cardinality: [0 - 5]
+ ├── volatile
+ ├── fd: ()-->(1)
+ ├── ordering: +2 opt(1) [actual: +2]
+ ├── index-join kuv
+ │    ├── columns: k:1!null u:2 v:3
+ │    ├── locking: for-update,skip-locked
+ │    ├── volatile
+ │    ├── fd: ()-->(1)
+ │    ├── ordering: +2 opt(1) [actual: +2]
+ │    ├── limit hint: 5.00
+ │    └── scan kuv@kuv_k_u_idx
+ │         ├── columns: k:1!null u:2 rowid:4!null
+ │         ├── constraint: /1/2/4: [/1 - /1]
+ │         ├── locking: for-update,skip-locked
+ │         ├── volatile
+ │         ├── key: (4)
+ │         ├── fd: ()-->(1), (4)-->(2)
+ │         ├── ordering: +2 opt(1) [actual: +2]
+ │         └── limit hint: 5.00
+ └── 5
+
 exec-ddl
 CREATE TABLE abcd (
   a INT PRIMARY KEY,
@@ -872,17 +902,17 @@ limit
  ├── ordering: +6
  ├── union-all
  │    ├── columns: val:2!null data1:6!null
- │    ├── left columns: val:35 data1:39
- │    ├── right columns: val:46 data1:50
+ │    ├── left columns: val:46 data1:50
+ │    ├── right columns: val:35 data1:39
  │    ├── cardinality: [0 - 30]
  │    ├── ordering: +6
  │    ├── limit hint: 10.00
  │    ├── union-all
- │    │    ├── columns: val:35!null data1:39!null
+ │    │    ├── columns: val:46!null data1:50!null
  │    │    ├── left columns: val:13 data1:17
  │    │    ├── right columns: val:24 data1:28
  │    │    ├── cardinality: [0 - 20]
- │    │    ├── ordering: +39
+ │    │    ├── ordering: +50
  │    │    ├── limit hint: 10.00
  │    │    ├── scan index_tab@b
  │    │    │    ├── columns: val:13!null data1:17!null
@@ -899,11 +929,11 @@ limit
  │    │         ├── ordering: +28 opt(24) [actual: +28]
  │    │         └── limit hint: 10.00
  │    └── scan index_tab@b
- │         ├── columns: val:46!null data1:50!null
- │         ├── constraint: /46/50/51/45: [/3 - /3]
+ │         ├── columns: val:35!null data1:39!null
+ │         ├── constraint: /35/39/40/34: [/3 - /3]
  │         ├── limit: 10
- │         ├── fd: ()-->(46)
- │         ├── ordering: +50 opt(46) [actual: +50]
+ │         ├── fd: ()-->(35)
+ │         ├── ordering: +39 opt(35) [actual: +39]
  │         └── limit hint: 10.00
  └── 10
 
@@ -1008,17 +1038,17 @@ scalar-group-by
  │    ├── fd: ()-->(2,6)
  │    ├── union-all
  │    │    ├── columns: val:2!null data1:6!null
- │    │    ├── left columns: val:36 data1:40
- │    │    ├── right columns: val:47 data1:51
+ │    │    ├── left columns: val:47 data1:51
+ │    │    ├── right columns: val:36 data1:40
  │    │    ├── cardinality: [0 - 3]
  │    │    ├── ordering: -6
  │    │    ├── limit hint: 1.00
  │    │    ├── union-all
- │    │    │    ├── columns: val:36!null data1:40!null
+ │    │    │    ├── columns: val:47!null data1:51!null
  │    │    │    ├── left columns: val:14 data1:18
  │    │    │    ├── right columns: val:25 data1:29
  │    │    │    ├── cardinality: [0 - 2]
- │    │    │    ├── ordering: -40
+ │    │    │    ├── ordering: -51
  │    │    │    ├── limit hint: 1.00
  │    │    │    ├── scan index_tab@b,rev
  │    │    │    │    ├── columns: val:14!null data1:18!null
@@ -1035,11 +1065,11 @@ scalar-group-by
  │    │    │         ├── fd: ()-->(25,29)
  │    │    │         └── limit hint: 1.00
  │    │    └── scan index_tab@b,rev
- │    │         ├── columns: val:47!null data1:51!null
- │    │         ├── constraint: /47/51/52/46: [/3 - /3]
+ │    │         ├── columns: val:36!null data1:40!null
+ │    │         ├── constraint: /36/40/41/35: [/3 - /3]
  │    │         ├── limit: 1(rev)
  │    │         ├── key: ()
- │    │         ├── fd: ()-->(47,51)
+ │    │         ├── fd: ()-->(36,40)
  │    │         └── limit hint: 1.00
  │    └── 1
  └── aggregations
@@ -1217,11 +1247,11 @@ top-k
       ├── right columns: latitude:92 longitude:93 data1:94 data2:95
       ├── union-all
       │    ├── columns: latitude:81!null longitude:82!null data1:83!null data2:84!null
-      │    ├── left columns: latitude:59 longitude:60 data1:61 data2:62
-      │    ├── right columns: latitude:70 longitude:71 data1:72 data2:73
+      │    ├── left columns: latitude:70 longitude:71 data1:72 data2:73
+      │    ├── right columns: latitude:59 longitude:60 data1:61 data2:62
       │    ├── cardinality: [0 - 30]
       │    ├── union-all
-      │    │    ├── columns: latitude:59!null longitude:60!null data1:61!null data2:62!null
+      │    │    ├── columns: latitude:70!null longitude:71!null data1:72!null data2:73!null
       │    │    ├── left columns: latitude:37 longitude:38 data1:39 data2:40
       │    │    ├── right columns: latitude:48 longitude:49 data1:50 data2:51
       │    │    ├── cardinality: [0 - 20]
@@ -1236,10 +1266,10 @@ top-k
       │    │         ├── limit: 10
       │    │         └── fd: ()-->(48,49)
       │    └── scan index_tab@d
-      │         ├── columns: latitude:70!null longitude:71!null data1:72!null data2:73!null
-      │         ├── constraint: /70/71/72/73/67: [/10/13 - /10/13]
+      │         ├── columns: latitude:59!null longitude:60!null data1:61!null data2:62!null
+      │         ├── constraint: /59/60/61/62/56: [/10/13 - /10/13]
       │         ├── limit: 10
-      │         └── fd: ()-->(70,71)
+      │         └── fd: ()-->(59,60)
       └── scan index_tab@d
            ├── columns: latitude:92!null longitude:93 data1:94!null data2:95!null
            └── constraint: /92/93/94/95/89
@@ -1303,17 +1333,17 @@ limit
  ├── ordering: +2
  ├── union-all
  │    ├── columns: p:1!null q:2!null r:3!null s:4!null
- │    ├── left columns: p:19 q:20 r:21 s:22
- │    ├── right columns: p:25 q:26 r:27 s:28
+ │    ├── left columns: p:25 q:26 r:27 s:28
+ │    ├── right columns: p:19 q:20 r:21 s:22
  │    ├── cardinality: [0 - 15]
  │    ├── ordering: +2
  │    ├── limit hint: 5.00
  │    ├── union-all
- │    │    ├── columns: p:19!null q:20!null r:21!null s:22!null
+ │    │    ├── columns: p:25!null q:26!null r:27!null s:28!null
  │    │    ├── left columns: p:7 q:8 r:9 s:10
  │    │    ├── right columns: p:13 q:14 r:15 s:16
  │    │    ├── cardinality: [0 - 10]
- │    │    ├── ordering: +20
+ │    │    ├── ordering: +26
  │    │    ├── limit hint: 5.00
  │    │    ├── scan pqrs
  │    │    │    ├── columns: p:7!null q:8!null r:9!null s:10!null
@@ -1332,12 +1362,12 @@ limit
  │    │         ├── ordering: +14 opt(13) [actual: +14]
  │    │         └── limit hint: 5.00
  │    └── scan pqrs
- │         ├── columns: p:25!null q:26!null r:27!null s:28!null
- │         ├── constraint: /25/26: [/10 - /10]
+ │         ├── columns: p:19!null q:20!null r:21!null s:22!null
+ │         ├── constraint: /19/20: [/10 - /10]
  │         ├── limit: 5
- │         ├── key: (26)
- │         ├── fd: ()-->(25), (26)-->(27,28)
- │         ├── ordering: +26 opt(25) [actual: +26]
+ │         ├── key: (20)
+ │         ├── fd: ()-->(19), (20)-->(21,22)
+ │         ├── ordering: +20 opt(19) [actual: +20]
  │         └── limit hint: 5.00
  └── 5
 
@@ -1525,7 +1555,7 @@ scalar-group-by
 
 # No-op case because the number of keys exceeds maxScanCount.
 opt expect-not=SplitLimitedScanIntoUnionScans
-SELECT max(data1) FROM index_tab WHERE val > 0 AND val < 20
+SELECT max(data1) FROM index_tab WHERE val > 0 AND val < 300
 ----
 scalar-group-by
  ├── columns: max:12
@@ -1534,7 +1564,7 @@ scalar-group-by
  ├── fd: ()-->(12)
  ├── scan index_tab@b
  │    ├── columns: val:2!null data1:6!null
- │    └── constraint: /2/6/7/1: [/1 - /19]
+ │    └── constraint: /2/6/7/1: [/1 - /299]
  └── aggregations
       └── max [as=max:12, outer=(6)]
            └── data1:6
@@ -1810,7 +1840,7 @@ INDEX df (d, f)
 memo expect=GenerateLimitedTopKScans
 SELECT d, e FROM defg ORDER BY d, e LIMIT 10
 ----
-memo (optimized, ~13KB, required=[presentation: d:1,e:2] [ordering: +1,+2])
+memo (optimized, ~14KB, required=[presentation: d:1,e:2] [ordering: +1,+2])
  ├── G1: (limit G2 G3 ordering=+1,+2) (top-k G2 &{10 +1,+2 }) (top-k G4 &{10 +1,+2 }) (top-k G5 &{10 +1,+2 }) (top-k G6 &{10 +1,+2 }) (top-k G2 &{10 +1,+2 +1}) (top-k G4 &{10 +1,+2 +1}) (top-k G5 &{10 +1,+2 +1}) (top-k G6 &{10 +1,+2 +1})
  │    ├── [presentation: d:1,e:2] [ordering: +1,+2]
  │    │    ├── best: (top-k G2 &{10 +1,+2 })
@@ -1936,6 +1966,34 @@ top-k
  └── scan defg
       └── columns: d:1 e:2 f:3 g:4
 
+# GenerateLimitedTopKScans will be triggered, but not add an index
+# scan to the memo since NO_INDEX_JOIN is specified.
+memo expect-not=GenerateLimitedTopKScans
+SELECT d, f, e FROM defg@{NO_INDEX_JOIN} ORDER BY d, f, e LIMIT 10
+----
+memo (optimized, ~4KB, required=[presentation: d:1,f:3,e:2] [ordering: +1,+3,+2])
+ ├── G1: (limit G2 G3 ordering=+1,+3,+2) (top-k G2 &{10 +1,+3,+2 }) (top-k G2 &{10 +1,+3,+2 +1,+3})
+ │    ├── [presentation: d:1,f:3,e:2] [ordering: +1,+3,+2]
+ │    │    ├── best: (top-k G2 &{10 +1,+3,+2 })
+ │    │    └── cost: 1196.32
+ │    └── []
+ │         ├── best: (top-k G2 &{10 +1,+3,+2 })
+ │         └── cost: 1196.32
+ ├── G2: (scan defg,cols=(1-3))
+ │    ├── [ordering: +1,+3,+2] [limit hint: 10.00]
+ │    │    ├── best: (sort G2)
+ │    │    └── cost: 1366.36
+ │    ├── [ordering: +1,+3]
+ │    │    ├── best: (sort G2)
+ │    │    └── cost: 1365.27
+ │    ├── [ordering: +1,+3] [limit hint: 100.00]
+ │    │    ├── best: (sort G2)
+ │    │    └── cost: 1365.27
+ │    └── []
+ │         ├── best: (scan defg,cols=(1-3))
+ │         └── cost: 1104.82
+ └── G3: (const 10)
+
 # ---------------------------------------------------
 # GeneratePartialOrderTopK
 # ---------------------------------------------------
@@ -2037,7 +2095,7 @@ memo (optimized, ~14KB, required=[presentation: d:1,e:2,f:3,g:4] [ordering: +1,+
 memo expect=GeneratePartialOrderTopK disable=GenerateLimitedTopKScans
 SELECT d, f, g FROM defg ORDER BY d, g LIMIT 10
 ----
-memo (optimized, ~4KB, required=[presentation: d:1,f:3,g:4] [ordering: +1,+4])
+memo (optimized, ~5KB, required=[presentation: d:1,f:3,g:4] [ordering: +1,+4])
  ├── G1: (limit G2 G3 ordering=+1,+4) (top-k G2 &{10 +1,+4 }) (top-k G2 &{10 +1,+4 +1})
  │    ├── [presentation: d:1,f:3,g:4] [ordering: +1,+4]
  │    │    ├── best: (top-k G2="[ordering: +1] [limit hint: 104.58]" &{10 +1,+4 +1})
@@ -2093,3 +2151,430 @@ top-k
  ├── ordering: +2
  └── scan defg
       └── columns: d:1 e:2 f:3 g:4
+
+# Regression testing for #76102.
+exec-ddl
+CREATE TABLE tab_76102 (
+ a INT2 NULL,
+ b INT2 NULL AS (a + NULL) STORED,
+ UNIQUE (a DESC)
+)
+----
+
+# The GROUP BY column can only have one value (NULL), so  we do not benefit from
+# limited TopK, and trying to apply the rule may lead to errors since the
+# required ordering is optimized away in this case.
+opt expect-not=GenerateLimitedTopKScans
+SELECT b FROM tab_76102@tab_76102_a_key GROUP BY b LIMIT 5
+----
+index-join tab_76102
+ ├── columns: b:2
+ ├── cardinality: [0 - 1]
+ ├── key: ()
+ ├── fd: ()-->(2)
+ └── scan tab_76102@tab_76102_a_key
+      ├── columns: rowid:3!null
+      ├── limit: 1
+      ├── flags: force-index=tab_76102_a_key
+      ├── key: ()
+      └── fd: ()-->(3)
+
+exec-ddl
+DROP TABLE pqrs
+----
+
+exec-ddl
+CREATE TABLE pqrs
+(
+    p INT NOT NULL,
+    q INT NOT NULL,
+    r INT NOT NULL,
+    s INT NOT NULL,
+    PRIMARY KEY (p, q, r, s),
+    CHECK (p IN (1,5,10))
+)
+----
+
+exec-ddl
+ALTER TABLE pqrs INJECT STATISTICS '[
+  {
+    "columns": ["q"],
+    "created_at": "2018-01-01 1:00:00.00000+00:00",
+    "row_count": 100000,
+    "distinct_count": 10000
+  }
+]'
+----
+
+# ----------------------------------
+# SplitLimitedSelectIntoUnionSelects
+# ----------------------------------
+opt expect=SplitLimitedSelectIntoUnionSelects
+SELECT * FROM pqrs WHERE q > 2 ORDER BY q LIMIT 10
+----
+limit
+ ├── columns: p:1!null q:2!null r:3!null s:4!null
+ ├── internal-ordering: +2
+ ├── cardinality: [0 - 10]
+ ├── key: (1-4)
+ ├── ordering: +2
+ ├── union-all
+ │    ├── columns: p:1!null q:2!null r:3!null s:4!null
+ │    ├── left columns: p:25 q:26 r:27 s:28
+ │    ├── right columns: p:19 q:20 r:21 s:22
+ │    ├── cardinality: [0 - 30]
+ │    ├── ordering: +2
+ │    ├── limit hint: 10.00
+ │    ├── union-all
+ │    │    ├── columns: p:25!null q:26!null r:27!null s:28!null
+ │    │    ├── left columns: p:7 q:8 r:9 s:10
+ │    │    ├── right columns: p:13 q:14 r:15 s:16
+ │    │    ├── cardinality: [0 - 20]
+ │    │    ├── ordering: +26
+ │    │    ├── limit hint: 10.00
+ │    │    ├── scan pqrs
+ │    │    │    ├── columns: p:7!null q:8!null r:9!null s:10!null
+ │    │    │    ├── constraint: /7/8/9/10: [/1/3 - /1]
+ │    │    │    ├── limit: 10
+ │    │    │    ├── key: (8-10)
+ │    │    │    ├── fd: ()-->(7)
+ │    │    │    ├── ordering: +8 opt(7) [actual: +8]
+ │    │    │    └── limit hint: 10.00
+ │    │    └── scan pqrs
+ │    │         ├── columns: p:13!null q:14!null r:15!null s:16!null
+ │    │         ├── constraint: /13/14/15/16: [/5/3 - /5]
+ │    │         ├── limit: 10
+ │    │         ├── key: (14-16)
+ │    │         ├── fd: ()-->(13)
+ │    │         ├── ordering: +14 opt(13) [actual: +14]
+ │    │         └── limit hint: 10.00
+ │    └── scan pqrs
+ │         ├── columns: p:19!null q:20!null r:21!null s:22!null
+ │         ├── constraint: /19/20/21/22: [/10/3 - /10]
+ │         ├── limit: 10
+ │         ├── key: (20-22)
+ │         ├── fd: ()-->(19)
+ │         ├── ordering: +20 opt(19) [actual: +20]
+ │         └── limit hint: 10.00
+ └── 10
+
+opt expect=SplitLimitedSelectIntoUnionSelects
+SELECT * FROM pqrs WHERE q IN (0,2,4) AND r IN (0,2,4) AND s IN (0,2,4) ORDER BY q LIMIT 10
+----
+top-k
+ ├── columns: p:1!null q:2!null r:3!null s:4!null
+ ├── internal-ordering: +2
+ ├── k: 10
+ ├── cardinality: [0 - 10]
+ ├── key: (1-4)
+ ├── ordering: +2
+ └── scan pqrs
+      ├── columns: p:1!null q:2!null r:3!null s:4!null
+      ├── constraint: /1/2/3/4
+      │    ├── [/1/0/0/0 - /1/0/0/0]
+      │    ├── [/1/0/0/2 - /1/0/0/2]
+      │    ├── [/1/0/0/4 - /1/0/0/4]
+      │    ├── [/1/0/2/0 - /1/0/2/0]
+      │    ├── [/1/0/2/2 - /1/0/2/2]
+      │    ├── [/1/0/2/4 - /1/0/2/4]
+      │    ├── [/1/0/4/0 - /1/0/4/0]
+      │    ├── [/1/0/4/2 - /1/0/4/2]
+      │    ├── [/1/0/4/4 - /1/0/4/4]
+      │    ├── [/1/2/0/0 - /1/2/0/0]
+      │    ├── [/1/2/0/2 - /1/2/0/2]
+      │    ├── [/1/2/0/4 - /1/2/0/4]
+      │    ├── [/1/2/2/0 - /1/2/2/0]
+      │    ├── [/1/2/2/2 - /1/2/2/2]
+      │    ├── [/1/2/2/4 - /1/2/2/4]
+      │    ├── [/1/2/4/0 - /1/2/4/0]
+      │    ├── [/1/2/4/2 - /1/2/4/2]
+      │    ├── [/1/2/4/4 - /1/2/4/4]
+      │    ├── [/1/4/0/0 - /1/4/0/0]
+      │    ├── [/1/4/0/2 - /1/4/0/2]
+      │    ├── [/1/4/0/4 - /1/4/0/4]
+      │    ├── [/1/4/2/0 - /1/4/2/0]
+      │    ├── [/1/4/2/2 - /1/4/2/2]
+      │    ├── [/1/4/2/4 - /1/4/2/4]
+      │    ├── [/1/4/4/0 - /1/4/4/0]
+      │    ├── [/1/4/4/2 - /1/4/4/2]
+      │    ├── [/1/4/4/4 - /1/4/4/4]
+      │    ├── [/5/0/0/0 - /5/0/0/0]
+      │    ├── [/5/0/0/2 - /5/0/0/2]
+      │    ├── [/5/0/0/4 - /5/0/0/4]
+      │    ├── [/5/0/2/0 - /5/0/2/0]
+      │    ├── [/5/0/2/2 - /5/0/2/2]
+      │    ├── [/5/0/2/4 - /5/0/2/4]
+      │    ├── [/5/0/4/0 - /5/0/4/0]
+      │    ├── [/5/0/4/2 - /5/0/4/2]
+      │    ├── [/5/0/4/4 - /5/0/4/4]
+      │    ├── [/5/2/0/0 - /5/2/0/0]
+      │    ├── [/5/2/0/2 - /5/2/0/2]
+      │    ├── [/5/2/0/4 - /5/2/0/4]
+      │    ├── [/5/2/2/0 - /5/2/2/0]
+      │    ├── [/5/2/2/2 - /5/2/2/2]
+      │    ├── [/5/2/2/4 - /5/2/2/4]
+      │    ├── [/5/2/4/0 - /5/2/4/0]
+      │    ├── [/5/2/4/2 - /5/2/4/2]
+      │    ├── [/5/2/4/4 - /5/2/4/4]
+      │    ├── [/5/4/0/0 - /5/4/0/0]
+      │    ├── [/5/4/0/2 - /5/4/0/2]
+      │    ├── [/5/4/0/4 - /5/4/0/4]
+      │    ├── [/5/4/2/0 - /5/4/2/0]
+      │    ├── [/5/4/2/2 - /5/4/2/2]
+      │    ├── [/5/4/2/4 - /5/4/2/4]
+      │    ├── [/5/4/4/0 - /5/4/4/0]
+      │    ├── [/5/4/4/2 - /5/4/4/2]
+      │    ├── [/5/4/4/4 - /5/4/4/4]
+      │    ├── [/10/0/0/0 - /10/0/0/0]
+      │    ├── [/10/0/0/2 - /10/0/0/2]
+      │    ├── [/10/0/0/4 - /10/0/0/4]
+      │    ├── [/10/0/2/0 - /10/0/2/0]
+      │    ├── [/10/0/2/2 - /10/0/2/2]
+      │    ├── [/10/0/2/4 - /10/0/2/4]
+      │    ├── [/10/0/4/0 - /10/0/4/0]
+      │    ├── [/10/0/4/2 - /10/0/4/2]
+      │    ├── [/10/0/4/4 - /10/0/4/4]
+      │    ├── [/10/2/0/0 - /10/2/0/0]
+      │    ├── [/10/2/0/2 - /10/2/0/2]
+      │    ├── [/10/2/0/4 - /10/2/0/4]
+      │    ├── [/10/2/2/0 - /10/2/2/0]
+      │    ├── [/10/2/2/2 - /10/2/2/2]
+      │    ├── [/10/2/2/4 - /10/2/2/4]
+      │    ├── [/10/2/4/0 - /10/2/4/0]
+      │    ├── [/10/2/4/2 - /10/2/4/2]
+      │    ├── [/10/2/4/4 - /10/2/4/4]
+      │    ├── [/10/4/0/0 - /10/4/0/0]
+      │    ├── [/10/4/0/2 - /10/4/0/2]
+      │    ├── [/10/4/0/4 - /10/4/0/4]
+      │    ├── [/10/4/2/0 - /10/4/2/0]
+      │    ├── [/10/4/2/2 - /10/4/2/2]
+      │    ├── [/10/4/2/4 - /10/4/2/4]
+      │    ├── [/10/4/4/0 - /10/4/4/0]
+      │    ├── [/10/4/4/2 - /10/4/4/2]
+      │    └── [/10/4/4/4 - /10/4/4/4]
+      └── key: (1-4)
+
+# Do not split limit select into union of selects when an index cannot provide
+# the required ordering.
+opt expect-not=SplitLimitedSelectIntoUnionSelects
+SELECT * FROM pqrs WHERE q IN (0,2,4) ORDER BY q, s LIMIT 10
+----
+top-k
+ ├── columns: p:1!null q:2!null r:3!null s:4!null
+ ├── internal-ordering: +2,+4
+ ├── k: 10
+ ├── cardinality: [0 - 10]
+ ├── key: (1-4)
+ ├── ordering: +2,+4
+ └── scan pqrs
+      ├── columns: p:1!null q:2!null r:3!null s:4!null
+      ├── constraint: /1/2/3/4
+      │    ├── [/1/0 - /1/0]
+      │    ├── [/1/2 - /1/2]
+      │    ├── [/1/4 - /1/4]
+      │    ├── [/5/0 - /5/0]
+      │    ├── [/5/2 - /5/2]
+      │    ├── [/5/4 - /5/4]
+      │    ├── [/10/0 - /10/0]
+      │    ├── [/10/2 - /10/2]
+      │    └── [/10/4 - /10/4]
+      └── key: (1-4)
+
+# Regression test for #82730.
+exec-ddl
+CREATE TABLE t82730a (
+  col1_0 NAME,
+  col1_1 INT8,
+  col1_3 INT8,
+  col1_5 VARCHAR,
+  PRIMARY KEY (col1_0 ASC),
+  UNIQUE (col1_1 ASC, col1_3 ASC)
+    PARTITION BY LIST (col1_1,col1_3) (
+      PARTITION table1_part_0 VALUES IN (
+                                (
+                                  1,
+                                  NULL
+                                )
+                              ),
+      PARTITION table1_part_1 VALUES IN (
+                                (
+                                  1000000000,
+                                  NULL
+                                )
+                              ),
+      PARTITION table1_part_2 VALUES IN (
+                                (
+                                  2000000000,
+                                  NULL
+                                )
+                              )
+      )
+)
+----
+
+opt expect-not=SplitLimitedSelectIntoUnionSelects
+UPDATE t82730a
+     SET col1_5 = col1_5
+   WHERE col1_0 ILIKE col1_0
+ORDER BY col1_3
+   LIMIT 84
+----
+update t82730a
+ ├── columns: <none>
+ ├── fetch columns: col1_0:7 col1_1:8 col1_3:9 col1_5:10
+ ├── update-mapping:
+ │    └── col1_5:10 => col1_5:4
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── top-k
+      ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+      ├── internal-ordering: +9
+      ├── k: 84
+      ├── cardinality: [0 - 84]
+      ├── key: (7)
+      ├── fd: (7)-->(8-10), (8,9)~~>(7,10)
+      └── select
+           ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+           ├── key: (7)
+           ├── fd: (7)-->(8-10), (8,9)~~>(7,10)
+           ├── scan t82730a
+           │    ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+           │    ├── key: (7)
+           │    └── fd: (7)-->(8-10), (8,9)~~>(7,10)
+           └── filters
+                └── col1_0:7 ILIKE col1_0:7 [outer=(7), constraints=(/7: (/NULL - ])]
+
+exec-ddl
+CREATE TABLE t82730b (
+  col1_0 NAME,
+  col1_1 INT8,
+  col1_3 INT8,
+  col1_5 VARCHAR,
+  PRIMARY KEY (col1_0 ASC),
+  UNIQUE (col1_1 ASC, col1_3 ASC)
+    PARTITION BY LIST (col1_1,col1_3) (
+      PARTITION table2_part_0 VALUES IN (
+                                (
+                                  1,
+                                  NULL
+                                )
+                              ),
+      PARTITION table2_part_1 VALUES IN (
+                                (
+                                  5,
+                                  NULL
+                                )
+                              ),
+      PARTITION table2_part_2 VALUES IN (
+                                (
+                                  5000000,
+                                  NULL
+                                )
+                              )
+      )
+)
+----
+
+opt expect=SplitLimitedSelectIntoUnionSelects
+UPDATE t82730b AS tab_41831
+     SET col1_5 = col1_5
+   WHERE col1_0 ILIKE col1_0
+ORDER BY col1_3
+   LIMIT 84
+----
+update t82730b [as=tab_41831]
+ ├── columns: <none>
+ ├── fetch columns: col1_0:7 col1_1:8 col1_3:9 col1_5:10
+ ├── update-mapping:
+ │    └── col1_5:10 => col1_5:4
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── top-k
+      ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+      ├── internal-ordering: +9
+      ├── k: 84
+      ├── cardinality: [0 - 84]
+      ├── key: (7)
+      ├── fd: (7)-->(8-10), (8,9)~~>(7,10)
+      └── select
+           ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+           ├── key: (7)
+           ├── fd: (7)-->(8-10), (8,9)~~>(7,10)
+           ├── scan t82730b [as=tab_41831]
+           │    ├── columns: col1_0:7!null col1_1:8 col1_3:9 col1_5:10
+           │    ├── key: (7)
+           │    └── fd: (7)-->(8-10), (8,9)~~>(7,10)
+           └── filters
+                └── col1_0:7 ILIKE col1_0:7 [outer=(7), constraints=(/7: (/NULL - ])]
+
+# Regression test for #88993. Do not construct an unordered limit below the
+# UnionAll.
+exec-ddl
+CREATE TABLE t88993 (
+  a INT,
+  b INT,
+  c INT,
+  INDEX bca_idx (b, c, a)
+);
+----
+
+opt disable=GenerateTopK
+SELECT min(a) FROM t88993@bca_idx WHERE (b <= 11 AND c < 50) OR (b = 11 AND c = 50) OR (b >= 11 AND c > 50)
+----
+scalar-group-by
+ ├── columns: min:7
+ ├── cardinality: [1 - 1]
+ ├── key: ()
+ ├── fd: ()-->(7)
+ ├── limit
+ │    ├── columns: a:1!null b:2!null c:3!null
+ │    ├── internal-ordering: +1
+ │    ├── cardinality: [0 - 1]
+ │    ├── key: ()
+ │    ├── fd: ()-->(1-3)
+ │    ├── union-all
+ │    │    ├── columns: a:1!null b:2!null c:3!null
+ │    │    ├── left columns: a:8 b:9 c:10
+ │    │    ├── right columns: a:14 b:15 c:16
+ │    │    ├── ordering: +1
+ │    │    ├── limit hint: 1.00
+ │    │    ├── limit
+ │    │    │    ├── columns: a:8!null b:9!null c:10!null
+ │    │    │    ├── internal-ordering: +8 opt(9,10)
+ │    │    │    ├── cardinality: [0 - 1]
+ │    │    │    ├── key: ()
+ │    │    │    ├── fd: ()-->(8-10)
+ │    │    │    ├── limit hint: 1.00
+ │    │    │    ├── select
+ │    │    │    │    ├── columns: a:8!null b:9!null c:10!null
+ │    │    │    │    ├── fd: ()-->(9,10)
+ │    │    │    │    ├── ordering: +8 opt(9,10) [actual: +8]
+ │    │    │    │    ├── limit hint: 1.00
+ │    │    │    │    ├── scan t88993@bca_idx
+ │    │    │    │    │    ├── columns: a:8!null b:9!null c:10!null
+ │    │    │    │    │    ├── constraint: /9/10/8/11: (/11/50/NULL - /11/50]
+ │    │    │    │    │    ├── flags: force-index=bca_idx
+ │    │    │    │    │    ├── fd: ()-->(9,10)
+ │    │    │    │    │    └── ordering: +8 opt(9,10) [actual: +8]
+ │    │    │    │    └── filters
+ │    │    │    │         └── (((b:9 <= 11) AND (c:10 < 50)) OR ((b:9 = 11) AND (c:10 = 50))) OR ((b:9 >= 11) AND (c:10 > 50)) [outer=(9,10), constraints=(/9: (/NULL - ]; /10: (/NULL - /49] [/50 - /50] [/51 - ])]
+ │    │    │    └── 1
+ │    │    └── sort
+ │    │         ├── columns: a:14!null b:15!null c:16!null
+ │    │         ├── ordering: +14
+ │    │         ├── limit hint: 1.00
+ │    │         └── select
+ │    │              ├── columns: a:14!null b:15!null c:16!null
+ │    │              ├── scan t88993@bca_idx
+ │    │              │    ├── columns: a:14 b:15!null c:16
+ │    │              │    ├── constraint: /15/16/14/17
+ │    │              │    │    ├── (/NULL - /11/49]
+ │    │              │    │    └── (/11/51/NULL - ]
+ │    │              │    └── flags: force-index=bca_idx
+ │    │              └── filters
+ │    │                   ├── (((b:15 <= 11) AND (c:16 < 50)) OR ((b:15 = 11) AND (c:16 = 50))) OR ((b:15 >= 11) AND (c:16 > 50)) [outer=(15,16), constraints=(/15: (/NULL - ]; /16: (/NULL - /49] [/50 - /50] [/51 - ])]
+ │    │                   └── a:14 IS NOT NULL [outer=(14), constraints=(/14: (/NULL - ]; tight)]
+ │    └── 1
+ └── aggregations
+      └── const-agg [as=min:7, outer=(1)]
+           └── a:1

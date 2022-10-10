@@ -11,20 +11,25 @@
 package builtins
 
 import (
+	"context"
+	gojson "encoding/json"
+
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinconstants"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 )
 
-func initReplicationBuiltins() {
-	// Add all replicationBuiltins to the Builtins map after a sanity check.
+func init() {
+	// Add all replicationBuiltins to the builtins map after a sanity check.
 	for k, v := range replicationBuiltins {
-		if _, exists := builtins[k]; exists {
-			panic("duplicate builtin: " + k)
-		}
-		builtins[k] = v
+		registerBuiltin(k, v)
 	}
 }
 
@@ -32,9 +37,10 @@ func initReplicationBuiltins() {
 //
 // For use in other packages, see AllBuiltinNames and GetBuiltinProperties().
 var replicationBuiltins = map[string]builtinDefinition{
+	// Stream ingestion functions starts here.
 	"crdb_internal.complete_stream_ingestion_job": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categoryStreamIngestion,
+			Category:         builtinconstants.CategoryStreamIngestion,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
@@ -43,36 +49,113 @@ var replicationBuiltins = map[string]builtinDefinition{
 				{"cutover_ts", types.TimestampTZ},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				mgr, err := streaming.GetStreamIngestManager(ctx, evalCtx)
 				if err != nil {
 					return nil, err
 				}
 
-				streamID := streaming.StreamID(*args[0].(*tree.DInt))
+				ingestionJobID := jobspb.JobID(*args[0].(*tree.DInt))
 				cutoverTime := args[1].(*tree.DTimestampTZ).Time
 				cutoverTimestamp := hlc.Timestamp{WallTime: cutoverTime.UnixNano()}
-				err = mgr.CompleteStreamIngestion(evalCtx, evalCtx.Txn, streamID, cutoverTimestamp)
+				err = mgr.CompleteStreamIngestion(ctx, evalCtx, evalCtx.Txn, ingestionJobID, cutoverTimestamp)
 				if err != nil {
 					return nil, err
 				}
-				return tree.NewDInt(tree.DInt(streamID)), err
+				return tree.NewDInt(tree.DInt(ingestionJobID)), err
 			},
 			Info: "This function can be used to signal a running stream ingestion job to complete. " +
 				"The job will eventually stop ingesting, revert to the specified timestamp and leave the " +
-				"cluster in a consistent state. The specified timestamp can only be specified up to the" +
-				" microsecond. " +
+				"cluster in a consistent state. The specified timestamp can only be specified up to the " +
+				"microsecond. " +
 				"This function does not wait for the job to reach a terminal state, " +
 				"but instead returns the job id as soon as it has signaled the job to complete. " +
-				"This builtin can be used in conjunction with SHOW JOBS WHEN COMPLETE to ensure that the" +
-				" job has left the cluster in a consistent state.",
-			Volatility: tree.VolatilityVolatile,
+				"This builtin can be used in conjunction with `SHOW JOBS WHEN COMPLETE` to ensure that the " +
+				"job has left the cluster in a consistent state.",
+			Volatility: volatility.Volatile,
 		},
 	),
 
+	"crdb_internal.stream_ingestion_stats_json": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategoryStreamIngestion,
+			DistsqlBlocklist: true,
+		},
+
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"job_id", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, errors.New("job_id cannot be specified with null argument")
+				}
+				mgr, err := streaming.GetStreamIngestManager(ctx, evalCtx)
+				if err != nil {
+					return nil, err
+				}
+				ingestionJobID := int64(tree.MustBeDInt(args[0]))
+				stats, err := mgr.GetStreamIngestionStats(ctx, evalCtx, evalCtx.Txn, jobspb.JobID(ingestionJobID))
+				if err != nil {
+					return nil, err
+				}
+				jsonStats, err := gojson.Marshal(stats)
+				if err != nil {
+					return nil, err
+				}
+				jsonDatum, err := tree.ParseDJSON(string(jsonStats))
+				if err != nil {
+					return nil, err
+				}
+				return jsonDatum, nil
+			},
+			Info: "This function can be used on the ingestion side to get a statistics summary " +
+				"of a stream ingestion job in json format.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
+	"crdb_internal.stream_ingestion_stats_pb": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategoryStreamIngestion,
+			DistsqlBlocklist: true,
+		},
+
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"job_id", types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Bytes),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull {
+					return tree.DNull, errors.New("job_id cannot be specified with null argument")
+				}
+				mgr, err := streaming.GetStreamIngestManager(ctx, evalCtx)
+				if err != nil {
+					return nil, err
+				}
+				ingestionJobID := int64(tree.MustBeDInt(args[0]))
+				stats, err := mgr.GetStreamIngestionStats(ctx, evalCtx, evalCtx.Txn, jobspb.JobID(ingestionJobID))
+				if err != nil {
+					return nil, err
+				}
+				rawStatus, err := protoutil.Marshal(stats)
+				if err != nil {
+					return nil, err
+				}
+				return tree.NewDBytes(tree.DBytes(rawStatus)), nil
+			},
+			Info: "This function can be used on the ingestion side to get a statistics summary " +
+				"of a stream ingestion job in protobuf format.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
+	// Stream production functions starts here.
 	"crdb_internal.start_replication_stream": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categoryStreamIngestion,
+			Category:         builtinconstants.CategoryStreamIngestion,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
@@ -80,8 +163,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 				{"tenant_id", types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				mgr, err := streaming.GetReplicationStreamManager(ctx, evalCtx)
 				if err != nil {
 					return nil, err
 				}
@@ -89,7 +172,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 				if err != nil {
 					return nil, err
 				}
-				jobID, err := mgr.StartReplicationStream(evalCtx, evalCtx.Txn, uint64(tenantID))
+				jobID, err := mgr.StartReplicationStream(ctx, evalCtx, evalCtx.Txn, uint64(tenantID))
 				if err != nil {
 					return nil, err
 				}
@@ -99,13 +182,13 @@ var replicationBuiltins = map[string]builtinDefinition{
 				"the specified tenant. The returned stream ID uniquely identifies created stream. " +
 				"The caller must periodically invoke crdb_internal.heartbeat_stream() function to " +
 				"notify that the replication is still ongoing.",
-			Volatility: tree.VolatilityVolatile,
+			Volatility: volatility.Volatile,
 		},
 	),
 
 	"crdb_internal.replication_stream_progress": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categoryStreamIngestion,
+			Category:         builtinconstants.CategoryStreamIngestion,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
@@ -114,8 +197,11 @@ var replicationBuiltins = map[string]builtinDefinition{
 				{"frontier_ts", types.String},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull {
+					return tree.DNull, errors.New("stream_id or frontier_ts cannot be specified with null argument")
+				}
+				mgr, err := streaming.GetReplicationStreamManager(ctx, evalCtx)
 				if err != nil {
 					return nil, err
 				}
@@ -124,7 +210,7 @@ var replicationBuiltins = map[string]builtinDefinition{
 					return nil, err
 				}
 				streamID := streaming.StreamID(int(tree.MustBeDInt(args[0])))
-				sps, err := mgr.UpdateReplicationStreamProgress(evalCtx, streamID, frontier, evalCtx.Txn)
+				sps, err := mgr.HeartbeatReplicationStream(ctx, evalCtx, streamID, frontier, evalCtx.Txn)
 				if err != nil {
 					return nil, err
 				}
@@ -136,15 +222,16 @@ var replicationBuiltins = map[string]builtinDefinition{
 			},
 			Info: "This function can be used on the consumer side to heartbeat its replication progress to " +
 				"a replication stream in the source cluster. The returns a StreamReplicationStatus message " +
-				"that indicates stream status (RUNNING, PAUSED, or STOPPED).",
-			Volatility: tree.VolatilityVolatile,
+				"that indicates stream status (`ACTIVE`, `PAUSED`, `INACTIVE`, or `STATUS_UNKNOWN_RETRY`).",
+			Volatility: volatility.Volatile,
 		},
 	),
 	"crdb_internal.stream_partition": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categoryStreamIngestion,
-			DistsqlBlocklist: false,
-			Class:            tree.GeneratorClass,
+			Category:           builtinconstants.CategoryStreamIngestion,
+			DistsqlBlocklist:   false,
+			Class:              tree.GeneratorClass,
+			VectorizeStreaming: true,
 		},
 		makeGeneratorOverload(
 			tree.ArgTypes{
@@ -155,8 +242,8 @@ var replicationBuiltins = map[string]builtinDefinition{
 				[]*types.T{types.Bytes},
 				[]string{"stream_event"},
 			),
-			func(evalCtx *tree.EvalContext, args tree.Datums) (tree.ValueGenerator, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+				mgr, err := streaming.GetReplicationStreamManager(ctx, evalCtx)
 				if err != nil {
 					return nil, err
 				}
@@ -167,13 +254,13 @@ var replicationBuiltins = map[string]builtinDefinition{
 				)
 			},
 			"Stream partition data",
-			tree.VolatilityVolatile,
+			volatility.Volatile,
 		),
 	),
 
 	"crdb_internal.replication_stream_spec": makeBuiltin(
 		tree.FunctionProperties{
-			Category:         categoryStreamIngestion,
+			Category:         builtinconstants.CategoryStreamIngestion,
 			DistsqlBlocklist: true,
 		},
 		tree.Overload{
@@ -181,14 +268,14 @@ var replicationBuiltins = map[string]builtinDefinition{
 				{"stream_id", types.Int},
 			},
 			ReturnType: tree.FixedReturnType(types.Bytes),
-			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
-				mgr, err := streaming.GetReplicationStreamManager(evalCtx)
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				mgr, err := streaming.GetReplicationStreamManager(ctx, evalCtx)
 				if err != nil {
 					return nil, err
 				}
 
 				streamID := int64(tree.MustBeDInt(args[0]))
-				spec, err := mgr.GetReplicationStreamSpec(evalCtx, evalCtx.Txn, streaming.StreamID(streamID))
+				spec, err := mgr.GetReplicationStreamSpec(ctx, evalCtx, evalCtx.Txn, streaming.StreamID(streamID))
 				if err != nil {
 					return nil, err
 				}
@@ -199,9 +286,41 @@ var replicationBuiltins = map[string]builtinDefinition{
 				return tree.NewDBytes(tree.DBytes(rawSpec)), err
 			},
 			Info: "This function can be used on the consumer side to get a replication stream specification " +
-				"for the specified stream starting from the specified 'start_from' timestamp. The consumer will " +
-				"later call 'stream_partition' to a partition with the spec to start streaming.",
-			Volatility: tree.VolatilityVolatile,
+				"for the specified stream. The consumer will later call 'stream_partition' to a partition with " +
+				"the spec to start streaming.",
+			Volatility: volatility.Volatile,
+		},
+	),
+
+	"crdb_internal.complete_replication_stream": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategoryStreamIngestion,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types: tree.ArgTypes{
+				{"stream_id", types.Int},
+				{"successful_ingestion", types.Bool},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				mgr, err := streaming.GetReplicationStreamManager(ctx, evalCtx)
+				if err != nil {
+					return nil, err
+				}
+
+				streamID := int64(tree.MustBeDInt(args[0]))
+				successfulIngestion := bool(tree.MustBeDBool(args[1]))
+				if err := mgr.CompleteReplicationStream(
+					ctx, evalCtx, evalCtx.Txn, streaming.StreamID(streamID), successfulIngestion,
+				); err != nil {
+					return nil, err
+				}
+				return tree.NewDInt(tree.DInt(streamID)), err
+			},
+			Info: "This function can be used on the producer side to complete and clean up a replication stream." +
+				"'successful_ingestion' indicates whether the stream ingestion finished successfully.",
+			Volatility: volatility.Volatile,
 		},
 	),
 }

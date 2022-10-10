@@ -15,7 +15,7 @@ import moment from "moment";
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { SortSetting } from "../sortedtable";
 import { Filters } from "../queryFilter";
-import { TimeScale, defaultTimeScaleOptions } from "../timeScaleDropdown";
+import { TimeScale } from "../timeScaleDropdown";
 
 const history = createMemoryHistory({ initialEntries: ["/transactions"] });
 
@@ -47,7 +47,7 @@ export const columns: string[] = ["all"];
 export const timeScale: TimeScale = {
   windowSize: moment.duration(5, "day"),
   sampleSize: moment.duration(5, "minutes"),
-  windowEnd: moment.utc("2021.08.12"),
+  fixedWindowEnd: moment.utc("2021.08.12"),
   key: "Custom",
 };
 export const timestamp = new protos.google.protobuf.Timestamp({
@@ -66,6 +66,8 @@ export const filters: Filters = {
   regions: "",
   nodes: "",
 };
+
+export const lastUpdated = moment();
 
 export const data: cockroach.server.serverpb.IStatementsResponse = {
   statements: [

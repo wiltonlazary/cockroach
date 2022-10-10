@@ -12,9 +12,11 @@ package sessionrevival
 
 import (
 	"crypto/ed25519"
+	"crypto/x509"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -27,7 +29,7 @@ const tokenLifetime = 10 * time.Minute
 // CreateSessionRevivalToken creates a token that can be used to log in
 // the given user.
 func CreateSessionRevivalToken(
-	cm *security.CertificateManager, user security.SQLUsername,
+	cm *security.CertificateManager, user username.SQLUsername,
 ) ([]byte, error) {
 	cert, err := cm.GetTenantSigningCert()
 	if err != nil {
@@ -76,60 +78,68 @@ func CreateSessionRevivalToken(
 // ValidateSessionRevivalToken checks if the given bytes are a valid
 // session revival token for the user.
 func ValidateSessionRevivalToken(
-	cm *security.CertificateManager, user security.SQLUsername, tokenBytes []byte,
-) (bool, error) {
+	cm *security.CertificateManager, user username.SQLUsername, tokenBytes []byte,
+) error {
 	cert, err := cm.GetTenantSigningCert()
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	token := &sessiondatapb.SessionRevivalToken{}
 	payload := &sessiondatapb.SessionRevivalToken_Payload{}
 	err = protoutil.Unmarshal(tokenBytes, token)
 	if err != nil {
-		return false, err
+		return err
 	}
 	err = protoutil.Unmarshal(token.Payload, payload)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if payloadValid, err := validatePayloadContents(payload, user); !payloadValid || err != nil {
-		return false, err
+	if err := validatePayloadContents(payload, user); err != nil {
+		return err
+	}
+
+	var signatureAlg x509.SignatureAlgorithm
+	switch payload.Algorithm {
+	case x509.Ed25519.String():
+		signatureAlg = x509.PureEd25519
+	default:
+		return errors.Newf("unsupported algorithm %s", payload.Algorithm)
 	}
 	for _, c := range cert.ParsedCertificates {
-		if err := c.CheckSignature(c.SignatureAlgorithm, token.Payload, token.Signature); err == nil {
-			return true, nil
+		if err := c.CheckSignature(signatureAlg, token.Payload, token.Signature); err == nil {
+			return nil
 		}
 	}
-	return false, errors.New("signature was not verified")
+	return errors.New("invalid signature")
 }
 
 func validatePayloadContents(
-	payload *sessiondatapb.SessionRevivalToken_Payload, user security.SQLUsername,
-) (bool, error) {
+	payload *sessiondatapb.SessionRevivalToken_Payload, user username.SQLUsername,
+) error {
 	issuedAt, err := pbtypes.TimestampFromProto(payload.IssuedAt)
 	if err != nil {
-		return false, err
+		return err
 	}
 	expiresAt, err := pbtypes.TimestampFromProto(payload.ExpiresAt)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	now := timeutil.Now()
 	if now.Before(issuedAt) {
-		return false, errors.Errorf("token issue time is in the future (%v)", issuedAt)
+		return errors.Errorf("token issue time is in the future (%v)", issuedAt)
 	}
 	if now.After(expiresAt) {
-		return false, errors.Errorf("token expiration time is in the past (%v)", expiresAt)
+		return errors.Errorf("token expiration time is in the past (%v)", expiresAt)
 	}
 	// This check is so the token cannot be brute-forced by spoofing a very large
 	// expiration date.
 	if issuedAt.Add(tokenLifetime + 1*time.Minute).Before(expiresAt) {
-		return false, errors.Errorf("token expiration time is too far in the future (%v)", expiresAt)
+		return errors.Errorf("token expiration time is too far in the future (%v)", expiresAt)
 	}
 	if user.Normalized() != payload.User {
-		return false, errors.Errorf("token is for the wrong user %q, wanted %q", payload.User, user)
+		return errors.Errorf("token is for the wrong user %q, wanted %q", payload.User, user)
 	}
-	return true, nil
+	return nil
 }

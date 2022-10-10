@@ -21,12 +21,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
-	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/errors"
 )
@@ -37,12 +35,12 @@ func registerSQLSmith(r registry.Registry) {
 		"empty":                     sqlsmith.Setups["empty"],
 		"seed":                      sqlsmith.Setups["seed"],
 		sqlsmith.RandTableSetupName: sqlsmith.Setups[sqlsmith.RandTableSetupName],
-		"tpch-sf1": func(r *rand.Rand) string {
-			return `RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`
+		"tpch-sf1": func(r *rand.Rand) []string {
+			return []string{`RESTORE TABLE tpch.* FROM 'gs://cockroach-fixtures/workload/tpch/scalefactor=1/backup?AUTH=implicit' WITH into_db = 'defaultdb';`}
 		},
-		"tpcc": func(r *rand.Rand) string {
+		"tpcc": func(r *rand.Rand) []string {
 			const version = "version=2.1.0,fks=true,interleaved=false,seed=1,warehouses=1"
-			var sb strings.Builder
+			var stmts []string
 			for _, t := range []string{
 				"customer",
 				"district",
@@ -54,9 +52,14 @@ func registerSQLSmith(r registry.Registry) {
 				"stock",
 				"warehouse",
 			} {
-				fmt.Fprintf(&sb, "RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';\n", t, version)
+				stmts = append(
+					stmts,
+					fmt.Sprintf("RESTORE TABLE tpcc.%s FROM 'gs://cockroach-fixtures/workload/tpcc/%[2]s/%[1]s?AUTH=implicit' WITH into_db = 'defaultdb';",
+						t, version,
+					),
+				)
 			}
-			return sb.String()
+			return stmts
 		},
 	}
 	settings := map[string]sqlsmith.SettingFunc{
@@ -89,11 +92,9 @@ func registerSQLSmith(r registry.Registry) {
 		rng, seed := randutil.NewTestRand()
 		t.L().Printf("seed: %d", seed)
 
-		c.Put(ctx, t.Cockroach(), "./cockroach")
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatalf("could not initialize libraries: %v", err)
-		}
-		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings())
+		// With 50% chance use the cockroach-short binary that was compiled with
+		// --crdb_test build tag.
+		maybeUseBuildWithEnabledAssertions(ctx, t, c, rng, 0.5 /* eaProb */)
 
 		setupFunc, ok := setups[setupName]
 		if !ok {
@@ -113,11 +114,13 @@ func registerSQLSmith(r registry.Registry) {
 		}
 		conn := allConns[0]
 		t.Status("executing setup")
-		t.L().Printf("setup:\n%s", setup)
-		if _, err := conn.Exec(setup); err != nil {
-			t.Fatal(err)
-		} else {
-			logStmt(setup)
+		t.L().Printf("setup:\n%s", strings.Join(setup, "\n"))
+		for _, stmt := range setup {
+			if _, err := conn.Exec(stmt); err != nil {
+				t.Fatal(err)
+			} else {
+				logStmt(stmt)
+			}
 		}
 
 		if settingName == "multi-region" {
@@ -225,6 +228,11 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 					_, err := conn.Exec(stmt)
 					if err == nil {
 						logStmt(stmt)
+						stmt = "EXPLAIN " + stmt
+						_, err = conn.Exec(stmt)
+						if err == nil {
+							logStmt(stmt)
+						}
 					}
 					done <- err
 				}(ctx)
@@ -274,7 +282,26 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 			for idx, c := range allConns {
 				if err := c.PingContext(ctx); err != nil {
 					logStmt(stmt)
-					t.Fatalf("ping node %d: %v\nprevious sql:\n%s;", idx+1, err, stmt)
+					nodeID := idx + 1
+					errStr := fmt.Sprintf("ping node %d: %v\n", nodeID, err)
+					hintStr := fmt.Sprintf(
+						"HINT: node likely crashed, check logs in artifacts > logs/%d.unredacted\n",
+						nodeID,
+					)
+
+					var sb strings.Builder
+					// Print the error message and a hint.
+					sb.WriteString(errStr)
+					sb.WriteString(hintStr)
+					// Print the previous SQL.
+					sb.WriteString(fmt.Sprintf("previous sql:\n%s;", stmt))
+					// Print the error message and hint again because
+					// github-post prunes the top of the error message away when
+					// the SQL is too long.
+					sb.WriteString(errStr)
+					sb.WriteString(hintStr)
+
+					t.Fatalf(sb.String())
 				}
 			}
 		}
@@ -288,11 +315,14 @@ INSERT INTO seed_mr_table DEFAULT VALUES;`, regionList[0]),
 			clusterSpec = r.MakeClusterSpec(numNodes)
 		}
 		r.Add(registry.TestSpec{
-			Name: fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
+			Name:            fmt.Sprintf("sqlsmith/setup=%s/setting=%s", setup, setting),
+			Owner:           registry.OwnerSQLQueries,
+			Cluster:         clusterSpec,
+			NativeLibs:      registry.LibGEOS,
+			Timeout:         time.Minute * 20,
+			RequiresLicense: true,
 			// NB: sqlsmith failures should never block a release.
-			Owner:   registry.OwnerSQLQueries,
-			Cluster: clusterSpec,
-			Timeout: time.Minute * 20,
+			NonReleaseBlocker: true,
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 				runSQLSmith(ctx, t, c, setup, setting)
 			},

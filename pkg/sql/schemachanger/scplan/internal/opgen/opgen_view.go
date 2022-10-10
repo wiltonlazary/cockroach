@@ -19,41 +19,81 @@ func init() {
 	opRegistry.register((*scpb.View)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_TXN_DROPPED),
 			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.View) scop.Op {
+			to(scpb.Status_TXN_DROPPED,
+				emit(func(this *scpb.View) *scop.NotImplemented {
 					return notImplemented(this)
+				}),
+			),
+			to(scpb.Status_PUBLIC,
+				emit(func(this *scpb.View) *scop.MarkDescriptorAsPublic {
+					return &scop.MarkDescriptorAsPublic{
+						DescriptorID: this.ViewID,
+					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.View) scop.Op {
-					return &scop.MarkDescriptorAsDroppedSynthetically{
-						DescID: this.TableID,
+				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
+					return &scop.MarkDescriptorAsSyntheticallyDropped{
+						DescriptorID: this.ViewID,
 					}
 				}),
 			),
 			to(scpb.Status_DROPPED,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.View) scop.Op {
+				emit(func(this *scpb.View) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.TableID,
+						DescriptorID: this.ViewID,
+					}
+				}),
+				emit(func(this *scpb.View) *scop.RemoveBackReferenceInTypes {
+					if len(this.UsesTypeIDs) == 0 {
+						return nil
+					}
+					return &scop.RemoveBackReferenceInTypes{
+						BackReferencedDescriptorID: this.ViewID,
+						TypeIDs:                    this.UsesTypeIDs,
+					}
+				}),
+				emit(func(this *scpb.View) *scop.RemoveViewBackReferencesInRelations {
+					if len(this.UsesRelationIDs) == 0 {
+						return nil
+					}
+					return &scop.RemoveViewBackReferencesInRelations{
+						BackReferencedViewID: this.ViewID,
+						RelationIDs:          this.UsesRelationIDs,
+					}
+				}),
+				emit(func(this *scpb.View) *scop.RemoveAllTableComments {
+					return &scop.RemoveAllTableComments{
+						TableID: this.ViewID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PostCommitPhase),
-				emit(func(this *scpb.View, ts scpb.TargetState) scop.Op {
-					return newLogEventOp(this, ts)
+				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
-				emit(func(this *scpb.View) scop.Op {
-					return &scop.CreateGcJobForTable{
-						TableID: this.TableID,
+				emit(func(this *scpb.View, md *targetsWithElementMap) *scop.CreateGCJobForTable {
+					if !this.IsMaterialized {
+						return nil
+
 					}
+					return &scop.CreateGCJobForTable{
+						TableID:             this.ViewID,
+						StatementForDropJob: statementForDropJob(this, md),
+					}
+				}),
+				emit(func(this *scpb.View) *scop.DeleteDescriptor {
+					if !this.IsMaterialized {
+						return &scop.DeleteDescriptor{
+							DescriptorID: this.ViewID,
+						}
+					}
+					return nil
 				}),
 			),
 		),

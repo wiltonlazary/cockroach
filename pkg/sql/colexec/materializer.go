@@ -17,12 +17,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/sql/colconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
+	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -71,10 +75,14 @@ type drainHelper struct {
 	// are noops.
 	ctx context.Context
 
+	// allocator can be nil in tests.
+	allocator *colmem.Allocator
+
 	statsCollectors []colexecop.VectorizedStatsCollector
 	sources         colexecop.MetadataSources
 
-	bufferedMeta []execinfrapb.ProducerMetadata
+	drained bool
+	meta    []execinfrapb.ProducerMetadata
 }
 
 var _ execinfra.RowSource = &drainHelper{}
@@ -111,18 +119,25 @@ func (d *drainHelper) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata)
 		}
 		d.statsCollectors = nil
 	}
-	if d.bufferedMeta == nil {
-		d.bufferedMeta = d.sources.DrainMeta()
-		if d.bufferedMeta == nil {
-			// Still nil, avoid more calls to DrainMeta.
-			d.bufferedMeta = []execinfrapb.ProducerMetadata{}
+	if !d.drained {
+		d.meta = d.sources.DrainMeta()
+		d.drained = true
+		if d.allocator != nil {
+			colexecutils.AccountForMetadata(d.allocator, d.meta)
 		}
 	}
-	if len(d.bufferedMeta) == 0 {
+	if len(d.meta) == 0 {
+		// Eagerly lose the reference to the slice.
+		d.meta = nil
+		if d.allocator != nil {
+			// At this point, the caller took over all of the metadata, so we
+			// can release all of the allocations.
+			d.allocator.ReleaseAll()
+		}
 		return nil, nil
 	}
-	meta := d.bufferedMeta[0]
-	d.bufferedMeta = d.bufferedMeta[1:]
+	meta := d.meta[0]
+	d.meta = d.meta[1:]
 	return nil, &meta
 }
 
@@ -141,18 +156,22 @@ var materializerPool = sync.Pool{
 // NewMaterializer creates a new Materializer processor which processes the
 // columnar data coming from input to return it as rows.
 // Arguments:
+// - allocator must use a memory account that is not shared with any other user,
+// can be nil in tests.
 // - typs is the output types schema. Typs are assumed to have been hydrated.
-// - getStats (when tracing is enabled) returns all of the execution statistics
-// of operators which the materializer is responsible for.
 // NOTE: the constructor does *not* take in an execinfrapb.PostProcessSpec
 // because we expect input to handle that for us.
 func NewMaterializer(
-	flowCtx *execinfra.FlowCtx, processorID int32, input colexecargs.OpWithMetaInfo, typs []*types.T,
+	allocator *colmem.Allocator,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input colexecargs.OpWithMetaInfo,
+	typs []*types.T,
 ) *Materializer {
 	// When the materializer is created in the middle of the chain of operators,
 	// it will modify the eval context when it is done draining, so we have to
 	// give it a copy to preserve the "global" eval context from being mutated.
-	return newMaterializerInternal(flowCtx, flowCtx.NewEvalCtx(), processorID, input, typs)
+	return newMaterializerInternal(allocator, flowCtx, flowCtx.NewEvalCtx(), processorID, input, typs)
 }
 
 // NewMaterializerNoEvalCtxCopy is the same as NewMaterializer but doesn't make
@@ -164,14 +183,19 @@ func NewMaterializer(
 // modifies the eval context) only when the whole flow is done, at which point
 // the eval context won't be used anymore.
 func NewMaterializerNoEvalCtxCopy(
-	flowCtx *execinfra.FlowCtx, processorID int32, input colexecargs.OpWithMetaInfo, typs []*types.T,
+	allocator *colmem.Allocator,
+	flowCtx *execinfra.FlowCtx,
+	processorID int32,
+	input colexecargs.OpWithMetaInfo,
+	typs []*types.T,
 ) *Materializer {
-	return newMaterializerInternal(flowCtx, flowCtx.EvalCtx, processorID, input, typs)
+	return newMaterializerInternal(allocator, flowCtx, flowCtx.EvalCtx, processorID, input, typs)
 }
 
 func newMaterializerInternal(
+	allocator *colmem.Allocator,
 	flowCtx *execinfra.FlowCtx,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	processorID int32,
 	input colexecargs.OpWithMetaInfo,
 	typs []*types.T,
@@ -190,6 +214,7 @@ func newMaterializerInternal(
 		// rowSourceToPlanNode wrappers.
 		closers: append(m.closers[:0], input.ToClose...),
 	}
+	m.drainHelper.allocator = allocator
 	m.drainHelper.statsCollectors = input.StatsCollectors
 	m.drainHelper.sources = input.MetadataSources
 
@@ -202,29 +227,24 @@ func newMaterializerInternal(
 		execinfra.ProcStateOpts{
 			// We append drainHelper to inputs to drain below in order to reuse
 			// the same underlying slice from the pooled materializer.
-			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
-				// Note that we delegate draining all of the metadata sources
-				// to drainHelper which is added as an input to drain below.
-				m.close()
-				return nil
-			},
+			TrailingMetaCallback: m.trailingMetaCallback,
 		},
 	)
 	m.AddInputToDrain(&m.drainHelper)
 	return m
 }
 
-var _ execinfra.OpNode = &Materializer{}
+var _ execopnode.OpNode = &Materializer{}
 var _ execinfra.Processor = &Materializer{}
-var _ execinfra.Releasable = &Materializer{}
+var _ execreleasable.Releasable = &Materializer{}
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (m *Materializer) ChildCount(verbose bool) int {
 	return 1
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (m *Materializer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (m *Materializer) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
 		return m.input
 	}
@@ -240,7 +260,7 @@ func (m *Materializer) OutputTypes() []*types.T {
 
 // Start is part of the execinfra.RowSource interface.
 func (m *Materializer) Start(ctx context.Context) {
-	ctx = m.StartInternalNoSpan(ctx)
+	ctx = m.StartInternal(ctx, "materializer" /* name */)
 	// We can encounter an expected error during Init (e.g. an operator
 	// attempts to allocate a batch, but the memory budget limit has been
 	// reached), so we need to wrap it with a catcher.
@@ -309,18 +329,30 @@ func (m *Materializer) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata
 	return nil, m.DrainHelper()
 }
 
+func (m *Materializer) trailingMetaCallback() []execinfrapb.ProducerMetadata {
+	// Note that we delegate draining all of the metadata sources to drainHelper
+	// which is added as an input to drain.
+	m.close()
+	return nil
+}
+
 func (m *Materializer) close() {
-	if m.InternalClose() {
-		if m.Ctx == nil {
-			// In some edge cases (like when Init of an operator above this
-			// materializer encounters a panic), the materializer might never be
-			// started, yet it still will attempt to close its Closers. This
-			// context is only used for logging purposes, so it is ok to grab
-			// the background context in order to prevent a NPE below.
-			m.Ctx = context.Background()
-		}
-		m.closers.CloseAndLogOnErr(m.Ctx, "materializer")
+	if m.Closed {
+		return
 	}
+	if m.Ctx == nil {
+		// In some edge cases (like when Init of an operator above this
+		// materializer encounters a panic), the materializer might never be
+		// started, yet it still will attempt to close its Closers. This
+		// context is only used for logging purposes, so it is ok to grab
+		// the background context in order to prevent a NPE below.
+		m.Ctx = context.Background()
+	}
+	// Make sure to call InternalClose() only after closing the closers - this
+	// allows the closers to utilize the unfinished tracing span (if tracing is
+	// enabled).
+	m.closers.CloseAndLogOnErr(m.Ctx, "materializer")
+	m.InternalClose()
 }
 
 // ConsumerClosed is part of the execinfra.RowSource interface.

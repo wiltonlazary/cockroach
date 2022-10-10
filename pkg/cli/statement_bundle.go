@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,14 +28,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cli/clierrorplus"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
-	"github.com/cockroachdb/cockroach/pkg/cli/democluster"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
@@ -65,9 +61,7 @@ var placeholderPairs []string
 var explainPrefix string
 
 func init() {
-	statementBundleRecreateCmd.RunE = clierrorplus.MaybeDecorateError(func(cmd *cobra.Command, args []string) error {
-		return runBundleRecreate(cmd, args)
-	})
+	statementBundleRecreateCmd.RunE = clierrorplus.MaybeDecorateError(runBundleRecreate)
 
 	statementBundleRecreateCmd.Flags().StringArrayVar(&placeholderPairs, "placeholder", nil,
 		"pass in a map of placeholder id to fully-qualified table column to get the program to produce all optimal"+
@@ -87,17 +81,23 @@ type statementBundle struct {
 func loadStatementBundle(zipdir string) (*statementBundle, error) {
 	ret := &statementBundle{}
 	var err error
-	ret.env, err = ioutil.ReadFile(filepath.Join(zipdir, "env.sql"))
+	ret.env, err = os.ReadFile(filepath.Join(zipdir, "env.sql"))
 	if err != nil {
 		return ret, err
 	}
-	ret.schema, err = ioutil.ReadFile(filepath.Join(zipdir, "schema.sql"))
+	ret.schema, err = os.ReadFile(filepath.Join(zipdir, "schema.sql"))
 	if err != nil {
 		return ret, err
 	}
-	ret.statement, err = ioutil.ReadFile(filepath.Join(zipdir, "statement.txt"))
+	ret.statement, err = os.ReadFile(filepath.Join(zipdir, "statement.sql"))
 	if err != nil {
-		return ret, err
+		// In 21.2 and prior releases, the statement file had 'txt' extension,
+		// let's try that.
+		var newErr error
+		ret.statement, newErr = os.ReadFile(filepath.Join(zipdir, "statement.txt"))
+		if newErr != nil {
+			return ret, errors.CombineErrors(err, newErr)
+		}
 	}
 
 	return ret, filepath.WalkDir(zipdir, func(path string, d fs.DirEntry, _ error) error {
@@ -107,7 +107,7 @@ func loadStatementBundle(zipdir string) (*statementBundle, error) {
 		if !strings.HasPrefix(d.Name(), "stats-") {
 			return nil
 		}
-		f, err := ioutil.ReadFile(path)
+		f, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
@@ -116,64 +116,29 @@ func loadStatementBundle(zipdir string) (*statementBundle, error) {
 	})
 }
 
-func runBundleRecreate(cmd *cobra.Command, args []string) error {
+func runBundleRecreate(cmd *cobra.Command, args []string) (resErr error) {
 	zipdir := args[0]
 	bundle, err := loadStatementBundle(zipdir)
 	if err != nil {
 		return err
 	}
 
-	closeFn, err := sqlCtx.Open(os.Stdin)
-	if err != nil {
-		return err
-	}
-	defer closeFn()
-	ctx := context.Background()
-	c, err := democluster.NewDemoCluster(ctx, &demoCtx,
-		log.Infof,
-		log.Warningf,
-		log.Ops.Shoutf,
-		func(ctx context.Context) (*stop.Stopper, error) {
-			// Override the default server store spec.
-			//
-			// This is needed because the logging setup code peeks into this to
-			// decide how to enable logging.
-			serverCfg.Stores.Specs = nil
-			return setupAndInitializeLoggingAndProfiling(ctx, cmd, false /* isServerCmd */)
-		},
-		getAdminClient,
-		func(ctx context.Context, ac serverpb.AdminClient) error {
-			return drainAndShutdown(ctx, ac, "local" /* targetNode */)
-		},
-	)
-	if err != nil {
-		c.Close(ctx)
-		return err
-	}
-	defer c.Close(ctx)
-
-	initGEOS(ctx)
-
-	if err := c.Start(ctx, runInitialSQL); err != nil {
-		return clierrorplus.CheckAndMaybeShout(err)
-	}
-	conn, err := sqlCtx.MakeConn(c.GetConnURL())
-	if err != nil {
-		return err
-	}
-	// Disable autostats collection, which will override the injected stats.
-	if err := conn.Exec(`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`, nil); err != nil {
-		return err
-	}
-	var initStmts = [][]byte{bundle.env, bundle.schema}
-	initStmts = append(initStmts, bundle.stats...)
-	for _, a := range initStmts {
-		if err := conn.Exec(string(a), nil); err != nil {
-			return errors.Wrapf(err, "failed to run %s", a)
+	demoCtx.NoExampleDatabase = true
+	return runDemoInternal(cmd, nil /* gen */, func(ctx context.Context, conn clisqlclient.Conn) error {
+		// Disable autostats collection, which will override the injected stats.
+		if err := conn.Exec(ctx,
+			`SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false`); err != nil {
+			return errors.Wrap(err, "disabling stats collection")
 		}
-	}
+		var initStmts = [][]byte{bundle.env, bundle.schema}
+		initStmts = append(initStmts, bundle.stats...)
+		for _, a := range initStmts {
+			if err := conn.Exec(ctx, string(a)); err != nil {
+				return errors.Wrapf(err, "failed to run: %s", a)
+			}
+		}
 
-	cliCtx.PrintfUnlessEmbedded(`#
+		cliCtx.PrintfUnlessEmbedded(`#
 # Statement bundle %s loaded.
 # Autostats disabled.
 #
@@ -182,32 +147,32 @@ func runBundleRecreate(cmd *cobra.Command, args []string) error {
 # %s
 `, zipdir, bundle.statement)
 
-	if placeholderPairs != nil {
-		placeholderToColMap := make(map[int]string)
-		for _, placeholderPairStr := range placeholderPairs {
-			pair := strings.Split(placeholderPairStr, "=")
-			if len(pair) != 2 {
-				return errors.New("use --placeholder='1=schema.table.col' --placeholder='2=schema.table.col...'")
+		if placeholderPairs != nil {
+			placeholderToColMap := make(map[int]string)
+			for _, placeholderPairStr := range placeholderPairs {
+				pair := strings.Split(placeholderPairStr, "=")
+				if len(pair) != 2 {
+					return errors.New("use --placeholder='1=schema.table.col' --placeholder='2=schema.table.col...'")
+				}
+				n, err := strconv.Atoi(pair[0])
+				if err != nil {
+					return err
+				}
+				placeholderToColMap[n] = pair[1]
 			}
-			n, err := strconv.Atoi(pair[0])
+			inputs, outputs, err := getExplainCombinations(ctx, conn, explainPrefix, placeholderToColMap, bundle)
 			if err != nil {
 				return err
 			}
-			placeholderToColMap[n] = pair[1]
-		}
-		inputs, outputs, err := getExplainCombinations(conn, explainPrefix, placeholderToColMap, bundle)
-		if err != nil {
-			return err
+
+			cliCtx.PrintfUnlessEmbedded("found %d unique explains:\n\n", len(inputs))
+			for i, inputs := range inputs {
+				cliCtx.PrintfUnlessEmbedded("Values %s: \n%s\n----\n\n", inputs, outputs[i])
+			}
 		}
 
-		cliCtx.PrintfUnlessEmbedded("found %d unique explains:\n\n", len(inputs))
-		for i, inputs := range inputs {
-			cliCtx.PrintfUnlessEmbedded("Values %s: \n%s\n----\n\n", inputs, outputs[i])
-		}
-	}
-
-	sqlCtx.ShellCtx.DemoCluster = c
-	return sqlCtx.Run(conn)
+		return nil
+	})
 }
 
 // placeholderRe matches the placeholder format at the bottom of statement.txt
@@ -240,6 +205,7 @@ type bucketKey struct {
 // Columns are linked to placeholders by the --placeholder=n=schema.table.col
 // commandline flags.
 func getExplainCombinations(
+	ctx context.Context,
 	conn clisqlclient.Conn,
 	explainPrefix string,
 	placeholderToColMap map[int]string,
@@ -270,7 +236,7 @@ func getExplainCombinations(
 			return nil, nil, errors.Errorf("specify --placeholder= for placeholder %d", n)
 		}
 	}
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 	fmtCtx := tree.FmtBareStrings
 
@@ -327,6 +293,12 @@ func getExplainCombinations(
 				return nil, nil, errors.Wrapf(err, "unable to parse type %s for col %s", typ, col)
 			}
 			colType := tree.MustBeStaticallyKnownType(colTypeRef)
+			if stat["histo_buckets"] == nil {
+				// There might not be any histogram buckets if the stats were
+				// collected when the table was empty or all values in the
+				// column were NULL.
+				continue
+			}
 			buckets := stat["histo_buckets"].([]interface{})
 			var maxUpperBound tree.Datum
 			for _, b := range buckets {
@@ -339,7 +311,7 @@ func getExplainCombinations(
 				}
 				upperBound := bucket["upper_bound"].(string)
 				bucketMap[key] = []string{upperBound}
-				datum, err := rowenc.ParseDatumStringAs(colType, upperBound, &evalCtx)
+				datum, err := rowenc.ParseDatumStringAs(ctx, colType, upperBound, &evalCtx)
 				if err != nil {
 					panic("failed parsing datum string as " + datum.String() + " " + err.Error())
 				}
@@ -416,13 +388,12 @@ func getExplainOutputs(
 ) (explainStrings []string, err error) {
 	for _, values := range inputs {
 		// Run an explain for each possible input.
-		dvals := make([]driver.Value, len(values))
-		for i := range values {
-			dvals[i] = values[i]
-		}
-
 		query := fmt.Sprintf("%s %s", explainPrefix, statement)
-		rows, err := conn.Query(query, dvals)
+		args := make([]interface{}, len(values))
+		for i, s := range values {
+			args[i] = s
+		}
+		rows, err := conn.Query(context.Background(), query, args...)
 		if err != nil {
 			return nil, err
 		}

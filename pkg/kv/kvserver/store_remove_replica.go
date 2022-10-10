@@ -90,7 +90,6 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 	// Sanity checks before committing to the removal by setting the
 	// destroy status.
 	var desc *roachpb.RangeDescriptor
-	var replicaID roachpb.ReplicaID
 	{
 		rep.readOnlyCmdMu.Lock()
 		rep.mu.Lock()
@@ -122,8 +121,8 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 		}
 
 		// This is a fatal error as an initialized replica can never become
-		/// uninitialized.
-		if !rep.isInitializedRLocked() {
+		// uninitialized.
+		if !rep.IsInitialized() {
 			rep.mu.Unlock()
 			rep.readOnlyCmdMu.Unlock()
 			log.Fatalf(ctx, "uninitialized replica cannot be removed with removeInitializedReplica: %v", rep)
@@ -132,11 +131,9 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 		// Mark the replica as removed before deleting data.
 		rep.mu.destroyStatus.Set(roachpb.NewRangeNotFoundError(rep.RangeID, rep.StoreID()),
 			destroyReasonRemoved)
-		replicaID = rep.mu.replicaID
 		rep.mu.Unlock()
 		rep.readOnlyCmdMu.Unlock()
 	}
-
 	// Proceed with the removal, all errors encountered from here down are fatal.
 
 	// Another sanity check that this replica is a part of this store.
@@ -150,7 +147,7 @@ func (s *Store) removeInitializedReplicaRaftMuLocked(
 
 	// During merges, the context might have the subsuming range, so we explicitly
 	// log the replica to be removed.
-	log.Infof(ctx, "removing replica r%d/%d", rep.RangeID, replicaID)
+	log.Infof(ctx, "removing replica r%d/%d", rep.RangeID, rep.replicaID)
 
 	s.mu.Lock()
 	if it := s.getOverlappingKeyRangeLocked(desc); it.repl != rep {
@@ -253,7 +250,7 @@ func (s *Store) removeUninitializedReplicaRaftMuLocked(
 			log.Fatalf(ctx, "uninitialized replica unexpectedly already removed")
 		}
 
-		if rep.isInitializedRLocked() {
+		if rep.IsInitialized() {
 			rep.mu.Unlock()
 			rep.readOnlyCmdMu.Unlock()
 			log.Fatalf(ctx, "cannot remove initialized replica in removeUninitializedReplica: %v", rep)
@@ -302,9 +299,9 @@ func (s *Store) unlinkReplicaByRangeIDLocked(ctx context.Context, rangeID roachp
 	delete(s.unquiescedReplicas.m, rangeID)
 	s.unquiescedReplicas.Unlock()
 	delete(s.mu.uninitReplicas, rangeID)
-	s.replicaQueues.Delete(int64(rangeID))
 	s.mu.replicasByRangeID.Delete(rangeID)
 	s.unregisterLeaseholderByID(ctx, rangeID)
+	s.raftRecvQueues.Delete(rangeID)
 }
 
 // removePlaceholder removes a placeholder for the specified range.

@@ -321,7 +321,7 @@ func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
 	src := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	dest := testAllocator.NewMemBatchWithMaxCapacity(typs)
 	bytesVec := src.ColVec(0).Bytes()
-	maxValueLen := coldata.BytesInitialAllocationFactor * 8
+	maxValueLen := coldata.BytesMaxInlineLength * 8
 	value := make([]byte, maxValueLen)
 	for i := 0; i < coldata.BatchSize(); i++ {
 		value = value[:rng.Intn(maxValueLen)]
@@ -341,12 +341,13 @@ func TestRecordBatchSerializerDeserializeMemoryEstimate(t *testing.T) {
 	newMemorySize := colmem.GetBatchMemSize(dest)
 
 	// We expect that the original and the new memory sizes are relatively close
-	// to each other (do not differ by more than a third). We cannot guarantee
-	// more precise bound here because the capacities of the underlying []byte
-	// slices is unpredictable. However, this check is sufficient to ensure that
-	// we don't double count memory under `Bytes.data`.
+	// to each other, specifically newMemorySize must less than
+	// 4/3*originalMemorySize. We cannot guarantee more precise bound here because
+	// the capacities of the underlying []byte slices is unpredictable. However,
+	// this check is sufficient to ensure that we don't double count memory under
+	// `Bytes.data`.
 	const maxDeviation = float64(0.33)
-	deviation := math.Abs(float64(originalMemorySize-newMemorySize) / (float64(originalMemorySize)))
+	deviation := float64(newMemorySize-originalMemorySize) / float64(originalMemorySize)
 	require.GreaterOrEqualf(t, maxDeviation, deviation,
 		"new memory size %d is too far away from original %d", newMemorySize, originalMemorySize)
 }

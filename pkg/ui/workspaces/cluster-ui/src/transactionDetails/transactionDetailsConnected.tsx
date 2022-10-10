@@ -13,27 +13,28 @@ import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import { Dispatch } from "redux";
 
-import { AppState } from "src/store";
+import { AppState, uiConfigActions } from "src/store";
+import { actions as nodesActions } from "../store/nodes";
 import { actions as sqlStatsActions } from "src/store/sqlStats";
 import {
   TransactionDetails,
   TransactionDetailsDispatchProps,
   TransactionDetailsProps,
+  TransactionDetailsStateProps,
 } from "./transactionDetails";
 import {
   selectTransactionsData,
   selectTransactionsLastError,
 } from "../transactionsPage/transactionsPage.selectors";
-import { selectIsTenant } from "../store/uiConfig";
+import {
+  selectIsTenant,
+  selectHasViewActivityRedactedRole,
+} from "../store/uiConfig";
 import { nodeRegionsByIDSelector } from "../store/nodes";
 import { selectTimeScale } from "src/statementsPage/statementsPage.selectors";
 import { StatementsRequest } from "src/api/statementsApi";
-import {
-  aggregatedTsAttr,
-  txnFingerprintIdAttr,
-  getMatchParamByName,
-  TimestampToString,
-} from "../util";
+import { txnFingerprintIdAttr, getMatchParamByName } from "../util";
+import { TimeScale } from "../timeScaleDropdown";
 
 export const selectTransaction = createSelector(
   (state: AppState) => state.adminUI.sqlStats,
@@ -41,39 +42,46 @@ export const selectTransaction = createSelector(
   (transactionState, props) => {
     const transactions = transactionState.data?.transactions;
     if (!transactions) {
-      return null;
+      return {
+        isLoading: true,
+        transaction: null,
+      };
     }
-    const aggregatedTs = getMatchParamByName(props.match, aggregatedTsAttr);
     const txnFingerprintId = getMatchParamByName(
       props.match,
       txnFingerprintIdAttr,
     );
 
-    return transactions
-      .filter(
-        txn =>
-          txn.stats_data.transaction_fingerprint_id.toString() ==
-          txnFingerprintId,
-      )
-      .filter(
-        txn => TimestampToString(txn.stats_data.aggregated_ts) == aggregatedTs,
-      )[0];
+    const transaction = transactions.filter(
+      txn =>
+        txn.stats_data.transaction_fingerprint_id.toString() ==
+        txnFingerprintId,
+    )[0];
+    return {
+      isLoading: false,
+      transaction: transaction,
+    };
   },
 );
 
-const mapStateToProps = (state: AppState, props: TransactionDetailsProps) => {
+const mapStateToProps = (
+  state: AppState,
+  props: TransactionDetailsProps,
+): TransactionDetailsStateProps => {
+  const { isLoading, transaction } = selectTransaction(state, props);
   return {
-    aggregatedTs: getMatchParamByName(props.match, aggregatedTsAttr),
     timeScale: selectTimeScale(state),
     error: selectTransactionsLastError(state),
     isTenant: selectIsTenant(state),
     nodeRegions: nodeRegionsByIDSelector(state),
     statements: selectTransactionsData(state)?.statements,
-    transaction: selectTransaction(state, props),
+    transaction,
     transactionFingerprintId: getMatchParamByName(
       props.match,
       txnFingerprintIdAttr,
     ),
+    isLoading: isLoading,
+    hasViewActivityRedactedRole: selectHasViewActivityRedactedRole(state),
   };
 };
 
@@ -82,6 +90,15 @@ const mapDispatchToProps = (
 ): TransactionDetailsDispatchProps => ({
   refreshData: (req?: StatementsRequest) =>
     dispatch(sqlStatsActions.refresh(req)),
+  refreshNodes: () => dispatch(nodesActions.refresh()),
+  refreshUserSQLRoles: () => dispatch(uiConfigActions.refreshUserSQLRoles()),
+  onTimeScaleChange: (ts: TimeScale) => {
+    dispatch(
+      sqlStatsActions.updateTimeScale({
+        ts: ts,
+      }),
+    );
+  },
 });
 
 export const TransactionDetailsPageConnected = withRouter<any, any>(

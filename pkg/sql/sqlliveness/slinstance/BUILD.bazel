@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -9,6 +10,8 @@ go_library(
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql/sqlliveness",
+        "//pkg/util/contextutil",
+        "//pkg/util/grpcutil",
         "//pkg/util/hlc",
         "//pkg/util/log",
         "//pkg/util/retry",
@@ -16,6 +19,7 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "//pkg/util/uuid",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -26,16 +30,21 @@ go_test(
         "helpers_test.go",
         "slinstance_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":slinstance"],
     deps = [
         "//pkg/clusterversion",
         "//pkg/settings/cluster",
         "//pkg/sql/sqlliveness",
         "//pkg/sql/sqlliveness/slstorage",
+        "//pkg/testutils",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
         "//pkg/util/log",
         "//pkg/util/stop",
+        "//pkg/util/timeutil",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

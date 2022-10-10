@@ -21,16 +21,17 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -44,7 +45,7 @@ func verifyRows(
 	ctx context.Context,
 	i RowIterator,
 	expectedRows rowenc.EncDatumRows,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	ordering colinfo.ColumnOrdering,
 ) error {
 	for i.Rewind(); ; i.Next() {
@@ -76,12 +77,13 @@ func verifyRows(
 // the memory accounting.
 func TestRowContainerReplaceMax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	rng, _ := randutil.NewTestRand()
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	makeRow := func(intVal int, strLen int) rowenc.EncDatumRow {
@@ -131,10 +133,11 @@ func TestRowContainerReplaceMax(t *testing.T) {
 
 func TestRowContainerIterators(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	const numRows = 10
@@ -187,10 +190,11 @@ func TestRowContainerIterators(t *testing.T) {
 
 func TestDiskBackedRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -237,9 +241,9 @@ func TestDiskBackedRowContainer(t *testing.T) {
 	// halfway through, keeps on adding rows, and then verifies that all rows
 	// were properly added to the DiskBackedRowContainer.
 	t.Run("NormalRun", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 
 		defer func() {
@@ -285,9 +289,9 @@ func TestDiskBackedRowContainer(t *testing.T) {
 	})
 
 	t.Run("AddRowOutOfMem", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 		defer diskMonitor.Stop(ctx)
 
 		defer func() {
@@ -311,9 +315,9 @@ func TestDiskBackedRowContainer(t *testing.T) {
 	})
 
 	t.Run("AddRowOutOfDisk", func(t *testing.T) {
-		memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		defer memoryMonitor.Stop(ctx)
-		diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(1))
+		diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(1))
 		defer diskMonitor.Stop(ctx)
 
 		defer func() {
@@ -342,10 +346,11 @@ func TestDiskBackedRowContainer(t *testing.T) {
 
 func TestDiskBackedRowContainerDeDuping(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -361,11 +366,10 @@ func TestDiskBackedRowContainerDeDuping(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
+	diskMonitor := newTestDiskMonitor(ctx, st)
 
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer memoryMonitor.Stop(ctx)
-	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
 	numRows := 10
@@ -428,7 +432,7 @@ func TestDiskBackedRowContainerDeDuping(t *testing.T) {
 // ordering.
 func verifyOrdering(
 	ctx context.Context,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	src SortableRowContainer,
 	types []*types.T,
 	ordering colinfo.ColumnOrdering,
@@ -462,10 +466,11 @@ func verifyOrdering(
 
 func TestDiskBackedIndexedRowContainer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		t.Fatal(err)
@@ -498,9 +503,9 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 	newOrdering := colinfo.ColumnOrdering{{ColIdx: 1, Direction: encoding.Ascending}}
 
 	rng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer memoryMonitor.Stop(ctx)
-	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
 	// SpillingHalfway adds half of all rows into DiskBackedIndexedRowContainer,
@@ -600,6 +605,18 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 					}
 					expectedRow := sortedRows.rows[i]
 					if readRow.GetIdx() != expectedRow.GetIdx() {
+						// Check whether both rows are equal.
+						cmp, err := compareIndexedRows(&evalCtx, expectedRow, readRow, ordering)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if cmp == 0 {
+							// The rows are equal, and since we don't use a
+							// stable sort, this is allowed. The ordering going
+							// forward will differ so there is no point in
+							// proceeding.
+							return
+						}
 						t.Fatalf("read row has different idx that what we expect")
 					}
 					for col, expectedDatum := range expectedRow.Row {
@@ -663,9 +680,9 @@ func TestDiskBackedIndexedRowContainer(t *testing.T) {
 				sortedRows.rows = append(sortedRows.rows, IndexedRow{Idx: len(sortedRows.rows), Row: row})
 			}
 
-			memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(budget))
+			memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(budget))
 			defer memoryMonitor.Stop(ctx)
-			diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+			diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 			defer diskMonitor.Stop(ctx)
 
 			sorter := rowsSorter{evalCtx: &evalCtx, rows: sortedRows, ordering: ordering}
@@ -826,7 +843,7 @@ func (ir indexedRows) Len() int {
 // There are possibly couple of other duplicates as well in other files, so we
 // should refactor it and probably extract the code into a new package.
 type rowsSorter struct {
-	evalCtx  *tree.EvalContext
+	evalCtx  *eval.Context
 	rows     indexedRows
 	ordering colinfo.ColumnOrdering
 	err      error
@@ -853,7 +870,13 @@ func (n *rowsSorter) Less(i, j int) bool {
 
 func (n *rowsSorter) Compare(i, j int) (int, error) {
 	ra, rb := n.rows.rows[i], n.rows.rows[j]
-	for _, o := range n.ordering {
+	return compareIndexedRows(n.evalCtx, ra, rb, n.ordering)
+}
+
+func compareIndexedRows(
+	evalCtx *eval.Context, ra, rb eval.IndexedRow, ordering colinfo.ColumnOrdering,
+) (int, error) {
+	for _, o := range ordering {
 		da, err := ra.GetDatum(o.ColIdx)
 		if err != nil {
 			return 0, err
@@ -862,7 +885,7 @@ func (n *rowsSorter) Compare(i, j int) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if c := da.Compare(n.evalCtx, db); c != 0 {
+		if c := da.Compare(evalCtx, db); c != 0 {
 			if o.Direction != encoding.Ascending {
 				return -c, nil
 			}
@@ -903,12 +926,15 @@ func generateAccessPattern(numRows int) []int {
 }
 
 func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
 	const numCols = 1
 	const numRows = 100000
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	tempEngine, _, err := storage.NewTempEngine(ctx, base.TempStorageConfig{InMemory: true}, base.DefaultTestStoreSpec)
 	if err != nil {
 		b.Fatal(err)
@@ -934,9 +960,9 @@ func BenchmarkDiskBackedIndexedRowContainer(b *testing.B) {
 		st,
 	)
 	rows := randgen.MakeIntRows(numRows, numCols)
-	memoryMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	memoryMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer memoryMonitor.Stop(ctx)
-	diskMonitor.Start(ctx, nil, mon.MakeStandaloneBudget(math.MaxInt64))
+	diskMonitor.Start(ctx, nil, mon.NewStandaloneBudget(math.MaxInt64))
 	defer diskMonitor.Stop(ctx)
 
 	accessPattern := generateAccessPattern(numRows)

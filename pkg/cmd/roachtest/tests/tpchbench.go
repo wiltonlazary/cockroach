@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -72,8 +71,13 @@ func runTPCHBench(ctx context.Context, t test.Test, c cluster.Cluster, b tpchBen
 
 	m := c.NewMonitor(ctx, roachNodes)
 	m.Go(func(ctx context.Context) error {
+		conn := c.Conn(ctx, t.L(), 1)
+		defer conn.Close()
+
 		t.Status("setting up dataset")
-		err := loadTPCHDataset(ctx, t, c, b.ScaleFactor, m, roachNodes)
+		err := loadTPCHDataset(
+			ctx, t, c, conn, b.ScaleFactor, m, roachNodes, true, /* disableMergeQueue */
+		)
 		if err != nil {
 			return err
 		}
@@ -140,7 +144,7 @@ func downloadFile(filename string, url string) (*os.File, error) {
 	defer resp.Body.Close()
 
 	// Create the file.
-	out, err := ioutil.TempFile(`` /* dir */, filename)
+	out, err := os.CreateTemp(`` /* dir */, filename)
 	if err != nil {
 		return nil, err
 	}

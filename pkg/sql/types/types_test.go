@@ -1006,6 +1006,8 @@ func TestWithoutTypeModifiers(t *testing.T) {
 		{MakeArray(MakeDecimal(5, 1)), DecimalArray},
 		{MakeTuple([]*T{MakeString(2), Time, MakeDecimal(5, 1)}),
 			MakeTuple([]*T{String, Time, Decimal})},
+		{MakeGeography(geopb.ShapeType_Point, 3857), Geography},
+		{MakeGeometry(geopb.ShapeType_PointZ, 4326), Geometry},
 
 		// Types without modifiers.
 		{Bool, Bool},
@@ -1026,8 +1028,61 @@ func TestWithoutTypeModifiers(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		if actual := tc.t.WithoutTypeModifiers(); !actual.Identical(tc.expected) {
-			t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), actual.DebugString())
+		t.Run(tc.t.SQLString(), func(t *testing.T) {
+			if actual := tc.t.WithoutTypeModifiers(); !actual.Identical(tc.expected) {
+				t.Errorf("expected <%v>, got <%v>", tc.expected.DebugString(), actual.DebugString())
+			}
+		})
+	}
+}
+
+func TestDelimiter(t *testing.T) {
+	testCases := []struct {
+		t        *T
+		expected string
+	}{
+		{Unknown, ","},
+		{Bool, ","},
+		{VarBit, ","},
+		{Int, ","},
+		{Int4, ","},
+		{Int2, ","},
+		{Float, ","},
+		{Float4, ","},
+		{Decimal, ","},
+		{String, ","},
+		{VarChar, ","},
+		{QChar, ","},
+		{Name, ","},
+		{Bytes, ","},
+		{Date, ","},
+		{Time, ","},
+		{TimeTZ, ","},
+		{Timestamp, ","},
+		{TimestampTZ, ","},
+		{Interval, ","},
+		{Jsonb, ","},
+		{Uuid, ","},
+		{INet, ","},
+		{Geometry, ":"},
+		{Geography, ":"},
+		{Box2D, ","},
+		{Void, ","},
+		{EncodedKey, ","},
+	}
+
+	for _, tc := range testCases {
+		if actual := tc.t.Delimiter(); actual != tc.expected {
+			t.Errorf("%v: expected <%v>, got <%v>", tc.t.Family(), tc.expected, actual)
 		}
 	}
+}
+
+// Prior to the patch which introduced this test, the below calls would
+// have panicked.
+func TestEnumWithoutTypeMetaNameDoesNotPanicInSQLString(t *testing.T) {
+	typ := MakeEnum(100100, 100101)
+	require.Equal(t, "@100100", typ.SQLString())
+	arrayType := MakeArray(typ)
+	require.Equal(t, "@100100[]", arrayType.SQLString())
 }

@@ -119,7 +119,12 @@ func (r *commandResult) Close(ctx context.Context, t sql.TransactionStatusIndica
 	r.conn.writerState.fi.registerCmd(r.pos)
 	if r.err != nil {
 		r.conn.bufferErr(ctx, r.err)
-		return
+		// Sync is the only client message that results in ReadyForQuery, and it
+		// must *always* result in ReadyForQuery, even if there are errors during
+		// Sync.
+		if r.typ != readyForQuery {
+			return
+		}
 	}
 
 	for _, notice := range r.buffer.notices {
@@ -156,11 +161,13 @@ func (r *commandResult) Close(ctx context.Context, t sql.TransactionStatusIndica
 		r.conn.bufferReadyForQuery(byte(t))
 		// The error is saved on conn.err.
 		_ /* err */ = r.conn.Flush(r.pos)
+		r.conn.maybeReallocate()
 	case emptyQueryResponse:
 		r.conn.bufferEmptyQueryResponse()
 	case flush:
 		// The error is saved on conn.err.
 		_ /* err */ = r.conn.Flush(r.pos)
+		r.conn.maybeReallocate()
 	case noCompletionMsg:
 		// nothing to do
 	default:
@@ -189,9 +196,8 @@ func (r *commandResult) SetError(err error) {
 	r.err = err
 }
 
-// addInternal is the skeleton of AddRow and AddBatch implementations.
-// bufferData should update rowsAffected and buffer the data accordingly.
-func (r *commandResult) addInternal(bufferData func()) error {
+// beforeAdd should be called before rows are buffered.
+func (r *commandResult) beforeAdd() error {
 	r.assertNotReleased()
 	if r.err != nil {
 		panic(errors.NewAssertionErrorWithWrappedErrf(r.err, "can't call AddRow after having set error"))
@@ -203,32 +209,25 @@ func (r *commandResult) addInternal(bufferData func()) error {
 	if r.err != nil {
 		panic("can't send row after error")
 	}
-
-	bufferData()
-
-	var err error
-	if r.bufferingDisabled {
-		err = r.conn.Flush(r.pos)
-	} else {
-		_ /* flushed */, err = r.conn.maybeFlush(r.pos)
-	}
-	return err
+	return nil
 }
 
 // AddRow is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) AddRow(ctx context.Context, row tree.Datums) error {
-	return r.addInternal(func() {
-		r.rowsAffected++
-		r.conn.bufferRow(ctx, row, r.formatCodes, r.conv, r.location, r.types)
-	})
+	if err := r.beforeAdd(); err != nil {
+		return err
+	}
+	r.rowsAffected++
+	return r.conn.bufferRow(ctx, row, r)
 }
 
 // AddBatch is part of the sql.RestrictedCommandResult interface.
 func (r *commandResult) AddBatch(ctx context.Context, batch coldata.Batch) error {
-	return r.addInternal(func() {
-		r.rowsAffected += batch.Length()
-		r.conn.bufferBatch(ctx, batch, r.formatCodes, r.conv, r.location)
-	})
+	if err := r.beforeAdd(); err != nil {
+		return err
+	}
+	r.rowsAffected += batch.Length()
+	return r.conn.bufferBatch(ctx, batch, r)
 }
 
 // SupportsAddBatch is part of the sql.RestrictedCommandResult interface.
@@ -438,9 +437,6 @@ func (r *limitedCommandResult) AddRow(ctx context.Context, row tree.Datums) erro
 
 		return r.moreResultsNeeded(ctx)
 	}
-	if _ /* flushed */, err := r.conn.maybeFlush(r.pos); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -499,6 +495,13 @@ func (r *limitedCommandResult) moreResultsNeeded(ctx context.Context) error {
 			// We can hard code InTxnBlock here because implicit transactions are
 			// handled above.
 			r.conn.bufferReadyForQuery(byte(sql.InTxnBlock))
+			if err := r.conn.Flush(r.pos); err != nil {
+				return err
+			}
+		case sql.Flush:
+			// Flush has no client response, so just advance the position and flush
+			// any existing results.
+			r.conn.stmtBuf.AdvanceOne()
 			if err := r.conn.Flush(r.pos); err != nil {
 				return err
 			}

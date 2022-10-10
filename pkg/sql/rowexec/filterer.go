@@ -14,7 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/errors"
 )
@@ -29,11 +31,12 @@ type filtererProcessor struct {
 
 var _ execinfra.Processor = &filtererProcessor{}
 var _ execinfra.RowSource = &filtererProcessor{}
-var _ execinfra.OpNode = &filtererProcessor{}
+var _ execopnode.OpNode = &filtererProcessor{}
 
 const filtererProcName = "filterer"
 
 func newFiltererProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.FiltererSpec,
@@ -44,6 +47,7 @@ func newFiltererProcessor(
 	f := &filtererProcessor{input: input}
 	types := input.OutputTypes()
 	if err := f.Init(
+		ctx,
 		f,
 		post,
 		types,
@@ -57,12 +61,11 @@ func newFiltererProcessor(
 	}
 
 	f.filter = &execinfrapb.ExprHelper{}
-	if err := f.filter.Init(spec.Filter, types, &f.SemaCtx, f.EvalCtx); err != nil {
+	if err := f.filter.Init(ctx, spec.Filter, types, &f.SemaCtx, f.EvalCtx); err != nil {
 		return nil, err
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
-	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		f.input = newInputStatCollector(f.input)
 		f.ExecStatsForTrace = f.execStatsForTrace
 	}
@@ -92,7 +95,7 @@ func (f *filtererProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMet
 		}
 
 		// Perform the actual filtering.
-		passes, err := f.filter.EvalFilter(row)
+		passes, err := f.filter.EvalFilter(f.Ctx, row)
 		if err != nil {
 			f.MoveToDraining(err)
 			break
@@ -118,21 +121,21 @@ func (f *filtererProcessor) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (f *filtererProcessor) ChildCount(bool) int {
-	if _, ok := f.input.(execinfra.OpNode); ok {
+	if _, ok := f.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (f *filtererProcessor) Child(nth int, _ bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (f *filtererProcessor) Child(nth int, _ bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := f.input.(execinfra.OpNode); ok {
+		if n, ok := f.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to filterer is not an execinfra.OpNode")
+		panic("input to filterer is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

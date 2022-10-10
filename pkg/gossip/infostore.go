@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 type stringMatcher interface {
@@ -253,7 +254,7 @@ func (is *infoStore) addInfo(key string, i *Info) error {
 		if highWaterStamp, ok := is.highWaterStamps[i.NodeID]; ok && highWaterStamp >= i.OrigStamp {
 			// Report both timestamps in the crash.
 			log.Fatalf(context.Background(),
-				"high water stamp %d >= %d", log.Safe(highWaterStamp), log.Safe(i.OrigStamp))
+				"high water stamp %d >= %d", redact.Safe(highWaterStamp), redact.Safe(i.OrigStamp))
 		}
 	}
 	// Update info map.
@@ -434,7 +435,7 @@ func (is *infoStore) delta(highWaterTimestamps map[roachpb.NodeID]int64) map[str
 // propagated regardless of high water stamps.
 func (is *infoStore) populateMostDistantMarkers(infos map[string]*Info) {
 	if err := is.visitInfos(func(key string, i *Info) error {
-		if IsNodeIDKey(key) {
+		if IsNodeDescKey(key) {
 			infos[key] = i
 		}
 		return nil
@@ -466,7 +467,7 @@ func (is *infoStore) mostDistant(
 		// acquire unreliably high Hops values in some pathological cases such as
 		// those described in #9819.
 		if i.NodeID != localNodeID && i.Hops > maxHops &&
-			IsNodeIDKey(key) && !hasOutgoingConn(i.NodeID) {
+			IsNodeDescKey(key) && !hasOutgoingConn(i.NodeID) {
 			maxHops = i.Hops
 			nodeID = i.NodeID
 		}

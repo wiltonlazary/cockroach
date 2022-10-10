@@ -108,7 +108,7 @@ parse
 SELECT~~+~++~bd(*)
 ----
 SELECT ~(~(~(~bd(*)))) -- normalized!
-SELECT (~((~((~((~((bd)((*)))))))))) -- fully parenthesized
+SELECT (~((~((~((~(bd((*)))))))))) -- fully parenthesized
 SELECT ~(~(~(~bd(*)))) -- literals removed
 SELECT ~(~(~(~bd(*)))) -- identifiers removed
 
@@ -157,7 +157,7 @@ SELECT (ARRAY (VALUES (1), (2)))[1]
 ----
 SELECT (ARRAY (VALUES (1), (2)))[1]
 SELECT ((((ARRAY ((VALUES ((1)), ((2)))))))[(1)]) -- fully parenthesized
-SELECT (ARRAY (VALUES (_), (__more1__)))[_] -- literals removed
+SELECT (ARRAY (VALUES (_), (__more1_10__)))[_] -- literals removed
 SELECT (ARRAY (VALUES (1), (2)))[1] -- identifiers removed
 
 parse
@@ -195,10 +195,10 @@ SELECT CASE 1 = 1 WHEN true THEN ARRAY[1, 2] ELSE ARRAY[2, 3] END[1]
 parse
 SELECT FAMILY (x)
 ----
-SELECT "family"(x) -- normalized!
-SELECT (("family")((x))) -- fully parenthesized
-SELECT "family"(x) -- literals removed
-SELECT "family"(_) -- identifiers removed
+SELECT family(x) -- normalized!
+SELECT (family((x))) -- fully parenthesized
+SELECT family(x) -- literals removed
+SELECT family(_) -- identifiers removed
 
 parse
 SELECT 1 IN (b)
@@ -301,7 +301,7 @@ SELECT (1, 2, 3)
 ----
 SELECT (1, 2, 3)
 SELECT (((1), (2), (3))) -- fully parenthesized
-SELECT (_, _, __more1__) -- literals removed
+SELECT (_, _, __more1_10__) -- literals removed
 SELECT (1, 2, 3) -- identifiers removed
 
 parse
@@ -309,7 +309,7 @@ SELECT ((1, 2, 3) AS a, b, c)
 ----
 SELECT ((1, 2, 3) AS a, b, c)
 SELECT ((((1), (2), (3)) AS a, b, c)) -- fully parenthesized
-SELECT ((_, _, __more1__) AS a, b) -- literals removed
+SELECT ((_, _, __more1_10__) AS a, b) -- literals removed
 SELECT ((1, 2, 3) AS _, _, _) -- identifiers removed
 
 parse
@@ -317,7 +317,7 @@ SELECT ((1, 2, 3))
 ----
 SELECT ((1, 2, 3))
 SELECT (((((1), (2), (3))))) -- fully parenthesized
-SELECT ((_, _, __more1__)) -- literals removed
+SELECT ((_, _, __more1_10__)) -- literals removed
 SELECT ((1, 2, 3)) -- identifiers removed
 
 parse
@@ -325,7 +325,7 @@ SELECT ((1, 2, 3) AS a, b, c)
 ----
 SELECT ((1, 2, 3) AS a, b, c)
 SELECT ((((1), (2), (3)) AS a, b, c)) -- fully parenthesized
-SELECT ((_, _, __more1__) AS a, b) -- literals removed
+SELECT ((_, _, __more1_10__) AS a, b) -- literals removed
 SELECT ((1, 2, 3) AS _, _, _) -- identifiers removed
 
 parse
@@ -333,7 +333,7 @@ SELECT (((1, 2, 3) AS a, b, c)).a
 ----
 SELECT (((1, 2, 3) AS a, b, c)).a
 SELECT ((((((1), (2), (3)) AS a, b, c))).a) -- fully parenthesized
-SELECT (((_, _, __more1__) AS a, b)).a -- literals removed
+SELECT (((_, _, __more1_10__) AS a, b)).a -- literals removed
 SELECT (((1, 2, 3) AS _, _, _))._ -- identifiers removed
 
 parse
@@ -341,7 +341,7 @@ SELECT (((1, 2, 3) AS a, b, c)).*
 ----
 SELECT (((1, 2, 3) AS a, b, c)).*
 SELECT ((((((1), (2), (3)) AS a, b, c))).*) -- fully parenthesized
-SELECT (((_, _, __more1__) AS a, b)).* -- literals removed
+SELECT (((_, _, __more1_10__) AS a, b)).* -- literals removed
 SELECT (((1, 2, 3) AS _, _, _)).* -- identifiers removed
 
 parse
@@ -603,20 +603,20 @@ SELECT BOOL '_', '_'::BOOL -- literals removed
 SELECT BOOL 'foo', 'foo'::BOOL -- identifiers removed
 
 parse
-SELECT BIT '10', '10'::BIT
+SELECT BIT '10', '10'::BIT, BIT(2) '10'
 ----
-SELECT BIT '10', '10'::BIT
-SELECT (BIT ('10')), (('10')::BIT) -- fully parenthesized
-SELECT BIT '_', '_'::BIT -- literals removed
-SELECT BIT '10', '10'::BIT -- identifiers removed
+SELECT BIT '10', '10'::BIT, BIT(2) '10'
+SELECT (BIT ('10')), (('10')::BIT), (BIT(2) ('10')) -- fully parenthesized
+SELECT BIT '_', '_'::BIT, BIT(2) '_' -- literals removed
+SELECT BIT '10', '10'::BIT, BIT(2) '10' -- identifiers removed
 
 parse
-SELECT VARBIT '1', '1'::VARBIT
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01'
 ----
-SELECT VARBIT '1', '1'::VARBIT
-SELECT (VARBIT ('1')), (('1')::VARBIT) -- fully parenthesized
-SELECT VARBIT '_', '_'::VARBIT -- literals removed
-SELECT VARBIT '1', '1'::VARBIT -- identifiers removed
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01'
+SELECT (VARBIT ('1')), (('1')::VARBIT), (VARBIT(2) ('01')) -- fully parenthesized
+SELECT VARBIT '_', '_'::VARBIT, VARBIT(2) '_' -- literals removed
+SELECT VARBIT '1', '1'::VARBIT, VARBIT(2) '01' -- identifiers removed
 
 parse
 SELECT INT2 'foo', 'foo'::INT2
@@ -685,28 +685,28 @@ SELECT DECIMAL 'foo' -- identifiers removed
 
 
 parse
-SELECT CHAR 'foo', 'foo'::CHAR
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo'
 ----
-SELECT CHAR 'foo', 'foo'::CHAR
-SELECT (CHAR ('foo')), (('foo')::CHAR) -- fully parenthesized
-SELECT CHAR '_', '_'::CHAR -- literals removed
-SELECT CHAR 'foo', 'foo'::CHAR -- identifiers removed
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo'
+SELECT (CHAR ('foo')), (('foo')::CHAR), (CHAR(2) ('foo')) -- fully parenthesized
+SELECT CHAR '_', '_'::CHAR, CHAR(2) '_' -- literals removed
+SELECT CHAR 'foo', 'foo'::CHAR, CHAR(2) 'foo' -- identifiers removed
 
 parse
-SELECT VARCHAR 'foo', 'foo'::VARCHAR
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo'
 ----
-SELECT VARCHAR 'foo', 'foo'::VARCHAR
-SELECT (VARCHAR ('foo')), (('foo')::VARCHAR) -- fully parenthesized
-SELECT VARCHAR '_', '_'::VARCHAR -- literals removed
-SELECT VARCHAR 'foo', 'foo'::VARCHAR -- identifiers removed
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo'
+SELECT (VARCHAR ('foo')), (('foo')::VARCHAR), (VARCHAR(5) ('foo')) -- fully parenthesized
+SELECT VARCHAR '_', '_'::VARCHAR, VARCHAR(5) '_' -- literals removed
+SELECT VARCHAR 'foo', 'foo'::VARCHAR, VARCHAR(5) 'foo' -- identifiers removed
 
 parse
-SELECT STRING 'foo', 'foo'::STRING
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo'
 ----
-SELECT STRING 'foo', 'foo'::STRING
-SELECT (STRING ('foo')), (('foo')::STRING) -- fully parenthesized
-SELECT STRING '_', '_'::STRING -- literals removed
-SELECT STRING 'foo', 'foo'::STRING -- identifiers removed
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo'
+SELECT (STRING ('foo')), (('foo')::STRING), (STRING(9) ('foo')) -- fully parenthesized
+SELECT STRING '_', '_'::STRING, STRING(9) '_' -- literals removed
+SELECT STRING 'foo', 'foo'::STRING, STRING(9) 'foo' -- identifiers removed
 
 parse
 SELECT BYTES 'foo', 'foo'::BYTES
@@ -1426,7 +1426,7 @@ SELECT (ARRAY['a', 'b', 'c']).name
 ----
 SELECT (ARRAY['a', 'b', 'c']).name
 SELECT (((ARRAY[('a'), ('b'), ('c')])).name) -- fully parenthesized
-SELECT (ARRAY['_', '_', __more1__]).name -- literals removed
+SELECT (ARRAY['_', '_', __more1_10__]).name -- literals removed
 SELECT (ARRAY['a', 'b', 'c'])._ -- identifiers removed
 
 parse
@@ -1816,6 +1816,14 @@ SELECT (('')::VOID) -- fully parenthesized
 SELECT '_'::VOID -- literals removed
 SELECT ''::VOID -- identifiers removed
 
+parse
+SELECT '':::void
+----
+SELECT '':::VOID -- normalized!
+SELECT ((''):::VOID) -- fully parenthesized
+SELECT '_':::VOID -- literals removed
+SELECT '':::VOID -- identifiers removed
+
 error
 SELECT ''::void[]
 ----
@@ -1823,3 +1831,99 @@ at or near "EOF": syntax error: type void[] does not exist
 DETAIL: source SQL:
 SELECT ''::void[]
                  ^
+
+parse
+SELECT overlaps(
+TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 01:00:00',
+TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+SELECT overlaps(TIMESTAMP '2000-01-01 00:00:00', TIMESTAMP '2000-01-01 01:00:00', TIMESTAMP '2000-01-01 00:30:00', TIMESTAMP '2000-01-01 01:30:00') -- normalized!
+SELECT (overlaps((TIMESTAMP ('2000-01-01 00:00:00')), (TIMESTAMP ('2000-01-01 01:00:00')), (TIMESTAMP ('2000-01-01 00:30:00')), (TIMESTAMP ('2000-01-01 01:30:00')))) -- fully parenthesized
+SELECT overlaps(TIMESTAMP '_', TIMESTAMP '_', TIMESTAMP '_', TIMESTAMP '_') -- literals removed
+SELECT overlaps(TIMESTAMP '2000-01-01 00:00:00', TIMESTAMP '2000-01-01 01:00:00', TIMESTAMP '2000-01-01 00:30:00', TIMESTAMP '2000-01-01 01:30:00') -- identifiers removed
+
+parse
+SELECT
+(TIMESTAMP '2000-01-01 00:00:00',
+TIMESTAMP '2000-01-01 01:00:00')
+OVERLAPS
+(TIMESTAMP '2000-01-01 00:30:00',
+TIMESTAMP '2000-01-01 01:30:00');
+----
+SELECT overlaps(TIMESTAMP '2000-01-01 00:00:00', TIMESTAMP '2000-01-01 01:00:00', TIMESTAMP '2000-01-01 00:30:00', TIMESTAMP '2000-01-01 01:30:00') -- normalized!
+SELECT (overlaps((TIMESTAMP ('2000-01-01 00:00:00')), (TIMESTAMP ('2000-01-01 01:00:00')), (TIMESTAMP ('2000-01-01 00:30:00')), (TIMESTAMP ('2000-01-01 01:30:00')))) -- fully parenthesized
+SELECT overlaps(TIMESTAMP '_', TIMESTAMP '_', TIMESTAMP '_', TIMESTAMP '_') -- literals removed
+SELECT overlaps(TIMESTAMP '2000-01-01 00:00:00', TIMESTAMP '2000-01-01 01:00:00', TIMESTAMP '2000-01-01 00:30:00', TIMESTAMP '2000-01-01 01:30:00') -- identifiers removed
+
+error
+SELECT
+(DATE '2000-01-03',
+DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03',
+DATE '2000-01-04');
+----
+at or near ")": syntax error: wrong number of parameters on left side of OVERLAPS expression
+DETAIL: source SQL:
+SELECT
+(DATE '2000-01-03',
+DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03',
+DATE '2000-01-04')
+                 ^
+
+error
+SELECT
+(DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04');
+----
+at or near ")": syntax error: wrong number of parameters on right side of OVERLAPS expression
+DETAIL: source SQL:
+SELECT
+(DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03',
+DATE '2000-01-03',
+DATE '2000-01-04')
+                 ^
+
+error
+SELECT
+(DATE '2000-01-03')
+OVERLAPS
+(DATE '2000-01-03',
+DATE '2000-01-04');
+----
+at or near "overlaps": syntax error
+DETAIL: source SQL:
+SELECT
+(DATE '2000-01-03')
+OVERLAPS
+^
+
+error
+SELECT
+(DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03');
+----
+at or near ")": syntax error
+DETAIL: source SQL:
+SELECT
+(DATE '2000-02-03',
+DATE '2000-03-03')
+OVERLAPS
+(DATE '2000-01-03')
+                  ^
+HINT: try \h SELECT

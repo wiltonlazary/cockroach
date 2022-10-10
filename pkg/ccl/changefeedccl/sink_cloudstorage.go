@@ -10,7 +10,6 @@ package changefeedccl
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -19,19 +18,23 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvevent"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/google/btree"
 )
@@ -59,13 +62,13 @@ func cloudStorageFormatTime(ts hlc.Timestamp) string {
 
 type cloudStorageSinkFile struct {
 	cloudStorageSinkKey
-	codec         io.WriteCloser
-	rawSize       int
-	numMessages   int
-	buf           bytes.Buffer
-	alloc         kvevent.Alloc
-	oldestMVCC    hlc.Timestamp
-	recordMetrics recordEmittedMessagesCallback
+	created     time.Time
+	codec       io.WriteCloser
+	rawSize     int
+	numMessages int
+	buf         bytes.Buffer
+	alloc       kvevent.Alloc
+	oldestMVCC  hlc.Timestamp
 }
 
 var _ io.Writer = &cloudStorageSinkFile{}
@@ -187,7 +190,6 @@ func (f *cloudStorageSinkFile) Write(p []byte) (int, error) {
 // guaranteed to be sorted by timestamp. A duplicate of some records might exist
 // in a different file or even in the same file.
 //
-//
 // The resolved timestamp files are named `<timestamp>.RESOLVED`. This is
 // carefully done so that we can offer the following external guarantee: At any
 // given time, if the files are iterated in lexicographic filename order,
@@ -274,18 +276,18 @@ func (f *cloudStorageSinkFile) Write(p []byte) (int, error) {
 // satisfies requirements of lemma 1. So we can consider these k jobs conceptually as one
 // job (call it P). Now, we're back to the case where k = 2 with jobs P and Q. Thus, by
 // induction we have the required proof.
-//
 type cloudStorageSink struct {
 	srcID             base.SQLInstanceID
 	sinkID            int64
 	targetMaxFileSize int64
 	settings          *cluster.Settings
 	partitionFormat   string
+	topicNamer        *TopicNamer
 
 	ext          string
 	rowDelimiter []byte
 
-	compression string
+	compression compressionAlgo
 
 	es cloud.ExternalStorage
 
@@ -302,10 +304,13 @@ type cloudStorageSink struct {
 	dataFileTs        string
 	dataFilePartition string
 	prevFilename      string
-	metrics           *sliMetrics
-}
+	metrics           metricsRecorder
 
-const sinkCompressionGzip = "gzip"
+	asyncFlushActive bool
+	flushCtx         context.Context
+	flushGroup       sync.WaitGroup
+	flushErr         atomic.Value
+}
 
 var cloudStorageSinkIDAtomic int64
 
@@ -325,11 +330,11 @@ func makeCloudStorageSink(
 	u sinkURL,
 	srcID base.SQLInstanceID,
 	settings *cluster.Settings,
-	opts map[string]string,
+	encodingOpts changefeedbase.EncodingOptions,
 	timestampOracle timestampLowerBoundOracle,
 	makeExternalStorageFromURI cloud.ExternalStorageFromURIFactory,
-	user security.SQLUsername,
-	m *sliMetrics,
+	user username.SQLUsername,
+	mb metricsRecorderBuilder,
 ) (Sink, error) {
 	var targetMaxFileSize int64 = 16 << 20 // 16MB
 	if fileSizeParam := u.consumeParam(changefeedbase.SinkParamFileSize); fileSizeParam != `` {
@@ -345,6 +350,15 @@ func makeCloudStorageSink(
 	if err != nil {
 		return nil, err
 	}
+
+	// Using + rather than . here because some consumers may be relying on there being exactly
+	// one '.' in the filepath, and '+' shares with '-' the useful property of being
+	// lexicographically earlier than '.'.
+	tn, err := MakeTopicNamer(changefeedbase.Targets{}, WithJoinByte('+'))
+	if err != nil {
+		return nil, err
+	}
+
 	s := &cloudStorageSink{
 		srcID:             srcID,
 		sinkID:            sinkID,
@@ -354,8 +368,11 @@ func makeCloudStorageSink(
 		partitionFormat:   defaultPartitionFormat,
 		timestampOracle:   timestampOracle,
 		// TODO(dan,ajwerner): Use the jobs framework's session ID once that's available.
-		jobSessionID: sessID,
-		metrics:      m,
+		jobSessionID:     sessID,
+		topicNamer:       tn,
+		asyncFlushActive: enableAsyncFlush.Get(&settings.SV),
+		// TODO (yevgeniy): Consider adding ctx to Dial method instead.
+		flushCtx: ctx,
 	}
 
 	if partitionFormat := u.consumeParam(changefeedbase.SinkParamPartitionFormat); partitionFormat != "" {
@@ -372,66 +389,82 @@ func makeCloudStorageSink(
 		s.dataFilePartition = s.timestampOracle.inclusiveLowerBoundTS().GoTime().Format(s.partitionFormat)
 	}
 
-	switch changefeedbase.FormatType(opts[changefeedbase.OptFormat]) {
+	switch encodingOpts.Format {
 	case changefeedbase.OptFormatJSON:
 		// TODO(dan): It seems like these should be on the encoder, but that
 		// would require a bit of refactoring.
 		s.ext = `.ndjson`
 		s.rowDelimiter = []byte{'\n'}
+	case changefeedbase.OptFormatCSV:
+		// TODO(dan): It seems like these should be on the encoder, but that
+		// would require a bit of refactoring.
+		s.ext = `.csv`
+		s.rowDelimiter = []byte{'\n'}
 	default:
 		return nil, errors.Errorf(`this sink is incompatible with %s=%s`,
-			changefeedbase.OptFormat, opts[changefeedbase.OptFormat])
+			changefeedbase.OptFormat, encodingOpts.Format)
 	}
 
-	switch changefeedbase.EnvelopeType(opts[changefeedbase.OptEnvelope]) {
-	case changefeedbase.OptEnvelopeWrapped:
+	switch encodingOpts.Envelope {
+	case changefeedbase.OptEnvelopeWrapped, changefeedbase.OptEnvelopeBare:
 	default:
 		return nil, errors.Errorf(`this sink is incompatible with %s=%s`,
-			changefeedbase.OptEnvelope, opts[changefeedbase.OptEnvelope])
+			changefeedbase.OptEnvelope, encodingOpts.Envelope)
 	}
 
-	if _, ok := opts[changefeedbase.OptKeyInValue]; !ok {
+	if encodingOpts.Envelope != changefeedbase.OptEnvelopeBare && !encodingOpts.KeyInValue {
 		return nil, errors.Errorf(`this sink requires the WITH %s option`, changefeedbase.OptKeyInValue)
 	}
 
-	if codec, ok := opts[changefeedbase.OptCompression]; ok && codec != "" {
-		if strings.EqualFold(codec, "gzip") {
-			s.compression = sinkCompressionGzip
-			s.ext = s.ext + ".gz"
-		} else {
-			return nil, errors.Errorf(`unsupported compression codec %q`, codec)
+	if codec := encodingOpts.Compression; codec != "" {
+		algo, ext, err := compressionFromString(codec)
+		if err != nil {
+			return nil, err
 		}
+		s.compression = algo
+		s.ext = s.ext + ext
 	}
 
-	if s.es, err = makeExternalStorageFromURI(ctx, u.String(), user); err != nil {
+	// We make the external storage with a nil IOAccountingInterceptor since we
+	// record usage metrics via s.metrics.
+	if s.es, err = makeExternalStorageFromURI(ctx, u.String(), user, cloud.WithIOAccountingInterceptor(nil)); err != nil {
 		return nil, err
 	}
-
+	if mb != nil {
+		s.metrics = mb(s.es.RequiresExternalIOAccounting())
+	} else {
+		s.metrics = (*sliMetrics)(nil)
+	}
 	return s, nil
 }
 
 func (s *cloudStorageSink) getOrCreateFile(
 	topic TopicDescriptor, eventMVCC hlc.Timestamp,
-) *cloudStorageSinkFile {
-	key := cloudStorageSinkKey{topic.GetName(), int64(topic.GetVersion())}
+) (*cloudStorageSinkFile, error) {
+	name, _ := s.topicNamer.Name(topic)
+	key := cloudStorageSinkKey{name, int64(topic.GetVersion())}
 	if item := s.files.Get(key); item != nil {
 		f := item.(*cloudStorageSinkFile)
 		if eventMVCC.Less(f.oldestMVCC) {
 			f.oldestMVCC = eventMVCC
 		}
-		return f
+		return f, nil
 	}
 	f := &cloudStorageSinkFile{
+		created:             timeutil.Now(),
 		cloudStorageSinkKey: key,
-		recordMetrics:       s.metrics.recordEmittedMessages(),
 		oldestMVCC:          eventMVCC,
 	}
-	switch s.compression {
-	case sinkCompressionGzip:
-		f.codec = gzip.NewWriter(&f.buf)
+
+	if s.compression.enabled() {
+		codec, err := newCompressionCodec(s.compression, &s.settings.SV, &f.buf)
+		if err != nil {
+			return nil, err
+		}
+		f.codec = codec
 	}
 	s.files.ReplaceOrInsert(f)
-	return f
+	return f, nil
 }
 
 // EmitRow implements the Sink interface.
@@ -446,7 +479,11 @@ func (s *cloudStorageSink) EmitRow(
 		return errors.New(`cannot EmitRow on a closed sink`)
 	}
 
-	file := s.getOrCreateFile(topic, mvcc)
+	s.metrics.recordMessageSize(int64(len(key) + len(value)))
+	file, err := s.getOrCreateFile(topic, mvcc)
+	if err != nil {
+		return err
+	}
 	file.alloc.Merge(&alloc)
 
 	if _, err := file.Write(value); err != nil {
@@ -457,6 +494,7 @@ func (s *cloudStorageSink) EmitRow(
 	}
 
 	if int64(file.buf.Len()) > s.targetMaxFileSize {
+		s.metrics.recordSizeBasedFlush()
 		if err := s.flushTopicVersions(ctx, file.topic, file.schemaID); err != nil {
 			return err
 		}
@@ -479,6 +517,13 @@ func (s *cloudStorageSink) EmitResolvedTimestamp(
 	if err != nil {
 		return err
 	}
+
+	// Wait for previously issued async flush requests to complete
+	// before we write  resolved time stamp file.
+	if err := s.waitAsyncFlush(); err != nil {
+		return errors.Wrapf(err, "while emitting resolved timestamp")
+	}
+
 	// Don't need to copy payload because we never buffer it anywhere.
 
 	part := resolved.GoTime().Format(s.partitionFormat)
@@ -548,29 +593,44 @@ func (s *cloudStorageSink) Flush(ctx context.Context) error {
 	// for an overview of the naming convention and proof of correctness.
 	s.dataFileTs = cloudStorageFormatTime(s.timestampOracle.inclusiveLowerBoundTS())
 	s.dataFilePartition = s.timestampOracle.inclusiveLowerBoundTS().GoTime().Format(s.partitionFormat)
+	return s.waitAsyncFlush()
+}
+
+// enableAsyncFlush controls async flushing behavior for this sink.
+var enableAsyncFlush = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"changefeed.cloudstorage.async_flush.enabled",
+	"enable async flushing",
+	true,
+)
+
+// waitAsyncFlush waits until all async flushes complete.
+func (s *cloudStorageSink) waitAsyncFlush() error {
+	s.flushGroup.Wait()
+	if v := s.flushErr.Load(); v != nil {
+		return v.(error)
+	}
 	return nil
 }
 
+// flushFile flushes file to the cloud storage.
 // file should not be used after flushing.
 func (s *cloudStorageSink) flushFile(ctx context.Context, file *cloudStorageSinkFile) error {
-	defer file.alloc.Release(ctx)
-
-	if file.rawSize == 0 {
-		// This method shouldn't be called with an empty file, but be defensive
-		// about not writing empty files anyway.
-		return nil
-	}
-
-	if file.codec != nil {
-		if err := file.codec.Close(); err != nil {
+	asyncFlushEnabled := enableAsyncFlush.Get(&s.settings.SV)
+	if s.asyncFlushActive && !asyncFlushEnabled {
+		// Async flush behavior was turned off --  drain any active flush requests
+		// before flushing this file.
+		if err := s.waitAsyncFlush(); err != nil {
 			return err
 		}
 	}
+	s.asyncFlushActive = asyncFlushEnabled
 
 	// We use this monotonically increasing fileID to ensure correct ordering
 	// among files emitted at the same timestamp during the same job session.
 	fileID := s.fileID
 	s.fileID++
+
 	// Pad file ID to maintain lexical ordering among files from the same sink.
 	// Note that we use `-` here to delimit the filename because we want
 	// `%d.RESOLVED` files to lexicographically succeed data files that have the
@@ -582,11 +642,52 @@ func (s *cloudStorageSink) flushFile(ctx context.Context, file *cloudStorageSink
 			"precedes a file emitted before: %s", filename, s.prevFilename)
 	}
 	s.prevFilename = filename
-	compressedBytes := file.buf.Len()
-	if err := cloud.WriteFile(ctx, s.es, filepath.Join(s.dataFilePartition, filename), bytes.NewReader(file.buf.Bytes())); err != nil {
+	dest := filepath.Join(s.dataFilePartition, filename)
+
+	if !asyncFlushEnabled {
+		return file.flushToStorage(ctx, s.es, dest, s.metrics)
+	}
+
+	s.flushGroup.Add(1)
+	go func() {
+		defer s.flushGroup.Done()
+		// NB: must use s.flushCtx; ctx may be short lived (i.e. cancelled).
+		if err := file.flushToStorage(s.flushCtx, s.es, dest, s.metrics); err != nil {
+			log.Errorf(ctx, "error flushing file to storage: %s", err)
+			// We must use the same type for error we store in flushErr.
+			s.flushErr.CompareAndSwap(nil, &flushError{error: err})
+		}
+	}()
+	return nil
+}
+
+type flushError struct {
+	error
+}
+
+// flushToStorage writes out file into external storage into 'dest'.
+func (f *cloudStorageSinkFile) flushToStorage(
+	ctx context.Context, es cloud.ExternalStorage, dest string, m metricsRecorder,
+) error {
+	defer f.alloc.Release(ctx)
+
+	if f.rawSize == 0 {
+		// This method shouldn't be called with an empty file, but be defensive
+		// about not writing empty files anyway.
+		return nil
+	}
+
+	if f.codec != nil {
+		if err := f.codec.Close(); err != nil {
+			return err
+		}
+	}
+
+	compressedBytes := f.buf.Len()
+	if err := cloud.WriteFile(ctx, es, dest, bytes.NewReader(f.buf.Bytes())); err != nil {
 		return err
 	}
-	file.recordMetrics(file.numMessages, file.oldestMVCC, file.rawSize, compressedBytes)
+	m.recordEmittedBatch(f.created, f.numMessages, f.oldestMVCC, f.rawSize, compressedBytes)
 
 	return nil
 }
@@ -594,7 +695,7 @@ func (s *cloudStorageSink) flushFile(ctx context.Context, file *cloudStorageSink
 // Close implements the Sink interface.
 func (s *cloudStorageSink) Close() error {
 	s.files = nil
-	return s.es.Close()
+	return errors.CombineErrors(s.waitAsyncFlush(), s.es.Close())
 }
 
 // Dial implements the Sink interface.

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 # gazelle:go_grpc_compilers //pkg/cmd/protoc-gen-gogoroach:protoc-gen-gogoroach_grpc_compiler,  @com_github_grpc_ecosystem_grpc_gateway//protoc-gen-grpc-gateway:go_gen_grpc_gateway
@@ -25,7 +26,7 @@ go_proto_library(
     proto = ":loqrecoverypb_proto",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
@@ -37,10 +38,13 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/keysutil",
         "//pkg/util/log/eventpb",
+        "//pkg/util/log/logpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_gogo_protobuf//proto",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -27,8 +27,8 @@ import (
 
 var activerecordResultRegex = regexp.MustCompile(`^(?P<test>[^\s]+#[^\s]+) = (?P<timing>\d+\.\d+ s) = (?P<result>.)$`)
 var railsReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)\.?(?P<subpoint>\d*)$`)
-var supportedRailsVersion = "6.1"
-var activerecordAdapterVersion = "v6.1.3"
+var supportedRailsVersion = "7.0.3"
+var activerecordAdapterVersion = "v7.0.0"
 
 // This test runs activerecord's full test suite against a single cockroach node.
 
@@ -44,9 +44,6 @@ func registerActiveRecord(r registry.Registry) {
 		node := c.Node(1)
 		t.Status("setting up cockroach")
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.All())
-		if err := c.PutLibraries(ctx, "./lib"); err != nil {
-			t.Fatal(err)
-		}
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.All())
 
 		version, err := fetchCockroachVersion(ctx, t.L(), c, node[0])
@@ -254,10 +251,11 @@ func registerActiveRecord(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Name:    "activerecord",
-		Owner:   registry.OwnerSQLExperience,
-		Cluster: r.MakeClusterSpec(1),
-		Tags:    []string{`default`, `orm`},
-		Run:     runActiveRecord,
+		Name:       "activerecord",
+		Owner:      registry.OwnerSQLExperience,
+		Cluster:    r.MakeClusterSpec(1),
+		NativeLibs: registry.LibGEOS,
+		Tags:       []string{`default`, `orm`},
+		Run:        runActiveRecord,
 	})
 }

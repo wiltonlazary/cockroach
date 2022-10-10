@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,7 +13,7 @@ go_library(
     deps = [
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/kv/kvserver/kvserverpb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/log",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_kr_pretty//:pretty",
@@ -23,9 +24,12 @@ go_test(
     name = "result_test",
     size = "small",
     srcs = ["result_test.go"],
+    args = ["-test.timeout=55s"],
     embed = [":result"],
     deps = [
         "//pkg/kv/kvserver/kvserverpb",
         "//pkg/util/leaktest",
     ],
 )
+
+get_x_data(name = "get_x_data")

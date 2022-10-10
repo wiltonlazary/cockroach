@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 )
@@ -64,9 +63,13 @@ func Validate(steps []Step, kvs *Engine) []error {
 	// by `After` timestamp is sufficient to get us the necessary ordering. This
 	// is because txns cannot be used concurrently, so none of the (Begin,After)
 	// timespans for a given transaction can overlap.
+	//
+	// TODO(tbg): if, as we should, we order all operations by the timestamp at
+	// which they executed (at least for MVCC-aware operations), then we would
+	// sort here by that timestamp.
 	sort.Slice(steps, func(i, j int) bool { return steps[i].After.Less(steps[j].After) })
 	for _, s := range steps {
-		v.processOp(nil /* txnID */, s.Op)
+		v.processOp(notBuffering, s.Op)
 	}
 
 	var extraKVs []observedOp
@@ -240,8 +243,12 @@ type observedScan struct {
 func (*observedScan) observedMarker() {}
 
 type validator struct {
-	kvs              *Engine
-	observedOpsByTxn map[string][]observedOp
+	kvs *Engine
+
+	// Observations for the current atomic unit. This is reset between units, in
+	// checkAtomic, which then calls processOp (which might recurse owing to the
+	// existence of txn closures, batches, etc).
+	curObservations []observedOp
 
 	// NB: The Generator carefully ensures that each value written is unique
 	// globally over a run, so there's a 1:1 relationship between a value that was
@@ -273,8 +280,12 @@ func makeValidator(kvs *Engine) (*validator, error) {
 			err = errors.CombineErrors(err, iterErr)
 			return
 		}
-		v := roachpb.Value{RawBytes: value}
-		if v.GetTag() != roachpb.ValueType_UNKNOWN {
+		v, decodeErr := storage.DecodeMVCCValue(value)
+		if err != nil {
+			err = errors.CombineErrors(err, decodeErr)
+			return
+		}
+		if v.Value.GetTag() != roachpb.ValueType_UNKNOWN {
 			valueStr := mustGetStringValue(value)
 			if existing, ok := kvByValue[valueStr]; ok {
 				// TODO(dan): This may be too strict. Some operations (db.Run on a
@@ -287,7 +298,7 @@ func makeValidator(kvs *Engine) (*validator, error) {
 			// globally over a run, so there's a 1:1 relationship between a value that
 			// was written and the operation that wrote it.
 			kvByValue[valueStr] = storage.MVCCKeyValue{Key: key, Value: value}
-		} else if len(value) == 0 {
+		} else if !v.Value.IsPresent() {
 			rawKey := string(key.Key)
 			if _, ok := tombstonesForKey[rawKey]; !ok {
 				tombstonesForKey[rawKey] = make(map[hlc.Timestamp]bool)
@@ -304,42 +315,58 @@ func makeValidator(kvs *Engine) (*validator, error) {
 		kvByValue:              kvByValue,
 		tombstonesForKey:       tombstonesForKey,
 		committedDeletesForKey: make(map[string]int),
-		observedOpsByTxn:       make(map[string][]observedOp),
 	}, nil
 }
 
 // getDeleteForKey looks up a stored tombstone for a given key (if it
 // exists) from tombstonesForKey, returning the tombstone (i.e. MVCCKey) along
 // with a `true` boolean value if found, or the empty key and `false` if not.
-func (v *validator) getDeleteForKey(key string, txn *roachpb.Transaction) (storage.MVCCKey, bool) {
-	if txn == nil {
+func (v *validator) getDeleteForKey(key string, optOpTS hlc.Timestamp) (storage.MVCCKey, bool) {
+	if optOpTS.IsEmpty() {
 		panic(errors.AssertionFailedf(`transaction required to look up delete for key: %v`, key))
 	}
 
-	if used, ok := v.tombstonesForKey[key][txn.TxnMeta.WriteTimestamp]; !used && ok {
-		v.tombstonesForKey[key][txn.TxnMeta.WriteTimestamp] = true
-		return storage.MVCCKey{Key: []byte(key), Timestamp: txn.TxnMeta.WriteTimestamp}, true
+	if used, ok := v.tombstonesForKey[key][optOpTS]; !used && ok {
+		v.tombstonesForKey[key][optOpTS] = true
+		return storage.MVCCKey{Key: []byte(key), Timestamp: optOpTS}, true
 	}
 
 	return storage.MVCCKey{}, false
 }
 
-func (v *validator) processOp(txnID *string, op Operation) {
+const (
+	notBuffering = false
+	isBuffering  = true
+)
+
+// processOp turns the result of an operation into its observations (which are
+// later checked against the MVCC history). The boolean parameter indicates
+// whether the operation is its own atomic unit or whether it's happening as
+// part of a surrounding transaction or batch (in which case the caller is
+// itself processOp, with the operation to handle being the batch or txn).
+// Whenever it is `false`, processOp invokes the validator's checkAtomic method
+// for the operation.
+func (v *validator) processOp(buffering bool, op Operation) {
+	// We don't need an execution timestamp when buffering (the caller will need
+	// an execution timestamp for the combined operation, though). Additionally,
+	// some operations supported by kvnemesis aren't MVCC-aware (splits, etc) and
+	// thus also don't need an execution timestamp.
+	execTimestampStrictlyOptional := buffering
 	switch t := op.GetValue().(type) {
 	case *GetOperation:
 		v.failIfError(op, t.Result)
-		if txnID == nil {
-			v.checkAtomic(`get`, t.Result, nil, op)
+		if !buffering {
+			v.checkAtomic(`get`, t.Result, op)
 		} else {
 			read := &observedRead{
 				Key:   t.Key,
 				Value: roachpb.Value{RawBytes: t.Result.Value},
 			}
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], read)
+			v.curObservations = append(v.curObservations, read)
 		}
 	case *PutOperation:
-		if txnID == nil {
-			v.checkAtomic(`put`, t.Result, nil, op)
+		if !buffering {
+			v.checkAtomic(`put`, t.Result, op)
 		} else {
 			// Accumulate all the writes for this transaction.
 			kv, ok := v.kvByValue[string(t.Value)]
@@ -352,11 +379,11 @@ func (v *validator) processOp(txnID *string, op Operation) {
 			if write.Materialized {
 				write.Timestamp = kv.Key.Timestamp
 			}
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], write)
+			v.curObservations = append(v.curObservations, write)
 		}
 	case *DeleteOperation:
-		if txnID == nil {
-			v.checkAtomic(`delete`, t.Result, nil, op)
+		if !buffering {
+			v.checkAtomic(`delete`, t.Result, op)
 		} else {
 			// NB: While Put operations can be identified as having materialized
 			// (or not) in the storage engine because the Generator guarantees each
@@ -368,17 +395,17 @@ func (v *validator) processOp(txnID *string, op Operation) {
 			// operation for a key in a given transaction was a Delete, and
 			// validating that a potential tombstone for that key was stored.
 			// This validation must be done at the end of the transaction;
-			// specifically, in the function `checkCommittedTxn(..)` where it looks
+			// specifically, in the function `checkAtomicCommitted(..)` where it looks
 			// up a corresponding tombstone with `getDeleteForKey(..)`.
 			write := &observedWrite{
 				Key:   t.Key,
 				Value: roachpb.Value{},
 			}
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], write)
+			v.curObservations = append(v.curObservations, write)
 		}
 	case *DeleteRangeOperation:
-		if txnID == nil {
-			v.checkAtomic(`deleteRange`, t.Result, nil, op)
+		if !buffering {
+			v.checkAtomic(`deleteRange`, t.Result, op)
 		} else {
 			// For the purposes of validation, DelRange operations decompose into
 			// a specialized scan for keys with non-nil values, followed by
@@ -406,17 +433,17 @@ func (v *validator) processOp(txnID *string, op Operation) {
 				}
 				deleteOps[i] = write
 			}
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], scan)
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], deleteOps...)
+			v.curObservations = append(v.curObservations, scan)
+			v.curObservations = append(v.curObservations, deleteOps...)
 		}
 	case *ScanOperation:
 		v.failIfError(op, t.Result)
-		if txnID == nil {
+		if !buffering {
 			atomicScanType := `scan`
 			if t.Reverse {
 				atomicScanType = `reverse scan`
 			}
-			v.checkAtomic(atomicScanType, t.Result, nil, op)
+			v.checkAtomic(atomicScanType, t.Result, op)
 		} else {
 			scan := &observedScan{
 				Span: roachpb.Span{
@@ -432,11 +459,13 @@ func (v *validator) processOp(txnID *string, op Operation) {
 					Value: roachpb.Value{RawBytes: kv.Value},
 				}
 			}
-			v.observedOpsByTxn[*txnID] = append(v.observedOpsByTxn[*txnID], scan)
+			v.curObservations = append(v.curObservations, scan)
 		}
 	case *SplitOperation:
+		execTimestampStrictlyOptional = true
 		v.failIfError(op, t.Result)
 	case *MergeOperation:
+		execTimestampStrictlyOptional = true
 		if resultIsErrorStr(t.Result, `cannot merge final range`) {
 			// Because of some non-determinism, it is not worth it (or maybe not
 			// possible) to prevent these usage errors. Additionally, I (dan) think
@@ -478,49 +507,57 @@ func (v *validator) processOp(txnID *string, op Operation) {
 			v.failIfError(op, t.Result)
 		}
 	case *ChangeReplicasOperation:
+		execTimestampStrictlyOptional = true
 		var ignore bool
 		if err := errorFromResult(t.Result); err != nil {
 			ignore = kvserver.IsRetriableReplicationChangeError(err) ||
-				kvserver.IsIllegalReplicationChangeError(err)
+				kvserver.IsIllegalReplicationChangeError(err) ||
+				kvserver.IsReplicationChangeInProgressError(err)
 		}
 		if !ignore {
 			v.failIfError(op, t.Result)
 		}
 	case *TransferLeaseOperation:
-		if resultIsErrorStr(t.Result, `replica cannot hold lease`) {
-			// Only VOTER_FULL replicas can currently hold a range lease.
-			// Attempts to transfer to lease to any other replica type are
-			// rejected.
-		} else if resultIsErrorStr(t.Result, `replica not found in RangeDescriptor`) {
-			// Only replicas that are part of the range can be given
-			// the lease. This case is hit if a TransferLease op races
-			// with a ChangeReplicas op.
-		} else if resultIsErrorStr(t.Result, `unable to find store \d+ in range`) {
-			// A lease transfer that races with a replica removal may find that
-			// the store it was targeting is no longer part of the range.
-		} else if resultIsErrorStr(t.Result, `cannot transfer lease while merge in progress`) {
-			// A lease transfer is not permitted while a range merge is in its
-			// critical phase.
-		} else if resultIsError(t.Result, liveness.ErrRecordCacheMiss) {
-			// If the existing leaseholder has not yet heard about the transfer
-			// target's liveness record through gossip, it will return an error.
-		} else if resultIsErrorStr(t.Result, liveness.ErrRecordCacheMiss.Error()) {
-			// Same as above, but matches cases where ErrRecordCacheMiss is
-			// passed through a LeaseRejectedError. This is necessary until
-			// LeaseRejectedErrors works with errors.Cause.
-		} else {
+		execTimestampStrictlyOptional = true
+		var ignore bool
+		if err := errorFromResult(t.Result); err != nil {
+			ignore = kvserver.IsLeaseTransferRejectedBecauseTargetMayNeedSnapshotError(err) ||
+				// Only VOTER (_FULL, _INCOMING, sometimes _OUTGOING) replicas can
+				// hold a range lease. Attempts to transfer to lease to any other
+				// replica type are rejected. See CheckCanReceiveLease.
+				resultIsErrorStr(t.Result, `replica cannot hold lease`) ||
+				// Only replicas that are part of the range can be given
+				// the lease. This case is hit if a TransferLease op races
+				// with a ChangeReplicas op.
+				resultIsErrorStr(t.Result, `replica not found in RangeDescriptor`) ||
+				// A lease transfer that races with a replica removal may find that
+				// the store it was targeting is no longer part of the range.
+				resultIsErrorStr(t.Result, `unable to find store \d+ in range`) ||
+				// A lease transfer is not permitted while a range merge is in its
+				// critical phase.
+				resultIsErrorStr(t.Result, `cannot transfer lease while merge in progress`) ||
+				// If the existing leaseholder has not yet heard about the transfer
+				// target's liveness record through gossip, it will return an error.
+				resultIsError(t.Result, liveness.ErrRecordCacheMiss) ||
+				// Same as above, but matches cases where ErrRecordCacheMiss is
+				// passed through a LeaseRejectedError. This is necessary until
+				// LeaseRejectedErrors works with errors.Cause.
+				resultIsErrorStr(t.Result, liveness.ErrRecordCacheMiss.Error())
+		}
+		if !ignore {
 			v.failIfError(op, t.Result)
 		}
 	case *ChangeZoneOperation:
+		execTimestampStrictlyOptional = true
 		v.failIfError(op, t.Result)
 	case *BatchOperation:
 		if !resultIsRetryable(t.Result) {
 			v.failIfError(op, t.Result)
-			if txnID == nil {
-				v.checkAtomic(`batch`, t.Result, nil, t.Ops...)
+			if !buffering {
+				v.checkAtomic(`batch`, t.Result, t.Ops...)
 			} else {
 				for _, op := range t.Ops {
-					v.processOp(txnID, op)
+					v.processOp(buffering, op)
 				}
 			}
 		}
@@ -529,33 +566,54 @@ func (v *validator) processOp(txnID *string, op Operation) {
 		if t.CommitInBatch != nil {
 			ops = append(ops, t.CommitInBatch.Ops...)
 		}
-		v.checkAtomic(`txn`, t.Result, t.Txn, ops...)
+		v.checkAtomic(`txn`, t.Result, ops...)
 	default:
 		panic(errors.AssertionFailedf(`unknown operation type: %T %v`, t, t))
 	}
+
+	if !execTimestampStrictlyOptional && !buffering && op.Result().Type != ResultType_Error && op.Result().OptionalTimestamp.IsEmpty() {
+		v.failures = append(v.failures, errors.Errorf("execution timestamp missing for %s", op))
+	}
 }
 
-func (v *validator) checkAtomic(
-	atomicType string, result Result, optTxn *roachpb.Transaction, ops ...Operation,
-) {
-	fakeTxnID := uuid.MakeV4().String()
+// checkAtomic verifies a set of operations that should be atomic by trying to find
+// a timestamp at which the observed reads and writes of the operations (as executed
+// in the order in which they appear in the arguments) match the MVCC history.
+func (v *validator) checkAtomic(atomicType string, result Result, ops ...Operation) {
 	for _, op := range ops {
-		v.processOp(&fakeTxnID, op)
+		// NB: we're not really necessarily in a txn, but passing true here means that
+		// we have an atomic unit, which is also the case if we are called here by a
+		// non-transactional Put, for example.
+		v.processOp(isBuffering, op)
 	}
-	txnObservations := v.observedOpsByTxn[fakeTxnID]
-	delete(v.observedOpsByTxn, fakeTxnID)
+	observations := v.curObservations
+	v.curObservations = nil
 
 	if result.Type != ResultType_Error {
-		v.checkCommittedTxn(`committed `+atomicType, txnObservations, optTxn)
+		// The timestamp is not optional in this case. Note however that at the time
+		// of writing, checkAtomicCommitted doesn't capitalize on this unconditional
+		// presence yet, and most unit tests don't specify it for reads.
+		if result.OptionalTimestamp.IsEmpty() {
+			err := errors.AssertionFailedf("operation has no execution timestamp: %s", result)
+			v.failures = append(v.failures, err)
+		}
+		v.checkAtomicCommitted(`committed `+atomicType, observations, result.OptionalTimestamp)
 	} else if resultIsAmbiguous(result) {
-		v.checkAmbiguousTxn(`ambiguous `+atomicType, txnObservations)
+		v.checkAtomicAmbiguous(`ambiguous `+atomicType, observations)
 	} else {
-		v.checkUncommittedTxn(`uncommitted `+atomicType, txnObservations)
+		v.checkAtomicUncommitted(`uncommitted `+atomicType, observations)
 	}
 }
 
-func (v *validator) checkCommittedTxn(
-	atomicType string, txnObservations []observedOp, optTxn *roachpb.Transaction,
+// checkAtomicCommitted verifies an atomic unit (i.e. single cmd, batch, or txn) that
+// was successful. Its writes thus must be present, and (as is always the case, no
+// matter the outcome) its reads must have been valid.
+//
+// The execution timestamp optOptsTimestamp is always present for operations that
+// succeeded in a "normal" way. However, for ambiguous results, it is not always
+// present. This limitation could be lifted, see checkAtomicAmbiguous.
+func (v *validator) checkAtomicCommitted(
+	atomicType string, txnObservations []observedOp, optOpsTimestamp hlc.Timestamp,
 ) {
 	// The following works by verifying that there is at least one time at which
 	// it was valid to see all the reads and writes that we saw in this
@@ -644,13 +702,20 @@ func (v *validator) checkCommittedTxn(
 				if o.isDelete() {
 					key := string(o.Key)
 					v.committedDeletesForKey[key]++
-					if optTxn == nil {
-						// In the case that the delete is not in a transaction (or in an
-						// ambiguous transaction), we do not match it to a specific
-						// tombstone as we cannot be certain which tombstone resulted from
-						// this operation; hence, we leave the timestamp empty.
+					if optOpsTimestamp.IsEmpty() {
+						// Special case: our operation doesn't know at which timestamp
+						// it wrote and so we're unable to match it to a particular tombstone
+						// and can only check the cardinality - if there was a tombstone left,
+						// we assume it's ours.
+						//
+						// We leave the Timestamp field empty as a result (if there are
+						// multiple tombstones left, how do we know which one is ours?) and
+						// everyone else needs to be able to handle this special case.
+						//
+						// TODO(tbg): see checkAtomicAmbiguous about letting ambiguously
+						// committed operations learn their commit timestamp.
 						o.Materialized = v.committedDeletesForKey[key] <= len(v.tombstonesForKey[key])
-					} else if storedDelete, ok := v.getDeleteForKey(key, optTxn); ok {
+					} else if storedDelete, ok := v.getDeleteForKey(key, optOpsTimestamp); ok {
 						o.Materialized = true
 						o.Timestamp = storedDelete.Timestamp
 					}
@@ -658,7 +723,7 @@ func (v *validator) checkCommittedTxn(
 			}
 			if !o.Timestamp.IsEmpty() {
 				mvccKey := storage.MVCCKey{Key: o.Key, Timestamp: o.Timestamp}
-				if err := batch.Delete(storage.EncodeKey(mvccKey), nil); err != nil {
+				if err := batch.Delete(storage.EncodeMVCCKey(mvccKey), nil); err != nil {
 					panic(err)
 				}
 			}
@@ -693,7 +758,7 @@ func (v *validator) checkCommittedTxn(
 					Timestamp: txnObservations[lastWriteIdx].(*observedWrite).Timestamp,
 				}
 			}
-			if err := batch.Set(storage.EncodeKey(mvccKey), o.Value.RawBytes, nil); err != nil {
+			if err := batch.Set(storage.EncodeMVCCKey(mvccKey), o.Value.RawBytes, nil); err != nil {
 				panic(err)
 			}
 		case *observedRead:
@@ -770,8 +835,8 @@ func (v *validator) checkCommittedTxn(
 		}
 		switch o := observation.(type) {
 		case *observedWrite:
-			if optTxn != nil && o.Materialized && optTxn.TxnMeta.WriteTimestamp != o.Timestamp {
-				failure = fmt.Sprintf(`committed txn mismatched write timestamp %s`, optTxn.TxnMeta.WriteTimestamp)
+			if optOpsTimestamp.IsSet() && o.Materialized && optOpsTimestamp != o.Timestamp {
+				failure = fmt.Sprintf(`mismatched write timestamp %s`, optOpsTimestamp)
 			}
 		}
 	}
@@ -782,16 +847,18 @@ func (v *validator) checkCommittedTxn(
 	}
 }
 
-func (v *validator) checkAmbiguousTxn(atomicType string, txnObservations []observedOp) {
+func (v *validator) checkAtomicAmbiguous(atomicType string, txnObservations []observedOp) {
 	var somethingCommitted bool
 	deletedKeysInTxn := make(map[string]int)
 	var hadWrite bool
+	var maybeExecTS hlc.Timestamp
 	for _, observation := range txnObservations {
 		switch o := observation.(type) {
 		case *observedWrite:
 			hadWrite = true
 			if o.Materialized {
 				somethingCommitted = true
+				maybeExecTS.Forward(o.Timestamp) // use Forward() just in case o.Timestamp is zero
 				break
 			}
 			if o.isDelete() && len(v.tombstonesForKey[string(o.Key)]) > v.committedDeletesForKey[string(o.Key)] {
@@ -807,6 +874,13 @@ func (v *validator) checkAmbiguousTxn(atomicType string, txnObservations []obser
 		// resulting from a delete operation, it is impossible to validate if the
 		// transaction was actually atomic. For now, we have chosen to fail loudly,
 		// though if we are able to validate properly, this should be removed.
+		//
+		// TODO(tbg): this might be addressable. For an ambiguous transaction we
+		// should still be able to salvage the timestamp at which the transaction
+		// would have committed if it did, because kvnemesis always has a local
+		// TxnCoordSender which always knows the one possible commit timestamp
+		// and so it's simply a matter of making sure this information is
+		// guaranteed to flow back with the AmbiguousResultError.
 		err := errors.Errorf(
 			`unable to validate delete operations in ambiguous transactions: %s`,
 			printObserved(txnObservations...),
@@ -821,19 +895,16 @@ func (v *validator) checkAmbiguousTxn(atomicType string, txnObservations []obser
 			// later deletes may show "committed delete missing write" errors.
 			v.committedDeletesForKey[key]++
 		}
-	} else if !hadWrite {
-		// TODO(dan): Is it possible to receive an ambiguous read-only txn? Assume
-		// committed for now because the committed case has assertions about reads
-		// but the uncommitted case doesn't and this seems to work.
-		v.checkCommittedTxn(atomicType, txnObservations, nil)
-	} else if somethingCommitted {
-		v.checkCommittedTxn(atomicType, txnObservations, nil)
+	} else if !hadWrite || somethingCommitted {
+		v.checkAtomicCommitted(atomicType, txnObservations, maybeExecTS)
 	} else {
-		v.checkUncommittedTxn(atomicType, txnObservations)
+		// This is a writing transaction but not a single one of its writes
+		// showed up in KV, so verify that it is uncommitted.
+		v.checkAtomicUncommitted(atomicType, txnObservations)
 	}
 }
 
-func (v *validator) checkUncommittedTxn(atomicType string, txnObservations []observedOp) {
+func (v *validator) checkAtomicUncommitted(atomicType string, txnObservations []observedOp) {
 	var failure string
 	for _, observed := range txnObservations {
 		if failure != `` {
@@ -913,14 +984,18 @@ func resultIsErrorStr(r Result, msgRE string) bool {
 }
 
 func mustGetStringValue(value []byte) string {
-	if len(value) == 0 {
-		return `<nil>`
-	}
-	v, err := roachpb.Value{RawBytes: value}.GetBytes()
+	v, err := storage.DecodeMVCCValue(value)
 	if err != nil {
 		panic(errors.Wrapf(err, "decoding %x", value))
 	}
-	return string(v)
+	if v.IsTombstone() {
+		return `<nil>`
+	}
+	b, err := v.Value.GetBytes()
+	if err != nil {
+		panic(errors.Wrapf(err, "decoding %x", value))
+	}
+	return string(b)
 }
 
 func validReadTimes(
@@ -931,7 +1006,7 @@ func validReadTimes(
 
 	iter := b.NewIter(nil)
 	defer func() { _ = iter.Close() }()
-	iter.SeekGE(storage.EncodeKey(storage.MVCCKey{Key: key}))
+	iter.SeekGE(storage.EncodeMVCCKey(storage.MVCCKey{Key: key}))
 	for ; iter.Valid(); iter.Next() {
 		mvccKey, err := storage.DecodeMVCCKey(iter.Key())
 		if err != nil {
@@ -996,7 +1071,7 @@ func validScanTime(
 	missingKeys := make(map[string]disjointTimeSpans)
 	iter := b.NewIter(nil)
 	defer func() { _ = iter.Close() }()
-	iter.SeekGE(storage.EncodeKey(storage.MVCCKey{Key: span.Key}))
+	iter.SeekGE(storage.EncodeMVCCKey(storage.MVCCKey{Key: span.Key}))
 	for ; iter.Valid(); iter.Next() {
 		mvccKey, err := storage.DecodeMVCCKey(iter.Key())
 		if err != nil {

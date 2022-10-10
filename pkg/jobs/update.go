@@ -19,7 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -123,14 +124,14 @@ func UpdateHighwaterProgressed(highWater hlc.Timestamp, md JobMetadata, ju *JobU
 //
 // Sample usage:
 //
-//   err := j.Update(ctx, func(_ *client.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-//     if md.Status != StatusRunning {
-//       return errors.New("job no longer running")
-//     }
-//     md.UpdateStatus(StatusPaused)
-//     // <modify md.Payload>
-//     md.UpdatePayload(md.Payload)
-//   }
+//	err := j.Update(ctx, func(_ *client.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+//	  if md.Status != StatusRunning {
+//	    return errors.New("job no longer running")
+//	  }
+//	  md.UpdateStatus(StatusPaused)
+//	  // <modify md.Payload>
+//	  md.UpdatePayload(md.Payload)
+//	}
 //
 // Note that there are various convenience wrappers (like FractionProgressed)
 // defined in jobs.go.
@@ -140,6 +141,9 @@ func (j *Job) Update(ctx context.Context, txn *kv.Txn, updateFn UpdateFn) error 
 }
 
 func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateFn UpdateFn) error {
+	ctx, sp := tracing.ChildSpan(ctx, "update-job")
+	defer sp.Finish()
+
 	var payload *jobspb.Payload
 	var progress *jobspb.Progress
 	var status Status
@@ -150,9 +154,9 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 		var err error
 		var row tree.Datums
 		row, err = j.registry.ex.QueryRowEx(
-			ctx, "log-job", txn,
-			sessiondata.InternalExecutorOverride{User: security.RootUserName()},
-			getSelectStmtForJobUpdate(j.sessionID != "", useReadLock), j.ID(),
+			ctx, "select-job", txn,
+			sessiondata.InternalExecutorOverride{User: username.RootUserName()},
+			getSelectStmtForJobUpdate(j.session != nil, useReadLock), j.ID(),
 		)
 		if err != nil {
 			return err
@@ -170,17 +174,17 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 		if progress, err = UnmarshalProgress(row[2]); err != nil {
 			return err
 		}
-		if j.sessionID != "" {
+		if j.session != nil {
 			if row[3] == tree.DNull {
 				return errors.Errorf(
 					"with status %q: expected session %q but found NULL",
-					status, j.sessionID)
+					status, j.session.ID())
 			}
 			storedSession := []byte(*row[3].(*tree.DBytes))
-			if !bytes.Equal(storedSession, j.sessionID.UnsafeBytes()) {
+			if !bytes.Equal(storedSession, j.session.ID().UnsafeBytes()) {
 				return errors.Errorf(
 					"with status %q: expected session %q but found %q",
-					status, j.sessionID, sqlliveness.SessionID(storedSession))
+					status, j.session.ID(), sqlliveness.SessionID(storedSession))
 			}
 		} else {
 			log.VInfof(ctx, 1, "job %d: update called with no session ID", j.ID())
@@ -194,7 +198,7 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 		}
 
 		offset := 0
-		if j.sessionID != "" {
+		if j.session != nil {
 			offset = 1
 		}
 		var lastRun *tree.DTimestamp
@@ -311,7 +315,7 @@ func (j *Job) update(ctx context.Context, txn *kv.Txn, useReadLock bool, updateF
 }
 
 // getSelectStmtForJobUpdate constructs the select statement used in Job.update.
-func getSelectStmtForJobUpdate(hasSessionID, useReadLock bool) string {
+func getSelectStmtForJobUpdate(hasSession, useReadLock bool) string {
 	const (
 		selectWithoutSession = `SELECT status, payload, progress`
 		selectWithSession    = selectWithoutSession + `, claim_session_id`
@@ -320,7 +324,7 @@ func getSelectStmtForJobUpdate(hasSessionID, useReadLock bool) string {
 		backoffColumns       = ", COALESCE(last_run, created), COALESCE(num_runs, 0)"
 	)
 	stmt := selectWithoutSession
-	if hasSessionID {
+	if hasSession {
 		stmt = selectWithSession
 	}
 	stmt = stmt + backoffColumns

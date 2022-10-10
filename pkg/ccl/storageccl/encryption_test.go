@@ -10,9 +10,9 @@ package storageccl
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
@@ -43,7 +43,7 @@ func TestEncryptDecrypt(t *testing.T) {
 						require.NoError(t, err)
 						require.True(t, AppearsEncrypted(ciphertext), "cipher text should appear encrypted")
 
-						decrypted, err := DecryptFile(ciphertext, key)
+						decrypted, err := DecryptFile(context.Background(), ciphertext, key, nil /* mm */)
 						require.NoError(t, err)
 						require.Equal(t, plaintext, decrypted)
 					})
@@ -53,7 +53,7 @@ func TestEncryptDecrypt(t *testing.T) {
 	})
 
 	t.Run("helpful error on bad input", func(t *testing.T) {
-		_, err := DecryptFile([]byte("a"), key)
+		_, err := DecryptFile(context.Background(), []byte("a"), key, nil /* mm */)
 		require.EqualError(t, err, "file does not appear to be encrypted")
 	})
 
@@ -162,7 +162,7 @@ func TestEncryptDecrypt(t *testing.T) {
 					plaintext := randutil.RandBytes(rng, rng.Intn(1024*32))
 					ciphertext, err := EncryptFile(plaintext, key)
 					require.NoError(t, err)
-					decrypted, err := DecryptFile(ciphertext, key)
+					decrypted, err := DecryptFile(context.Background(), ciphertext, key, nil /* mm */)
 					require.NoError(t, err)
 					if len(plaintext) == 0 {
 						require.Equal(t, len(plaintext), len(decrypted))
@@ -270,7 +270,7 @@ func BenchmarkEncryption(b *testing.B) {
 							if err != nil {
 								b.Fatal(err)
 							}
-							_, err = io.Copy(ioutil.Discard, r.(io.Reader))
+							_, err = io.Copy(io.Discard, r.(io.Reader))
 							if err != nil {
 								b.Fatal(err)
 							}

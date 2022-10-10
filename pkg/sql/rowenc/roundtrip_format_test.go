@@ -11,6 +11,7 @@
 package rowenc_test
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -56,13 +58,14 @@ func TestRandParseDatumStringAs(t *testing.T) {
 		}
 	}
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	rng, _ := randutil.NewTestRand()
 	for _, typ := range tests {
 		const testsForTyp = 100
 		t.Run(typ.String(), func(t *testing.T) {
 			for i := 0; i < testsForTyp; i++ {
-				datum := randgen.RandDatumWithNullChance(rng, typ, 0)
+				datum := randgen.RandDatumWithNullChance(rng, typ, 0, /* nullChance */
+					false /* favorCommonData */, false /* targetColumnIsUnique */)
 				ds := tree.AsStringWithFlags(datum, tree.FmtExport)
 
 				// Because of how RandDatumWithNullChanceWorks, we might
@@ -95,7 +98,7 @@ func TestRandParseDatumStringAs(t *testing.T) {
 					t.Fatal(ds, err)
 				}
 
-				parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+				parsed, err := rowenc.ParseDatumStringAs(context.Background(), typ, ds, evalCtx)
 				if err != nil {
 					t.Fatal(ds, err)
 				}
@@ -286,12 +289,12 @@ func TestParseDatumStringAs(t *testing.T) {
 		},
 	}
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	for typ, exprs := range tests {
 		t.Run(typ.String(), func(t *testing.T) {
 			for _, s := range exprs {
 				t.Run(fmt.Sprintf("%q", s), func(t *testing.T) {
-					d, err := rowenc.ParseDatumStringAs(typ, s, evalCtx)
+					d, err := rowenc.ParseDatumStringAs(context.Background(), typ, s, evalCtx)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -299,7 +302,7 @@ func TestParseDatumStringAs(t *testing.T) {
 						t.Fatalf("unexpected type: %s", d.ResolvedType())
 					}
 					ds := tree.AsStringWithFlags(d, tree.FmtExport)
-					parsed, err := rowenc.ParseDatumStringAs(typ, ds, evalCtx)
+					parsed, err := rowenc.ParseDatumStringAs(context.Background(), typ, ds, evalCtx)
 					if err != nil {
 						t.Fatal(err)
 					}

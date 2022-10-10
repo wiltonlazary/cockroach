@@ -24,7 +24,7 @@ import (
 )
 
 var pgxReleaseTagRegex = regexp.MustCompile(`^v(?P<major>\d+)\.(?P<minor>\d+)\.(?P<point>\d+)$`)
-var supportedPGXTag = "v4.11.0"
+var supportedPGXTag = "v4.15.0"
 
 // This test runs pgx's full test suite against a single cockroach node.
 
@@ -76,7 +76,7 @@ func registerPgx(r registry.Registry) {
 
 		t.Status("installing go-junit-report")
 		if err := repeatRunE(
-			ctx, t, c, node, "install go-junit-report", "go get -u github.com/jstemmer/go-junit-report",
+			ctx, t, c, node, "install go-junit-report", "go install github.com/jstemmer/go-junit-report@latest",
 		); err != nil {
 			t.Fatal(err)
 		}

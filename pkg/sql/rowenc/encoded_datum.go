@@ -20,12 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // EncodingDirToDatumEncoding returns an equivalent descpb.DatumEncoding for the given
@@ -254,15 +255,15 @@ func (ed *EncDatum) EnsureDecoded(typ *types.T, a *tree.DatumAlloc) error {
 	case descpb.DatumEncoding_VALUE:
 		ed.Datum, rem, err = valueside.Decode(a, typ, ed.encoded)
 	default:
-		return errors.AssertionFailedf("unknown encoding %d", log.Safe(ed.encoding))
+		return errors.AssertionFailedf("unknown encoding %d", redact.Safe(ed.encoding))
 	}
 	if err != nil {
-		return errors.Wrapf(err, "error decoding %d bytes", log.Safe(len(ed.encoded)))
+		return errors.Wrapf(err, "error decoding %d bytes", redact.Safe(len(ed.encoded)))
 	}
 	if len(rem) != 0 {
 		ed.Datum = nil
 		return errors.AssertionFailedf(
-			"%d trailing bytes in encoded value: %+v", log.Safe(len(rem)), rem)
+			"%d trailing bytes in encoded value: %+v", redact.Safe(len(rem)), rem)
 	}
 	return nil
 }
@@ -348,11 +349,12 @@ func (ed *EncDatum) Fingerprint(
 }
 
 // Compare returns:
-//    -1 if the receiver is less than rhs,
-//    0  if the receiver is equal to rhs,
-//    +1 if the receiver is greater than rhs.
+//
+//	-1 if the receiver is less than rhs,
+//	0  if the receiver is equal to rhs,
+//	+1 if the receiver is greater than rhs.
 func (ed *EncDatum) Compare(
-	typ *types.T, a *tree.DatumAlloc, evalCtx *tree.EvalContext, rhs *EncDatum,
+	typ *types.T, a *tree.DatumAlloc, evalCtx *eval.Context, rhs *EncDatum,
 ) (int, error) {
 	// TODO(radu): if we have both the Datum and a key encoding available, which
 	// one would be faster to use?
@@ -492,10 +494,11 @@ func EncDatumRowToDatums(
 
 // Compare returns the relative ordering of two EncDatumRows according to a
 // ColumnOrdering:
-//   -1 if the receiver comes before the rhs in the ordering,
-//   +1 if the receiver comes after the rhs in the ordering,
-//   0 if the relative order does not matter (i.e. the two rows have the same
-//     values for the columns in the ordering).
+//
+//	-1 if the receiver comes before the rhs in the ordering,
+//	+1 if the receiver comes after the rhs in the ordering,
+//	0 if the relative order does not matter (i.e. the two rows have the same
+//	  values for the columns in the ordering).
 //
 // Note that a return value of 0 does not (in general) imply that the rows are
 // equal; for example, rows [1 1 5] and [1 1 6] when compared against ordering
@@ -505,7 +508,7 @@ func (r EncDatumRow) Compare(
 	types []*types.T,
 	a *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rhs EncDatumRow,
 ) (int, error) {
 	if len(r) != len(types) || len(rhs) != len(types) {
@@ -531,7 +534,7 @@ func (r EncDatumRow) CompareToDatums(
 	types []*types.T,
 	a *tree.DatumAlloc,
 	ordering colinfo.ColumnOrdering,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	rhs tree.Datums,
 ) (int, error) {
 	for _, c := range ordering {

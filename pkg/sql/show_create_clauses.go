@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -33,9 +34,10 @@ import (
 
 // tableComments stores the comment data for a table.
 type tableComments struct {
-	comment *string
-	columns []comment
-	indexes []comment
+	comment     *string
+	columns     []comment
+	indexes     []comment
+	constraints []comment
 }
 
 type comment struct {
@@ -48,7 +50,7 @@ type comment struct {
 func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc *tableComments) {
 	query := fmt.Sprintf("SELECT type, object_id, sub_id, comment FROM system.comments WHERE object_id = %d", tableID)
 
-	txn := p.ExtendedEvalContext().Txn
+	txn := p.Txn()
 	it, err := p.ExtendedEvalContext().ExecCfg.InternalExecutor.QueryIterator(
 		ctx, "show-tables-with-comment", txn, query)
 	if err != nil {
@@ -59,7 +61,8 @@ func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc 
 			row := it.Cur()
 			commentType := keys.CommentType(tree.MustBeDInt(row[0]))
 			switch commentType {
-			case keys.TableCommentType, keys.ColumnCommentType, keys.IndexCommentType:
+			case keys.TableCommentType, keys.ColumnCommentType,
+				keys.IndexCommentType, keys.ConstraintCommentType:
 				subID := int(tree.MustBeDInt(row[2]))
 				cmt := string(tree.MustBeDString(row[3]))
 
@@ -74,6 +77,8 @@ func selectComment(ctx context.Context, p PlanHookState, tableID descpb.ID) (tc 
 					tc.columns = append(tc.columns, comment{subID, cmt})
 				case keys.IndexCommentType:
 					tc.indexes = append(tc.indexes, comment{subID, cmt})
+				case keys.ConstraintCommentType:
+					tc.constraints = append(tc.constraints, comment{subID, cmt})
 				}
 			}
 		}
@@ -100,6 +105,9 @@ func ShowCreateView(
 	f.WriteString("CREATE ")
 	if desc.IsTemporary() {
 		f.WriteString("TEMP ")
+	}
+	if desc.MaterializedView() {
+		f.WriteString("MATERIALIZED ")
 	}
 	f.WriteString("VIEW ")
 	f.FormatNode(tn)
@@ -159,7 +167,7 @@ func formatViewQueryForDisplay(
 	}
 
 	// Convert sequences referenced by ID in the view back to their names.
-	sequenceReplacedViewQuery, err := formatViewQuerySequencesForDisplay(ctx, semaCtx, typeReplacedViewQuery)
+	sequenceReplacedViewQuery, err := formatQuerySequencesForDisplay(ctx, semaCtx, typeReplacedViewQuery, false /* multiStmt */)
 	if err != nil {
 		log.Warningf(ctx, "error converting sequence IDs to names for view %s (%v): %+v",
 			desc.GetName(), desc.GetID(), err)
@@ -169,11 +177,11 @@ func formatViewQueryForDisplay(
 	return sequenceReplacedViewQuery
 }
 
-// formatViewQuerySequencesForDisplay walks the view query and
+// formatQuerySequencesForDisplay walks the view query and
 // looks for sequence IDs in the statement. If it finds any,
 // it will replace the IDs with the descriptor's fully qualified name.
-func formatViewQuerySequencesForDisplay(
-	ctx context.Context, semaCtx *tree.SemaContext, viewQuery string,
+func formatQuerySequencesForDisplay(
+	ctx context.Context, semaCtx *tree.SemaContext, queries string, multiStmt bool,
 ) (string, error) {
 	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
 		newExpr, err = schemaexpr.ReplaceIDsWithFQNames(ctx, expr, semaCtx)
@@ -183,16 +191,39 @@ func formatViewQuerySequencesForDisplay(
 		return false, newExpr, nil
 	}
 
-	stmt, err := parser.ParseOne(viewQuery)
-	if err != nil {
-		return "", err
+	var stmts tree.Statements
+	if multiStmt {
+		parsedStmts, err := parser.Parse(queries)
+		if err != nil {
+			return "", err
+		}
+		stmts = make(tree.Statements, len(parsedStmts))
+		for i, stmt := range parsedStmts {
+			stmts[i] = stmt.AST
+		}
+	} else {
+		stmt, err := parser.ParseOne(queries)
+		if err != nil {
+			return "", err
+		}
+		stmts = tree.Statements{stmt.AST}
 	}
 
-	newStmt, err := tree.SimpleStmtVisit(stmt.AST, replaceFunc)
-	if err != nil {
-		return "", err
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		fmtCtx.FormatNode(newStmt)
+		if multiStmt {
+			fmtCtx.WriteString(";")
+		}
 	}
-	return newStmt.String(), nil
+	return fmtCtx.CloseAndGetString(), nil
 }
 
 // formatViewQueryTypesForDisplay walks the view query and
@@ -205,30 +236,36 @@ func formatViewQueryTypesForDisplay(
 	desc catalog.TableDescriptor,
 ) (string, error) {
 	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		// We need to resolve the type to check if it's user-defined. If not,
+		// no other work is needed.
+		var typRef tree.ResolvableTypeReference
 		switch n := expr.(type) {
-		case *tree.AnnotateTypeExpr, *tree.CastExpr:
-			texpr, err := tree.TypeCheck(ctx, n, semaCtx, types.Any)
-			if err != nil {
-				return false, expr, err
-			}
-			if !texpr.ResolvedType().UserDefined() {
-				return true, expr, nil
-			}
-
-			formattedExpr, err := schemaexpr.FormatExprForDisplay(
-				ctx, desc, expr.String(), semaCtx, sessionData, tree.FmtParsable,
-			)
-			if err != nil {
-				return false, expr, err
-			}
-			newExpr, err = parser.ParseExpr(formattedExpr)
-			if err != nil {
-				return false, expr, err
-			}
-			return false, newExpr, nil
+		case *tree.CastExpr:
+			typRef = n.Type
+		case *tree.AnnotateTypeExpr:
+			typRef = n.Type
 		default:
 			return true, expr, nil
 		}
+		var typ *types.T
+		typ, err = tree.ResolveType(ctx, typRef, semaCtx.TypeResolver)
+		if err != nil {
+			return false, expr, err
+		}
+		if !typ.UserDefined() {
+			return true, expr, nil
+		}
+		formattedExpr, err := schemaexpr.FormatExprForDisplay(
+			ctx, desc, expr.String(), semaCtx, sessionData, tree.FmtParsable,
+		)
+		if err != nil {
+			return false, expr, err
+		}
+		newExpr, err = parser.ParseExpr(formattedExpr)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, newExpr, nil
 	}
 
 	viewQuery := desc.GetViewQuery()
@@ -242,6 +279,77 @@ func formatViewQueryTypesForDisplay(
 		return "", err
 	}
 	return newStmt.String(), nil
+}
+
+// formatFunctionQueryTypesForDisplay is similar to
+// formatViewQueryTypesForDisplay but can only be used for function.
+// nil is used as the table descriptor for schemaexpr.FormatExprForDisplay call.
+// This is fine assuming that UDFs cannot be created with expression casting a
+// column/var to an enum in function body. This is super rare case for now, and
+// it's tracked with issue #87475. We should also unify this function with
+// formatViewQueryTypesForDisplay.
+func formatFunctionQueryTypesForDisplay(
+	ctx context.Context,
+	semaCtx *tree.SemaContext,
+	sessionData *sessiondata.SessionData,
+	queries string,
+) (string, error) {
+	replaceFunc := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		// We need to resolve the type to check if it's user-defined. If not,
+		// no other work is needed.
+		var typRef tree.ResolvableTypeReference
+		switch n := expr.(type) {
+		case *tree.CastExpr:
+			typRef = n.Type
+		case *tree.AnnotateTypeExpr:
+			typRef = n.Type
+		default:
+			return true, expr, nil
+		}
+		var typ *types.T
+		typ, err = tree.ResolveType(ctx, typRef, semaCtx.TypeResolver)
+		if err != nil {
+			return false, expr, err
+		}
+		if !typ.UserDefined() {
+			return true, expr, nil
+		}
+		formattedExpr, err := schemaexpr.FormatExprForDisplay(
+			ctx, nil, expr.String(), semaCtx, sessionData, tree.FmtParsable,
+		)
+		if err != nil {
+			return false, expr, err
+		}
+		newExpr, err = parser.ParseExpr(formattedExpr)
+		if err != nil {
+			return false, expr, err
+		}
+		return false, newExpr, nil
+	}
+
+	var stmts tree.Statements
+	parsedStmts, err := parser.Parse(queries)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse query")
+	}
+	stmts = make(tree.Statements, len(parsedStmts))
+	for i, stmt := range parsedStmts {
+		stmts[i] = stmt.AST
+	}
+
+	fmtCtx := tree.NewFmtCtx(tree.FmtSimple)
+	for i, stmt := range stmts {
+		newStmt, err := tree.SimpleStmtVisit(stmt, replaceFunc)
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			fmtCtx.WriteString("\n")
+		}
+		fmtCtx.FormatNode(newStmt)
+		fmtCtx.WriteString(";")
+	}
+	return fmtCtx.CloseAndGetString(), nil
 }
 
 // showComments prints out the COMMENT statements sufficient to populate a
@@ -263,7 +371,7 @@ func showComments(
 	}
 
 	for _, columnComment := range tc.columns {
-		col, err := table.FindColumnWithID(descpb.ColumnID(columnComment.subID))
+		col, err := table.FindColumnWithPGAttributeNum(descpb.PGAttributeNum(columnComment.subID))
 		if err != nil {
 			return err
 		}
@@ -291,6 +399,25 @@ func showComments(
 				Index: tree.UnrestrictedName(idx.GetName()),
 			},
 			Comment: &indexComment.comment,
+		})
+	}
+
+	// Get all the constraints for the table and create a map by ID.
+	constraints, err := table.GetConstraintInfo()
+	if err != nil {
+		return err
+	}
+	constraintIDToConstraint := make(map[descpb.ConstraintID]string)
+	for constraintName, constraint := range constraints {
+		constraintIDToConstraint[constraint.ConstraintID] = constraintName
+	}
+	for _, constraintComment := range tc.constraints {
+		f.WriteString(";\n")
+		constraintName := constraintIDToConstraint[descpb.ConstraintID(constraintComment.subID)]
+		f.FormatNode(&tree.CommentOnConstraint{
+			Constraint: tree.Name(constraintName),
+			Table:      tn.ToUnresolvedObjectName(),
+			Comment:    &constraintComment.comment,
 		})
 	}
 
@@ -396,7 +523,13 @@ func ShowCreateSequence(
 // showFamilyClause creates the FAMILY clauses for a CREATE statement, writing them
 // to tree.FmtCtx f
 func showFamilyClause(desc catalog.TableDescriptor, f *tree.FmtCtx) {
-	for _, fam := range desc.GetFamilies() {
+	// Do not show family in SHOW CREATE TABLE if there is only one and
+	// it is named "primary".
+	families := desc.GetFamilies()
+	if len(families) == 1 && families[0].Name == tabledesc.FamilyPrimaryName {
+		return
+	}
+	for _, fam := range families {
 		activeColumnNames := make([]string, 0, len(fam.ColumnNames))
 		for i, colID := range fam.ColumnIDs {
 			if col, _ := desc.FindColumnWithID(colID); col != nil && col.Public() {
@@ -564,7 +697,7 @@ func showConstraintClause(
 	f *tree.FmtCtx,
 ) error {
 	for _, e := range desc.AllActiveAndInactiveChecks() {
-		if e.Hidden {
+		if e.FromHashShardedColumn {
 			continue
 		}
 		f.WriteString(",\n\t")

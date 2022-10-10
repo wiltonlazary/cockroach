@@ -12,6 +12,7 @@ package batcheval
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -29,8 +30,9 @@ func declareKeysRangeStats(
 	header *roachpb.Header,
 	req roachpb.Request,
 	latchSpans, lockSpans *spanset.SpanSet,
+	maxOffset time.Duration,
 ) {
-	DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans)
+	DefaultDeclareKeys(rs, header, req, latchSpans, lockSpans, maxOffset)
 	// The request will return the descriptor and lease.
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeDescriptorKey(rs.GetStartKey())})
 	latchSpans.AddNonMVCC(spanset.SpanReadOnly, roachpb.Span{Key: keys.RangeLeaseKey(rs.GetRangeID())})
@@ -42,8 +44,8 @@ func RangeStats(
 ) (result.Result, error) {
 	reply := resp.(*roachpb.RangeStatsResponse)
 	reply.MVCCStats = cArgs.EvalCtx.GetMVCCStats()
-	reply.DeprecatedLastQueriesPerSecond = cArgs.EvalCtx.GetLastSplitQPS()
-	if qps, ok := cArgs.EvalCtx.GetMaxSplitQPS(); ok {
+	reply.DeprecatedLastQueriesPerSecond = cArgs.EvalCtx.GetLastSplitQPS(ctx)
+	if qps, ok := cArgs.EvalCtx.GetMaxSplitQPS(ctx); ok {
 		reply.MaxQueriesPerSecond = qps
 	} else {
 		// See comment on MaxQueriesPerSecond. -1 means !ok.

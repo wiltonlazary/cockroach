@@ -30,8 +30,8 @@ import (
 // accidentally and it splits the details of the filename into groups for easy
 // parsing. The log file format is
 //
-//   {program}.{host}.{username}.{timestamp}.{pid}.log
-//   cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
+//	{program}.{host}.{username}.{timestamp}.{pid}.log
+//	cockroach.Brams-MacBook-Pro.bram.2015-06-09T16-10-48Z.30209.log
 //
 // All underscore in process, host and username are escaped to double
 // underscores and all periods are escaped to an underscore.
@@ -115,10 +115,11 @@ func listLogGroups() (logGroups [][]logpb.FileInfo, err error) {
 // the log configuration. For example, consider the following config:
 //
 // file-groups:
-//    groupA:
-//      dir: dir1
-//    groupB:
-//      dir: dir2
+//
+//	groupA:
+//	  dir: dir1
+//	groupB:
+//	  dir: dir2
 //
 // The result of ListLogFiles on this config will return the list
 // {cockroach-groupA.XXX.log, cockroach-groupB.XXX.log}, without
@@ -250,7 +251,7 @@ func GetLogReader(filename string) (io.ReadCloser, error) {
 	sb, ok := fs.mu.file.(*syncBuffer)
 	if ok && baseFileName == filepath.Base(sb.file.Name()) {
 		// If the file being read is also the file being written to, then we
-		// want mutual exclusion between the reader and the flusher.
+		// want mutual exclusion between the reader and the runFlusher.
 		lr := &lockedReader{}
 		lr.mu.RWMutex = &fs.mu.RWMutex
 		lr.mu.wrappedFile = file
@@ -371,7 +372,7 @@ var _ io.ReadCloser = (*lockedReader)(nil)
 // lockedReader locks accesses to a wrapped io.ReadCloser,
 // using a RWMutex shared with another component.
 // We use this when reading log files (using the GetLogReader API)
-// that are concurrently being written to by the log flusher,
+// that are concurrently being written to by the log runFlusher,
 // to ensure that read operations cannot observe partial flushes.
 type lockedReader struct {
 	mu struct {

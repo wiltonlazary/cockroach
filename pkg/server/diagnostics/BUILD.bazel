@@ -1,4 +1,6 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "diagnostics",
@@ -15,14 +17,16 @@ go_library(
         "//pkg/config/zonepb",
         "//pkg/keys",
         "//pkg/kv",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/roachpb",
+        "//pkg/security/username",
         "//pkg/server/diagnostics/diagnosticspb",
         "//pkg/server/status/statuspb",
         "//pkg/server/telemetry",
         "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog",
+        "//pkg/sql/catalog/descbuilder",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/sem/tree",
         "//pkg/sql/sessiondata",
@@ -51,19 +55,18 @@ go_test(
     name = "diagnostics_test",
     size = "medium",
     srcs = [
-        "dep_test.go",
         "main_test.go",
         "update_checker_test.go",
     ],
-    embed = [":diagnostics"],
+    args = ["-test.timeout=295s"],
     tags = ["no-remote"],
     deps = [
+        ":diagnostics",
         "//pkg/base",
         "//pkg/build",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/diagutils",
         "//pkg/testutils/serverutils",
         "//pkg/util/cloudinfo",
@@ -72,3 +75,11 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+disallowed_imports_test(
+    "diagnostics",
+    # TODO(#81378): This should be flipped to "true".
+    disallow_cdeps = False,
+)
+
+get_x_data(name = "get_x_data")

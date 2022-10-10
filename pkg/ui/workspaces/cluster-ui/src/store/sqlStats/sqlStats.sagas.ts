@@ -9,18 +9,10 @@
 // licenses/APL.txt.
 
 import { PayloadAction } from "@reduxjs/toolkit";
-import {
-  all,
-  call,
-  put,
-  delay,
-  takeLatest,
-  takeEvery,
-} from "redux-saga/effects";
+import { all, call, put, takeLatest, takeEvery } from "redux-saga/effects";
 import Long from "long";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import {
-  getStatements,
   getCombinedStatements,
   StatementsRequest,
 } from "src/api/statementsApi";
@@ -30,32 +22,22 @@ import {
   actions as sqlStatsActions,
   UpdateTimeScalePayload,
 } from "./sqlStats.reducer";
-import { rootActions } from "../reducers";
-import { CACHE_INVALIDATION_PERIOD, throttleWithReset } from "src/store/utils";
+import { actions as sqlDetailsStatsActions } from "../statementDetails/statementDetails.reducer";
 import { toDateRange } from "../../timeScaleDropdown";
 
-export function* refreshSQLStatsSaga(
-  action?: PayloadAction<StatementsRequest>,
-) {
-  yield put(sqlStatsActions.request(action?.payload));
+export function* refreshSQLStatsSaga(action: PayloadAction<StatementsRequest>) {
+  yield put(sqlStatsActions.request(action.payload));
 }
 
 export function* requestSQLStatsSaga(
-  action?: PayloadAction<StatementsRequest>,
+  action: PayloadAction<StatementsRequest>,
 ): any {
   try {
-    const result = yield action?.payload?.combined
-      ? call(getCombinedStatements, action.payload)
-      : call(getStatements);
+    const result = yield call(getCombinedStatements, action.payload);
     yield put(sqlStatsActions.received(result));
   } catch (e) {
     yield put(sqlStatsActions.failed(e));
   }
-}
-
-export function* receivedSQLStatsSaga(delayMs: number) {
-  yield delay(delayMs);
-  yield put(sqlStatsActions.invalidated());
 }
 
 export function* updateSQLStatsTimeScaleSaga(
@@ -68,46 +50,31 @@ export function* updateSQLStatsTimeScaleSaga(
       value: ts,
     }),
   );
-  yield put(sqlStatsActions.invalidated());
   const [start, end] = toDateRange(ts);
   const req = new cockroach.server.serverpb.StatementsRequest({
     combined: true,
     start: Long.fromNumber(start.unix()),
     end: Long.fromNumber(end.unix()),
   });
+  yield put(sqlStatsActions.invalidated());
   yield put(sqlStatsActions.refresh(req));
 }
 
-export function* resetSQLStatsSaga() {
+export function* resetSQLStatsSaga(action: PayloadAction<StatementsRequest>) {
   try {
     yield call(resetSQLStats);
+    yield put(sqlDetailsStatsActions.invalidateAll());
     yield put(sqlStatsActions.invalidated());
-    yield put(sqlStatsActions.refresh());
+    yield put(sqlStatsActions.refresh(action.payload));
   } catch (e) {
     yield put(sqlStatsActions.failed(e));
   }
 }
 
-export function* sqlStatsSaga(
-  cacheInvalidationPeriod: number = CACHE_INVALIDATION_PERIOD,
-) {
+export function* sqlStatsSaga() {
   yield all([
-    throttleWithReset(
-      cacheInvalidationPeriod,
-      sqlStatsActions.refresh,
-      [
-        sqlStatsActions.invalidated,
-        sqlStatsActions.failed,
-        rootActions.resetState,
-      ],
-      refreshSQLStatsSaga,
-    ),
+    takeLatest(sqlStatsActions.refresh, refreshSQLStatsSaga),
     takeLatest(sqlStatsActions.request, requestSQLStatsSaga),
-    takeLatest(
-      sqlStatsActions.received,
-      receivedSQLStatsSaga,
-      cacheInvalidationPeriod,
-    ),
     takeLatest(sqlStatsActions.updateTimeScale, updateSQLStatsTimeScaleSaga),
     takeEvery(sqlStatsActions.reset, resetSQLStatsSaga),
   ]);

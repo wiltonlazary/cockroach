@@ -12,15 +12,18 @@ package sql
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/idxrecommendations"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 )
 
 // EngineMetrics groups a set of SQL metrics.
@@ -39,6 +42,8 @@ type EngineMetrics struct {
 	SQLServiceLatency     *metric.Histogram
 	SQLTxnLatency         *metric.Histogram
 	SQLTxnsOpen           *metric.Gauge
+	SQLActiveStatements   *metric.Gauge
+	SQLContendedTxns      *metric.Counter
 
 	// TxnAbortCount counts transactions that were aborted, either due
 	// to non-retriable errors, or retriable errors when the client-side
@@ -100,14 +105,14 @@ var _ metric.Struct = GuardrailMetrics{}
 // MetricStruct is part of the metric.Struct interface.
 func (GuardrailMetrics) MetricStruct() {}
 
-// recordStatementSummery gathers various details pertaining to the
+// recordStatementSummary gathers various details pertaining to the
 // last executed statement/query and performs the associated
 // accounting in the passed-in EngineMetrics.
-// - distSQLUsed reports whether the query was distributed.
-// - automaticRetryCount is the count of implicit txn retries
-//   so far.
-// - result is the result set computed by the query/statement.
-// - err is the error encountered, if any.
+//   - distSQLUsed reports whether the query was distributed.
+//   - automaticRetryCount is the count of implicit txn retries
+//     so far.
+//   - result is the result set computed by the query/statement.
+//   - err is the error encountered, if any.
 func (ex *connExecutor) recordStatementSummary(
 	ctx context.Context,
 	planner *planner,
@@ -115,7 +120,7 @@ func (ex *connExecutor) recordStatementSummary(
 	rowsAffected int,
 	stmtErr error,
 	stats topLevelQueryStats,
-) {
+) roachpb.StmtFingerprintID {
 	phaseTimes := ex.statsCollector.PhaseTimes()
 
 	// Collect the statistics.
@@ -154,57 +159,54 @@ func (ex *connExecutor) recordStatementSummary(
 		}
 	}
 
+	fullScan := flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan)
 	recordedStmtStatsKey := roachpb.StatementStatisticsKey{
 		Query:        stmt.StmtNoConstants,
 		QuerySummary: stmt.StmtSummary,
 		DistSQL:      flags.IsDistributed(),
 		Vec:          flags.IsSet(planFlagVectorized),
 		ImplicitTxn:  flags.IsSet(planFlagImplicitTxn),
-		FullScan:     flags.IsSet(planFlagContainsFullIndexScan) || flags.IsSet(planFlagContainsFullTableScan),
+		FullScan:     fullScan,
 		Failed:       stmtErr != nil,
 		Database:     planner.SessionData().Database,
+		PlanHash:     planner.instrumentation.planGist.Hash(),
 	}
 
-	// We only populate the transaction fingerprint ID field if we are in an
-	// implicit transaction.
-	//
-	// TODO(azhng): This will require some big refactoring later, we already
-	//  compute statement's fingerprintID in RecordStatement().
-	//  However, we need to recompute the Fingerprint() here because this
-	//  is required to populate the transaction fingerprint ID field.
-	//
-	//  The reason behind it is that: for explicit transactions, we have a final
-	//  callback that will eventually invoke
-	//  statsCollector.EndExplicitTransaction() which will use the extraTxnState
-	//  stored in the connExecutor to compute the transaction fingerprintID.
-	//  Unfortunately, that callback is not invoked for implicit transactions,
-	//  because we don't create temporary stats container for the implicit
-	//  transactions. (The statement stats directly gets written to the actual
-	//  stats container). This means that, unless we populate the transaction
-	//  fingerprintID here, we will not have another chance to do so later.
-	if ex.implicitTxn() {
-		stmtFingerprintID := recordedStmtStatsKey.FingerprintID()
-		txnFingerprintHash := util.MakeFNV64()
-		txnFingerprintHash.Add(uint64(stmtFingerprintID))
-		recordedStmtStatsKey.TransactionFingerprintID =
-			roachpb.TransactionFingerprintID(txnFingerprintHash.Sum())
-	}
+	idxRecommendations := idxrecommendations.FormatIdxRecommendations(planner.instrumentation.indexRecs)
+	queryLevelStats, queryLevelStatsOk := planner.instrumentation.GetQueryLevelStats()
 
+	// We only have node information when it was collected with trace, but we know at least the current
+	// node should be on the list.
+	nodeID, err := strconv.ParseInt(ex.server.sqlStats.GetSQLInstanceID().String(), 10, 64)
+	if err != nil {
+		log.Warningf(ctx, "failed to convert node ID to int: %s", err)
+	}
 	recordedStmtStats := sqlstats.RecordedStmtStats{
-		AutoRetryCount:  automaticRetryCount,
-		RowsAffected:    rowsAffected,
-		ParseLatency:    parseLat,
-		PlanLatency:     planLat,
-		RunLatency:      runLat,
-		ServiceLatency:  svcLat,
-		OverheadLatency: execOverhead,
-		BytesRead:       stats.bytesRead,
-		RowsRead:        stats.rowsRead,
-		RowsWritten:     stats.rowsWritten,
-		Nodes:           getNodesFromPlanner(planner),
-		StatementType:   stmt.AST.StatementType(),
-		Plan:            planner.instrumentation.PlanForStats(ctx),
-		StatementError:  stmtErr,
+		SessionID:            ex.sessionID,
+		StatementID:          planner.stmt.QueryID,
+		AutoRetryCount:       automaticRetryCount,
+		AutoRetryReason:      ex.state.mu.autoRetryReason,
+		RowsAffected:         rowsAffected,
+		ParseLatency:         parseLat,
+		PlanLatency:          planLat,
+		RunLatency:           runLat,
+		ServiceLatency:       svcLat,
+		OverheadLatency:      execOverhead,
+		BytesRead:            stats.bytesRead,
+		RowsRead:             stats.rowsRead,
+		RowsWritten:          stats.rowsWritten,
+		Nodes:                util.CombineUniqueInt64(getNodesFromPlanner(planner), []int64{nodeID}),
+		StatementType:        stmt.AST.StatementType(),
+		Plan:                 planner.instrumentation.PlanForStats(ctx),
+		PlanGist:             planner.instrumentation.planGist.String(),
+		StatementError:       stmtErr,
+		IndexRecommendations: idxRecommendations,
+		Query:                stmt.StmtNoConstants,
+		StartTime:            phaseTimes.GetSessionPhaseTime(sessionphase.PlannerStartExecStmt),
+		EndTime:              phaseTimes.GetSessionPhaseTime(sessionphase.PlannerStartExecStmt).Add(svcLatRaw),
+		FullScan:             fullScan,
+		SessionData:          planner.SessionData(),
+		ExecStats:            queryLevelStats,
 	}
 
 	stmtFingerprintID, err :=
@@ -215,6 +217,17 @@ func (ex *connExecutor) recordStatementSummary(
 			log.Warningf(ctx, "failed to record statement: %s", err)
 		}
 		ex.server.ServerMetrics.StatsMetrics.DiscardedStatsCount.Inc(1)
+	}
+
+	// Record statement execution statistics if span is recorded and no error was
+	// encountered while collecting query-level statistics.
+	if queryLevelStatsOk {
+		err = ex.statsCollector.RecordStatementExecStats(recordedStmtStatsKey, *queryLevelStats)
+		if err != nil {
+			if log.V(2 /* level */) {
+				log.Warningf(ctx, "unable to record statement exec stats: %s", err)
+			}
+		}
 	}
 
 	// Do some transaction level accounting for the transaction this statement is
@@ -255,6 +268,7 @@ func (ex *connExecutor) recordStatementSummary(
 			sessionAge,
 		)
 	}
+	return stmtFingerprintID
 }
 
 func (ex *connExecutor) updateOptCounters(planFlags planFlags) {
@@ -275,10 +289,10 @@ func shouldIncludeStmtInLatencyMetrics(stmt *Statement) bool {
 func getNodesFromPlanner(planner *planner) []int64 {
 	// Retrieve the list of all nodes which the statement was executed on.
 	var nodes []int64
-	if planner.instrumentation.sp != nil {
-		trace := planner.instrumentation.sp.GetRecording(tracing.RecordingStructured)
+	if _, ok := planner.instrumentation.Tracing(); !ok {
+		trace := planner.instrumentation.sp.GetRecording(tracingpb.RecordingStructured)
 		// ForEach returns nodes in order.
-		execinfrapb.ExtractNodesFromSpans(planner.EvalContext().Context, trace).ForEach(func(i int) {
+		execinfrapb.ExtractNodesFromSpans(trace).ForEach(func(i int) {
 			nodes = append(nodes, int64(i))
 		})
 	}

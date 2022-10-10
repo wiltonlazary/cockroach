@@ -1,5 +1,7 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 load("//pkg/sql/colexecop:EXECGEN.bzl", "eg_go_filegroup", "gen_eg_go_rules")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "colexecwindow",
@@ -27,10 +29,12 @@ go_library(
         "//pkg/sql/colexecop",  # keep
         "//pkg/sql/colmem",  # keep
         "//pkg/sql/execinfra",  # keep
+        "//pkg/sql/execinfra/execreleasable",  # keep
         "//pkg/sql/execinfrapb",  # keep
         "//pkg/sql/memsize",  # keep
         "//pkg/sql/rowenc",  # keep
         "//pkg/sql/sem/builtins",  # keep
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",  # keep
         "//pkg/sql/types",  # keep
         "//pkg/util/duration",  # keep
@@ -46,13 +50,13 @@ go_library(
 go_test(
     name = "colexecwindow_test",
     srcs = [
-        "dep_test.go",
         "inject_setup_test.go",
         "main_test.go",
         "min_max_queue_test.go",
         "window_framer_test.go",
         "window_functions_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":colexecwindow"],
     tags = ["no-remote"],
     deps = [
@@ -72,9 +76,10 @@ go_test(
         "//pkg/sql/execinfra",
         "//pkg/sql/execinfrapb",
         "//pkg/sql/randgen",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/types",
-        "//pkg/testutils/buildutil",
         "//pkg/testutils/colcontainerutils",
         "//pkg/testutils/skip",
         "//pkg/util/encoding",
@@ -115,3 +120,17 @@ eg_go_filegroup(
 
 # Define gen rules for individual eg.go files.
 gen_eg_go_rules(targets)
+
+disallowed_imports_test(
+    "colexecwindow",
+    [
+        "//pkg/sql/colexec",
+        "//pkg/sql/colexec/colexechash",
+        "//pkg/sql/colexec/colexecjoin",
+        "//pkg/sql/colexec/colexecproj",
+        "//pkg/sql/colexec/colexecprojconst",
+        "//pkg/sql/colexec/colexecsel",
+    ],
+)
+
+get_x_data(name = "get_x_data")

@@ -11,20 +11,29 @@
 package scplan
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/deprules"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/opgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/rules"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraphviz"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scopt"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
 // Params holds the arguments for planning.
 type Params struct {
+	// InRollback is used to indicate whether we've already been reverted.
+	// Note that when in rollback, there is no turning back and all work is
+	// non-revertible. Theory dictates that this is fine because of how we
+	// had carefully crafted stages to only allow entering rollback while it
+	// remains safe to do so.
+	InRollback bool
+
 	// ExecutionPhase indicates the phase that the plan should be constructed for.
 	ExecutionPhase scop.Phase
 
@@ -63,58 +72,63 @@ func (p Plan) StagesForCurrentPhase() []scstage.Stage {
 	return p.Stages
 }
 
-// DecorateErrorWithPlanDetails adds plan graphviz URLs as error details.
-func (p Plan) DecorateErrorWithPlanDetails(err error) error {
-	return scgraphviz.DecorateErrorWithPlanDetails(err, p.CurrentState, p.Graph, p.Stages)
-}
-
-// DependenciesURL returns a URL to render the dependency graph in the Plan.
-func (p Plan) DependenciesURL() (string, error) {
-	return scgraphviz.DependenciesURL(p.CurrentState, p.Graph)
-}
-
-// StagesURL returns a URL to render the stages in the Plan.
-func (p Plan) StagesURL() (string, error) {
-	return scgraphviz.StagesURL(p.CurrentState, p.Graph, p.Stages)
-}
-
 // MakePlan generates a Plan for a particular phase of a schema change, given
-// the initial state for a set of targets.
-// Returns an error when planning fails. It is up to the caller to wrap this
-// error as an assertion failure and with useful debug information details.
-func MakePlan(initial scpb.CurrentState, params Params) (p Plan, err error) {
+// the initial state for a set of targets. Returns an error when planning fails.
+func MakePlan(ctx context.Context, initial scpb.CurrentState, params Params) (p Plan, err error) {
 	p = Plan{
 		CurrentState: initial,
 		Params:       params,
 	}
+	err = makePlan(ctx, &p)
+	if err != nil && ctx.Err() == nil {
+		err = p.DecorateErrorWithPlanDetails(err)
+	}
+	return p, err
+}
+
+func makePlan(ctx context.Context, p *Plan) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			rAsErr, ok := r.(error)
 			if !ok {
 				rAsErr = errors.Errorf("panic during MakePlan: %v", r)
 			}
-			err = p.DecorateErrorWithPlanDetails(rAsErr)
+			err = rAsErr
 		}
+		err = errors.WithAssertionFailure(err)
 	}()
-
-	p.Graph = buildGraph(p.CurrentState)
-	p.Stages = scstage.BuildStages(initial, params.ExecutionPhase, p.Graph, params.SchemaChangerJobIDSupplier)
+	{
+		start := timeutil.Now()
+		p.Graph = buildGraph(ctx, p.CurrentState)
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "graph generation took %v", timeutil.Since(start))
+		}
+	}
+	{
+		start := timeutil.Now()
+		p.Stages = scstage.BuildStages(
+			ctx, p.CurrentState, p.Params.ExecutionPhase, p.Graph, p.Params.SchemaChangerJobIDSupplier,
+		)
+		if log.ExpensiveLogEnabled(ctx, 2) {
+			log.Infof(ctx, "stage generation took %v", timeutil.Since(start))
+		}
+	}
 	if n := len(p.Stages); n > 0 && p.Stages[n-1].Phase > scop.PreCommitPhase {
 		// Only get the job ID if it's actually been assigned already.
-		p.JobID = params.SchemaChangerJobIDSupplier()
+		p.JobID = p.Params.SchemaChangerJobIDSupplier()
 	}
 	if err := scstage.ValidateStages(p.TargetState, p.Stages, p.Graph); err != nil {
 		panic(errors.Wrapf(err, "invalid execution plan"))
 	}
-	return p, nil
+	return nil
 }
 
-func buildGraph(cs scpb.CurrentState) *scgraph.Graph {
-	g, err := opgen.BuildGraph(cs)
+func buildGraph(ctx context.Context, cs scpb.CurrentState) *scgraph.Graph {
+	g, err := opgen.BuildGraph(ctx, cs)
 	if err != nil {
 		panic(errors.Wrapf(err, "build graph op edges"))
 	}
-	err = deprules.Apply(g)
+	err = rules.ApplyDepRules(ctx, g)
 	if err != nil {
 		panic(errors.Wrapf(err, "build graph dep edges"))
 	}
@@ -122,7 +136,7 @@ func buildGraph(cs scpb.CurrentState) *scgraph.Graph {
 	if err != nil {
 		panic(errors.Wrapf(err, "validate graph"))
 	}
-	g, err = scopt.OptimizeGraph(g)
+	g, err = rules.ApplyOpRules(ctx, g)
 	if err != nil {
 		panic(errors.Wrapf(err, "mark op edges as no-op"))
 	}

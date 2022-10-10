@@ -16,12 +16,13 @@ import { connect } from "react-redux";
 import { createSelector } from "reselect";
 
 import { AdminUIState } from "src/redux/state";
-import { nodesSummarySelector, NodesSummary } from "src/redux/nodes";
+import { nodeSumsSelector } from "src/redux/nodes";
 import { Bytes as formatBytes } from "src/util/format";
 import createChartComponent from "src/views/shared/util/d3-react";
 import capacityChart from "./capacity";
 import spinner from "assets/spinner.gif";
 import { refreshNodes, refreshLiveness } from "src/redux/apiReducers";
+import OverviewListAlerts from "src/views/shared/containers/alerts/overviewListAlerts";
 import EmailSubscription from "src/views/dashboard/emailSubscription";
 import "./cluster.styl";
 import {
@@ -80,9 +81,9 @@ function renderCapacityUsage(props: CapacityUsageProps) {
 }
 
 const mapStateToCapacityUsageProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const { capacityUsed, capacityUsable } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { capacityUsed, capacityUsable } = nodeSums;
     return {
       usedCapacity: capacityUsed,
       usableCapacity: capacityUsable,
@@ -148,9 +149,9 @@ function renderNodeLiveness(props: NodeLivenessProps) {
 }
 
 const mapStateToNodeLivenessProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const { nodeCounts } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { nodeCounts } = nodeSums;
     return {
       liveNodes: nodeCounts.healthy,
       suspectNodes: nodeCounts.suspect,
@@ -219,13 +220,9 @@ function renderReplicationStatus(props: ReplicationStatusProps) {
 }
 
 const mapStateToReplicationStatusProps = createSelector(
-  nodesSummarySelector,
-  function(nodesSummary: NodesSummary) {
-    const {
-      totalRanges,
-      underReplicatedRanges,
-      unavailableRanges,
-    } = nodesSummary.nodeSums;
+  nodeSumsSelector,
+  nodeSums => {
+    const { totalRanges, underReplicatedRanges, unavailableRanges } = nodeSums;
     return {
       totalRanges: totalRanges,
       underReplicatedRanges: underReplicatedRanges,
@@ -311,6 +308,7 @@ export default class ClusterOverview extends React.Component<any, any> {
       <div className="cluster-page">
         <Helmet title="Cluster Overview" />
         <EmailSubscription />
+        <OverviewListAlerts />
         <section className="section cluster-overview">
           <ClusterSummaryConnected />
         </section>

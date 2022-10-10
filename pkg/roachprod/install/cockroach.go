@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/cockroachdb/errors"
 )
 
@@ -73,25 +72,6 @@ func cockroachNodeBinary(c *SyncedCluster, node Node) string {
 	return path
 }
 
-func getCockroachVersion(
-	ctx context.Context, c *SyncedCluster, node Node,
-) (*version.Version, error) {
-	sess, err := c.newSession(node)
-	if err != nil {
-		return nil, err
-	}
-	defer sess.Close()
-
-	cmd := cockroachNodeBinary(c, node) + " version"
-	out, err := sess.CombinedOutput(ctx, cmd+" --build-tag")
-	if err != nil {
-		return nil, errors.Wrapf(err, "~ %s --build-tag\n%s", cmd, out)
-	}
-
-	verString := strings.TrimSpace(string(out))
-	return version.Parse(verString)
-}
-
 func argExists(args []string, target string) int {
 	for i, arg := range args {
 		if arg == target || strings.HasPrefix(arg, target+"=") {
@@ -107,6 +87,9 @@ type StartOpts struct {
 	Sequential bool
 	ExtraArgs  []string
 
+	// systemd limits on resources.
+	NumFilesLimit int64
+
 	// -- Options that apply only to StartDefault target --
 
 	SkipInit        bool
@@ -114,8 +97,9 @@ type StartOpts struct {
 	EncryptedStores bool
 
 	// -- Options that apply only to StartTenantSQL target --
-	TenantID int
-	KVAddrs  string
+	TenantID  int
+	KVAddrs   string
+	KVCluster *SyncedCluster
 }
 
 // StartTarget identifies what flavor of cockroach we are starting.
@@ -150,8 +134,15 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	if startOpts.Target == StartTenantProxy {
 		return fmt.Errorf("start tenant proxy not implemented")
 	}
-	if err := c.distributeCerts(ctx, l); err != nil {
-		return err
+	switch startOpts.Target {
+	case StartDefault:
+		if err := c.distributeCerts(ctx, l); err != nil {
+			return err
+		}
+	case StartTenantSQL:
+		if err := c.distributeTenantCerts(ctx, l, startOpts.KVCluster, startOpts.TenantID); err != nil {
+			return err
+		}
 	}
 
 	nodes := c.TargetNodes()
@@ -163,14 +154,10 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	l.Printf("%s: starting nodes", c.Name)
 	return c.Parallel(l, "", len(nodes), parallelism, func(nodeIdx int) ([]byte, error) {
 		node := nodes[nodeIdx]
-		vers, err := getCockroachVersion(ctx, c, node)
-		if err != nil {
-			return nil, err
-		}
 
 		// NB: if cockroach started successfully, we ignore the output as it is
 		// some harmless start messaging.
-		if _, err := c.startNode(ctx, l, node, startOpts, vers); err != nil {
+		if _, err := c.startNode(ctx, l, node, startOpts); err != nil {
 			return nil, err
 		}
 
@@ -197,27 +184,13 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 
 		shouldInit := !c.useStartSingleNode()
 		if shouldInit {
-			l.Printf("%s: initializing cluster", c.Name)
-			initOut, err := c.initializeCluster(ctx, node)
-			if err != nil {
-				return nil, errors.WithDetail(err, "unable to initialize cluster")
-			}
-
-			if initOut != "" {
-				l.Printf(initOut)
+			if err := c.initializeCluster(ctx, l, node); err != nil {
+				return nil, errors.Wrap(err, "failed to initialize cluster")
 			}
 		}
 
-		// We're sure to set cluster settings after having initialized the
-		// cluster.
-
-		l.Printf("%s: setting cluster settings", c.Name)
-		clusterSettingsOut, err := c.setClusterSettings(ctx, l, node)
-		if err != nil {
-			return nil, errors.Wrap(err, "unable to set cluster settings")
-		}
-		if clusterSettingsOut != "" {
-			l.Printf(clusterSettingsOut)
+		if err := c.setClusterSettings(ctx, l, node); err != nil {
+			return nil, errors.Wrap(err, "failed to set cluster settings")
 		}
 		return nil, nil
 	})
@@ -357,9 +330,9 @@ func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []str
 }
 
 func (c *SyncedCluster) startNode(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) (string, error) {
-	startCmd, err := c.generateStartCmd(ctx, l, node, startOpts, vers)
+	startCmd, err := c.generateStartCmd(ctx, l, node, startOpts)
 	if err != nil {
 		return "", err
 	}
@@ -405,9 +378,9 @@ func (c *SyncedCluster) startNode(
 }
 
 func (c *SyncedCluster) generateStartCmd(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) (string, error) {
-	args, err := c.generateStartArgs(ctx, l, node, startOpts, vers)
+	args, err := c.generateStartArgs(ctx, l, node, startOpts)
 	if err != nil {
 		return "", err
 	}
@@ -420,21 +393,23 @@ func (c *SyncedCluster) generateStartCmd(
 			"GOTRACEBACK=crash",
 			"COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=1",
 		}, c.Env...), getEnvVars()...),
-		Binary:    cockroachNodeBinary(c, node),
-		Args:      args,
-		MemoryMax: config.MemoryMax,
-		Local:     c.IsLocal(),
+		Binary:        cockroachNodeBinary(c, node),
+		Args:          args,
+		MemoryMax:     config.MemoryMax,
+		NumFilesLimit: startOpts.NumFilesLimit,
+		Local:         c.IsLocal(),
 	})
 }
 
 type startTemplateData struct {
-	Local     bool
-	LogDir    string
-	Binary    string
-	KeyCmd    string
-	MemoryMax string
-	Args      []string
-	EnvVars   []string
+	Local         bool
+	LogDir        string
+	Binary        string
+	KeyCmd        string
+	MemoryMax     string
+	NumFilesLimit int64
+	Args          []string
+	EnvVars       []string
 }
 
 func execStartTemplate(data startTemplateData) (string, error) {
@@ -457,7 +432,7 @@ func execStartTemplate(data startTemplateData) (string, error) {
 // generateStartArgs generates cockroach binary arguments for starting a node.
 // The first argument is the command (e.g. "start").
 func (c *SyncedCluster) generateStartArgs(
-	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts, vers *version.Version,
+	ctx context.Context, l *logger.Logger, node Node, startOpts StartOpts,
 ) ([]string, error) {
 	var args []string
 
@@ -489,11 +464,13 @@ func (c *SyncedCluster) generateStartArgs(
 	}
 
 	logDir := c.LogDir(node)
-	if vers.AtLeast(version.MustParse("v21.1.0-alpha.0")) {
+	idx1 := argExists(startOpts.ExtraArgs, "--log")
+	idx2 := argExists(startOpts.ExtraArgs, "--log-config-file")
+
+	// if neither --log nor --log-config-file are present
+	if idx1 == -1 && idx2 == -1 {
 		// Specify exit-on-error=false to work around #62763.
 		args = append(args, "--log", `file-defaults: {dir: '`+logDir+`', exit-on-error: false}`)
-	} else {
-		args = append(args, `--log-dir`, logDir)
 	}
 
 	listenHost := ""
@@ -531,11 +508,11 @@ func (c *SyncedCluster) generateStartArgs(
 	}
 
 	if startOpts.Target == StartDefault {
-		args = append(args, c.generateStartFlagsKV(node, startOpts, vers)...)
+		args = append(args, c.generateStartFlagsKV(node, startOpts)...)
 	}
 
 	if startOpts.Target == StartDefault || startOpts.Target == StartTenantSQL {
-		args = append(args, c.generateStartFlagsSQL(node, startOpts, vers)...)
+		args = append(args, c.generateStartFlagsSQL()...)
 	}
 
 	// Argument template expansion is node specific (e.g. for {store-dir}).
@@ -556,9 +533,7 @@ func (c *SyncedCluster) generateStartArgs(
 // generateStartFlagsKV generates `cockroach start` arguments that are relevant
 // for the KV and storage layers (and consequently are never used by
 // `cockroach mt start-sql`).
-func (c *SyncedCluster) generateStartFlagsKV(
-	node Node, startOpts StartOpts, vers *version.Version,
-) []string {
+func (c *SyncedCluster) generateStartFlagsKV(node Node, startOpts StartOpts) []string {
 	var args []string
 	var storeDirs []string
 	if idx := argExists(startOpts.ExtraArgs, "--store"); idx == -1 {
@@ -566,9 +541,12 @@ func (c *SyncedCluster) generateStartFlagsKV(
 			storeDir := c.NodeDir(node, i)
 			storeDirs = append(storeDirs, storeDir)
 			// Place a store{i} attribute on each store to allow for zone configs
-			// that use specific stores.
+			// that use specific stores. Note that `i` is 1 most of the time, since
+			// it's the i-th store on the *current* node. This isn't always useful,
+			// for example it doesn't let one single out a specific node. We add
+			// nodeX-flavor attributes for that.
 			args = append(args, `--store`,
-				`path=`+storeDir+`,attrs=`+fmt.Sprintf("store%d", i))
+				fmt.Sprintf(`path=%s,attrs=store%d:node%d:node%dstore%d`, storeDir, i, node, node, i))
 		}
 	} else {
 		storeDir := strings.TrimPrefix(startOpts.ExtraArgs[idx], "--store=")
@@ -598,9 +576,7 @@ func (c *SyncedCluster) generateStartFlagsKV(
 // generateStartFlagsSQL generates `cockroach start` and `cockroach mt
 // start-sql` arguments that are relevant for the SQL layers, used by both KV
 // and storage layers (and in particular, are never used by `
-func (c *SyncedCluster) generateStartFlagsSQL(
-	node Node, startOpts StartOpts, vers *version.Version,
-) []string {
+func (c *SyncedCluster) generateStartFlagsSQL() []string {
 	var args []string
 	args = append(args, fmt.Sprintf("--max-sql-memory=%d%%", c.maybeScaleMem(25)))
 	return args
@@ -618,38 +594,45 @@ func (c *SyncedCluster) maybeScaleMem(val int) int {
 	return val
 }
 
-func (c *SyncedCluster) initializeCluster(ctx context.Context, node Node) (string, error) {
+func (c *SyncedCluster) initializeCluster(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: initializing cluster\n", c.Name)
 	initCmd := c.generateInitCmd(node)
 
 	sess, err := c.newSession(node)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer sess.Close()
 
 	out, err := sess.CombinedOutput(ctx, initCmd)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", initCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", initCmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
-func (c *SyncedCluster) setClusterSettings(
-	ctx context.Context, l *logger.Logger, node Node,
-) (string, error) {
+func (c *SyncedCluster) setClusterSettings(ctx context.Context, l *logger.Logger, node Node) error {
+	l.Printf("%s: setting cluster settings", c.Name)
 	clusterSettingCmd := c.generateClusterSettingCmd(l, node)
 
 	sess, err := c.newSession(node)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer sess.Close()
 
 	out, err := sess.CombinedOutput(ctx, clusterSettingCmd)
 	if err != nil {
-		return "", errors.Wrapf(err, "~ %s\n%s", clusterSettingCmd, out)
+		return errors.Wrapf(err, "~ %s\n%s", clusterSettingCmd, out)
 	}
-	return strings.TrimSpace(string(out)), nil
+	if out := strings.TrimSpace(string(out)); out != "" {
+		l.Printf(out)
+	}
+	return nil
 }
 
 func (c *SyncedCluster) generateClusterSettingCmd(l *logger.Logger, node Node) string {
@@ -735,6 +718,16 @@ func (c *SyncedCluster) distributeCerts(ctx context.Context, l *logger.Logger) e
 		if node == 1 && c.Secure {
 			return c.DistributeCerts(ctx, l)
 		}
+	}
+	return nil
+}
+
+// distributeCerts distributes certs if it's a secure cluster.
+func (c *SyncedCluster) distributeTenantCerts(
+	ctx context.Context, l *logger.Logger, hostCluster *SyncedCluster, tenantID int,
+) error {
+	if c.Secure {
+		return c.DistributeTenantCerts(ctx, l, hostCluster, tenantID)
 	}
 	return nil
 }

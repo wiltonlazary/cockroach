@@ -16,6 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo"
 	"github.com/cockroachdb/cockroach/pkg/geo/geogfn"
+	// Blank import so projections are initialized correctly.
+	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoprojbase"
@@ -27,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -62,7 +65,7 @@ func GetGeoIndexRelationship(expr opt.ScalarExpr) (_ geoindex.RelationshipType, 
 // geospatial relationship. It is implemented by getSpanExprForGeographyIndex
 // and getSpanExprForGeometryIndex and used in extractGeoFilterCondition.
 type getSpanExprForGeoIndexFn func(
-	context.Context, tree.Datum, []tree.Datum, geoindex.RelationshipType, *geoindex.Config,
+	context.Context, tree.Datum, []tree.Datum, geoindex.RelationshipType, geoindex.Config,
 ) inverted.Expression
 
 // getSpanExprForGeographyIndex gets a SpanExpression that constrains the given
@@ -72,7 +75,7 @@ func getSpanExprForGeographyIndex(
 	d tree.Datum,
 	additionalParams []tree.Datum,
 	relationship geoindex.RelationshipType,
-	indexConfig *geoindex.Config,
+	indexConfig geoindex.Config,
 ) inverted.Expression {
 	geogIdx := geoindex.NewS2GeographyIndex(*indexConfig.S2Geography)
 	geog := d.(*tree.DGeography).Geography
@@ -159,7 +162,7 @@ func getSpanExprForGeometryIndex(
 	d tree.Datum,
 	additionalParams []tree.Datum,
 	relationship geoindex.RelationshipType,
-	indexConfig *geoindex.Config,
+	indexConfig geoindex.Config,
 ) inverted.Expression {
 	geomIdx := geoindex.NewS2GeometryIndex(*indexConfig.S2Geometry)
 	geom := d.(*tree.DGeometry).Geometry
@@ -274,10 +277,10 @@ func (g *geoJoinPlanner) extractInvertedJoinConditionFromLeaf(
 // of the comparison operation. If commuteArgs is true, returns a new function
 // representing the same relationship but with commuted arguments. For example:
 //
-//   ST_Intersects(g1, g2) <-> ST_Intersects(g2, g1)
-//   ST_Covers(g1, g2) <-> ST_CoveredBy(g2, g1)
-//   g1 && g2 -> ST_Intersects(g2, g1)
-//   g1 ~ g2 -> ST_CoveredBy(g2, g1)
+//	ST_Intersects(g1, g2) <-> ST_Intersects(g2, g1)
+//	ST_Covers(g1, g2) <-> ST_CoveredBy(g2, g1)
+//	g1 && g2 -> ST_Intersects(g2, g1)
+//	g1 ~ g2 -> ST_CoveredBy(g2, g1)
 //
 // See geoindex.CommuteRelationshipMap for the full list of mappings.
 //
@@ -334,7 +337,7 @@ var _ invertedFilterPlanner = &geoFilterPlanner{}
 // extractInvertedFilterConditionFromLeaf is part of the invertedFilterPlanner
 // interface.
 func (g *geoFilterPlanner) extractInvertedFilterConditionFromLeaf(
-	evalCtx *tree.EvalContext, expr opt.ScalarExpr,
+	ctx context.Context, evalCtx *eval.Context, expr opt.ScalarExpr,
 ) (
 	invertedExpr inverted.Expression,
 	remainingFilters opt.ScalarExpr,
@@ -372,11 +375,11 @@ func (g *geoFilterPlanner) extractInvertedFilterConditionFromLeaf(
 	//
 	// See geoindex.CommuteRelationshipMap for the full list of mappings.
 	invertedExpr, pfState := extractGeoFilterCondition(
-		evalCtx.Context, g.factory, expr, args, false /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
+		ctx, g.factory, expr, args, false /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
 	)
 	if _, ok := invertedExpr.(inverted.NonInvertedColExpression); ok {
 		invertedExpr, pfState = extractGeoFilterCondition(
-			evalCtx.Context, g.factory, expr, args, true /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
+			ctx, g.factory, expr, args, true /* commuteArgs */, g.tabID, g.index, g.getSpanExpr,
 		)
 	}
 	if !invertedExpr.IsTight() {
@@ -685,7 +688,7 @@ func (p *PreFilterer) PreFilter(
 				if err != nil {
 					return false, err
 				}
-				angleToExpand := s1.Angle(distance / proj.Spheroid.SphereRadius)
+				angleToExpand := s1.Angle(distance / proj.Spheroid.SphereRadius())
 				if useSphereOrSpheroid == geogfn.UseSpheroid {
 					angleToExpand *= (1 + geogfn.SpheroidErrorFraction)
 				}
@@ -705,10 +708,10 @@ func (p *PreFilterer) PreFilter(
 // geoDatumsToInvertedExpr implements invertedexpr.DatumsToInvertedExpr for
 // geospatial columns.
 type geoDatumsToInvertedExpr struct {
-	evalCtx      *tree.EvalContext
+	evalCtx      *eval.Context
 	colTypes     []*types.T
 	invertedExpr tree.TypedExpr
-	indexConfig  *geoindex.Config
+	indexConfig  geoindex.Config
 	typ          *types.T
 	getSpanExpr  getSpanExprForGeoIndexFn
 
@@ -720,17 +723,17 @@ type geoDatumsToInvertedExpr struct {
 }
 
 var _ invertedexpr.DatumsToInvertedExpr = &geoDatumsToInvertedExpr{}
-var _ tree.IndexedVarContainer = &geoDatumsToInvertedExpr{}
+var _ eval.IndexedVarContainer = &geoDatumsToInvertedExpr{}
 
-// IndexedVarEval is part of the IndexedVarContainer interface.
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
 func (g *geoDatumsToInvertedExpr) IndexedVarEval(
-	idx int, ctx *tree.EvalContext,
+	ctx context.Context, idx int, e tree.ExprEvaluator,
 ) (tree.Datum, error) {
 	err := g.row[idx].EnsureDecoded(g.colTypes[idx], &g.alloc)
 	if err != nil {
 		return nil, err
 	}
-	return g.row[idx].Datum.Eval(ctx)
+	return g.row[idx].Datum.Eval(ctx, e)
 }
 
 // IndexedVarResolvedType is part of the IndexedVarContainer interface.
@@ -746,9 +749,13 @@ func (g *geoDatumsToInvertedExpr) IndexedVarNodeFormatter(idx int) tree.NodeForm
 
 // NewGeoDatumsToInvertedExpr returns a new geoDatumsToInvertedExpr.
 func NewGeoDatumsToInvertedExpr(
-	evalCtx *tree.EvalContext, colTypes []*types.T, expr tree.TypedExpr, config *geoindex.Config,
+	ctx context.Context,
+	evalCtx *eval.Context,
+	colTypes []*types.T,
+	expr tree.TypedExpr,
+	config geoindex.Config,
 ) (invertedexpr.DatumsToInvertedExpr, error) {
-	if geoindex.IsEmptyConfig(config) {
+	if config.IsEmpty() {
 		return nil, fmt.Errorf("inverted joins are currently only supported for geospatial indexes")
 	}
 
@@ -757,10 +764,10 @@ func NewGeoDatumsToInvertedExpr(
 		colTypes:    colTypes,
 		indexConfig: config,
 	}
-	if geoindex.IsGeographyConfig(config) {
+	if config.IsGeography() {
 		g.typ = types.Geography
 		g.getSpanExpr = getSpanExprForGeographyIndex
-	} else if geoindex.IsGeometryConfig(config) {
+	} else if config.IsGeometry() {
 		g.typ = types.Geometry
 		g.getSpanExpr = getSpanExprForGeometryIndex
 	} else {
@@ -810,7 +817,7 @@ func NewGeoDatumsToInvertedExpr(
 			// it for every row.
 			var invertedExpr inverted.Expression
 			if d, ok := nonIndexParam.(tree.Datum); ok {
-				invertedExpr = g.getSpanExpr(evalCtx.Ctx(), d, additionalParams, relationship, g.indexConfig)
+				invertedExpr = g.getSpanExpr(ctx, d, additionalParams, relationship, g.indexConfig)
 			} else if funcExprCount == 1 {
 				// Currently pre-filtering is limited to a single FuncExpr.
 				preFilterRelationship = relationship
@@ -857,7 +864,7 @@ func (g *geoDatumsToInvertedExpr) Convert(
 				// We call Copy so the caller can modify the returned expression.
 				return t.invertedExpr.Copy(), nil
 			}
-			d, err := t.nonIndexParam.Eval(g.evalCtx)
+			d, err := eval.Expr(ctx, g.evalCtx, t.nonIndexParam)
 			if err != nil {
 				return nil, err
 			}

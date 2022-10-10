@@ -16,11 +16,13 @@ import Long from "long";
 import {
   createDiagnosticsReportSaga,
   requestStatementsDiagnosticsSaga,
+  cancelDiagnosticsReportSaga,
   StatementDiagnosticsState,
 } from "src/store/statementDiagnostics";
 import { actions, reducer } from "src/store/statementDiagnostics";
 import {
   createStatementDiagnosticsReport,
+  cancelStatementDiagnosticsReport,
   getStatementDiagnosticsReports,
 } from "src/api/statementDiagnosticsApi";
 
@@ -28,6 +30,11 @@ const CreateStatementDiagnosticsReportRequest =
   cockroach.server.serverpb.CreateStatementDiagnosticsReportRequest;
 const CreateStatementDiagnosticsReportResponse =
   cockroach.server.serverpb.CreateStatementDiagnosticsReportResponse;
+
+const CancelStatementDiagnosticsReportRequest =
+  cockroach.server.serverpb.CancelStatementDiagnosticsReportRequest;
+const CancelStatementDiagnosticsReportResponse =
+  cockroach.server.serverpb.CancelStatementDiagnosticsReportResponse;
 
 describe("statementsDiagnostics sagas", () => {
   describe("createDiagnosticsReportSaga", () => {
@@ -53,9 +60,10 @@ describe("statementsDiagnostics sagas", () => {
       },
     });
 
-    const reportsResponse = new cockroach.server.serverpb.StatementDiagnosticsReportsResponse(
-      { reports: [] },
-    );
+    const reportsResponse =
+      new cockroach.server.serverpb.StatementDiagnosticsReportsResponse({
+        reports: [],
+      });
 
     it("successful request", () => {
       expectSaga(createDiagnosticsReportSaga, actions.createReport(request))
@@ -88,9 +96,10 @@ describe("statementsDiagnostics sagas", () => {
 
   describe("requestStatementsDiagnosticsSaga", () => {
     const statementFingerprint = "SELECT * FROM table";
-    const reportsResponse = new cockroach.server.serverpb.StatementDiagnosticsReportsResponse(
-      { reports: [{ statement_fingerprint: statementFingerprint }] },
-    );
+    const reportsResponse =
+      new cockroach.server.serverpb.StatementDiagnosticsReportsResponse({
+        reports: [{ statement_fingerprint: statementFingerprint }],
+      });
 
     it("successfully requests diagnostics reports", () => {
       expectSaga(requestStatementsDiagnosticsSaga)
@@ -116,6 +125,57 @@ describe("statementsDiagnostics sagas", () => {
           lastError: error,
           valid: false,
         })
+        .run();
+    });
+  });
+
+  describe("cancelDiagnosticsReportSaga", () => {
+    const requestID = Long.fromNumber(12345);
+    const request = new CancelStatementDiagnosticsReportRequest({
+      request_id: requestID,
+    });
+
+    const report = new CancelStatementDiagnosticsReportResponse({
+      canceled: true,
+      error: "",
+    });
+
+    const reportsResponse =
+      new cockroach.server.serverpb.StatementDiagnosticsReportsResponse({
+        reports: [],
+      });
+
+    it("successful request", () => {
+      return expectSaga(
+        cancelDiagnosticsReportSaga,
+        actions.cancelReport(request),
+      )
+        .provide([
+          [call(cancelStatementDiagnosticsReport, request), report],
+          [call(getStatementDiagnosticsReports), reportsResponse],
+        ])
+        .put(actions.cancelReportCompleted())
+        .put(actions.request())
+        .withReducer(reducer)
+        .hasFinalState<StatementDiagnosticsState>({
+          data: null,
+          lastError: null,
+          valid: true,
+        })
+        .run();
+    });
+
+    it("failed request", () => {
+      const error = new Error("Failed request");
+      return expectSaga(
+        cancelDiagnosticsReportSaga,
+        actions.cancelReport(request),
+      )
+        .provide([
+          [call(cancelStatementDiagnosticsReport, request), throwError(error)],
+          [call(getStatementDiagnosticsReports), reportsResponse],
+        ])
+        .put(actions.cancelReportFailed(error))
         .run();
     });
   });

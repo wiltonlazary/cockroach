@@ -33,7 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
@@ -51,7 +51,7 @@ type testUtils struct {
 	// testAllocator is an Allocator with an unlimited budget for use in tests.
 	testAllocator     *colmem.Allocator
 	testColumnFactory coldata.ColumnFactory
-	evalCtx           *tree.EvalContext
+	evalCtx           *eval.Context
 
 	// testMemMonitor and testMemAcc are a test monitor with an unlimited budget
 	// and a memory account bound to it for use in tests.
@@ -68,7 +68,7 @@ func newTestUtils(ctx context.Context) *testUtils {
 	st := cluster.MakeTestingClusterSettings()
 	testMemMonitor := execinfra.NewTestMemMonitor(ctx, st)
 	memAcc := testMemMonitor.MakeBoundAccount()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	testColumnFactory := coldataext.NewExtendedColumnFactory(&evalCtx)
 	testAllocator := colmem.NewAllocator(ctx, &memAcc, testColumnFactory)
 	testDiskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
@@ -112,7 +112,8 @@ type memoryTestCase struct {
 // Note that not all tests will check for a spill, it is enough that some
 // deterministic tests do so for the simple cases.
 // TODO(asubiotto): We might want to also return a verify() function that will
-//  check for leftover files.
+//
+//	check for leftover files.
 func getDiskQueueCfgAndMemoryTestCases(
 	t *testing.T, rng *rand.Rand,
 ) (colcontainer.DiskQueueCfg, func(), []memoryTestCase) {
@@ -218,7 +219,7 @@ func TestRouterOutputAddBatch(t *testing.T) {
 		for _, mtc := range memoryTestCases {
 			t.Run(fmt.Sprintf("%s/memoryLimit=%s", tc.name, humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
 				// Clear the testAllocator for use.
-				tu.testAllocator.ReleaseMemory(tu.testAllocator.Used())
+				tu.testAllocator.ReleaseAll()
 				o := newRouterOutputOp(
 					routerOutputOpArgs{
 						types:               typs,
@@ -895,7 +896,7 @@ func TestHashRouterOneOutput(t *testing.T) {
 	for _, mtc := range memoryTestCases {
 		t.Run(fmt.Sprintf("memoryLimit=%s", humanizeutil.IBytes(mtc.bytes)), func(t *testing.T) {
 			// Clear the testAllocator for use.
-			tu.testAllocator.ReleaseMemory(tu.testAllocator.Used())
+			tu.testAllocator.ReleaseAll()
 			diskAcc := tu.testDiskMonitor.MakeBoundAccount()
 			defer diskAcc.Close(ctx)
 			r, routerOutputs := NewHashRouter(
@@ -1037,7 +1038,7 @@ func TestHashRouterRandom(t *testing.T) {
 			colexectestutils.RunTestsWithFn(t, tu.testAllocator, []colexectestutils.Tuples{data}, nil, func(t *testing.T, inputs []colexecop.Operator) {
 				unblockEventsChan := make(chan struct{}, 2*numOutputs)
 				outputs := make([]routerOutput, numOutputs)
-				outputsAsOps := make([]colexecop.DrainableOperator, numOutputs)
+				outputsAsOps := make([]colexecop.DrainableClosableOperator, numOutputs)
 				memoryLimitPerOutput := mtc.bytes / int64(len(outputs))
 				for i := range outputs {
 					// Create separate monitoring infrastructure as well as

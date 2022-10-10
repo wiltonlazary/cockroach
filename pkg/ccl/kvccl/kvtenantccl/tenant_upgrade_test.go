@@ -13,26 +13,29 @@ import (
 	gosql "database/sql"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
-	"github.com/cockroachdb/cockroach/pkg/migration"
-	"github.com/cockroachdb/cockroach/pkg/migration/migrations"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slinstance"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
+	"github.com/cockroachdb/cockroach/pkg/upgrade"
+	"github.com/cockroachdb/cockroach/pkg/upgrade/upgrades"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/stretchr/testify/require"
 )
 
 // TestTenantUpgrade exercises the case where a system tenant is in a
 // non-finalized version state and creates a tenant. The test ensures
-// that that newly created tenant begins in that same version.
+// that the newly created tenant begins in that same version.
 //
 // The first subtest creates the tenant in the mixed version state,
 // then upgrades the system tenant, then upgrades the secondary tenant,
@@ -44,6 +47,7 @@ import (
 // also verifies that the version is correct after a restart
 func TestTenantUpgrade(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettingsWithVersions(
 		clusterversion.TestingBinaryVersion,
@@ -55,10 +59,13 @@ func TestTenantUpgrade(t *testing.T) {
 		clusterversion.TestingBinaryMinSupportedVersion, &settings.SV))
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Settings: settings,
+			// Test validates tenant behavior. No need for the default test
+			// tenant.
+			DisableDefaultTestTenant: true,
+			Settings:                 settings,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
 					BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
 				},
 			},
@@ -67,7 +74,7 @@ func TestTenantUpgrade(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 
 	connectToTenant := func(t *testing.T, addr string) (_ *gosql.DB, cleanup func()) {
-		pgURL, cleanupPGUrl := sqlutils.PGUrl(t, addr, "Tenant", url.User(security.RootUser))
+		pgURL, cleanupPGUrl := sqlutils.PGUrl(t, addr, "Tenant", url.User(username.RootUser))
 		tenantDB, err := gosql.Open("postgres", pgURL.String())
 		require.NoError(t, err)
 		return tenantDB, func() {
@@ -129,7 +136,6 @@ func TestTenantUpgrade(t *testing.T) {
 		{
 			tenantServer, err := tc.Server(0).StartTenant(ctx, base.TestTenantArgs{
 				TenantID: roachpb.MakeTenantID(initialTenantID),
-				Existing: true,
 			})
 			require.NoError(t, err)
 			initialTenant, cleanup = connectToTenant(t, tenantServer.SQLAddr())
@@ -154,7 +160,6 @@ func TestTenantUpgrade(t *testing.T) {
 		{
 			tenantServer, err := tc.Server(0).StartTenant(ctx, base.TestTenantArgs{
 				TenantID: roachpb.MakeTenantID(postUpgradeTenantID),
-				Existing: true,
 			})
 			require.NoError(t, err)
 			postUpgradeTenant, cleanup = connectToTenant(t, tenantServer.SQLAddr())
@@ -167,22 +172,17 @@ func TestTenantUpgrade(t *testing.T) {
 
 }
 
-// Returns two versions v0, v1, v2 which correspond to adjacent releases. v1 will
+// Returns two versions v0, v1, v2 which correspond to adjacent releases. v0 will
 // equal the TestingBinaryMinSupportedVersion to avoid rot in tests using this
 // (as we retire old versions).
 func v0v1v2() (roachpb.Version, roachpb.Version, roachpb.Version) {
-	v1 := clusterversion.TestingBinaryVersion
 	v0 := clusterversion.TestingBinaryMinSupportedVersion
+	v1 := clusterversion.TestingBinaryVersion
 	v2 := clusterversion.TestingBinaryVersion
-	if v0.Minor > 0 {
-		v0.Minor--
+	if v1.Internal > 2 {
+		v1.Internal -= 2
 	} else {
-		v0.Major--
-	}
-	if v1.Minor > 0 {
-		v1.Minor--
-	} else {
-		v1.Major--
+		v2.Internal += 2
 	}
 	return v0, v1, v2
 }
@@ -191,6 +191,7 @@ func v0v1v2() (roachpb.Version, roachpb.Version, roachpb.Version) {
 // between version upgrades.
 func TestTenantUpgradeFailure(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 	// Contains information for starting a tenant
 	// and maintaining a stopper.
 	type tenantInfo struct {
@@ -200,18 +201,21 @@ func TestTenantUpgradeFailure(t *testing.T) {
 	v0, v1, v2 := v0v1v2()
 	ctx := context.Background()
 	settings := cluster.MakeTestingClusterSettingsWithVersions(
-		clusterversion.TestingBinaryVersion,
-		clusterversion.TestingBinaryMinSupportedVersion,
+		v2,
+		v0,
 		false, // initializeVersion
 	)
 	// Initialize the version to the BinaryMinSupportedVersion.
 	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
-			Settings: settings,
+			// Test validates tenant behavior. No need for the default test
+			// tenant here.
+			DisableDefaultTestTenant: true,
+			Settings:                 settings,
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					DisableAutomaticVersionUpgrade: 1,
-					BinaryVersionOverride:          clusterversion.TestingBinaryMinSupportedVersion,
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+					BinaryVersionOverride:          v0,
 				},
 			},
 		},
@@ -222,8 +226,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 	startAndConnectToTenant := func(t *testing.T, tenantInfo *tenantInfo) (_ *gosql.DB, cleanup func()) {
 		tenant, err := tc.Server(0).StartTenant(ctx, *tenantInfo.tenantArgs)
 		require.NoError(t, err)
-		tenantInfo.tenantArgs.Existing = true
-		pgURL, cleanupPGUrl := sqlutils.PGUrl(t, tenant.SQLAddr(), "Tenant", url.User(security.RootUser))
+		pgURL, cleanupPGUrl := sqlutils.PGUrl(t, tenant.SQLAddr(), "Tenant", url.User(username.RootUser))
 		tenantDB, err := gosql.Open("postgres", pgURL.String())
 		require.NoError(t, err)
 		return tenantDB, func() {
@@ -231,44 +234,46 @@ func TestTenantUpgradeFailure(t *testing.T) {
 			cleanupPGUrl()
 		}
 	}
-	mkTenant := func(t *testing.T, id uint64, existing bool) *tenantInfo {
+	mkTenant := func(t *testing.T, id uint64) *tenantInfo {
 		settings := cluster.MakeTestingClusterSettingsWithVersions(
 			v2,
 			v0,
 			false, // initializeVersion
 		)
+		slinstance.DefaultTTL.Override(ctx, &settings.SV, 3*time.Second)
+		slinstance.DefaultHeartBeat.Override(ctx, &settings.SV, 500*time.Millisecond)
 		v2onMigrationStopper := stop.NewStopper()
 		// Initialize the version to the minimum it could be.
 		require.NoError(t, clusterversion.Initialize(ctx,
-			clusterversion.TestingBinaryMinSupportedVersion, &settings.SV))
+			v0, &settings.SV))
 		tenantArgs := base.TestTenantArgs{
 			Stopper:  v2onMigrationStopper,
 			TenantID: roachpb.MakeTenantID(id),
-			Existing: existing,
 			TestingKnobs: base.TestingKnobs{
-				MigrationManager: &migration.TestingKnobs{
+				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+				UpgradeManager: &upgrade.TestingKnobs{
 					ListBetweenOverride: func(from, to clusterversion.ClusterVersion) []clusterversion.ClusterVersion {
 						return []clusterversion.ClusterVersion{{Version: v1}, {Version: v2}}
 					},
-					RegistryOverride: func(cv clusterversion.ClusterVersion) (migration.Migration, bool) {
+					RegistryOverride: func(cv clusterversion.ClusterVersion) (upgrade.Upgrade, bool) {
 						switch cv.Version {
 						case v1:
-							return migration.NewTenantMigration("testing", clusterversion.ClusterVersion{
+							return upgrade.NewTenantUpgrade("testing", clusterversion.ClusterVersion{
 								Version: v1,
 							},
-								migrations.NoPrecondition,
+								upgrades.NoPrecondition,
 								func(
-									ctx context.Context, version clusterversion.ClusterVersion, deps migration.TenantDeps, _ *jobs.Job,
+									ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps, _ *jobs.Job,
 								) error {
 									return nil
 								}), true
 						case v2:
-							return migration.NewTenantMigration("testing next", clusterversion.ClusterVersion{
+							return upgrade.NewTenantUpgrade("testing next", clusterversion.ClusterVersion{
 								Version: v2,
 							},
-								migrations.NoPrecondition,
+								upgrades.NoPrecondition,
 								func(
-									ctx context.Context, version clusterversion.ClusterVersion, deps migration.TenantDeps, _ *jobs.Job,
+									ctx context.Context, version clusterversion.ClusterVersion, deps upgrade.TenantDeps, _ *jobs.Job,
 								) error {
 									tenantStopperChannel <- struct{}{}
 									return nil
@@ -288,20 +293,14 @@ func TestTenantUpgradeFailure(t *testing.T) {
 	t.Run("upgrade tenant have it crash then resume", func(t *testing.T) {
 		// Create a tenant before upgrading anything and verify its version.
 		const initialTenantID = 10
-		tenantInfo := mkTenant(t, initialTenantID, false /*existing*/)
+		tenantInfo := mkTenant(t, initialTenantID)
 		tenant, cleanup := startAndConnectToTenant(t, tenantInfo)
 		initialTenantRunner := sqlutils.MakeSQLRunner(tenant)
 		// Ensure that the tenant works.
 		initialTenantRunner.CheckQueryResults(t, "SHOW CLUSTER SETTING version",
-			[][]string{{clusterversion.TestingBinaryMinSupportedVersion.String()}})
+			[][]string{{v0.String()}})
 		initialTenantRunner.Exec(t, "CREATE TABLE t (i INT PRIMARY KEY)")
 		initialTenantRunner.Exec(t, "INSERT INTO t VALUES (1), (2)")
-		// Upgrade the host cluster and have it crash on v1.
-		sqlutils.MakeSQLRunner(tc.ServerConn(0)).Exec(t,
-			"SET CLUSTER SETTING version = $1",
-			v2.String())
-		// Ensure that the tenant still works.
-		initialTenantRunner.CheckQueryResults(t, "SELECT * FROM t", [][]string{{"1"}, {"2"}})
 		// Use to wait for tenant crash leading to a clean up.
 		waitForTenantClose := make(chan struct{})
 		// Cause the upgrade to crash on v1.
@@ -311,15 +310,20 @@ func TestTenantUpgradeFailure(t *testing.T) {
 			tenantInfo.v2onMigrationStopper.Stop(ctx)
 			waitForTenantClose <- struct{}{}
 		}()
-		// Upgrade the tenant cluster, but the upgrade
-		// will fail on v1.
+		// Upgrade the host cluster to the latest version.
+		sqlutils.MakeSQLRunner(tc.ServerConn(0)).Exec(t,
+			"SET CLUSTER SETTING version = $1",
+			clusterversion.TestingBinaryVersion.String())
+		// Ensure that the tenant still works.
+		initialTenantRunner.CheckQueryResults(t, "SELECT * FROM t", [][]string{{"1"}, {"2"}})
+		// Upgrade the tenant cluster, but the upgrade will fail on v1.
 		initialTenantRunner.ExpectErr(t,
 			".*(database is closed|failed to connect|closed network connection)+",
 			"SET CLUSTER SETTING version = $1",
-			clusterversion.TestingBinaryVersion.String())
+			v2.String())
 		<-waitForTenantClose
 		cleanup()
-		tenantInfo = mkTenant(t, initialTenantID, true /*existing*/)
+		tenantInfo = mkTenant(t, initialTenantID)
 		tenant, cleanup = startAndConnectToTenant(t, tenantInfo)
 		initialTenantRunner = sqlutils.MakeSQLRunner(tenant)
 		// Ensure that the tenant still works and the target
@@ -349,7 +353,7 @@ func TestTenantUpgradeFailure(t *testing.T) {
 		// Upgrade the tenant cluster.
 		initialTenantRunner.Exec(t,
 			"SET CLUSTER SETTING version = $1",
-			clusterversion.TestingBinaryVersion.String())
+			v2.String())
 		close(tenantStopperChannel)
 		// Validate the target version has been reached.
 		initialTenantRunner.CheckQueryResults(t, "SELECT * FROM t", [][]string{{"1"}, {"2"}})

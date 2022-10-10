@@ -501,6 +501,17 @@ func TestNewObjectBuilderWithCounter(t *testing.T) {
 }
 
 func TestBuildJSONObject(t *testing.T) {
+	checkJSONObjectsEqual := func(t *testing.T, expected, found JSON) {
+		t.Helper()
+		c, err := found.Compare(expected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c != 0 {
+			t.Fatalf("expected %v to equal %v", found, expectError)
+		}
+	}
+
 	testCases := []struct {
 		input []string
 	}{
@@ -523,15 +534,50 @@ func TestBuildJSONObject(t *testing.T) {
 				t.Fatal(err)
 			}
 			result := b.Build()
-			c, err := result.Compare(expectedResult)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if c != 0 {
-				t.Fatalf("expected %v to equal %v", result, expectedResult)
-			}
+			checkJSONObjectsEqual(t, expectedResult, result)
+
+			t.Run("fixedKeys", func(t *testing.T) {
+				uniqueKeys := func() (keys []string) {
+					for k := range m {
+						keys = append(keys, k)
+					}
+					return keys
+				}()
+
+				fkb, err := NewFixedKeysObjectBuilder(uniqueKeys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := 0; i < 5; i++ {
+					for k, v := range m {
+						if err := fkb.Set(k, v.(JSON)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					result, err := fkb.Build()
+					if err != nil {
+						t.Fatal(err)
+					}
+					checkJSONObjectsEqual(t, expectedResult, result)
+				}
+			})
 		})
 	}
+}
+
+func TestBuildFixedKeysJSONObjectErrors(t *testing.T) {
+	t.Run("require_unique_keys", func(t *testing.T) {
+		_, err := NewFixedKeysObjectBuilder([]string{"a", "b", "c", "a", "d"})
+		require.Error(t, err)
+	})
+	t.Run("requires_all_keys_set", func(t *testing.T) {
+		b, err := NewFixedKeysObjectBuilder([]string{"a", "b", "c"})
+		require.NoError(t, err)
+		require.NoError(t, b.Set("a", jsonNull{}))
+		require.NoError(t, b.Set("b", jsonNull{}))
+		_, err = b.Build()
+		require.Error(t, err)
+	})
 }
 
 func jsonTestShorthand(s string) JSON {
@@ -802,6 +848,30 @@ func TestJSONExists(t *testing.T) {
 				}
 			})
 		}
+	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		left, err := Random(20, rng)
+		require.NoError(t, err)
+		right := randomJSONString(rng).(string)
+		require.NoError(t, err)
+
+		var exists bool
+		exists, err = left.Exists(right)
+		require.NoError(t, err)
+
+		// Test that we get the same result with the encoded form of the JSON.
+		b, err := EncodeJSON(nil, left)
+		require.NoError(t, err)
+		j, err := FromEncoding(b)
+		require.NoError(t, err)
+
+		existsEncoded, err := j.Exists(right)
+		require.NoError(t, err)
+
+		require.Equal(t, exists, existsEncoded, "expected encoded/non-encoded Exists to match but didn't: %s %s", left, right)
 	}
 }
 
@@ -1696,6 +1766,112 @@ func TestEncodeContainedJSONInvertedIndexSpans(t *testing.T) {
 	}
 }
 
+func TestEncodeExistsJSONInvertedIndexSpans(t *testing.T) {
+	testCases := []struct {
+		indexedValue string
+		value        string
+		expected     bool
+	}{
+		// This test uses EncodeInvertedIndexKeys and EncodeExistsInvertedIndexSpans
+		// to determine if the spans produced from the string key will include or
+		// excludes the keys produced by the JSON value, indicated by exists.
+		// Then, if indexedValue ? value, expected is true.
+
+		// First we test that the spans will include expected results.
+		{`{"a": "a"}`, `a`, true},
+		{`{"a": null}`, `a`, true},
+		{`{"a": []}`, `a`, true},
+		{`{"a": {}}`, `a`, true},
+		{`{"a": 3}`, `a`, true},
+		{`["a"]`, `a`, true},
+		{`["a", "a"]`, `a`, true},
+		{`["b", "a"]`, `a`, true},
+		{`"a"`, `a`, true},
+
+		// Test negative cases.
+		// The number 1 doesn't have key string-1.
+		{`1`, `1`, false},
+		// Null doesn't have key string-null.
+		{`null`, `null`, false},
+		// [] doesn't have key string-null.
+		{`[]`, `null`, false},
+		{`["a"]`, `argh`, false},
+		{`["argh"]`, `a`, false},
+		{`{}`, `null`, false},
+		{`{}`, `a`, false},
+		{`{"a":"a"}`, `argh`, false},
+		{`{"argh":"a"}`, `a`, false},
+	}
+
+	runTest := func(indexedValue JSON, value string, expected bool) {
+		keys, err := EncodeInvertedIndexKeys(nil, indexedValue)
+		require.NoError(t, err)
+
+		invertedExpr, err := EncodeExistsInvertedIndexSpans(nil, value)
+		require.NoError(t, err)
+
+		spanExpr, ok := invertedExpr.(*inverted.SpanExpression)
+		if !ok {
+			t.Fatalf("invertedExpr %v is not a SpanExpression", invertedExpr)
+		}
+
+		// Spans should always be tight for exists.
+		if !spanExpr.Tight {
+			t.Errorf("For %s, expected tight=true, but got false", value)
+		}
+
+		// Spans should never be unique for exists.
+		if spanExpr.Unique {
+			t.Errorf("For %s, expected unique=false, but got true", value)
+		}
+
+		containsKeys, err := spanExpr.ContainsKeys(keys)
+		require.NoError(t, err)
+
+		if containsKeys != expected {
+			if expected {
+				t.Errorf("expected spans of %s to include %s but they did not", value, indexedValue)
+			} else {
+				t.Errorf("expected spans of %s not to include %s but they did", value, indexedValue)
+			}
+		}
+	}
+
+	// Run pre-defined test cases from above.
+	for _, c := range testCases {
+		indexedValue, value := jsonTestShorthand(c.indexedValue), c.value
+
+		// First check that evaluating `indexedValue ? value` matches the expected
+		// result.
+		actual, err := indexedValue.Exists(value)
+		require.NoError(t, err)
+		if actual != c.expected {
+			t.Fatalf(
+				"expected value of %s ? %s did not match actual value. Expected: %v. Got: %v",
+				c.indexedValue, c.value, c.expected, actual,
+			)
+		}
+		runTest(indexedValue, value, c.expected)
+	}
+
+	// Run a set of randomly generated test cases.
+	rng, _ := randutil.NewTestRand()
+	for i := 0; i < 100; i++ {
+		// Generate two random JSONs and evaluate the result of `left ? right`.
+		left, err := Random(20, rng)
+		require.NoError(t, err)
+		right := randomJSONString(rng).(string)
+		require.NoError(t, err)
+
+		var exists bool
+		exists, err = left.Exists(right)
+		require.NoError(t, err)
+
+		// Now check that we get the same result with the inverted index spans.
+		runTest(left, right, exists)
+	}
+}
+
 func TestNumInvertedIndexEntries(t *testing.T) {
 	testCases := []struct {
 		value    string
@@ -2017,10 +2193,10 @@ func TestPositiveRandomJSONContains(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !c {
-			t.Fatal(fmt.Sprintf("%s should contain %s", j, subdoc))
+			t.Fatalf("%s should contain %s", j, subdoc)
 		}
 		if !slowContains(j, subdoc) {
-			t.Fatal(fmt.Sprintf("%s should slowContains %s", j, subdoc))
+			t.Fatalf("%s should slowContains %s", j, subdoc)
 		}
 	}
 }

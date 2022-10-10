@@ -55,6 +55,11 @@ const consistencyCheckRateBurstFactor = 8
 // churn on timers.
 const consistencyCheckRateMinWait = 100 * time.Millisecond
 
+// consistencyCheckSyncTimeout is the max amount of time the consistency check
+// computation and the checksum collection request will wait for each other
+// before giving up.
+const consistencyCheckSyncTimeout = 5 * time.Second
+
 var testingAggressiveConsistencyChecks = envutil.EnvOrDefaultBool("COCKROACH_CONSISTENCY_AGGRESSIVE", false)
 
 type consistencyQueue struct {
@@ -62,6 +67,8 @@ type consistencyQueue struct {
 	interval       func() time.Duration
 	replicaCountFn func() int
 }
+
+var _ queueImpl = &consistencyQueue{}
 
 // A data wrapper to allow for the shouldQueue method to be easier to test.
 type consistencyShouldQueueData struct {
@@ -195,6 +202,11 @@ func (q *consistencyQueue) process(
 	return true, nil
 }
 
+func (*consistencyQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 	// An interval between replicas to space consistency checks out over
 	// the check interval.
@@ -211,5 +223,9 @@ func (q *consistencyQueue) timer(duration time.Duration) time.Duration {
 
 // purgatoryChan returns nil.
 func (*consistencyQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*consistencyQueue) updateChan() <-chan time.Time {
 	return nil
 }

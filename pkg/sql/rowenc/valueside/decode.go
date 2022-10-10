@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/lib/pq/oid"
 )
 
 // Decode decodes a value encoded by Encode.
@@ -101,6 +102,12 @@ func DecodeUntaggedDatum(
 			return nil, b, err
 		}
 		return a.NewDBytes(tree.DBytes(data)), b, nil
+	case types.EncodedKeyFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return a.NewDEncodedKey(tree.DEncodedKey(data)), b, nil
 	case types.DateFamily:
 		b, data, err := encoding.DecodeUntaggedIntValue(buf)
 		if err != nil {
@@ -182,15 +189,20 @@ func DecodeUntaggedDatum(
 		}
 		return a.NewDJSON(tree.DJSON{JSON: j}), b, nil
 	case types.OidFamily:
+		// TODO: This possibly should decode to uint32 (with corresponding changes
+		// to encoding) to ensure that the value fits in a DOid without any loss of
+		// precision. In practice, this may not matter, since everything at
+		// execution time uses a uint32 for OIDs. The extra safety may not be worth
+		// the loss of variable length encoding.
 		b, data, err := encoding.DecodeUntaggedIntValue(buf)
-		return a.NewDOid(tree.MakeDOid(tree.DInt(data))), b, err
+		return a.NewDOid(tree.MakeDOid(oid.Oid(data), t)), b, err
 	case types.ArrayFamily:
 		// Skip the encoded data length.
 		b, _, _, err := encoding.DecodeNonsortingUvarint(buf)
 		if err != nil {
 			return nil, nil, err
 		}
-		return decodeArray(a, t.ArrayContents(), b)
+		return decodeArray(a, t, b)
 	case types.TupleFamily:
 		return decodeTuple(a, t, buf)
 	case types.EnumFamily:

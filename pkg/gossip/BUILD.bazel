@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -23,7 +24,7 @@ go_library(
         "//pkg/base",
         "//pkg/config",
         "//pkg/config/zonepb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
         "//pkg/rpc/nodedialer",
         "//pkg/util",
@@ -61,15 +62,16 @@ go_test(
         "storage_test.go",
         "util_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":gossip"],
     deps = [
         "//pkg/base",
         "//pkg/config",
         "//pkg/config/zonepb",
         "//pkg/gossip/simulation",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/testutils",
         "//pkg/testutils/skip",
@@ -111,9 +113,11 @@ go_proto_library(
     proto = ":gossip_proto",
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util",
         "//pkg/util/hlc",
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
+
+get_x_data(name = "get_x_data")

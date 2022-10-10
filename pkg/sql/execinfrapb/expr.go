@@ -11,12 +11,15 @@
 package execinfrapb
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/normalize"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/transform"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -53,8 +56,9 @@ func (*ivarBinder) VisitPost(expr tree.Expr) tree.Expr { return expr }
 //
 // evalCtx will not be mutated.
 func processExpression(
+	ctx context.Context,
 	exprSpec Expression,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	h *tree.IndexedVarHelper,
 ) (tree.TypedExpr, error) {
@@ -78,7 +82,7 @@ func processExpression(
 
 	semaCtx.IVarContainer = h.Container()
 	// Convert to a fully typed expression.
-	typedExpr, err := tree.TypeCheck(evalCtx.Context, expr, semaCtx, types.Any)
+	typedExpr, err := tree.TypeCheck(ctx, expr, semaCtx, types.Any)
 	if err != nil {
 		// Type checking must succeed by now.
 		return nil, errors.NewAssertionErrorWithWrappedErrf(err, "%s", expr)
@@ -89,7 +93,7 @@ func processExpression(
 	//
 	// TODO(solon): It would be preferable to enhance our expression serialization
 	// format so this wouldn't be necessary.
-	c := tree.MakeConstantEvalVisitor(evalCtx)
+	c := normalize.MakeConstantEvalVisitor(ctx, evalCtx)
 	expr, _ = tree.WalkExpr(&c, typedExpr)
 	if err := c.Err(); err != nil {
 		return nil, err
@@ -108,7 +112,7 @@ type ExprHelper struct {
 	// `Row`.
 	Vars tree.IndexedVarHelper
 
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 
 	Types      []*types.T
 	Row        rowenc.EncDatumRow
@@ -123,20 +127,22 @@ func (eh *ExprHelper) String() string {
 }
 
 // ExprHelper implements tree.IndexedVarContainer.
-var _ tree.IndexedVarContainer = &ExprHelper{}
+var _ eval.IndexedVarContainer = &ExprHelper{}
 
 // IndexedVarResolvedType is part of the tree.IndexedVarContainer interface.
 func (eh *ExprHelper) IndexedVarResolvedType(idx int) *types.T {
 	return eh.Types[idx]
 }
 
-// IndexedVarEval is part of the tree.IndexedVarContainer interface.
-func (eh *ExprHelper) IndexedVarEval(idx int, ctx *tree.EvalContext) (tree.Datum, error) {
+// IndexedVarEval is part of the eval.IndexedVarContainer interface.
+func (eh *ExprHelper) IndexedVarEval(
+	ctx context.Context, idx int, e tree.ExprEvaluator,
+) (tree.Datum, error) {
 	err := eh.Row[idx].EnsureDecoded(eh.Types[idx], &eh.datumAlloc)
 	if err != nil {
 		return nil, err
 	}
-	return eh.Row[idx].Datum.Eval(ctx)
+	return eh.Row[idx].Datum.Eval(ctx, e)
 }
 
 // IndexedVarNodeFormatter is part of the parser.IndexedVarContainer interface.
@@ -150,18 +156,22 @@ func (eh *ExprHelper) IndexedVarNodeFormatter(idx int) tree.NodeFormatter {
 //
 // evalCtx will not be mutated.
 func DeserializeExpr(
-	expr string, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext, vars *tree.IndexedVarHelper,
+	ctx context.Context,
+	expr string,
+	semaCtx *tree.SemaContext,
+	evalCtx *eval.Context,
+	vars *tree.IndexedVarHelper,
 ) (tree.TypedExpr, error) {
 	if expr == "" {
 		return nil, nil
 	}
 
-	deserializedExpr, err := processExpression(Expression{Expr: expr}, evalCtx, semaCtx, vars)
+	deserializedExpr, err := processExpression(ctx, Expression{Expr: expr}, evalCtx, semaCtx, vars)
 	if err != nil {
 		return deserializedExpr, err
 	}
 	var t transform.ExprTransformContext
-	if t.AggregateInExpr(deserializedExpr, evalCtx.SessionData().SearchPath) {
+	if t.AggregateInExpr(ctx, deserializedExpr, evalCtx.SessionData().SearchPath) {
 		return nil, errors.Errorf("expression '%s' has aggregate", deserializedExpr)
 	}
 	return deserializedExpr, nil
@@ -169,7 +179,11 @@ func DeserializeExpr(
 
 // Init initializes the ExprHelper.
 func (eh *ExprHelper) Init(
-	expr Expression, types []*types.T, semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
+	ctx context.Context,
+	expr Expression,
+	types []*types.T,
+	semaCtx *tree.SemaContext,
+	evalCtx *eval.Context,
 ) error {
 	if expr.Empty() {
 		return nil
@@ -186,33 +200,33 @@ func (eh *ExprHelper) Init(
 	}
 	if semaCtx.TypeResolver != nil {
 		for _, t := range types {
-			if err := typedesc.EnsureTypeIsHydrated(evalCtx.Context, t, semaCtx.TypeResolver.(catalog.TypeDescriptorResolver)); err != nil {
+			if err := typedesc.EnsureTypeIsHydrated(ctx, t, semaCtx.TypeResolver.(catalog.TypeDescriptorResolver)); err != nil {
 				return err
 			}
 		}
 	}
 	var err error
-	eh.Expr, err = DeserializeExpr(expr.Expr, semaCtx, evalCtx, &eh.Vars)
+	eh.Expr, err = DeserializeExpr(ctx, expr.Expr, semaCtx, evalCtx, &eh.Vars)
 	return err
 }
 
 // EvalFilter is used for filter expressions; it evaluates the expression and
 // returns whether the filter passes.
-func (eh *ExprHelper) EvalFilter(row rowenc.EncDatumRow) (bool, error) {
+func (eh *ExprHelper) EvalFilter(ctx context.Context, row rowenc.EncDatumRow) (bool, error) {
 	eh.Row = row
 	eh.evalCtx.PushIVarContainer(eh)
-	pass, err := RunFilter(eh.Expr, eh.evalCtx)
+	pass, err := RunFilter(ctx, eh.Expr, eh.evalCtx)
 	eh.evalCtx.PopIVarContainer()
 	return pass, err
 }
 
 // RunFilter runs a filter expression and returns whether the filter passes.
-func RunFilter(filter tree.TypedExpr, evalCtx *tree.EvalContext) (bool, error) {
+func RunFilter(ctx context.Context, filter tree.TypedExpr, evalCtx *eval.Context) (bool, error) {
 	if filter == nil {
 		return true, nil
 	}
 
-	d, err := filter.Eval(evalCtx)
+	d, err := eval.Expr(ctx, evalCtx, filter)
 	if err != nil {
 		return false, err
 	}
@@ -222,15 +236,16 @@ func RunFilter(filter tree.TypedExpr, evalCtx *tree.EvalContext) (bool, error) {
 
 // Eval - given a row - evaluates the wrapped expression and returns the
 // resulting datum. For example, given a row (1, 2, 3, 4, 5):
-//  '@2' would return '2'
-//  '@2 + @5' would return '7'
-//  '@1' would return '1'
-//  '@2 + 10' would return '12'
-func (eh *ExprHelper) Eval(row rowenc.EncDatumRow) (tree.Datum, error) {
+//
+//	'@2' would return '2'
+//	'@2 + @5' would return '7'
+//	'@1' would return '1'
+//	'@2 + 10' would return '12'
+func (eh *ExprHelper) Eval(ctx context.Context, row rowenc.EncDatumRow) (tree.Datum, error) {
 	eh.Row = row
 
 	eh.evalCtx.PushIVarContainer(eh)
-	d, err := eh.Expr.Eval(eh.evalCtx)
+	d, err := eval.Expr(ctx, eh.evalCtx, eh.Expr)
 	eh.evalCtx.PopIVarContainer()
 	return d, err
 }

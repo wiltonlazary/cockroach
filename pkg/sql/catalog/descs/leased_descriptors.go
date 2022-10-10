@@ -72,7 +72,7 @@ func makeLeasedDescriptors(lm leaseManager) leasedDescriptors {
 // transaction, and supports access by name and by ID.
 type leasedDescriptors struct {
 	lm    leaseManager
-	cache nstree.Map
+	cache nstree.NameMap
 }
 
 // getLeasedDescriptorByName return a leased descriptor valid for the
@@ -110,10 +110,8 @@ func (ld *leasedDescriptors) getByName(
 
 // getByID return a leased descriptor valid for the transaction,
 // acquiring one if necessary.
-// We set a deadline on the transaction based on the lease expiration, which is
-// the usual case, unless setTxnDeadline is false.
 func (ld *leasedDescriptors) getByID(
-	ctx context.Context, txn deadlineHolder, id descpb.ID, setTxnDeadline bool,
+	ctx context.Context, txn deadlineHolder, id descpb.ID,
 ) (_ catalog.Descriptor, shouldReadFromStore bool, _ error) {
 	// First, look to see if we already have the table in the shared cache.
 	if cached := ld.getCachedByID(ctx, id); cached != nil {
@@ -126,6 +124,7 @@ func (ld *leasedDescriptors) getByID(
 
 	readTimestamp := txn.ReadTimestamp()
 	desc, err := ld.lm.Acquire(ctx, readTimestamp, id)
+	const setTxnDeadline = false
 	return ld.getResult(ctx, txn, setTxnDeadline, desc, err)
 }
 
@@ -174,7 +173,7 @@ func (ld *leasedDescriptors) getResult(
 		log.Fatalf(ctx, "bad descriptor for T=%s, expiration=%s", readTimestamp, expiration)
 	}
 
-	ld.cache.Upsert(ldesc)
+	ld.cache.Upsert(ldesc, ldesc.Underlying().SkipNamespace())
 	if log.V(2) {
 		log.Eventf(ctx, "added descriptor '%s' to collection: %+v", ldesc.GetName(), ldesc.Underlying())
 	}

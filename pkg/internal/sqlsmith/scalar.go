@@ -15,6 +15,10 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -44,6 +48,9 @@ var (
 		{1, scalarNoContext(makeOr)},
 		{1, scalarNoContext(makeNot)},
 		{1, scalarNoContext(makeCompareOp)},
+		// Binary operators can return boolean sometimes, so make sure to sample
+		// from the available binary operators as well.
+		{1, scalarNoContext(makeBinOp)},
 		{1, scalarNoContext(makeIn)},
 		{1, scalarNoContext(makeStringComparison)},
 		{1, func(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
@@ -57,7 +64,8 @@ var (
 // TODO(mjibson): remove this and correctly pass around the Context.
 func scalarNoContext(fn func(*Smither, *types.T, colRefs) (tree.TypedExpr, bool)) scalarExpr {
 	return func(s *Smither, ctx Context, t *types.T, refs colRefs) (tree.TypedExpr, bool) {
-		return fn(s, t, refs)
+		scalarExpressionMaker, ok := fn(s, t, refs)
+		return scalarExpressionMaker, ok
 	}
 }
 
@@ -68,7 +76,7 @@ func makeScalar(s *Smither, typ *types.T, refs colRefs) tree.TypedExpr {
 }
 
 func makeScalarContext(s *Smither, ctx Context, typ *types.T, refs colRefs) tree.TypedExpr {
-	return makeScalarSample(s.scalarExprSampler, s, ctx, typ, refs)
+	return makeScalarSample(s.scalarExprSampler, s, ctx, typ, refs, false /* isPredicate */)
 }
 
 func makeBoolExpr(s *Smither, refs colRefs) tree.TypedExpr {
@@ -85,11 +93,11 @@ func makeBoolExprWithPlaceholders(s *Smither, refs colRefs) (tree.Expr, []interf
 }
 
 func makeBoolExprContext(s *Smither, ctx Context, refs colRefs) tree.TypedExpr {
-	return makeScalarSample(s.boolExprSampler, s, ctx, types.Bool, refs)
+	return makeScalarSample(s.boolExprSampler, s, ctx, types.Bool, refs, true /* isPredicate */)
 }
 
 func makeScalarSample(
-	sampler *scalarExprSampler, s *Smither, ctx Context, typ *types.T, refs colRefs,
+	sampler *scalarExprSampler, s *Smither, ctx Context, typ *types.T, refs colRefs, isPredicate bool,
 ) tree.TypedExpr {
 	// If we are in a GROUP BY, attempt to find an aggregate function.
 	if ctx.fnClass == tree.AggregateClass {
@@ -97,7 +105,7 @@ func makeScalarSample(
 			return expr
 		}
 	}
-	if s.canRecurse() {
+	if s.canRecurseScalar(isPredicate, typ) {
 		for {
 			// No need for a retry counter here because makeConstExpr will eventually
 			// be called and it always succeeds.
@@ -107,9 +115,16 @@ func makeScalarSample(
 			}
 		}
 	}
+	generateColRef := false
+	if s.avoidConstantBooleanExpressions(isPredicate, typ) {
+		// 1 in 20 chance of making a constant expression.
+		generateColRef = s.rnd.Intn(20) != 0
+	} else {
+		generateColRef = s.coin()
+	}
 	// Sometimes try to find a col ref or a const if there's no columns
 	// with a matching type.
-	if s.coin() {
+	if generateColRef {
 		if expr, ok := makeColRef(s, typ, refs); ok {
 			return expr
 		}
@@ -174,11 +189,15 @@ func makeConstExpr(s *Smither, typ *types.T, refs colRefs) tree.TypedExpr {
 func makeConstDatum(s *Smither, typ *types.T) tree.Datum {
 	var datum tree.Datum
 	s.lock.Lock()
-	datum = randgen.RandDatumWithNullChance(s.rnd, typ, 6)
+	defer s.lock.Unlock()
+	nullChance := 6
+	if s.unlikelyRandomNulls {
+		nullChance = 20 // A one out of 20 chance of generating a NULL.
+	}
+	datum = randgen.RandDatumWithNullChance(s.rnd, typ, nullChance, s.favorCommonData, false /* targetColumnIsUnique */)
 	if f := datum.ResolvedType().Family(); f != types.UnknownFamily && s.simpleDatums {
 		datum = randgen.RandDatumSimple(s.rnd, typ)
 	}
-	s.lock.Unlock()
 
 	return datum
 }
@@ -192,6 +211,10 @@ func getColRef(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef,
 	// Filter by needed type.
 	cols := make(colRefs, 0, len(refs))
 	for _, c := range refs {
+		// TODO(msirek): Add detection of the nullability of the source colRef and
+		//               compare with that of the destination for INSERT SELECT.
+		//               If destination requires NOT NULL, but the source is
+		//               nullable, don't use the colRef.
 		if typ.Family() == types.AnyFamily || c.typ.Equivalent(typ) {
 			cols = append(cols, c)
 		}
@@ -200,6 +223,9 @@ func getColRef(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef,
 		return nil, nil, false
 	}
 	col := cols[s.rnd.Intn(len(cols))]
+	if s.disableDecimals && col.typ.Family() == types.DecimalFamily {
+		return nil, nil, false
+	}
 	return col.typedExpr(), col, true
 }
 
@@ -228,6 +254,7 @@ func makeOr(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 	default:
 		return nil, false
 	}
+	// Assume we're in a WHERE to avoid having to modify all make* functions.
 	left := makeBoolExpr(s, refs)
 	right := makeBoolExpr(s, refs)
 	return typedParen(tree.NewTypedOrExpr(left, right), types.Bool), true
@@ -239,6 +266,7 @@ func makeAnd(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 	default:
 		return nil, false
 	}
+	// Assume we're in a WHERE to avoid having to modify all make* functions.
 	left := makeBoolExpr(s, refs)
 	right := makeBoolExpr(s, refs)
 	return typedParen(tree.NewTypedAndExpr(left, right), types.Bool), true
@@ -250,20 +278,23 @@ func makeNot(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 	default:
 		return nil, false
 	}
+	// Assume we're in a WHERE to avoid having to modify all make* functions.
 	expr := makeBoolExpr(s, refs)
 	return typedParen(tree.NewTypedNotExpr(expr), types.Bool), true
 }
 
-// TODO(mjibson): add the other operators somewhere.
-var compareOps = [...]tree.ComparisonOperatorSymbol{
-	tree.EQ,
-	tree.LT,
-	tree.GT,
-	tree.LE,
-	tree.GE,
-	tree.NE,
-	tree.IsDistinctFrom,
-	tree.IsNotDistinctFrom,
+var compareOps []treecmp.ComparisonOperatorSymbol
+
+func init() {
+	for i := 0; i < int(treecmp.NumComparisonOperatorSymbols); i++ {
+		op := treecmp.ComparisonOperatorSymbol(i)
+		switch op {
+		// Ignore ANY/SOME/ALL which are special (need sub operators).
+		case treecmp.Any, treecmp.All, treecmp.Some:
+			continue
+		}
+		compareOps = append(compareOps, op)
+	}
 }
 
 func makeCompareOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
@@ -277,7 +308,7 @@ func makeCompareOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool
 	}
 	left := makeScalar(s, typ, refs)
 	right := makeScalar(s, typ, refs)
-	return typedParen(tree.NewTypedComparisonExpr(tree.MakeComparisonOperator(op), left, right), typ), true
+	return typedParen(tree.NewTypedComparisonExpr(treecmp.MakeComparisonOperator(op), left, right), typ), true
 }
 
 func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
@@ -307,6 +338,10 @@ func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 			op.RightType = transform.rightType
 		}
 	}
+	if s.disableDivision &&
+		(op.Operator.Symbol == treebin.Div || op.Operator.Symbol == treebin.FloorDiv) {
+		return nil, false
+	}
 	left := makeScalar(s, op.LeftType, refs)
 	right := makeScalar(s, op.RightType, refs)
 	return castType(
@@ -320,7 +355,7 @@ func makeBinOp(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 
 type binOpTriple struct {
 	left  types.Family
-	op    tree.BinaryOperatorSymbol
+	op    treebin.BinaryOperatorSymbol
 	right types.Family
 }
 
@@ -331,31 +366,31 @@ type binOpOperands struct {
 
 var ignorePostgresBinOps = map[binOpTriple]bool{
 	// Integer division in cockroach returns a different type.
-	{types.IntFamily, tree.Div, types.IntFamily}: true,
+	{types.IntFamily, treebin.Div, types.IntFamily}: true,
 	// Float * date isn't exact.
-	{types.FloatFamily, tree.Mult, types.DateFamily}: true,
-	{types.DateFamily, tree.Mult, types.FloatFamily}: true,
-	{types.DateFamily, tree.Div, types.FloatFamily}:  true,
+	{types.FloatFamily, treebin.Mult, types.DateFamily}: true,
+	{types.DateFamily, treebin.Mult, types.FloatFamily}: true,
+	{types.DateFamily, treebin.Div, types.FloatFamily}:  true,
 
 	// Postgres does not have separate floor division operator.
-	{types.IntFamily, tree.FloorDiv, types.IntFamily}:         true,
-	{types.FloatFamily, tree.FloorDiv, types.FloatFamily}:     true,
-	{types.DecimalFamily, tree.FloorDiv, types.DecimalFamily}: true,
-	{types.DecimalFamily, tree.FloorDiv, types.IntFamily}:     true,
-	{types.IntFamily, tree.FloorDiv, types.DecimalFamily}:     true,
+	{types.IntFamily, treebin.FloorDiv, types.IntFamily}:         true,
+	{types.FloatFamily, treebin.FloorDiv, types.FloatFamily}:     true,
+	{types.DecimalFamily, treebin.FloorDiv, types.DecimalFamily}: true,
+	{types.DecimalFamily, treebin.FloorDiv, types.IntFamily}:     true,
+	{types.IntFamily, treebin.FloorDiv, types.DecimalFamily}:     true,
 
-	{types.FloatFamily, tree.Mod, types.FloatFamily}: true,
+	{types.FloatFamily, treebin.Mod, types.FloatFamily}: true,
 }
 
 // For certain operations, Postgres is picky about the operand types.
 var postgresBinOpTransformations = map[binOpTriple]binOpOperands{
-	{types.IntFamily, tree.Plus, types.DateFamily}:          {types.Int4, types.Date},
-	{types.DateFamily, tree.Plus, types.IntFamily}:          {types.Date, types.Int4},
-	{types.IntFamily, tree.Minus, types.DateFamily}:         {types.Int4, types.Date},
-	{types.DateFamily, tree.Minus, types.IntFamily}:         {types.Date, types.Int4},
-	{types.JsonFamily, tree.JSONFetchVal, types.IntFamily}:  {types.Jsonb, types.Int4},
-	{types.JsonFamily, tree.JSONFetchText, types.IntFamily}: {types.Jsonb, types.Int4},
-	{types.JsonFamily, tree.Minus, types.IntFamily}:         {types.Jsonb, types.Int4},
+	{types.IntFamily, treebin.Plus, types.DateFamily}:          {types.Int4, types.Date},
+	{types.DateFamily, treebin.Plus, types.IntFamily}:          {types.Date, types.Int4},
+	{types.IntFamily, treebin.Minus, types.DateFamily}:         {types.Int4, types.Date},
+	{types.DateFamily, treebin.Minus, types.IntFamily}:         {types.Date, types.Int4},
+	{types.JsonFamily, treebin.JSONFetchVal, types.IntFamily}:  {types.Jsonb, types.Int4},
+	{types.JsonFamily, treebin.JSONFetchText, types.IntFamily}: {types.Jsonb, types.Int4},
+	{types.JsonFamily, treebin.Minus, types.IntFamily}:         {types.Jsonb, types.Int4},
 }
 
 func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
@@ -373,7 +408,7 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		return nil, false
 	}
 	fn := fns[s.rnd.Intn(len(fns))]
-	if s.disableImpureFns && fn.overload.Volatility > tree.VolatilityImmutable {
+	if s.disableNondeterministicFns && fn.overload.Volatility > volatility.Immutable {
 		return nil, false
 	}
 	for _, ignore := range s.ignoreFNs {
@@ -409,6 +444,10 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		return nil, false
 	}
 
+	if fn.def.Class == tree.AggregateClass && s.disableAggregateFuncs {
+		return nil, false
+	}
+
 	var window *tree.WindowDef
 	// Use a window function if:
 	// - we chose an aggregate function, then 1/6 chance, but not if we're in a HAVING (noWindow == true)
@@ -422,14 +461,28 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 			order      tree.OrderBy
 			orderTypes []*types.T
 		)
+		addOrdCol := func(expr tree.Expr, typ *types.T) {
+			order = append(order, &tree.Order{Expr: expr, Direction: s.randDirection()})
+			orderTypes = append(orderTypes, typ)
+		}
 		s.sample(len(refs)-len(parts), 2, func(i int) {
 			ref := refs[i+len(parts)]
-			order = append(order, &tree.Order{
-				Expr:      ref.item,
-				Direction: s.randDirection(),
-			})
-			orderTypes = append(orderTypes, ref.typ)
+			addOrdCol(ref.item, ref.typ)
 		})
+		if s.disableNondeterministicFns {
+			switch fn.def.Name {
+			case "rank", "dense_rank", "percent_rank":
+				// The rank functions don't need to add ordering columns because they
+				// return the same result for all rows in a given peer group.
+			default:
+				// Other window functions care about the relative order of rows within
+				// each peer group, so we ensure that the ordering is deterministic by
+				// limiting each peer group to one row (by ordering on all columns).
+				for _, i := range s.rnd.Perm(len(refs)) {
+					addOrdCol(refs[i].typedExpr(), refs[i].typ)
+				}
+			}
+		}
 		var frame *tree.WindowFrame
 		if s.coin() {
 			frame = makeWindowFrame(s, refs, orderTypes)
@@ -441,9 +494,7 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		}
 	}
 
-	// Cast the return and arguments to prevent ambiguity during function
-	// implementation choosing.
-	return castType(tree.NewTypedFuncExpr(
+	funcExpr := tree.NewTypedFuncExpr(
 		tree.ResolvableFunctionReference{FunctionReference: fn.def},
 		0, /* aggQualifier */
 		args,
@@ -452,24 +503,48 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 		typ,
 		&fn.def.FunctionProperties,
 		fn.overload,
-	), typ), true
+	)
+
+	// Some aggregation functions need an order by clause to be deterministic.
+	if s.disableNondeterministicFns && len(args) > 0 {
+		switch fn.def.Name {
+		case "array_agg",
+			"concat_agg",
+			"json_agg",
+			"json_object_agg",
+			"jsonb_agg",
+			"jsonb_object_agg",
+			"st_makeline",
+			"string_agg",
+			"xmlagg":
+			funcExpr.AggType = tree.GeneralAgg
+			funcExpr.OrderBy = make(tree.OrderBy, len(args))
+			for i := range funcExpr.OrderBy {
+				funcExpr.OrderBy[i] = &tree.Order{Expr: args[i], Direction: s.randDirection()}
+			}
+		}
+	}
+
+	// Cast the return and arguments to prevent ambiguity during function
+	// implementation choosing.
+	return castType(funcExpr, typ), true
 }
 
-var windowFrameModes = []tree.WindowFrameMode{
-	tree.RANGE,
-	tree.ROWS,
-	tree.GROUPS,
+var windowFrameModes = []treewindow.WindowFrameMode{
+	treewindow.RANGE,
+	treewindow.ROWS,
+	treewindow.GROUPS,
 }
 
-func randWindowFrameMode(s *Smither) tree.WindowFrameMode {
+func randWindowFrameMode(s *Smither) treewindow.WindowFrameMode {
 	return windowFrameModes[s.rnd.Intn(len(windowFrameModes))]
 }
 
 func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.WindowFrame {
-	var frameMode tree.WindowFrameMode
+	var frameMode treewindow.WindowFrameMode
 	for {
 		frameMode = randWindowFrameMode(s)
-		if len(orderTypes) > 0 || frameMode != tree.GROUPS {
+		if len(orderTypes) > 0 || frameMode != treewindow.GROUPS {
 			// GROUPS mode requires an ORDER BY clause, so if it is not present and
 			// GROUPS mode was randomly chosen, we need to generate again; otherwise,
 			// we're done.
@@ -492,31 +567,31 @@ func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.Wind
 			allowRangeWithOffsets = true
 		}
 	}
-	if frameMode == tree.RANGE && !allowRangeWithOffsets {
+	if frameMode == treewindow.RANGE && !allowRangeWithOffsets {
 		if s.coin() {
-			startBound.BoundType = tree.UnboundedPreceding
+			startBound.BoundType = treewindow.UnboundedPreceding
 		} else {
-			startBound.BoundType = tree.CurrentRow
+			startBound.BoundType = treewindow.CurrentRow
 		}
 		if s.coin() {
 			endBound = new(tree.WindowFrameBound)
 			if s.coin() {
-				endBound.BoundType = tree.CurrentRow
+				endBound.BoundType = treewindow.CurrentRow
 			} else {
-				endBound.BoundType = tree.UnboundedFollowing
+				endBound.BoundType = treewindow.UnboundedFollowing
 			}
 		}
 	} else {
 		// There are 5 bound types, but only 4 can be used for the start bound.
-		startBound.BoundType = tree.WindowFrameBoundType(s.rnd.Intn(4))
-		if startBound.BoundType == tree.OffsetFollowing {
+		startBound.BoundType = treewindow.WindowFrameBoundType(s.rnd.Intn(4))
+		if startBound.BoundType == treewindow.OffsetFollowing {
 			// With OffsetFollowing as the start bound, the end bound must be
 			// present and can either be OffsetFollowing or UnboundedFollowing.
 			endBound = new(tree.WindowFrameBound)
 			if s.coin() {
-				endBound.BoundType = tree.OffsetFollowing
+				endBound.BoundType = treewindow.OffsetFollowing
 			} else {
-				endBound.BoundType = tree.UnboundedFollowing
+				endBound.BoundType = treewindow.UnboundedFollowing
 			}
 		}
 		if endBound == nil && s.coin() {
@@ -524,19 +599,19 @@ func makeWindowFrame(s *Smither, refs colRefs, orderTypes []*types.T) *tree.Wind
 			// endBound cannot be "smaller" than startBound, so we will "prohibit" all
 			// such choices.
 			endBoundProhibitedChoices := int(startBound.BoundType)
-			if startBound.BoundType == tree.UnboundedPreceding {
+			if startBound.BoundType == treewindow.UnboundedPreceding {
 				// endBound cannot be UnboundedPreceding, so we always need to skip that
 				// choice.
 				endBoundProhibitedChoices = 1
 			}
-			endBound.BoundType = tree.WindowFrameBoundType(endBoundProhibitedChoices + s.rnd.Intn(5-endBoundProhibitedChoices))
+			endBound.BoundType = treewindow.WindowFrameBoundType(endBoundProhibitedChoices + s.rnd.Intn(5-endBoundProhibitedChoices))
 		}
 		// We will set offsets regardless of the bound type, but they will only be
 		// used when a bound is either OffsetPreceding or OffsetFollowing. Both
 		// ROWS and GROUPS mode need non-negative integers as bounds whereas RANGE
 		// mode takes the type as the single ORDER BY clause has.
 		typ := types.Int
-		if frameMode == tree.RANGE {
+		if frameMode == treewindow.RANGE {
 			typ = orderTypes[0]
 		}
 		startBound.OffsetExpr = makeScalar(s, typ, refs)
@@ -603,12 +678,12 @@ func makeIn(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, bool) {
 		subq.SetType(types.MakeTuple([]*types.T{t}))
 		rhs = subq
 	}
-	op := tree.In
+	op := treecmp.In
 	if s.coin() {
-		op = tree.NotIn
+		op = treecmp.NotIn
 	}
 	return tree.NewTypedComparisonExpr(
-		tree.MakeComparisonOperator(op),
+		treecmp.MakeComparisonOperator(op),
 		// Cast any NULLs to a concrete type.
 		castType(makeScalar(s, t, refs), t),
 		rhs,

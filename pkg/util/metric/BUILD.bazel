@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
@@ -7,14 +8,15 @@ go_library(
     srcs = [
         "doc.go",
         "graphite_exporter.go",
+        "histogram_buckets.go",
         "metric.go",
         "prometheus_exporter.go",
         "prometheus_rule_exporter.go",
         "registry.go",
         "rule.go",
         "rule_registry.go",
-        "sliding_histogram.go",
         "test_helpers.go",
+        "tick_helper.go",
     ],
     embed = [":metric_go_proto"],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/metric",
@@ -24,7 +26,6 @@ go_library(
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_codahale_hdrhistogram//:hdrhistogram",
         "@com_github_gogo_protobuf//proto",
         "@com_github_prometheus_client_golang//prometheus",
         "@com_github_prometheus_client_golang//prometheus/graphite",
@@ -32,7 +33,6 @@ go_library(
         "@com_github_prometheus_common//expfmt",
         "@com_github_prometheus_prometheus//promql/parser",
         "@com_github_rcrowley_go_metrics//:go-metrics",
-        "@com_github_vividcortex_ewma//:ewma",
         "@in_gopkg_yaml_v3//:yaml_v3",
     ],
 )
@@ -41,16 +41,24 @@ go_test(
     name = "metric_test",
     size = "small",
     srcs = [
+        "histogram_buckets_test.go",
+        "metric_ext_test.go",
         "metric_test.go",
         "prometheus_exporter_test.go",
         "prometheus_rule_exporter_test.go",
         "registry_test.go",
         "rule_test.go",
     ],
+    args = ["-test.timeout=55s"],
+    data = glob(["testdata/**"]),
     embed = [":metric"],
     deps = [
+        "//pkg/testutils",
+        "//pkg/testutils/echotest",
         "//pkg/util/log",
+        "@com_github_dustin_go_humanize//:go-humanize",
         "@com_github_kr_pretty//:pretty",
+        "@com_github_prometheus_client_golang//prometheus",
         "@com_github_prometheus_client_model//go",
         "@com_github_stretchr_testify//require",
     ],
@@ -63,7 +71,7 @@ proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "@com_github_gogo_protobuf//gogoproto:gogo_proto",
-        "@com_github_prometheus_client_model//io/prometheus/client:client_proto",
+        "@com_github_prometheus_client_model//io/prometheus/client:io_prometheus_client_proto",
     ],
 )
 
@@ -78,3 +86,5 @@ go_proto_library(
         "@com_github_prometheus_client_model//go",
     ],
 )
+
+get_x_data(name = "get_x_data")

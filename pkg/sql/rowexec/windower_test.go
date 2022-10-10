@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -48,7 +49,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		math.MaxInt64, /* noteworthy */
 		st,
 	)
-	evalCtx := tree.MakeTestingEvalContextWithMon(st, monitor)
+	evalCtx := eval.MakeTestingEvalContextWithMon(st, monitor)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
@@ -60,6 +61,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -93,7 +95,7 @@ func TestWindowerAccountingForResults(t *testing.T) {
 		types.OneIntCol, nil, distsqlutils.RowBufferArgs{},
 	)
 
-	d, err := newWindower(flowCtx, 0 /* processorID */, &spec, input, post, output)
+	d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post, output)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,13 +202,14 @@ func BenchmarkWindower(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -252,11 +255,11 @@ func BenchmarkWindower(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					d, err := newWindower(flowCtx, 0 /* processorID */, &spec, input, post, disposer)
+					d, err := newWindower(ctx, flowCtx, 0 /* processorID */, &spec, input, post, disposer)
 					if err != nil {
 						b.Fatal(err)
 					}
-					d.Run(context.Background())
+					d.Run(ctx)
 					input.Reset()
 				}
 				b.StopTimer()

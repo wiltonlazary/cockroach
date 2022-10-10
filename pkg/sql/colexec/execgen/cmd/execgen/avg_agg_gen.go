@@ -18,7 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -36,10 +36,10 @@ type avgTmplInfo struct {
 func (a avgTmplInfo) AssignAdd(targetElem, leftElem, rightElem, _, _, _ string) string {
 	// Note that we already have correctly resolved method for "Plus" overload,
 	// and we simply need to create a skeleton of lastArgWidthOverload to
-	// supply tree.Plus as the binary operator in order for the correct code to
-	// be returned.
+	// supply treebin.Plus as the binary operator in order for the correct code
+	// to be returned.
 	lawo := &lastArgWidthOverload{lastArgTypeOverload: &lastArgTypeOverload{
-		overloadBase: newBinaryOverloadBase(tree.Plus),
+		overloadBase: newBinaryOverloadBase(treebin.Plus),
 	}}
 	return a.avgOverload(lawo, targetElem, leftElem, rightElem, "", "", "")
 }
@@ -51,7 +51,7 @@ func (a avgTmplInfo) AssignSubtract(
 	// the resolved overload to use Minus overload in particular, so all other
 	// fields remain unset.
 	lawo := &lastArgWidthOverload{lastArgTypeOverload: &lastArgTypeOverload{
-		overloadBase: newBinaryOverloadBase(tree.Minus),
+		overloadBase: newBinaryOverloadBase(treebin.Minus),
 	}}
 	return a.avgOverload(lawo, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol)
 }
@@ -64,7 +64,7 @@ func (a avgTmplInfo) AssignDivInt64(targetElem, leftElem, rightElem, _, _, _ str
 		return fmt.Sprintf(`
 			%s.SetInt64(%s)
 			if _, err := tree.DecimalCtx.Quo(&%s, &%s, &%s); err != nil {
-				colexecerror.InternalError(err)
+				colexecerror.ExpectedError(err)
 			}`,
 			targetElem, rightElem, targetElem, leftElem, targetElem,
 		)
@@ -145,7 +145,7 @@ func genAvgAgg(inputFileContents string, wr io.Writer) error {
 	// canonical representatives, so we can operate with their type family
 	// directly.
 	for _, inputTypeFamily := range []types.Family{types.IntFamily, types.DecimalFamily, types.FloatFamily, types.IntervalFamily} {
-		tmplInfo := avgAggTypeTmplInfo{TypeFamily: toString(inputTypeFamily)}
+		tmplInfo := avgAggTypeTmplInfo{TypeFamily: familyToString(inputTypeFamily)}
 		for _, inputTypeWidth := range supportedWidthsByCanonicalTypeFamily[inputTypeFamily] {
 			// Note that we don't use execinfrapb.GetAggregateInfo because we don't
 			// want to bring in a dependency on that package to reduce the burden

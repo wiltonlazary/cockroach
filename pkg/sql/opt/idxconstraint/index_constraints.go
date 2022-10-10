@@ -18,6 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/partition"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -281,7 +283,7 @@ func (c *indexConstraintCtx) makeSpansForSingleColumnDatum(
 	case opt.LikeOp:
 		if s, ok := tree.AsDString(datum); ok {
 			// Normalize the like pattern to a regexp.
-			if pattern, err := tree.LikeEscape(string(s)); err == nil {
+			if pattern, err := eval.LikeEscape(string(s)); err == nil {
 				if re, err := regexp.Compile(pattern); err == nil {
 					prefix, complete := re.LiteralPrefix()
 					if complete {
@@ -297,7 +299,7 @@ func (c *indexConstraintCtx) makeSpansForSingleColumnDatum(
 					// If pattern is simply prefix + .* the span is tight. Also pattern
 					// will have regexp special chars escaped and so prefix needs to be
 					// escaped too.
-					if prefixEscape, err := tree.LikeEscape(prefix); err == nil {
+					if prefixEscape, err := eval.LikeEscape(prefix); err == nil {
 						return strings.HasSuffix(pattern, ".*") && strings.TrimSuffix(pattern, ".*") == prefixEscape
 					}
 				}
@@ -307,7 +309,7 @@ func (c *indexConstraintCtx) makeSpansForSingleColumnDatum(
 	case opt.SimilarToOp:
 		// a SIMILAR TO 'foo_*' -> prefix "foo"
 		if s, ok := tree.AsDString(datum); ok {
-			pattern := tree.SimilarEscape(string(s))
+			pattern := eval.SimilarEscape(string(s))
 			if re, err := regexp.Compile(pattern); err == nil {
 				prefix, complete := re.LiteralPrefix()
 				if complete {
@@ -524,7 +526,9 @@ func (c *indexConstraintCtx) makeSpansForTupleInequality(
 
 // makeSpansForTupleIn creates spans for index columns starting at
 // <offset> from a tuple IN tuple expression, for example:
-//   (a, b, c) IN ((1, 2, 3), (4, 5, 6))
+//
+//	(a, b, c) IN ((1, 2, 3), (4, 5, 6))
+//
 // Assumes that both sides are tuples.
 // The <tight> return value indicates if the spans are exactly equivalent
 // to the expression (and not weaker).
@@ -869,32 +873,34 @@ func (c *indexConstraintCtx) binaryMergeSpansForOr(
 // getMaxSimplifyPrefix finds the longest prefix (maxSimplifyPrefix) such that
 // every span has the same first maxSimplifyPrefix values for the start and end
 // key. For example, for:
-//  [/1/2/3 - /1/2/4]
-//  [/2/3/4 - /2/3/4]
+//
+//	[/1/2/3 - /1/2/4]
+//	[/2/3/4 - /2/3/4]
+//
 // the longest prefix is 2.
 //
 // This prefix is significant for filter simplification: we can only
 // drop an expression based on its spans if the offset is at most
 // maxSimplifyPrefix. Examples:
 //
-//   Filter:           @1 = 1 AND @2 >= 5
-//   Spans:            [/1/5 - /1]
-//   Remaining filter: <none>
-//   Here maxSimplifyPrefix is 1; we can drop @2 >= 5 from the filter.
+//	Filter:           @1 = 1 AND @2 >= 5
+//	Spans:            [/1/5 - /1]
+//	Remaining filter: <none>
+//	Here maxSimplifyPrefix is 1; we can drop @2 >= 5 from the filter.
 //
-//   Filter:           @1 >= 1 AND @1 <= 3 AND @2 >= 5
-//   Spans:            [/1/5 - /3]
-//   Remaining filter: @2 >= 5
-//   Here maxSimplifyPrefix is 0; we cannot drop @2 >= 5. Because the span
-//   contains more than one value for the first column, there are areas where
-//   the condition needs to be checked, e.g for /2/0 to /2/4.
+//	Filter:           @1 >= 1 AND @1 <= 3 AND @2 >= 5
+//	Spans:            [/1/5 - /3]
+//	Remaining filter: @2 >= 5
+//	Here maxSimplifyPrefix is 0; we cannot drop @2 >= 5. Because the span
+//	contains more than one value for the first column, there are areas where
+//	the condition needs to be checked, e.g for /2/0 to /2/4.
 //
-//   Filter:           (@1, @2) IN ((1, 1), (2, 2)) AND @3 >= 3 AND @4 = 4
-//   Spans:            [/1/1/3/4 - /1/1]
-//                     [/2/2/3/4 - /2/2]
-//   Remaining filter: @4 = 4
-//   Here maxSimplifyPrefix is 2; we can drop the IN and @3 >= 3 but we can't
-//   drop @4 = 4.
+//	Filter:           (@1, @2) IN ((1, 1), (2, 2)) AND @3 >= 3 AND @4 = 4
+//	Spans:            [/1/1/3/4 - /1/1]
+//	                  [/2/2/3/4 - /2/2]
+//	Remaining filter: @4 = 4
+//	Here maxSimplifyPrefix is 2; we can drop the IN and @3 >= 3 but we can't
+//	drop @4 = 4.
 func (c *indexConstraintCtx) getMaxSimplifyPrefix(idxConstraint *constraint.Constraint) int {
 	maxOffset := len(c.columns) - 1
 	for i := 0; i < idxConstraint.Spans.Count(); i++ {
@@ -929,28 +935,28 @@ func (c *indexConstraintCtx) getMaxSimplifyPrefix(idxConstraint *constraint.Cons
 // The following conditions are (together) sufficient for a sub-expression to be
 // true:
 //
-//  - the spans generated for this sub-expression are equivalent to the
-//    expression; we call such spans "tight". For example the condition
-//    `@1 >= 1` results in span `[/1 - ]` which is tight: inside this span, the
-//    condition is always true. On the other hand, if we have an index on
-//    @1,@2,@3 and condition `(@1, @3) >= (1, 3)`, the generated span is
-//    `[/1 - ]` which is not tight: we still need to verify the condition on @3
-//    inside this span.
+//   - the spans generated for this sub-expression are equivalent to the
+//     expression; we call such spans "tight". For example the condition
+//     `@1 >= 1` results in span `[/1 - ]` which is tight: inside this span, the
+//     condition is always true. On the other hand, if we have an index on
+//     @1,@2,@3 and condition `(@1, @3) >= (1, 3)`, the generated span is
+//     `[/1 - ]` which is not tight: we still need to verify the condition on @3
+//     inside this span.
 //
-//  - the spans for the entire filter are completely contained in the (tight)
-//    spans for this sub-expression. In this case, there can be no rows that are
-//    inside the filter span but outside the expression span.
+//   - the spans for the entire filter are completely contained in the (tight)
+//     spans for this sub-expression. In this case, there can be no rows that are
+//     inside the filter span but outside the expression span.
 //
-//    For example: `@1 = 1 AND @2 = 2` with span `[/1/2 - /1/2]`. When looking
-//    at sub-expression `@1 = 1` and its span `[/1 - /1]`, we see that it
-//    contains the filter span `[/1/2 - /1/2]` and thus the condition is always
-//    true inside `[/1/2 - /1/2`].  For `@2 = 2` we have the span `[/2 - /2]`
-//    but this span refers to the second index column (so it's actually
-//    equivalent to a collection of spans `[/?/2 - /?/2]`); the only way we can
-//    compare it against the filter span is if the latter restricts the previous
-//    column to a single value (which it does in this case; this is determined
-//    by getMaxSimplifyPrefix). So `[/1/2 - /1/2]` is contained in the
-//    expression span and we can simplify `@2 = 2` to `true`.
+//     For example: `@1 = 1 AND @2 = 2` with span `[/1/2 - /1/2]`. When looking
+//     at sub-expression `@1 = 1` and its span `[/1 - /1]`, we see that it
+//     contains the filter span `[/1/2 - /1/2]` and thus the condition is always
+//     true inside `[/1/2 - /1/2`].  For `@2 = 2` we have the span `[/2 - /2]`
+//     but this span refers to the second index column (so it's actually
+//     equivalent to a collection of spans `[/?/2 - /?/2]`); the only way we can
+//     compare it against the filter span is if the latter restricts the previous
+//     column to a single value (which it does in this case; this is determined
+//     by getMaxSimplifyPrefix). So `[/1/2 - /1/2]` is contained in the
+//     expression span and we can simplify `@2 = 2` to `true`.
 //
 // nestedUnderOrExpr indicates if we are processing a ScalarExpr which is the child
 // of an OrExpr.
@@ -1015,13 +1021,14 @@ func (c *indexConstraintCtx) simplifyFilter(
 // expression.
 //
 // Sample usage:
-//   var ic Instance
-//   if err := ic.Init(...); err != nil {
-//     ..
-//   }
-//   spans, ok := ic.Spans()
-//   remFilterGroup := ic.RemainingFilters()
-//   remFilter := o.Optimize(remFilterGroup, &opt.PhysicalProps{})
+//
+//	var ic Instance
+//	if err := ic.Init(...); err != nil {
+//	  ..
+//	}
+//	spans, ok := ic.Spans()
+//	remFilterGroup := ic.RemainingFilters()
+//	remFilter := o.Optimize(remFilterGroup, &opt.PhysicalProps{})
 type Instance struct {
 	indexConstraintCtx
 
@@ -1050,8 +1057,9 @@ func (ic *Instance) Init(
 	notNullCols opt.ColSet,
 	computedCols map[opt.ColumnID]opt.ScalarExpr,
 	consolidate bool,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	factory *norm.Factory,
+	ps partition.PrefixSorter,
 ) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
@@ -1089,7 +1097,7 @@ func (ic *Instance) Init(
 	// we have [/1/1 - /1/2].
 	if consolidate {
 		ic.consolidatedConstraint = ic.constraint
-		ic.consolidatedConstraint.ConsolidateSpans(evalCtx)
+		ic.consolidatedConstraint.ConsolidateSpans(evalCtx, ps)
 		ic.consolidated = true
 	}
 	ic.initialized = true
@@ -1150,7 +1158,7 @@ type indexConstraintCtx struct {
 
 	computedCols map[opt.ColumnID]opt.ScalarExpr
 
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 
 	// We pre-initialize the KeyContext for each suffix of the index columns.
 	keyCtx []constraint.KeyContext
@@ -1162,7 +1170,7 @@ func (c *indexConstraintCtx) init(
 	columns []opt.OrderingColumn,
 	notNullCols opt.ColSet,
 	computedCols map[opt.ColumnID]opt.ScalarExpr,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	factory *norm.Factory,
 ) {
 	// This initialization pattern ensures that fields are not unwittingly
@@ -1184,10 +1192,9 @@ func (c *indexConstraintCtx) init(
 
 // isIndexColumn returns true if e is an expression that corresponds to index
 // column <offset>. The expression can be either
-//  - a variable on the index column, or
-//  - an expression that matches the computed column expression (if the index
-//    column is computed).
-//
+//   - a variable on the index column, or
+//   - an expression that matches the computed column expression (if the index
+//     column is computed).
 func (c *indexConstraintCtx) isIndexColumn(e opt.Expr, offset int) bool {
 	if v, ok := e.(*memo.VariableExpr); ok && v.Col == c.columns[offset].ID() {
 		return true

@@ -11,16 +11,19 @@
 import React from "react";
 import { Link, RouteComponentProps } from "react-router-dom";
 import { Tooltip } from "antd";
+import "antd/lib/tooltip/style";
 import classNames from "classnames/bind";
-import _ from "lodash";
+import classnames from "classnames/bind";
 
+import { Anchor } from "src/anchor";
 import { StackIcon } from "src/icon/stackIcon";
 import { Pagination, ResultsPerPageLabel } from "src/pagination";
+import { BooleanSetting } from "src/settings/booleanSetting";
 import {
   ColumnDescriptor,
   ISortedTablePagination,
-  SortSetting,
   SortedTable,
+  SortSetting,
 } from "src/sortedtable";
 import * as format from "src/util/format";
 
@@ -30,10 +33,13 @@ import {
   baseHeadingClasses,
   statisticsClasses,
 } from "src/transactionsPage/transactionsPageClasses";
-import { syncHistory } from "../util";
+import { syncHistory, tableStatsClusterSetting } from "src/util";
+import booleanSettingStyles from "../settings/booleanSetting.module.scss";
+import { CircleFilled } from "../icon";
 
 const cx = classNames.bind(styles);
 const sortableTableCx = classNames.bind(sortableTableStyles);
+const booleanSettingCx = classnames.bind(booleanSettingStyles);
 
 // We break out separate interfaces for some of the nested objects in our data
 // both so that they can be available as SortedTable rows and for making
@@ -67,6 +73,7 @@ export interface DatabasesPageData {
   loaded: boolean;
   databases: DatabasesPageDataDatabase[];
   sortSetting: SortSetting;
+  automaticStatsCollectionEnabled?: boolean;
   showNodeRegionsColumn?: boolean;
 }
 
@@ -81,6 +88,7 @@ export interface DatabasesPageDataDatabase {
   // String of nodes grouped by region in alphabetical order, e.g.
   // regionA(n1,n2), regionB(n3)
   nodesByRegionString?: string;
+  numIndexRecommendations: number;
 }
 
 // A "missing" table is one for which we were unable to gather size and range
@@ -99,6 +107,7 @@ export interface DatabasesPageActions {
   refreshDatabases: () => void;
   refreshDatabaseDetails: (database: string) => void;
   refreshTableStats: (database: string, table: string) => void;
+  refreshSettings: () => void;
   refreshNodes?: () => void;
   onSortingChange?: (
     name: string,
@@ -160,16 +169,20 @@ export class DatabasesPage extends React.Component<
       this.props.refreshNodes();
     }
 
+    if (this.props.refreshSettings != null) {
+      this.props.refreshSettings();
+    }
+
     if (!this.props.loaded && !this.props.loading) {
       return this.props.refreshDatabases();
     }
 
-    _.forEach(this.props.databases, database => {
+    this.props.databases.forEach(database => {
       if (!database.loaded && !database.loading) {
         return this.props.refreshDatabaseDetails(database.name);
       }
 
-      _.forEach(database.missingTables, table => {
+      database.missingTables.forEach(table => {
         if (!table.loading) {
           return this.props.refreshTableStats(database.name, table.name);
         }
@@ -192,6 +205,29 @@ export class DatabasesPage extends React.Component<
     if (this.props.onSortingChange) {
       this.props.onSortingChange("Databases", ss.columnTitle, ss.ascending);
     }
+  };
+
+  private renderIndexRecommendations = (
+    database: DatabasesPageDataDatabase,
+  ): React.ReactNode => {
+    const text =
+      database.numIndexRecommendations > 0
+        ? `${database.numIndexRecommendations} index ${
+            database.numIndexRecommendations > 1
+              ? "recommendations"
+              : "recommendation"
+          }`
+        : "None";
+    const classname =
+      database.numIndexRecommendations > 0
+        ? "index-recommendations-icon__exist"
+        : "index-recommendations-icon__none";
+    return (
+      <div>
+        <CircleFilled className={cx(classname)} />
+        <span>{text}</span>
+      </div>
+    );
   };
 
   private columns: ColumnDescriptor<DatabasesPageDataDatabase>[] = [
@@ -248,7 +284,7 @@ export class DatabasesPage extends React.Component<
           placement="bottom"
           title="The total number of ranges across all tables in the database."
         >
-          Range count
+          Range Count
         </Tooltip>
       ),
       cell: database => database.rangeCount,
@@ -260,9 +296,9 @@ export class DatabasesPage extends React.Component<
       title: (
         <Tooltip
           placement="bottom"
-          title="Regions/nodes on which the database tables are located."
+          title="Regions/Nodes on which the database tables are located."
         >
-          Regions/nodes
+          Regions/Nodes
         </Tooltip>
       ),
       cell: database => database.nodesByRegionString || "None",
@@ -271,18 +307,54 @@ export class DatabasesPage extends React.Component<
       name: "nodeRegions",
       hideIfTenant: true,
     },
+    {
+      title: (
+        <Tooltip
+          placement="bottom"
+          title="Index recommendations will appear if the system detects improper index usage, such as the occurrence of unused indexes. Following index recommendations may help improve query performance."
+        >
+          Index Recommendations
+        </Tooltip>
+      ),
+      cell: this.renderIndexRecommendations,
+      sort: database => database.numIndexRecommendations,
+      className: cx("databases-table__col-node-regions"),
+      name: "numIndexRecommendations",
+    },
   ];
 
   render(): React.ReactElement {
-    this.columns.find(
-      c => c.name === "nodeRegions",
-    ).showByDefault = this.props.showNodeRegionsColumn;
+    this.columns.find(c => c.name === "nodeRegions").showByDefault =
+      this.props.showNodeRegionsColumn;
     const displayColumns = this.columns.filter(
       col => col.showByDefault !== false,
     );
     return (
       <div>
-        <h3 className={baseHeadingClasses.tableName}>Databases</h3>
+        <div className={baseHeadingClasses.wrapper}>
+          <h3 className={baseHeadingClasses.tableName}>Databases</h3>
+          {this.props.automaticStatsCollectionEnabled != null && (
+            <BooleanSetting
+              text={"Auto stats collection"}
+              enabled={this.props.automaticStatsCollectionEnabled}
+              tooltipText={
+                <span>
+                  {" "}
+                  Automatic statistics can help improve query performance. Learn
+                  how to{" "}
+                  <Anchor
+                    href={tableStatsClusterSetting}
+                    target="_blank"
+                    className={booleanSettingCx("crl-hover-text__link-text")}
+                  >
+                    manage statistics collection
+                  </Anchor>
+                  .
+                </span>
+              }
+            />
+          )}
+        </div>
         <section className={sortableTableCx("cl-table-container")}>
           <div className={statisticsClasses.statistic}>
             <h4 className={statisticsClasses.countTitle}>

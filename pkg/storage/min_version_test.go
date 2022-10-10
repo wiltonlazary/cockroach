@@ -96,28 +96,11 @@ func TestSetMinVersion(t *testing.T) {
 	defer p.Close()
 	require.Equal(t, pebble.FormatMostCompatible, p.db.FormatMajorVersion())
 
-	// The earliest supported Cockroach version advances the pebble version.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.V21_2))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Setting the same min version twice is okay.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.V21_2))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Advancing the store cluster version to another cluster version
-	// that does not advance the Pebble format major version should
-	// leave the format major version unchanged.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.ValidateGrantOption))
-	require.NoError(t, err)
-	require.Equal(t, pebble.FormatSetWithDelete, p.db.FormatMajorVersion())
-
-	// Advancing the store cluster version to PebbleFormatBlockPropertyCollector
+	// Advancing the store cluster version to TODOPreV22_1
 	// should also advance the store's format major version.
-	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.PebbleFormatBlockPropertyCollector))
+	err = p.SetMinVersion(clusterversion.ByKey(clusterversion.TODOPreV22_1))
 	require.NoError(t, err)
-	require.Equal(t, pebble.FormatBlockPropertyCollector, p.db.FormatMajorVersion())
+	require.Equal(t, pebble.FormatSplitUserKeysMarked, p.db.FormatMajorVersion())
 
 }
 
@@ -164,9 +147,8 @@ func fauxNewEncryptedEnvFunc(
 	fs vfs.FS, fr *PebbleFileRegistry, dbDir string, readOnly bool, optionBytes []byte,
 ) (*EncryptionEnv, error) {
 	return &EncryptionEnv{
-		Closer:         nopCloser{},
-		FS:             fauxEncryptedFS{FS: fs},
-		UpgradeVersion: func() error { return nil },
+		Closer: nopCloser{},
+		FS:     fauxEncryptedFS{FS: fs},
 	}, nil
 }
 

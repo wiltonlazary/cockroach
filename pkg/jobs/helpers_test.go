@@ -46,7 +46,7 @@ func (d FakeResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	return nil
 }
 
-func (d FakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}) error {
+func (d FakeResumer) OnFailOrCancel(ctx context.Context, _ interface{}, _ error) error {
 	if d.FailOrCancel != nil {
 		return d.FailOrCancel(ctx)
 	}
@@ -122,7 +122,7 @@ const (
 	AdoptQuery                     = claimQuery
 	CancelQuery                    = pauseAndCancelUpdate
 	GcQuery                        = expiredJobsQuery
-	RemoveClaimsQuery              = removeClaimsQuery
+	RemoveClaimsQuery              = removeClaimsForDeadSessionsQuery
 	ProcessJobsQuery               = processQueryWithBackoff
 	IntervalBaseSettingKey         = intervalBaseSettingKey
 	AdoptIntervalSettingKey        = adoptIntervalSettingKey
@@ -139,5 +139,4 @@ var (
 	CancelIntervalSetting           = cancelIntervalSetting
 	CancellationsUpdateLimitSetting = cancellationsUpdateLimitSetting
 	GcIntervalSetting               = gcIntervalSetting
-	RetentionTimeSetting            = retentionTimeSetting
 )

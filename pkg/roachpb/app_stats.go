@@ -19,25 +19,15 @@ import (
 // StmtFingerprintID is the type of a Statement's fingerprint ID.
 type StmtFingerprintID uint64
 
-// FingerprintID returns the FingerprintID of the StatementStatisticsKey.
-func (m *StatementStatisticsKey) FingerprintID() StmtFingerprintID {
-	return ConstructStatementFingerprintID(
-		m.Query,
-		m.Failed,
-		m.ImplicitTxn,
-		m.Database,
-	)
-}
-
-// ConstructStatementFingerprintID constructs an ID by hashing an anonymized query, its database
-// and failure status, and if it was part of an implicit txn. At the time of writing,
-// these are the axis' we use to bucket queries for stats collection
-// (see stmtKey).
+// ConstructStatementFingerprintID constructs an ID by hashing query with
+// constants redacted, its database and failure status, and if it was part of an
+// implicit txn. At the time of writing, these are the axis' we use to bucket
+// queries for stats collection (see stmtKey).
 func ConstructStatementFingerprintID(
-	anonymizedStmt string, failed bool, implicitTxn bool, database string,
+	stmtNoConstants string, failed bool, implicitTxn bool, database string,
 ) StmtFingerprintID {
 	fnv := util.MakeFNV64()
-	for _, c := range anonymizedStmt {
+	for _, c := range stmtNoConstants {
 		fnv.Add(uint64(c))
 	}
 	for _, c := range database {
@@ -59,6 +49,9 @@ func ConstructStatementFingerprintID(
 // TransactionFingerprintID is the hashed string constructed using the
 // individual statement fingerprint IDs that comprise the transaction.
 type TransactionFingerprintID uint64
+
+// InvalidTransactionFingerprintID denotes an invalid transaction fingerprint ID.
+const InvalidTransactionFingerprintID = TransactionFingerprintID(0)
 
 // Size returns the size of the TransactionFingerprintID.
 func (t TransactionFingerprintID) Size() int64 {
@@ -161,6 +154,8 @@ func (s *StatementStatistics) Add(other *StatementStatistics) {
 	s.RowsRead.Add(other.RowsRead, s.Count, other.Count)
 	s.RowsWritten.Add(other.RowsWritten, s.Count, other.Count)
 	s.Nodes = util.CombineUniqueInt64(s.Nodes, other.Nodes)
+	s.PlanGists = util.CombineUniqueString(s.PlanGists, other.PlanGists)
+	s.IndexRecommendations = other.IndexRecommendations
 
 	s.ExecStats.Add(other.ExecStats)
 

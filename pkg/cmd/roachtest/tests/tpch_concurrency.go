@@ -13,7 +13,6 @@ package tests
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
@@ -21,32 +20,33 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/workload/tpch"
+	"github.com/stretchr/testify/require"
 )
 
 func registerTPCHConcurrency(r registry.Registry) {
 	const numNodes = 4
 
-	setupCluster := func(ctx context.Context, t test.Test, c cluster.Cluster, disableTxnStatsSampling bool) {
+	setupCluster := func(
+		ctx context.Context,
+		t test.Test,
+		c cluster.Cluster,
+		disableStreamer bool,
+	) {
 		c.Put(ctx, t.Cockroach(), "./cockroach", c.Range(1, numNodes-1))
 		c.Put(ctx, t.DeprecatedWorkload(), "./workload", c.Node(numNodes))
 		c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), c.Range(1, numNodes-1))
 
-		// In order to keep more things constant throughout the different test
-		// runs, we disable range merges and range movements.
 		conn := c.Conn(ctx, t.L(), 1)
-		if _, err := conn.Exec("SET CLUSTER SETTING kv.allocator.min_lease_transfer_interval = '24h';"); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := conn.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false;"); err != nil {
-			t.Fatal(err)
-		}
-		if disableTxnStatsSampling {
-			if _, err := conn.Exec("SET CLUSTER SETTING sql.txn_stats.sample_rate = 0;"); err != nil {
+		if disableStreamer {
+			if _, err := conn.Exec("SET CLUSTER SETTING sql.distsql.use_streamer.enabled = false;"); err != nil {
 				t.Fatal(err)
 			}
 		}
 
-		if err := loadTPCHDataset(ctx, t, c, 1 /* sf */, c.NewMonitor(ctx, c.Range(1, numNodes-1)), c.Range(1, numNodes-1)); err != nil {
+		if err := loadTPCHDataset(
+			ctx, t, c, conn, 1 /* sf */, c.NewMonitor(ctx, c.Range(1, numNodes-1)),
+			c.Range(1, numNodes-1), true, /* disableMergeQueue */
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -73,16 +73,17 @@ func registerTPCHConcurrency(r registry.Registry) {
 			t.Fatal(err)
 		}
 		scatterTables(t, conn, tpchTables)
-		WaitFor3XReplication(t, conn)
+		err := WaitFor3XReplication(ctx, t, conn)
+		require.NoError(t, err)
 
 		// Populate the range cache on each node.
-		for node := 1; node < numNodes; node++ {
-			conn = c.Conn(ctx, t.L(), node)
-			if _, err := conn.Exec("USE tpch;"); err != nil {
+		for nodeIdx := 1; nodeIdx < numNodes; nodeIdx++ {
+			node := c.Conn(ctx, t.L(), nodeIdx)
+			if _, err := node.Exec("USE tpch;"); err != nil {
 				t.Fatal(err)
 			}
 			for _, table := range tpchTables {
-				if _, err := conn.Exec(fmt.Sprintf("SELECT count(*) FROM %s", table)); err != nil {
+				if _, err := node.Exec(fmt.Sprintf("SELECT count(*) FROM %s", table)); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -93,6 +94,7 @@ func registerTPCHConcurrency(r registry.Registry) {
 			t.Status(fmt.Sprintf("running with concurrency = %d", concurrency))
 			// Run each query once on each connection.
 			for queryNum := 1; queryNum <= tpch.NumQueries; queryNum++ {
+				t.Status("running Q", queryNum)
 				// The way --max-ops flag works is as follows: the global ops
 				// counter is incremented **after** each worker completes a
 				// single operation, so it is possible for all connections start
@@ -144,15 +146,20 @@ func registerTPCHConcurrency(r registry.Registry) {
 		return m.WaitE()
 	}
 
-	runTPCHConcurrency := func(ctx context.Context, t test.Test, c cluster.Cluster, disableTxnStatsSampling bool) {
-		setupCluster(ctx, t, c, disableTxnStatsSampling)
+	runTPCHConcurrency := func(
+		ctx context.Context,
+		t test.Test,
+		c cluster.Cluster,
+		disableStreamer bool,
+	) {
+		setupCluster(ctx, t, c, disableStreamer)
 		// TODO(yuzefovich): once we have a good grasp on the expected value for
 		// max supported concurrency, we should use search.Searcher instead of
 		// the binary search here. Additionally, we should introduce an
 		// additional step to ensure that some kind of lower bound for the
 		// supported concurrency is always sustained and fail the test if it
 		// isn't.
-		minConcurrency, maxConcurrency := 32, 192
+		minConcurrency, maxConcurrency := 50, 110
 		// Run the binary search to find the largest concurrency that doesn't
 		// crash a node in the cluster. The current range is represented by
 		// [minConcurrency, maxConcurrency).
@@ -178,24 +185,21 @@ func registerTPCHConcurrency(r registry.Registry) {
 		c.Run(ctx, c.Node(numNodes), cmd)
 	}
 
-	for _, disableTxnStatsSampling := range []bool{false, true} {
-		name := "tpch_concurrency"
-		if disableTxnStatsSampling {
-			name += "/no_sampling"
-		}
-		r.Add(registry.TestSpec{
-			Name:    name,
-			Owner:   registry.OwnerSQLQueries,
-			Cluster: r.MakeClusterSpec(numNodes),
-			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				runTPCHConcurrency(ctx, t, c, disableTxnStatsSampling)
-			},
-			// By default, the timeout is 10 hours which might not be sufficient
-			// given that a single iteration of checkConcurrency might take on
-			// the order of one hour, so in order to let each test run to
-			// complete we'll give it 18 hours. Successful runs typically take
-			// a lot less, around six hours.
-			Timeout: 18 * time.Hour,
-		})
-	}
+	r.Add(registry.TestSpec{
+		Name:    "tpch_concurrency",
+		Owner:   registry.OwnerSQLQueries,
+		Cluster: r.MakeClusterSpec(numNodes),
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runTPCHConcurrency(ctx, t, c, false /* disableStreamer */)
+		},
+	})
+
+	r.Add(registry.TestSpec{
+		Name:    "tpch_concurrency/no_streamer",
+		Owner:   registry.OwnerSQLQueries,
+		Cluster: r.MakeClusterSpec(numNodes),
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runTPCHConcurrency(ctx, t, c, true /* disableStreamer */)
+		},
+	})
 }

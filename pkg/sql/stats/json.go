@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -127,9 +128,9 @@ func (js *JSONStatistic) DecodeAndSetHistogram(
 
 // GetHistogram converts the json histogram into HistogramData.
 func (js *JSONStatistic) GetHistogram(
-	semaCtx *tree.SemaContext, evalCtx *tree.EvalContext,
+	ctx context.Context, semaCtx *tree.SemaContext, evalCtx *eval.Context,
 ) (*HistogramData, error) {
-	if len(js.HistogramBuckets) == 0 {
+	if js.HistogramColumnType == "" {
 		return nil, nil
 	}
 	h := &HistogramData{}
@@ -137,7 +138,7 @@ func (js *JSONStatistic) GetHistogram(
 	if err != nil {
 		return nil, err
 	}
-	colType, err := tree.ResolveType(evalCtx.Context, colTypeRef, semaCtx.GetTypeResolver())
+	colType, err := tree.ResolveType(ctx, colTypeRef, semaCtx.GetTypeResolver())
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +147,7 @@ func (js *JSONStatistic) GetHistogram(
 	h.Buckets = make([]HistogramData_Bucket, len(js.HistogramBuckets))
 	for i := range h.Buckets {
 		hb := &js.HistogramBuckets[i]
-		upperVal, err := rowenc.ParseDatumStringAs(colType, hb.UpperBound, evalCtx)
+		upperVal, err := rowenc.ParseDatumStringAs(ctx, colType, hb.UpperBound, evalCtx)
 		if err != nil {
 			return nil, err
 		}

@@ -15,7 +15,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 )
 
 const (
@@ -24,10 +24,13 @@ const (
 	AuthParam = "AUTH"
 	// AuthParamImplicit is the query parameter for the implicit authentication
 	// mode in a URI.
-	AuthParamImplicit = roachpb.ExternalStorageAuthImplicit
+	AuthParamImplicit = cloudpb.ExternalStorageAuthImplicit
 	// AuthParamSpecified is the query parameter for the specified authentication
 	// mode in a URI.
-	AuthParamSpecified = roachpb.ExternalStorageAuthSpecified
+	AuthParamSpecified = cloudpb.ExternalStorageAuthSpecified
+	// LocalityURLParam is the parameter name used when specifying a locality tag
+	// in a locality aware backup/restore.
+	LocalityURLParam = "COCKROACH_LOCALITY"
 )
 
 // GetPrefixBeforeWildcard gets the prefix of a path that does not contain glob-
@@ -76,4 +79,61 @@ func JoinPathPreservingTrailingSlash(prefix, suffix string) string {
 		out += "/"
 	}
 	return out
+}
+
+// ParseRoleString parses a comma separated string of roles into a list of
+// intermediate delegate roles and the final assumed role.
+func ParseRoleString(roleString string) (assumeRole string, delegateRoles []string) {
+	if roleString == "" {
+		return assumeRole, delegateRoles
+	}
+
+	roles := strings.Split(roleString, ",")
+	delegateRoles = make([]string, len(roles)-1)
+
+	assumeRole = roles[len(roles)-1]
+	for i := 0; i < len(roles)-1; i++ {
+		delegateRoles[i] = roles[i]
+	}
+	return assumeRole, delegateRoles
+}
+
+// ConsumeURL is a helper struct which for "consuming" URL query
+// parameters from the underlying URL.
+type ConsumeURL struct {
+	*url.URL
+	q url.Values
+}
+
+// ConsumeParam returns the value of the parameter p from the underlying URL,
+// and deletes the parameter from the URL.
+func (u *ConsumeURL) ConsumeParam(p string) string {
+	if u.q == nil {
+		u.q = u.Query()
+	}
+	v := u.q.Get(p)
+	u.q.Del(p)
+	return v
+}
+
+// RemainingQueryParams returns the query parameters that have not been consumed
+// from the underlying URL.
+func (u *ConsumeURL) RemainingQueryParams() (res []string) {
+	if u.q == nil {
+		u.q = u.Query()
+	}
+	for p := range u.q {
+		// The `COCKROACH_LOCALITY` parameter is supported for all External Storage
+		// implementations and is not used when creating the External Storage, but
+		// instead during backup/restore resolution. So, this parameter is not
+		// "consumed" by the individual External Storage implementations in their
+		// parse functions and so it will always show up in this method. We should
+		// consider this param invisible when validating that all the passed in
+		// query parameters are supported for an External Storage URI.
+		if p == LocalityURLParam {
+			continue
+		}
+		res = append(res, p)
+	}
+	return
 }

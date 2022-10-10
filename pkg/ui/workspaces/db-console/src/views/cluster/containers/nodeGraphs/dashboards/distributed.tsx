@@ -12,16 +12,13 @@ import React from "react";
 import _ from "lodash";
 
 import { LineGraph } from "src/views/cluster/components/linegraph";
-import {
-  Metric,
-  Axis,
-  AxisUnits,
-} from "src/views/shared/components/metricQuery";
+import { Metric, Axis } from "src/views/shared/components/metricQuery";
+import { AxisUnits } from "@cockroachlabs/cluster-ui";
 
 import { GraphDashboardProps, nodeDisplayName } from "./dashboardUtils";
 
-export default function(props: GraphDashboardProps) {
-  const { nodeIDs, nodesSummary, nodeSources } = props;
+export default function (props: GraphDashboardProps) {
+  const { nodeIDs, nodeSources, nodeDisplayNameByID } = props;
 
   return [
     <LineGraph title="Batches" sources={nodeSources}>
@@ -96,7 +93,7 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.txn.durations-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -114,7 +111,7 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.txn.durations-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -132,7 +129,7 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.liveness.heartbeatlatency-p99"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />
@@ -150,7 +147,7 @@ export default function(props: GraphDashboardProps) {
           <Metric
             key={node}
             name="cr.node.liveness.heartbeatlatency-p90"
-            title={nodeDisplayName(nodesSummary, node)}
+            title={nodeDisplayName(nodeDisplayNameByID, node)}
             sources={[node]}
             downsampleMax
           />

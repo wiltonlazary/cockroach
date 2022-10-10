@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,5 +15,8 @@ go_library(
 go_test(
     name = "config_test",
     srcs = ["config_test.go"],
+    args = ["-test.timeout=295s"],
     embed = [":config"],
 )
+
+get_x_data(name = "get_x_data")

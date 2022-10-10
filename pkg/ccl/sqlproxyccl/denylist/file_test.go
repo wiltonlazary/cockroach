@@ -12,7 +12,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -108,7 +108,7 @@ denylist:
 		tempDir := t.TempDir()
 		for i, tc := range testCases {
 			filename := filepath.Join(tempDir, fmt.Sprintf("denylist%d.yaml", i))
-			require.NoError(t, ioutil.WriteFile(filename, []byte(tc.input), 0777))
+			require.NoError(t, os.WriteFile(filename, []byte(tc.input), 0777))
 			dl, _ := newDenylistWithFile(ctx, filename)
 			require.Equal(t, tc.expected, dl.entries, "should return expected parsed file for %s",
 				tc.input)
@@ -121,12 +121,12 @@ denylist:
 			Denylist: []*DenyEntry{
 				{
 					DenyEntity{"63", ClusterType},
-					timeutil.Now(),
+					timeutil.NowNoMono(),
 					"over usage",
 				},
 				{
 					DenyEntity{"8.8.8.8", IPAddrType},
-					timeutil.Now().Add(1 * time.Hour),
+					timeutil.NowNoMono().Add(1 * time.Hour),
 					"malicious IP",
 				},
 			},
@@ -238,7 +238,7 @@ denylist:
 	_, channel := newDenylistWithFile(
 		ctx, filename, WithPollingInterval(100*time.Millisecond), WithTimeSource(manualTime))
 	for _, tc := range testCases {
-		require.NoError(t, ioutil.WriteFile(filename, []byte(tc.input), 0777))
+		require.NoError(t, os.WriteFile(filename, []byte(tc.input), 0777))
 		manualTime.AdvanceTo(tc.time)
 		dl := <-channel
 		for _, ioPairs := range tc.specs {

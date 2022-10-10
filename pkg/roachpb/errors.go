@@ -17,11 +17,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/errors/errorspb"
 	_ "github.com/cockroachdb/errors/extgrpc" // register EncodeError support for gRPC Status
 	"github.com/cockroachdb/redact"
 )
@@ -152,26 +152,6 @@ func NewError(err error) *Error {
 	e := &Error{
 		EncodedError: errors.EncodeError(context.Background(), err),
 	}
-
-	// This block is deprecated behavior retained for compat with
-	// 20.2 nodes. It makes sure that if applicable, deprecatedMessage,
-	// ErrorDetail, and deprecatedTransactionRestart are set.
-	{
-		if intErr, ok := err.(*internalError); ok {
-			*e = *(*Error)(intErr)
-		} else if detail := ErrorDetailInterface(nil); errors.As(err, &detail) {
-			e.deprecatedMessage = detail.message(e)
-			if r, ok := detail.(transactionRestartError); ok {
-				e.deprecatedTransactionRestart = r.canRestartTransaction()
-			} else {
-				e.deprecatedTransactionRestart = TransactionRestart_NONE
-			}
-			e.deprecatedDetail.MustSetInner(detail)
-			e.checkTxnStatusValid()
-		} else {
-			e.deprecatedMessage = err.Error()
-		}
-	}
 	return e
 }
 
@@ -201,42 +181,7 @@ func (e *Error) SafeFormat(s redact.SafePrinter, _ rune) {
 		return
 	}
 
-	if e.EncodedError != (errors.EncodedError{}) {
-		err := errors.DecodeError(context.Background(), e.EncodedError)
-		var iface ErrorDetailInterface
-		if errors.As(err, &iface) {
-			// Deprecated code: if there is a detail and the message produced by the detail
-			// (which gets to see the surrounding Error) is different, then use that message.
-			// What is likely the cause of that is that someone passed an updated Transaction
-			// to the Error via SetTxn, and the error detail prints that txn.
-			//
-			// TODO(tbg): change SetTxn so that instead of stashing the transaction on the
-			// Error struct, it wraps the EncodedError with an error containing the updated
-			// txn. Make GetTxn retrieve the first one it sees (overridden by UnexposedTxn
-			// while it's still around). Remove the `message(Error)` methods from ErrorDetailInterface.
-			// We also have to remove GetDetail() in the process since it doesn't understand the
-			// wrapping; instead we need a method that looks for a specific kind of detail, i.e.
-			// we basically want to use `errors.As` instead.
-			deprecatedMsg := iface.message(e)
-			if deprecatedMsg != err.Error() {
-				s.Print(deprecatedMsg)
-				return
-			}
-		}
-		s.Print(err)
-	} else {
-		// TODO(tbg): remove this block in the 21.2 cycle and rely on EncodedError
-		// always being populated.
-		switch t := e.GetDetail().(type) {
-		case nil:
-			s.Print(e.deprecatedMessage)
-		default:
-			// We have a detail and ignore e.deprecatedMessage. We do assume that if a detail is
-			// present, e.deprecatedMessage does correspond to that detail's message. This
-			// assumption is not enforced but appears sane.
-			s.Print(t)
-		}
-	}
+	s.Print(errors.DecodeError(context.Background(), e.EncodedError))
 
 	if txn := e.GetTxn(); txn != nil {
 		s.SafeString(": ")
@@ -251,15 +196,11 @@ func (e *Error) String() string {
 
 // TransactionRestart returns the TransactionRestart for this Error.
 func (e *Error) TransactionRestart() TransactionRestart {
-	if e.EncodedError == (errorspb.EncodedError{}) {
-		// Legacy code.
-		//
-		// TODO(tbg): delete in 21.2.
-		return e.deprecatedTransactionRestart
-	}
-	var iface transactionRestartError
-	if errors.As(errors.DecodeError(context.Background(), e.EncodedError), &iface) {
-		return iface.canRestartTransaction()
+	if e.EncodedError.IsSet() {
+		var iface transactionRestartError
+		if errors.As(errors.DecodeError(context.Background(), e.EncodedError), &iface) {
+			return iface.canRestartTransaction()
+		}
 	}
 	return TransactionRestart_NONE
 }
@@ -289,6 +230,7 @@ type ErrorDetailType int
 // This lists all ErrorDetail types. The numeric values in this list are used to
 // identify corresponding timeseries. The values correspond to the proto oneof
 // values.
+//
 //go:generate stringer -type=ErrorDetailType
 const (
 	NotLeaseHolderErrType                   ErrorDetailType = 1
@@ -323,6 +265,7 @@ const (
 	OptimisticEvalConflictsErrType          ErrorDetailType = 41
 	MinTimestampBoundUnsatisfiableErrType   ErrorDetailType = 42
 	RefreshFailedErrType                    ErrorDetailType = 43
+	MVCCHistoryMutationErrType              ErrorDetailType = 44
 	// When adding new error types, don't forget to update NumErrors below.
 
 	// CommunicationErrType indicates a gRPC error; this is not an ErrorDetail.
@@ -332,7 +275,7 @@ const (
 	// detail. The value 25 is chosen because it's reserved in the errors proto.
 	InternalErrType ErrorDetailType = 25
 
-	NumErrors int = 44
+	NumErrors int = 45
 )
 
 // GoError returns a Go error converted from Error. If the error is a transaction
@@ -343,7 +286,7 @@ func (e *Error) GoError() error {
 	if e == nil {
 		return nil
 	}
-	if e.EncodedError != (errorspb.EncodedError{}) {
+	if e.EncodedError.IsSet() {
 		err := errors.DecodeError(context.Background(), e.EncodedError)
 		var iface transactionRestartError
 		if errors.As(err, &iface) {
@@ -372,18 +315,11 @@ func (e *Error) GoError() error {
 
 // GetDetail returns an error detail associated with the error, or nil otherwise.
 func (e *Error) GetDetail() ErrorDetailInterface {
-	if e == nil {
+	if e == nil || !e.EncodedError.IsSet() {
 		return nil
 	}
 	var detail ErrorDetailInterface
-	if e.EncodedError != (errorspb.EncodedError{}) {
-		errors.As(errors.DecodeError(context.Background(), e.EncodedError), &detail)
-	} else {
-		// Legacy behavior.
-		//
-		// TODO(tbg): delete in v21.2.
-		detail, _ = e.deprecatedDetail.GetInner().(ErrorDetailInterface)
-	}
+	errors.As(errors.DecodeError(context.Background(), e.EncodedError), &detail)
 	return detail
 }
 
@@ -405,30 +341,21 @@ func (e *Error) UpdateTxn(o *Transaction) {
 	} else {
 		e.UnexposedTxn.Update(o)
 	}
-	if sErr, ok := e.deprecatedDetail.GetInner().(ErrorDetailInterface); ok {
-		// Refresh the message as the txn is updated.
-		//
-		// TODO(tbg): deprecated, remove in 21.2.
-		e.deprecatedMessage = sErr.message(e)
-	}
 	e.checkTxnStatusValid()
 }
 
 // checkTxnStatusValid verifies that the transaction status is in-sync with the
 // error detail.
 func (e *Error) checkTxnStatusValid() {
-	// TODO(tbg): this will need to be updated when we
-	// remove all of these deprecated fields in 21.2.
-
 	txn := e.UnexposedTxn
-	err := e.deprecatedDetail.GetInner()
+	err := e.GetDetail()
 	if txn == nil {
 		return
 	}
-	if e.deprecatedTransactionRestart == TransactionRestart_NONE {
+	if errors.HasType(err, (*TransactionAbortedError)(nil)) {
 		return
 	}
-	if errors.HasType(err, (*TransactionAbortedError)(nil)) {
+	if e.TransactionRestart() == TransactionRestart_NONE {
 		return
 	}
 	if txn.Status.IsFinalized() {
@@ -486,12 +413,12 @@ func (e *NotLeaseHolderError) message(_ *Error) string {
 	} else {
 		fmt.Fprint(&buf, "replica not lease holder; ")
 	}
-	if e.LeaseHolder == nil {
+	if e.DeprecatedLeaseHolder == nil {
 		fmt.Fprint(&buf, "lease holder unknown")
 	} else if e.Lease != nil {
 		fmt.Fprintf(&buf, "current lease is %s", e.Lease)
 	} else {
-		fmt.Fprintf(&buf, "replica %s is", *e.LeaseHolder)
+		fmt.Fprintf(&buf, "replica %s is", *e.DeprecatedLeaseHolder)
 	}
 	return buf.String()
 }
@@ -546,17 +473,14 @@ func IsRangeNotFoundError(err error) bool {
 	return errors.HasType(err, (*RangeNotFoundError)(nil))
 }
 
-// NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
-//
-// desc and lease represent info about the range that the request was
-// erroneously routed to. lease can be nil. If it's not nil but the leaseholder
-// is not part of desc, it is ignored. This allows callers to read the
-// descriptor and lease non-atomically without worrying about incoherence.
-//
-// Note that more range info is commonly added to the error after the error is
-// created.
-func NewRangeKeyMismatchError(
-	ctx context.Context, start, end Key, desc *RangeDescriptor, lease *Lease,
+// NewRangeKeyMismatchErrorWithCTPolicy initializes a new RangeKeyMismatchError.
+// identical to NewRangeKeyMismatchError, with the given ClosedTimestampPolicy.
+func NewRangeKeyMismatchErrorWithCTPolicy(
+	ctx context.Context,
+	start, end Key,
+	desc *RangeDescriptor,
+	lease *Lease,
+	ctPolicy RangeClosedTimestampPolicy,
 ) *RangeKeyMismatchError {
 	if desc == nil {
 		panic("NewRangeKeyMismatchError with nil descriptor")
@@ -578,9 +502,35 @@ func NewRangeKeyMismatchError(
 		RequestStartKey: start,
 		RequestEndKey:   end,
 	}
+	ri := RangeInfo{
+		Desc:                  *desc,
+		Lease:                 l,
+		ClosedTimestampPolicy: ctPolicy,
+	}
 	// More ranges are sometimes added to rangesInternal later.
-	e.AppendRangeInfo(ctx, *desc, l)
+	e.AppendRangeInfo(ctx, ri)
 	return e
+}
+
+// NewRangeKeyMismatchError initializes a new RangeKeyMismatchError.
+//
+// desc and lease represent info about the range that the request was
+// erroneously routed to. lease can be nil. If it's not nil but the leaseholder
+// is not part of desc, it is ignored. This allows callers to read the
+// descriptor and lease non-atomically without worrying about incoherence.
+//
+// Note that more range info is commonly added to the error after the error is
+// created.
+func NewRangeKeyMismatchError(
+	ctx context.Context, start, end Key, desc *RangeDescriptor, lease *Lease,
+) *RangeKeyMismatchError {
+	return NewRangeKeyMismatchErrorWithCTPolicy(ctx,
+		start,
+		end,
+		desc,
+		lease,
+		LAG_BY_CLUSTER_SETTING, /* default closed timestsamp policy*/
+	)
 }
 
 func (e *RangeKeyMismatchError) Error() string {
@@ -612,54 +562,23 @@ func (e *RangeKeyMismatchError) MismatchedRange() (RangeInfo, error) {
 	return e.Ranges[0], nil
 }
 
-// AppendRangeInfo appends info about one range to the set returned to the
+// AppendRangeInfo appends info about a group of ranges to the set returned to the
 // kvclient.
 //
 // l can be empty. Otherwise, the leaseholder is asserted to be a replica in
 // desc.
-func (e *RangeKeyMismatchError) AppendRangeInfo(
-	ctx context.Context, desc RangeDescriptor, l Lease,
-) {
-	if !l.Empty() {
-		if _, ok := desc.GetReplicaDescriptorByID(l.Replica.ReplicaID); !ok {
-			log.Fatalf(ctx, "lease names missing replica; lease: %s, desc: %s", l, desc)
+func (e *RangeKeyMismatchError) AppendRangeInfo(ctx context.Context, ris ...RangeInfo) {
+	for _, ri := range ris {
+		if !ri.Lease.Empty() {
+			if _, ok := ri.Desc.GetReplicaDescriptorByID(ri.Lease.Replica.ReplicaID); !ok {
+				log.Fatalf(ctx, "lease names missing replica; lease: %s, desc: %s", ri.Lease, ri.Desc)
+			}
 		}
+		e.Ranges = append(e.Ranges, ri)
 	}
-	e.Ranges = append(e.Ranges, RangeInfo{
-		Desc:  desc,
-		Lease: l,
-	})
 }
 
 var _ ErrorDetailInterface = &RangeKeyMismatchError{}
-
-// NewAmbiguousResultError initializes a new AmbiguousResultError with
-// an explanatory message.
-func NewAmbiguousResultError(msg string) *AmbiguousResultError {
-	return &AmbiguousResultError{Message: msg}
-}
-
-// NewAmbiguousResultErrorf initializes a new AmbiguousResultError with
-// an explanatory format and set of arguments.
-func NewAmbiguousResultErrorf(format string, args ...interface{}) *AmbiguousResultError {
-	return NewAmbiguousResultError(fmt.Sprintf(format, args...))
-}
-
-func (e *AmbiguousResultError) Error() string {
-	return e.message(nil)
-}
-
-func (e *AmbiguousResultError) message(_ *Error) string {
-	if e.WrappedErr != nil {
-		return fmt.Sprintf("result is ambiguous (%v)", e.WrappedErr)
-	}
-	return fmt.Sprintf("result is ambiguous (%s)", e.Message)
-}
-
-// Type is part of the ErrorDetailInterface.
-func (e *AmbiguousResultError) Type() ErrorDetailType {
-	return AmbiguousResultErrType
-}
 
 // ClientVisibleAmbiguousError implements the ClientVisibleAmbiguousError interface.
 func (e *AmbiguousResultError) ClientVisibleAmbiguousError() {}
@@ -928,12 +847,21 @@ func (e *WriteTooOldError) Type() ErrorDetailType {
 	return WriteTooOldErrType
 }
 
+// RetryTimestamp returns the timestamp that should be used to retry an
+// operation after encountering a WriteTooOldError.
+func (e *WriteTooOldError) RetryTimestamp() hlc.Timestamp {
+	return e.ActualTimestamp
+}
+
 var _ ErrorDetailInterface = &WriteTooOldError{}
 var _ transactionRestartError = &WriteTooOldError{}
 
 // NewReadWithinUncertaintyIntervalError creates a new uncertainty retry error.
 // The read and existing timestamps as well as the txn are purely informational
 // and used for formatting the error message.
+// TODO(nvanbenschoten): change localUncertaintyLimit to hlc.ClockTimestamp.
+// TODO(nvanbenschoten): change existingTS to versionTs.
+// TODO(nvanbenschoten): add localTs and include in error string.
 func NewReadWithinUncertaintyIntervalError(
 	readTS, existingTS, localUncertaintyLimit hlc.Timestamp, txn *Transaction,
 ) *ReadWithinUncertaintyIntervalError {
@@ -986,6 +914,39 @@ func (e *ReadWithinUncertaintyIntervalError) Type() ErrorDetailType {
 
 func (*ReadWithinUncertaintyIntervalError) canRestartTransaction() TransactionRestart {
 	return TransactionRestart_IMMEDIATE
+}
+
+// RetryTimestamp returns the timestamp that should be used to retry an
+// operation after encountering a ReadWithinUncertaintyIntervalError.
+func (e *ReadWithinUncertaintyIntervalError) RetryTimestamp() hlc.Timestamp {
+	// If the reader encountered a newer write within the uncertainty interval,
+	// we advance the txn's timestamp just past the uncertain value's timestamp.
+	// This ensures that we read above the uncertain value on a retry.
+	ts := e.ExistingTimestamp.Next()
+	// In addition to advancing past the uncertainty value's timestamp, we also
+	// advance the txn's timestamp up to the local uncertainty limit on the node
+	// which hit the error. This ensures that no future read after the retry on
+	// this node (ignoring lease complications in ComputeLocalUncertaintyLimit
+	// and values with synthetic timestamps) will throw an uncertainty error,
+	// even when reading other keys.
+	//
+	// Note that if the request was not able to establish a local uncertainty
+	// limit due to a missing observed timestamp (for instance, if the request
+	// was evaluated on a follower replica and the txn had never visited the
+	// leaseholder), then LocalUncertaintyLimit will be empty and the Forward
+	// will be a no-op. In this case, we could advance all the way past the
+	// global uncertainty limit, but this time would likely be in the future, so
+	// this would necessitate a commit-wait period after committing.
+	//
+	// In general, we expect the local uncertainty limit, if set, to be above
+	// the uncertainty value's timestamp. So we expect this Forward to advance
+	// ts. However, this is not always the case. The one exception is if the
+	// uncertain value had a synthetic timestamp, so it was compared against the
+	// global uncertainty limit to determine uncertainty (see IsUncertain). In
+	// such cases, we're ok advancing just past the value's timestamp. Either
+	// way, we won't see the same value in our uncertainty interval on a retry.
+	ts.Forward(e.LocalUncertaintyLimit)
+	return ts
 }
 
 var _ ErrorDetailInterface = &ReadWithinUncertaintyIntervalError{}
@@ -1169,6 +1130,21 @@ func (e *BatchTimestampBeforeGCError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &BatchTimestampBeforeGCError{}
+
+func (e *MVCCHistoryMutationError) Error() string {
+	return e.message(nil)
+}
+
+func (e *MVCCHistoryMutationError) message(_ *Error) string {
+	return fmt.Sprintf("unexpected MVCC history mutation in span %s", e.Span)
+}
+
+// Type is part of the ErrorDetailInterface.
+func (e *MVCCHistoryMutationError) Type() ErrorDetailType {
+	return MVCCHistoryMutationErrType
+}
+
+var _ ErrorDetailInterface = &MVCCHistoryMutationError{}
 
 // NewIntentMissingError creates a new IntentMissingError.
 func NewIntentMissingError(key Key, wrongIntent *Intent) *IntentMissingError {
@@ -1368,3 +1344,8 @@ func (e *RefreshFailedError) Type() ErrorDetailType {
 }
 
 var _ ErrorDetailInterface = &RefreshFailedError{}
+
+func (e *InsufficientSpaceError) Error() string {
+	return fmt.Sprintf("store %d has insufficient remaining capacity to %s (remaining: %s / %.1f%%, min required: %.1f%%)",
+		e.StoreID, e.Op, humanizeutil.IBytes(e.Available), float64(e.Available)/float64(e.Capacity)*100, e.Required*100)
+}

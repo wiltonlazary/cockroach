@@ -22,6 +22,7 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/util/log" // for flags
 	"github.com/kr/pretty"
 	prometheusgo "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
 )
 
 func testMarshal(t *testing.T, m json.Marshaler, exp string) {
@@ -83,15 +84,6 @@ func TestGaugeFloat64(t *testing.T) {
 	}
 }
 
-func TestRate(t *testing.T) {
-	r := NewRate(emptyMetadata, time.Minute)
-	r.Add(0)
-	if v := r.Value(); v != 0 {
-		t.Fatalf("unexpected value: %f", v)
-	}
-	testMarshal(t, r, "0")
-}
-
 func TestCounter(t *testing.T) {
 	c := NewCounter(emptyMetadata)
 	c.Inc(90)
@@ -108,7 +100,7 @@ func setNow(d time.Duration) {
 	}
 }
 
-func TestHistogramPrometheus(t *testing.T) {
+func TestHistogram(t *testing.T) {
 	u := func(v int) *uint64 {
 		n := uint64(v)
 		return &n
@@ -119,92 +111,84 @@ func TestHistogramPrometheus(t *testing.T) {
 		return &n
 	}
 
-	h := NewHistogram(Metadata{}, time.Hour, 10, 1)
-	h.RecordValue(1)
-	h.RecordValue(5)
-	h.RecordValue(5)
-	h.RecordValue(10)
-	h.RecordValue(15000) // counts as 10
+	h := NewHistogram(
+		Metadata{},
+		time.Hour,
+		[]float64{
+			1.0,
+			5.0,
+			10.0,
+			25.0,
+			100.0,
+		},
+	)
+
+	// should return 0 if no observations are made
+	require.Equal(t, 0.0, h.ValueAtQuantileWindowed(0))
+
+	// 200 is intentionally set us the first value to verify that the function
+	// does not return NaN or Inf.
+	measurements := []int64{200, 0, 4, 5, 10, 20, 25, 30, 40, 90}
+	var expSum float64
+	for i, m := range measurements {
+		h.RecordValue(m)
+		if i == 0 {
+			require.Equal(t, 0.0, h.ValueAtQuantileWindowed(0))
+			require.Equal(t, 100.0, h.ValueAtQuantileWindowed(99))
+		}
+		expSum += float64(m)
+	}
+
 	act := *h.ToPrometheusMetric().Histogram
-
-	expSum := float64(1*1 + 2*5 + 2*10)
-
 	exp := prometheusgo.Histogram{
-		SampleCount: u(5),
+		SampleCount: u(len(measurements)),
 		SampleSum:   &expSum,
 		Bucket: []*prometheusgo.Bucket{
 			{CumulativeCount: u(1), UpperBound: f(1)},
 			{CumulativeCount: u(3), UpperBound: f(5)},
-			{CumulativeCount: u(5), UpperBound: f(10)},
+			{CumulativeCount: u(4), UpperBound: f(10)},
+			{CumulativeCount: u(6), UpperBound: f(25)},
+			{CumulativeCount: u(9), UpperBound: f(100)},
+			// NB: 200 is greater than the largest defined bucket so prometheus
+			// puts it in an implicit bucket with +Inf as the upper bound.
 		},
 	}
 
 	if !reflect.DeepEqual(act, exp) {
 		t.Fatalf("expected differs from actual: %s", pretty.Diff(exp, act))
 	}
+
+	require.Equal(t, 0.0, h.ValueAtQuantileWindowed(0))
+	require.Equal(t, 1.0, h.ValueAtQuantileWindowed(10))
+	require.Equal(t, 17.5, h.ValueAtQuantileWindowed(50))
+	require.Equal(t, 75.0, h.ValueAtQuantileWindowed(80))
+	require.Equal(t, 100.0, h.ValueAtQuantileWindowed(99.99))
 }
 
-func TestHistogramRotate(t *testing.T) {
+func TestNewHistogramRotate(t *testing.T) {
 	defer TestingSetNow(nil)()
 	setNow(0)
-	duration := histWrapNum * time.Second
-	h := NewHistogram(emptyMetadata, duration, 1000+10*histWrapNum, 3)
-	var cur time.Duration
-	for i := 0; i < 3*histWrapNum; i++ {
-		v := int64(10 * i)
-		h.RecordValue(v)
-		cur += time.Second
-		setNow(cur)
-		cur, windowDuration := h.Windowed()
-		if windowDuration != duration {
-			t.Fatalf("window changed: is %s, should be %s", windowDuration, duration)
+
+	h := NewHistogram(emptyMetadata, 10*time.Second, nil)
+	for i := 0; i < 4; i++ {
+		// Windowed histogram is initially empty.
+		h.Inspect(func(interface{}) {}) // triggers ticking
+		var m prometheusgo.Metric
+		require.NoError(t, h.Windowed().Write(&m))
+		require.Zero(t, *m.Histogram.SampleSum)
+		// But cumulative histogram has history (if i > 0).
+		require.EqualValues(t, i, *h.ToPrometheusMetric().Histogram.SampleCount)
+
+		// Add a measurement and verify it's there.
+		{
+			h.RecordValue(12345)
+			f := float64(12345)
+			var m prometheusgo.Metric
+			require.NoError(t, h.Windowed().Write(&m))
+			require.Equal(t, *m.Histogram.SampleSum, f)
 		}
-
-		// When i == histWrapNum-1, we expect the entry from i==0 to move out
-		// of the window (since we rotated for the histWrapNum'th time).
-		expMin := int64((1 + i - (histWrapNum - 1)) * 10)
-		if expMin < 0 {
-			expMin = 0
-		}
-
-		if min := cur.Min(); min != expMin {
-			t.Fatalf("%d: unexpected minimum %d, expected %d", i, min, expMin)
-		}
-
-		if max, expMax := cur.Max(), v; max != expMax {
-			t.Fatalf("%d: unexpected maximum %d, expected %d", i, max, expMax)
-		}
-	}
-}
-
-func TestRateRotate(t *testing.T) {
-	defer TestingSetNow(nil)()
-	setNow(0)
-	const interval = 10 * time.Second
-	r := NewRate(emptyMetadata, interval)
-
-	// Skip the warmup phase of the wrapped EWMA for this test.
-	for i := 0; i < 100; i++ {
-		r.wrapped.Add(0)
-	}
-
-	// Put something nontrivial in.
-	r.Add(100)
-
-	for cur := time.Duration(0); cur < 5*interval; cur += time.Second / 2 {
-		prevVal := r.Value()
-		setNow(cur)
-		curVal := r.Value()
-		expChange := (cur % time.Second) != 0
-		hasChange := prevVal != curVal
-		if expChange != hasChange {
-			t.Fatalf("%s: expChange %t, hasChange %t (from %v to %v)",
-				cur, expChange, hasChange, prevVal, curVal)
-		}
-	}
-
-	v := r.Value()
-	if v > .1 {
-		t.Fatalf("final value implausible: %v", v)
+		// Tick. This rotates the histogram.
+		setNow(time.Duration(i+1) * 10 * time.Second)
+		// Go to beginning.
 	}
 }

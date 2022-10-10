@@ -14,7 +14,9 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/invertedidx"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
@@ -62,11 +64,12 @@ type invertedFilterer struct {
 
 var _ execinfra.Processor = &invertedFilterer{}
 var _ execinfra.RowSource = &invertedFilterer{}
-var _ execinfra.OpNode = &invertedFilterer{}
+var _ execopnode.OpNode = &invertedFilterer{}
 
 const invertedFiltererProcName = "inverted filterer"
 
 func newInvertedFilterer(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.InvertedFiltererSpec,
@@ -94,7 +97,7 @@ func newInvertedFilterer(
 
 	// Initialize ProcessorBase.
 	if err := ifr.ProcessorBase.Init(
-		ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
+		ctx, ifr, post, outputColTypes, flowCtx, processorID, output, nil, /* memMonitor */
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{ifr.input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {
@@ -106,9 +109,8 @@ func newInvertedFilterer(
 		return nil, err
 	}
 
-	ctx := flowCtx.EvalCtx.Ctx()
 	// Initialize memory monitor and row container for input rows.
-	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, "inverted-filterer-limited")
+	ifr.MemMonitor = execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, "inverted-filterer-limited")
 	ifr.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, "inverted-filterer-disk")
 	ifr.rc = rowcontainer.NewDiskBackedNumberedRowContainer(
 		true, /* deDup */
@@ -119,16 +121,16 @@ func newInvertedFilterer(
 		ifr.diskMonitor,
 	)
 
-	if execinfra.ShouldCollectStats(flowCtx.EvalCtx.Ctx(), flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		ifr.input = newInputStatCollector(ifr.input)
 		ifr.ExecStatsForTrace = ifr.execStatsForTrace
 	}
 
 	if spec.PreFiltererSpec != nil {
-		semaCtx := flowCtx.NewSemaContext(flowCtx.EvalCtx.Txn)
+		semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
 		var exprHelper execinfrapb.ExprHelper
 		colTypes := []*types.T{spec.PreFiltererSpec.Type}
-		if err := exprHelper.Init(spec.PreFiltererSpec.Expression, colTypes, semaCtx, ifr.EvalCtx); err != nil {
+		if err := exprHelper.Init(ctx, spec.PreFiltererSpec.Expression, colTypes, semaCtx, ifr.EvalCtx); err != nil {
 			return nil, err
 		}
 		preFilterer, preFiltererState, err := invertedidx.NewBoundPreFilterer(
@@ -226,11 +228,11 @@ func (ifr *invertedFilterer) readInput() (invertedFiltererState, *execinfrapb.Pr
 			ifr.MoveToDraining(errors.New("no datum found"))
 			return ifrStateUnknown, ifr.DrainHelper()
 		}
-		if row[ifr.invertedColIdx].Datum.ResolvedType().Family() != types.BytesFamily {
-			ifr.MoveToDraining(errors.New("inverted column should have type bytes"))
+		if row[ifr.invertedColIdx].Datum.ResolvedType().Family() != types.EncodedKeyFamily {
+			ifr.MoveToDraining(errors.New("inverted column should have type encodedkey"))
 			return ifrStateUnknown, ifr.DrainHelper()
 		}
-		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DBytes))
+		enc = []byte(*row[ifr.invertedColIdx].Datum.(*tree.DEncodedKey))
 	}
 	shouldAdd, err := ifr.invertedEval.prepareAddIndexRow(enc, nil /* encFull */)
 	if err != nil {
@@ -325,21 +327,21 @@ func (ifr *invertedFilterer) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (ifr *invertedFilterer) ChildCount(verbose bool) int {
-	if _, ok := ifr.input.(execinfra.OpNode); ok {
+	if _, ok := ifr.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (ifr *invertedFilterer) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (ifr *invertedFilterer) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := ifr.input.(execinfra.OpNode); ok {
+		if n, ok := ifr.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to invertedFilterer is not an execinfra.OpNode")
+		panic("input to invertedFilterer is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

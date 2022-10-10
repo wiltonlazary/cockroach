@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execreleasable"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -68,7 +68,7 @@ type VecToDatumConverter struct {
 	da               tree.DatumAlloc
 }
 
-var _ execinfra.Releasable = &VecToDatumConverter{}
+var _ execreleasable.Releasable = &VecToDatumConverter{}
 
 var vecToDatumConverterPool = sync.Pool{
 	New: func() interface{} {
@@ -104,10 +104,10 @@ func getNewVecToDatumConverter(batchWidth int, willRelease bool) *VecToDatumConv
 }
 
 // NewVecToDatumConverter creates a new VecToDatumConverter.
-// - batchWidth determines the width of the batches that it will be converting.
-// - vecIdxsToConvert determines which vectors need to be converted.
-// - willRelease indicates whether the caller intends to call Release() on the
-//   converter.
+//   - batchWidth determines the width of the batches that it will be converting.
+//   - vecIdxsToConvert determines which vectors need to be converted.
+//   - willRelease indicates whether the caller intends to call Release() on the
+//     converter.
 func NewVecToDatumConverter(
 	batchWidth int, vecIdxsToConvert []int, willRelease bool,
 ) *VecToDatumConverter {

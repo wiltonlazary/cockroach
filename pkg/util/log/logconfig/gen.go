@@ -16,7 +16,7 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -115,7 +115,7 @@ func run() error {
 }
 
 func readInput(infos map[string]*sinkInfo) error {
-	fileData, err := ioutil.ReadAll(os.Stdin)
+	fileData, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return err
 	}
@@ -215,7 +215,7 @@ func readInput(infos map[string]*sinkInfo) error {
 			}
 			if strings.HasPrefix(comment, "indicates ") {
 				comment = strings.TrimPrefix(comment, "indicates ")
-			} else if strings.HasPrefix(comment, "is ") {
+			} else {
 				comment = strings.TrimPrefix(comment, "is ")
 			}
 

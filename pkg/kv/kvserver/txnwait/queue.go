@@ -45,16 +45,22 @@ var TxnLivenessHeartbeatMultiplier = envutil.EnvOrDefaultInt(
 // mutable to allow tests to override it.
 //
 // Use TestingOverrideTxnLivenessThreshold to override the value in tests.
-var TxnLivenessThreshold = time.Duration(TxnLivenessHeartbeatMultiplier) * base.DefaultTxnHeartbeatInterval
+//
+// This is an atomic to avoid data races as some tests want to update this
+// in a running cluster.
+var TxnLivenessThreshold = func() *atomic.Int64 {
+	var a atomic.Int64
+	a.Store(int64(TxnLivenessHeartbeatMultiplier) * int64(base.DefaultTxnHeartbeatInterval))
+	return &a
+}()
 
 // TestingOverrideTxnLivenessThreshold allows tests to override the transaction
 // liveness threshold. The function returns a closure that should be called to
 // reset the value.
 func TestingOverrideTxnLivenessThreshold(t time.Duration) func() {
-	old := TxnLivenessThreshold
-	TxnLivenessThreshold = t
+	old := TxnLivenessThreshold.Swap(int64(t))
 	return func() {
-		TxnLivenessThreshold = old
+		TxnLivenessThreshold.Store(old)
 	}
 }
 
@@ -69,25 +75,31 @@ func ShouldPushImmediately(req *roachpb.PushTxnRequest) bool {
 	if !(req.PushType == roachpb.PUSH_ABORT || req.PushType == roachpb.PUSH_TIMESTAMP) {
 		return true
 	}
-	p1, p2 := req.PusherTxn.Priority, req.PusheeTxn.Priority
-	if p1 > p2 && (p1 == enginepb.MaxTxnPriority || p2 == enginepb.MinTxnPriority) {
+	if CanPushWithPriority(req.PusherTxn.Priority, req.PusheeTxn.Priority) {
 		return true
 	}
 	return false
+}
+
+// CanPushWithPriority returns true if the given pusher can push the pushee
+// based on its priority.
+func CanPushWithPriority(pusher, pushee enginepb.TxnPriority) bool {
+	return pusher > pushee &&
+		(pusher == enginepb.MaxTxnPriority || pushee == enginepb.MinTxnPriority)
 }
 
 // isPushed returns whether the PushTxn request has already been
 // fulfilled by the current transaction state. This may be true
 // for transactions with pushed timestamps.
 func isPushed(req *roachpb.PushTxnRequest, txn *roachpb.Transaction) bool {
-	return (txn.Status.IsFinalized() ||
-		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.LessEq(txn.WriteTimestamp)))
+	return txn.Status.IsFinalized() ||
+		(req.PushType == roachpb.PUSH_TIMESTAMP && req.PushTo.LessEq(txn.WriteTimestamp))
 }
 
 // TxnExpiration computes the timestamp after which the transaction will be
 // considered expired.
 func TxnExpiration(txn *roachpb.Transaction) hlc.Timestamp {
-	return txn.LastActive().Add(TxnLivenessThreshold.Nanoseconds(), 0)
+	return txn.LastActive().Add(TxnLivenessThreshold.Load(), 0)
 }
 
 // IsExpired is true if the given transaction is expired.

@@ -57,6 +57,10 @@ func (n Node) RangeFeed(_ *roachpb.RangeFeedRequest, _ roachpb.Internal_RangeFee
 	panic("unimplemented")
 }
 
+func (n Node) MuxRangeFeed(server roachpb.Internal_MuxRangeFeedServer) error {
+	panic("unimplemented")
+}
+
 func (n Node) GossipSubscription(
 	_ *roachpb.GossipSubscriptionRequest, _ roachpb.Internal_GossipSubscriptionServer,
 ) error {
@@ -85,6 +89,12 @@ func (n Node) GetSpanConfigs(
 	panic("unimplemented")
 }
 
+func (n Node) GetAllSystemSpanConfigsThatApply(
+	_ context.Context, _ *roachpb.GetAllSystemSpanConfigsThatApplyRequest,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
+	panic("unimplemented")
+}
+
 func (n Node) UpdateSpanConfigs(
 	_ context.Context, _ *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
@@ -107,7 +117,7 @@ func TestSendToOneClient(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	// This test uses the testing function sendBatch() which does not
 	// support setting the node ID on GRPCDialNode(). Disable Node ID
@@ -160,7 +170,7 @@ func (f *firstNErrorTransport) SendNext(
 
 func (f *firstNErrorTransport) NextInternalClient(
 	ctx context.Context,
-) (context.Context, roachpb.InternalClient, error) {
+) (rpc.RestrictedInternalClient, error) {
 	panic("unimplemented")
 }
 
@@ -172,7 +182,8 @@ func (f *firstNErrorTransport) SkipReplica() {
 	panic("SkipReplica not supported")
 }
 
-func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) {
+func (*firstNErrorTransport) MoveToFront(roachpb.ReplicaDescriptor) bool {
+	return true
 }
 
 // TestComplexScenarios verifies various complex success/failure scenarios by
@@ -185,7 +196,7 @@ func TestComplexScenarios(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
 	// We're going to serve multiple node IDs with that one
 	// context. Disable node ID checks.

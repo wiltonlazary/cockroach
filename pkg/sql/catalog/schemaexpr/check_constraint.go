@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
 
@@ -96,18 +97,20 @@ func (b *CheckConstraintBuilder) Build(
 		types.Bool,
 		"CHECK",
 		b.semaCtx,
-		tree.VolatilityVolatile,
+		volatility.Volatile,
 		&b.tableName,
 	)
 	if err != nil {
 		return nil, err
 	}
-
+	constraintID := b.desc.TableDesc().GetNextConstraintID()
+	b.desc.TableDesc().NextConstraintID++
 	return &descpb.TableDescriptor_CheckConstraint{
-		Expr:      expr,
-		Name:      name,
-		ColumnIDs: colIDs.Ordered(),
-		Hidden:    c.Hidden,
+		Expr:                  expr,
+		Name:                  name,
+		ColumnIDs:             colIDs.Ordered(),
+		FromHashShardedColumn: c.FromHashShardedColumn,
+		ConstraintID:          constraintID,
 	}, nil
 }
 
@@ -151,9 +154,9 @@ func (b *CheckConstraintBuilder) generateUniqueName(expr tree.Expr) (string, err
 //
 // For example:
 //
-//   CHECK (a < 0) => check_a
-//   CHECK (a < 0 AND b = 'foo') => check_a_b
-//   CHECK (a < 0 AND b = 'foo' AND a < 10) => check_a_b_a
+//	CHECK (a < 0) => check_a
+//	CHECK (a < 0 AND b = 'foo') => check_a_b
+//	CHECK (a < 0 AND b = 'foo' AND a < 10) => check_a_b_a
 //
 // Note that the generated name is not guaranteed to be unique among the other
 // constraints of the table.

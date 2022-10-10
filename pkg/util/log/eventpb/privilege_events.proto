@@ -14,6 +14,7 @@ option go_package = "eventpb";
 
 import "gogoproto/gogo.proto";
 import "util/log/eventpb/events.proto";
+import "util/log/logpb/event.proto";
 
 // Category: SQL Privilege changes
 // Channel: PRIVILEGES
@@ -82,6 +83,14 @@ message ChangeTypePrivilege {
   string type_name = 4 [(gogoproto.jsontag) = ",omitempty"];
 }
 
+message ChangeFunctionPrivilege {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLPrivilegeEventDetails privs = 3 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the affected function.
+  string func_name = 4 [(gogoproto.jsontag) = ",omitempty"];
+}
+
 
 // AlterDatabaseOwner is recorded when a database's owner is changed.
 message AlterDatabaseOwner {
@@ -121,6 +130,16 @@ message AlterTableOwner {
   string table_name = 3 [(gogoproto.jsontag) = ",omitempty"];
   // The name of the new owner.
   string owner = 4 [(gogoproto.jsontag) = ",omitempty"];
+}
+
+// AlterTableOwner is recorded when the owner of a user-defined function is changed.
+message AlterFunctionOwner {
+  CommonEventDetails common = 1 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  CommonSQLEventDetails sql = 2 [(gogoproto.nullable) = false, (gogoproto.jsontag) = "", (gogoproto.embed) = true];
+  // The name of the affected user-defined function.
+  string function_name = 3 [(gogoproto.jsontag) = ",omitempty"];
+  // The name of the new owner.
+  string owner = 5 [(gogoproto.jsontag) = ",omitempty"];
 }
 
 // AlterDefaultPrivileges is recorded when default privileges are changed.

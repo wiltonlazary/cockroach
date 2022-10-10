@@ -23,6 +23,10 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+// ErrMutableTableImplicitType indicates that a table implicit type was fetched
+// as a mutable, which is not allowed.
+var ErrMutableTableImplicitType = pgerror.Newf(pgcode.DependentObjectsStillExist, "table implicit type not mutable")
+
 // GetMutableTypeByName returns a mutable type descriptor with properties
 // according to the provided lookup flags. RequireMutable is ignored.
 func (tc *Collection) GetMutableTypeByName(
@@ -51,7 +55,7 @@ func (tc *Collection) getTypeByName(
 	ctx context.Context, txn *kv.Txn, name tree.ObjectName, flags tree.ObjectLookupFlags,
 ) (found bool, _ catalog.TypeDescriptor, err error) {
 	flags.DesiredObjectKind = tree.TypeObject
-	_, desc, err := tc.getObjectByName(
+	_, desc, err := tc.GetObjectByName(
 		ctx, txn, name.Catalog(), name.Schema(), name.Object(), flags)
 	if err != nil || desc == nil {
 		return false, nil, err
@@ -91,7 +95,7 @@ func (tc *Collection) GetMutableTypeByID(
 	case *typedesc.Mutable:
 		return t, nil
 	case *typedesc.TableImplicitRecordType:
-		return nil, pgerror.Newf(pgcode.DependentObjectsStillExist, "cannot modify table record type %q", desc.GetName())
+		return nil, errors.Wrapf(ErrMutableTableImplicitType, "cannot modify table record type %q", desc.GetName())
 	}
 	return nil,
 		errors.AssertionFailedf("unhandled type descriptor type %T during GetMutableTypeByID", desc)
@@ -111,7 +115,7 @@ func (tc *Collection) GetImmutableTypeByID(
 func (tc *Collection) getTypeByID(
 	ctx context.Context, txn *kv.Txn, typeID descpb.ID, flags tree.ObjectLookupFlags,
 ) (catalog.TypeDescriptor, error) {
-	desc, err := tc.getDescriptorByID(ctx, txn, typeID, flags.CommonLookupFlags)
+	descs, err := tc.getDescriptorsByID(ctx, txn, flags.CommonLookupFlags, typeID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			return nil, pgerror.Newf(
@@ -119,16 +123,11 @@ func (tc *Collection) getTypeByID(
 		}
 		return nil, err
 	}
-	switch t := desc.(type) {
+	switch t := descs[0].(type) {
 	case catalog.TypeDescriptor:
 		// User-defined type.
 		return t, nil
 	case catalog.TableDescriptor:
-		// Table record type.
-		t, err = tc.hydrateTypesInTableDesc(ctx, txn, t)
-		if err != nil {
-			return nil, err
-		}
 		return typedesc.CreateImplicitRecordTypeFromTableDesc(t)
 	}
 	return nil, pgerror.Newf(

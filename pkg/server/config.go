@@ -23,9 +23,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/docs"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -43,6 +44,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 )
@@ -179,8 +181,19 @@ type BaseConfig struct {
 	// Environment Variable: COCKROACH_DISABLE_SPAN_CONFIGS
 	SpanConfigsDisabled bool
 
+	// Disables the default test tenant.
+	DisableDefaultTestTenant bool
+
 	// TestingKnobs is used for internal test controls only.
 	TestingKnobs base.TestingKnobs
+
+	// EnableWebSessionAuthentication enables session-based authentication for
+	// the Admin API's HTTP endpoints.
+	EnableWebSessionAuthentication bool
+
+	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
+	// which a feature unique to the demo shell.
+	EnableDemoLoginEndpoint bool
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -192,17 +205,19 @@ func MakeBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 		clusterID: &base.ClusterIDContainer{},
 		serverID:  &base.NodeIDContainer{},
 	}
+	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	baseCfg := BaseConfig{
-		Tracer:             tr,
-		idProvider:         idsProvider,
-		IDContainer:        idsProvider.serverID,
-		ClusterIDContainer: idsProvider.clusterID,
-		AmbientCtx:         log.MakeServerAmbientContext(tr, idsProvider),
-		Config:             new(base.Config),
-		Settings:           st,
-		MaxOffset:          MaxOffsetType(base.DefaultMaxClockOffset),
-		DefaultZoneConfig:  zonepb.DefaultZoneConfig(),
-		StorageEngine:      storage.DefaultStorageEngine,
+		Tracer:                         tr,
+		idProvider:                     idsProvider,
+		IDContainer:                    idsProvider.serverID,
+		ClusterIDContainer:             idsProvider.clusterID,
+		AmbientCtx:                     log.MakeServerAmbientContext(tr, idsProvider),
+		Config:                         new(base.Config),
+		Settings:                       st,
+		MaxOffset:                      MaxOffsetType(base.DefaultMaxClockOffset),
+		DefaultZoneConfig:              zonepb.DefaultZoneConfig(),
+		StorageEngine:                  storage.DefaultStorageEngine,
+		EnableWebSessionAuthentication: !disableWebLogin,
 	}
 	// We use the tag "n" here for both KV nodes and SQL instances,
 	// using the knowledge that the value part of a SQL instance ID
@@ -210,7 +225,44 @@ func MakeBaseConfig(st *cluster.Settings, tr *tracing.Tracer) BaseConfig {
 	// in a tag that is prefixed with "nsql".
 	baseCfg.AmbientCtx.AddLogTag("n", baseCfg.IDContainer)
 	baseCfg.InitDefaults()
+	baseCfg.InitTestingKnobs()
+
 	return baseCfg
+}
+
+// InitTestingKnobs sets up any testing knobs based on e.g. envvars.
+func (cfg *BaseConfig) InitTestingKnobs() {
+	// If requested, write an MVCC range tombstone at the bottom of the SQL table
+	// data keyspace during cluster bootstrapping, for performance and correctness
+	// testing. This shouldn't affect data written above it, but activates range
+	// key-specific code paths in the storage layer. We'll also have to tweak
+	// rangefeeds and batcheval to not choke on it.
+	if envutil.EnvOrDefaultBool("COCKROACH_GLOBAL_MVCC_RANGE_TOMBSTONE", false) {
+		if cfg.TestingKnobs.Store == nil {
+			cfg.TestingKnobs.Store = &kvserver.StoreTestingKnobs{}
+		}
+		if cfg.TestingKnobs.RangeFeed == nil {
+			cfg.TestingKnobs.RangeFeed = &rangefeed.TestingKnobs{}
+		}
+		storeKnobs := cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs)
+		storeKnobs.GlobalMVCCRangeTombstone = true
+		storeKnobs.EvalKnobs.DisableInitPutFailOnTombstones = true
+		cfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs).IgnoreOnDeleteRangeError = true
+	}
+
+	// If requested, replace point tombstones with range tombstones on a best-effort
+	// basis.
+	if envutil.EnvOrDefaultBool("COCKROACH_MVCC_RANGE_TOMBSTONES_FOR_POINT_DELETES", false) {
+		if cfg.TestingKnobs.Store == nil {
+			cfg.TestingKnobs.Store = &kvserver.StoreTestingKnobs{}
+		}
+		if cfg.TestingKnobs.RangeFeed == nil {
+			cfg.TestingKnobs.RangeFeed = &rangefeed.TestingKnobs{}
+		}
+		storeKnobs := cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs)
+		storeKnobs.EvalKnobs.UseRangeTombstonesForPointDeletes = true
+		cfg.TestingKnobs.RangeFeed.(*rangefeed.TestingKnobs).IgnoreOnDeleteRangeError = true
+	}
 }
 
 // Config holds the parameters needed to set up a combined KV and SQL server.
@@ -251,6 +303,10 @@ type KVConfig struct {
 	// CacheSize is the amount of memory in bytes to use for caching data.
 	// The value is split evenly between the stores if there are more than one.
 	CacheSize int64
+
+	// SoftSlotGranter can be optionally passed into a store to allow the store
+	// to perform additional CPU bound work.
+	SoftSlotGranter *admission.SoftSlotGranter
 
 	// TimeSeriesServerConfig contains configuration specific to the time series
 	// server.
@@ -321,28 +377,33 @@ type KVConfig struct {
 	// in a timely fashion, typically 30s after the server starts listening.
 	DelayedBootstrapFn func()
 
-	// EnableWebSessionAuthentication enables session-based authentication for
-	// the Admin API's HTTP endpoints.
-	EnableWebSessionAuthentication bool
-
-	// EnableDemoLoginEndpoint enables the HTTP GET endpoint for user logins,
-	// which a feature unique to the demo shell.
-	EnableDemoLoginEndpoint bool
-
 	enginesCreated bool
+
+	// SnapshotSendLimit is the number of concurrent snapshots a store will send.
+	SnapshotSendLimit int64
+
+	// SnapshotApplyLimit is the number of concurrent snapshots a store will
+	// apply. The send limit is typically higher than the apply limit for a few
+	// reasons. One is that it keeps "pipelining" of requests in the case where
+	// there is only a single sender and single receiver. As soon as a receiver
+	// finishes a request, there will be another one to start. The performance
+	// impact of sending snapshots is lower than applying. Finally, snapshots are
+	// not sent until the receiver is ready to apply, so the cost of sending is
+	// low until the receiver is ready.
+	SnapshotApplyLimit int64
 }
 
 // MakeKVConfig returns a KVConfig with default values.
 func MakeKVConfig(storeSpec base.StoreSpec) KVConfig {
-	disableWebLogin := envutil.EnvOrDefaultBool("COCKROACH_DISABLE_WEB_LOGIN", false)
 	kvCfg := KVConfig{
-		DefaultSystemZoneConfig:        zonepb.DefaultSystemZoneConfig(),
-		CacheSize:                      DefaultCacheSize,
-		ScanInterval:                   defaultScanInterval,
-		ScanMinIdleTime:                defaultScanMinIdleTime,
-		ScanMaxIdleTime:                defaultScanMaxIdleTime,
-		EventLogEnabled:                defaultEventLogEnabled,
-		EnableWebSessionAuthentication: !disableWebLogin,
+		DefaultSystemZoneConfig: zonepb.DefaultSystemZoneConfig(),
+		CacheSize:               DefaultCacheSize,
+		ScanInterval:            defaultScanInterval,
+		ScanMinIdleTime:         defaultScanMinIdleTime,
+		ScanMaxIdleTime:         defaultScanMaxIdleTime,
+		EventLogEnabled:         defaultEventLogEnabled,
+		SnapshotSendLimit:       kvserver.DefaultSnapshotSendLimit,
+		SnapshotApplyLimit:      kvserver.DefaultSnapshotApplyLimit,
 		Stores: base.StoreSpecList{
 			Specs: []base.StoreSpec{storeSpec},
 		},
@@ -356,10 +417,6 @@ func MakeKVConfig(storeSpec base.StoreSpec) KVConfig {
 type SQLConfig struct {
 	// The tenant that the SQL server runs on the behalf of.
 	TenantID roachpb.TenantID
-
-	// SocketFile, if non-empty, sets up a TLS-free local listener using
-	// a unix datagram socket at the specified path.
-	SocketFile string
 
 	// TempStorageConfig is used to configure temp storage, which stores
 	// ephemeral data when processing large queries.
@@ -402,13 +459,13 @@ func MakeSQLConfig(tenID roachpb.TenantID, tempStorageCfg base.TempStorageConfig
 // limit if needed. Returns an error if the hard limit is too low. Returns the
 // value to set maxOpenFiles to for each store.
 //
-// Minimum - 1700 per store, 256 saved for networking
+// # Minimum - 1700 per store, 256 saved for networking
 //
-// Constrained - 256 saved for networking, rest divided evenly per store
+// # Constrained - 256 saved for networking, rest divided evenly per store
 //
-// Constrained (network only) - 10000 per store, rest saved for networking
+// # Constrained (network only) - 10000 per store, rest saved for networking
 //
-// Recommended - 10000 per store, 5000 for network
+// # Recommended - 10000 per store, 5000 for network
 //
 // Please note that current and max limits are commonly referred to as the soft
 // and hard limits respectively.
@@ -437,11 +494,6 @@ func MakeConfig(ctx context.Context, st *cluster.Settings) Config {
 
 	sqlCfg := MakeSQLConfig(roachpb.SystemTenantID, tempStorageCfg)
 	tr := tracing.NewTracerWithOpt(ctx, tracing.WithClusterSettings(&st.SV))
-	// NB: The OnChange callback will be called on server startup when the version
-	// is initialized.
-	st.Version.SetOnChange(func(ctx context.Context, newVersion clusterversion.ClusterVersion) {
-		tr.SetBackwardsCompatibilityWith211(!newVersion.IsActive(clusterversion.TraceIDDoesntImplyStructuredRecording))
-	})
 	baseCfg := MakeBaseConfig(st, tr)
 	kvCfg := MakeKVConfig(storeSpec)
 
@@ -485,7 +537,7 @@ func (cfg *Config) Report(ctx context.Context) {
 	} else {
 		log.Infof(ctx, "system total memory: %s", humanizeutil.IBytes(memSize))
 	}
-	log.Infof(ctx, "server configuration:\n%s", cfg)
+	log.Infof(ctx, "server configuration:\n%s", log.SafeManaged(cfg))
 }
 
 // Engines is a container of engines, allowing convenient closing.
@@ -493,6 +545,7 @@ type Engines []storage.Engine
 
 // Close closes all the Engines.
 // This method has a pointer receiver so that the following pattern works:
+//
 //	func f() {
 //		engines := Engines(engineSlice)
 //		defer engines.Close()  // make sure the engines are Closed if this
@@ -505,6 +558,19 @@ func (e *Engines) Close() {
 		eng.Close()
 	}
 	*e = nil
+}
+
+// cpuWorkPermissionGranter implements the pebble.CPUWorkPermissionGranter
+// interface.
+type cpuWorkPermissionGranter struct {
+	*admission.SoftSlotGranter
+}
+
+func (c *cpuWorkPermissionGranter) TryGetProcs(count int) int {
+	return c.TryGetSlots(count)
+}
+func (c *cpuWorkPermissionGranter) ReturnProcs(count int) {
+	c.ReturnSlots(count)
 }
 
 // CreateEngines creates Engines based on the specs in cfg.Stores.
@@ -540,8 +606,11 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 		tableCache = pebble.NewTableCache(pebbleCache, runtime.GOMAXPROCS(0), totalFileLimit)
 	}
 
-	skipSizeCheck := cfg.TestingKnobs.Store != nil &&
-		cfg.TestingKnobs.Store.(*kvserver.StoreTestingKnobs).SkipMinSizeCheck
+	var storeKnobs kvserver.StoreTestingKnobs
+	if s := cfg.TestingKnobs.Store; s != nil {
+		storeKnobs = *s.(*kvserver.StoreTestingKnobs)
+	}
+
 	for i, spec := range cfg.Stores.Specs {
 		log.Eventf(ctx, "initializing %+v", spec)
 		var sizeInBytes = spec.Size.InBytes
@@ -553,7 +622,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 				}
 				sizeInBytes = int64(float64(sysMem) * spec.Size.Percent / 100)
 			}
-			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
+			if sizeInBytes != 0 && !storeKnobs.SkipMinSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of memory is only %s bytes, which is below the minimum requirement of %s",
 					spec.Size.Percent, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
@@ -584,7 +653,9 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 					storage.CacheSize(cfg.CacheSize),
 					storage.MaxSize(sizeInBytes),
 					storage.EncryptionAtRest(spec.EncryptionOptions),
-					storage.Settings(cfg.Settings))
+					storage.Settings(cfg.Settings),
+					storage.If(storeKnobs.SmallEngineBlocks, storage.BlockSize(1)),
+				)
 				if err != nil {
 					return Engines{}, err
 				}
@@ -601,7 +672,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			if spec.Size.Percent > 0 {
 				sizeInBytes = int64(float64(du.TotalBytes) * spec.Size.Percent / 100)
 			}
-			if sizeInBytes != 0 && !skipSizeCheck && sizeInBytes < base.MinimumStoreSize {
+			if sizeInBytes != 0 && !storeKnobs.SkipMinSizeCheck && sizeInBytes < base.MinimumStoreSize {
 				return Engines{}, errors.Errorf("%f%% of %s's total free space is only %s bytes, which is below the minimum requirement of %s",
 					spec.Size.Percent, spec.Path, humanizeutil.IBytes(sizeInBytes), humanizeutil.IBytes(base.MinimumStoreSize))
 			}
@@ -625,9 +696,29 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			pebbleConfig.Opts.Cache = pebbleCache
 			pebbleConfig.Opts.TableCache = tableCache
 			pebbleConfig.Opts.MaxOpenFiles = int(openFileLimitPerStore)
+			pebbleConfig.Opts.Experimental.MaxWriterConcurrency = 2
+			pebbleConfig.Opts.Experimental.CPUWorkPermissionGranter = &cpuWorkPermissionGranter{
+				cfg.SoftSlotGranter,
+			}
+			if storeKnobs.SmallEngineBlocks {
+				for i := range pebbleConfig.Opts.Levels {
+					pebbleConfig.Opts.Levels[i].BlockSize = 1
+					pebbleConfig.Opts.Levels[i].IndexBlockSize = 1
+				}
+			}
 			// If the spec contains Pebble options, set those too.
 			if len(spec.PebbleOptions) > 0 {
-				err := pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{})
+				err := pebbleConfig.Opts.Parse(spec.PebbleOptions, &pebble.ParseHooks{
+					NewFilterPolicy: func(name string) (pebble.FilterPolicy, error) {
+						switch name {
+						case "none":
+							return nil, nil
+						case "rocksdb.BuiltinBloomFilter":
+							return bloom.FilterPolicy(10), nil
+						}
+						return nil, nil
+					},
+				})
 				if err != nil {
 					return nil, err
 				}
@@ -652,7 +743,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 	}
 
 	log.Infof(ctx, "%d storage engine%s initialized",
-		len(engines), util.Pluralize(int64(len(engines))))
+		len(engines), redact.Safe(util.Pluralize(int64(len(engines)))))
 	for _, s := range details {
 		log.Infof(ctx, "%v", s)
 	}
@@ -707,7 +798,7 @@ func (cfg *Config) FilterGossipBootstrapAddresses(ctx context.Context) []util.Un
 
 // RequireWebSession indicates whether the server should require authentication
 // sessions when serving admin API requests.
-func (cfg *Config) RequireWebSession() bool {
+func (cfg *BaseConfig) RequireWebSession() bool {
 	return !cfg.Insecure && cfg.EnableWebSessionAuthentication
 }
 
@@ -720,6 +811,8 @@ func (cfg *Config) readEnvironmentVariables() {
 	cfg.ScanInterval = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_INTERVAL", cfg.ScanInterval)
 	cfg.ScanMinIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MIN_IDLE_TIME", cfg.ScanMinIdleTime)
 	cfg.ScanMaxIdleTime = envutil.EnvOrDefaultDuration("COCKROACH_SCAN_MAX_IDLE_TIME", cfg.ScanMaxIdleTime)
+	cfg.SnapshotSendLimit = envutil.EnvOrDefaultInt64("COCKROACH_CONCURRENT_SNAPSHOT_SEND_LIMIT", cfg.SnapshotSendLimit)
+	cfg.SnapshotApplyLimit = envutil.EnvOrDefaultInt64("COCKROACH_CONCURRENT_SNAPSHOT_APPLY_LIMIT", cfg.SnapshotApplyLimit)
 }
 
 // parseGossipBootstrapAddresses parses list of gossip bootstrap addresses.

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -40,21 +41,21 @@ var Contradiction = &Set{contradiction: true}
 // expression tree each time.
 //
 // A few examples:
-//  - @1 >= 10
-//      /@1: [/10 - ]
 //
-//  - @1 > 10 AND @2 = 5
-//      /@1: [/11 - ]
-//      /@2: [/5 - /5]
+//   - @1 >= 10
+//     /@1: [/10 - ]
 //
-//  - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
-//      /@1: [/10 - /10] [/20 - /20]
-//      /@2: [/1 - ]
+//   - @1 > 10 AND @2 = 5
+//     /@1: [/11 - ]
+//     /@2: [/5 - /5]
 //
-//  - @1 > 10.5 AND @2 != 'foo'
-//      /@1: (10.5 - ]
-//      /@2: [ - 'foo') ('foo' - ]
+//   - (@1 = 10 AND @2 > 5) OR (@1 = 20 AND @2 > 0)
+//     /@1: [/10 - /10] [/20 - /20]
+//     /@2: [/1 - ]
 //
+//   - @1 > 10.5 AND @2 != 'foo'
+//     /@1: (10.5 - ]
+//     /@2: [ - 'foo') ('foo' - ]
 type Set struct {
 	// firstConstraint holds the first constraint in the set and otherConstraints
 	// hold any constraints beyond the first. These are separated in order to
@@ -116,7 +117,7 @@ func (s *Set) IsUnconstrained() bool {
 // Constraints that exist in either of the input sets will get merged into the
 // combined set. Compatible constraints (that share same column list) are
 // intersected with one another. Intersect returns the merged set.
-func (s *Set) Intersect(evalCtx *tree.EvalContext, other *Set) *Set {
+func (s *Set) Intersect(evalCtx *eval.Context, other *Set) *Set {
 	// Intersection with the contradiction set is always the contradiction set.
 	if s == Contradiction || other == Contradiction {
 		return Contradiction
@@ -184,11 +185,13 @@ func (s *Set) Intersect(evalCtx *tree.EvalContext, other *Set) *Set {
 // may not be "tight", meaning that the new constraint set might allow
 // additional combinations of values that neither of the input sets allowed. For
 // example:
-//   (x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
+//	(x > 1 AND y > 10) OR (x < 5 AND y < 50)
+//
 // the union is unconstrained (and thus allows combinations like x,y = 10,0).
 //
 // Union returns the merged set.
-func (s *Set) Union(evalCtx *tree.EvalContext, other *Set) *Set {
+func (s *Set) Union(evalCtx *eval.Context, other *Set) *Set {
 	// Union with the contradiction set is an identity operation.
 	if s == Contradiction {
 		return other
@@ -265,7 +268,7 @@ func (s *Set) ExtractCols() opt.ColSet {
 
 // ExtractNotNullCols returns a set of columns that cannot be NULL for the
 // constraints in the set to hold.
-func (s *Set) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
+func (s *Set) ExtractNotNullCols(evalCtx *eval.Context) opt.ColSet {
 	if s == Unconstrained || s == Contradiction {
 		return opt.ColSet{}
 	}
@@ -278,7 +281,7 @@ func (s *Set) ExtractNotNullCols(evalCtx *tree.EvalContext) opt.ColSet {
 
 // ExtractConstCols returns a set of columns which can only have one value
 // for the constraints in the set to hold.
-func (s *Set) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
+func (s *Set) ExtractConstCols(evalCtx *eval.Context) opt.ColSet {
 	if s == Unconstrained || s == Contradiction {
 		return opt.ColSet{}
 	}
@@ -291,7 +294,7 @@ func (s *Set) ExtractConstCols(evalCtx *tree.EvalContext) opt.ColSet {
 
 // ExtractValueForConstCol extracts the value for a constant column returned
 // by ExtractConstCols. If the given column is not constant, nil is returned.
-func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnID) tree.Datum {
+func (s *Set) ExtractValueForConstCol(evalCtx *eval.Context, col opt.ColumnID) tree.Datum {
 	if s == Unconstrained || s == Contradiction {
 		return nil
 	}
@@ -315,7 +318,7 @@ func (s *Set) ExtractValueForConstCol(evalCtx *tree.EvalContext, col opt.ColumnI
 // constraint on a single column which allows for one or more non-ranging
 // constant values. On success, returns the column and the constant value.
 func (s *Set) HasSingleColumnConstValues(
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 ) (col opt.ColumnID, constValues tree.Datums, ok bool) {
 	if s.Length() != 1 {
 		return 0, nil, false

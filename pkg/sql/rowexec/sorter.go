@@ -12,17 +12,18 @@ package rowexec
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowcontainer"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/optional"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // sorter sorts the input rows according to the specified ordering.
@@ -41,10 +42,11 @@ type sorterBase struct {
 }
 
 func (s *sorterBase) init(
+	ctx context.Context,
 	self execinfra.RowSource,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
-	processorName string,
+	processorName redact.RedactableString,
 	input execinfra.RowSource,
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
@@ -52,23 +54,22 @@ func (s *sorterBase) init(
 	matchLen uint32,
 	opts execinfra.ProcStateOpts,
 ) error {
-	ctx := flowCtx.EvalCtx.Ctx()
-	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		input = newInputStatCollector(input)
 		s.ExecStatsForTrace = s.execStatsForTrace
 	}
 
 	// Limit the memory use by creating a child monitor with a hard limit.
 	// The processor will overflow to disk if this limit is not enough.
-	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.EvalCtx.Mon, flowCtx, fmt.Sprintf("%s-limited", processorName))
+	memMonitor := execinfra.NewLimitedMonitor(ctx, flowCtx.Mon, flowCtx, redact.Sprintf("%s-limited", processorName))
 	if err := s.ProcessorBase.Init(
-		self, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor, opts,
+		ctx, self, post, input.OutputTypes(), flowCtx, processorID, output, memMonitor, opts,
 	); err != nil {
 		memMonitor.Stop(ctx)
 		return err
 	}
 
-	s.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, fmt.Sprintf("%s-disk", processorName))
+	s.diskMonitor = execinfra.NewMonitor(ctx, flowCtx.DiskMonitor, redact.Sprintf("%s-disk", processorName))
 	rc := rowcontainer.DiskBackedRowContainer{}
 	rc.Init(
 		ordering,
@@ -163,7 +164,7 @@ func newSorter(
 		// our sort procedure by maintaining a max-heap populated with only the
 		// smallest k rows seen. It has a worst-case time complexity of
 		// O(n*log(k)) and a worst-case space complexity of O(k).
-		return newSortTopKProcessor(flowCtx, processorID, spec, input, post, output, uint64(spec.Limit))
+		return newSortTopKProcessor(ctx, flowCtx, processorID, spec, input, post, output, uint64(spec.Limit))
 	}
 	// Ordering match length is specified. We will be able to use existing
 	// ordering in order to avoid loading all the rows into memory. If we're
@@ -172,7 +173,7 @@ func newSorter(
 	// chunk and then output.
 	// TODO(irfansharif): Add optimization for case where both ordering match
 	// length and limit is specified.
-	return newSortChunksProcessor(flowCtx, processorID, spec, input, post, output)
+	return newSortChunksProcessor(ctx, flowCtx, processorID, spec, input, post, output)
 }
 
 // sortAllProcessor reads in all values into the wrapped rows and
@@ -200,7 +201,7 @@ func newSortAllProcessor(
 ) (execinfra.Processor, error) {
 	proc := &sortAllProcessor{}
 	if err := proc.sorterBase.init(
-		proc, flowCtx, processorID, sortAllProcName, input, post, out,
+		ctx, proc, flowCtx, processorID, sortAllProcName, input, post, out,
 		execinfrapb.ConvertToColumnOrdering(spec.OutputOrdering),
 		spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
@@ -236,8 +237,6 @@ func (s *sortAllProcessor) Start(ctx context.Context) {
 // drain if it's not recoverable. It is possible for ok to be false even if no
 // error is returned - in case an error metadata was received.
 func (s *sortAllProcessor) fill() (ok bool, _ error) {
-	ctx := s.EvalCtx.Ctx()
-
 	for {
 		row, meta := s.input.Next()
 		if meta != nil {
@@ -251,13 +250,13 @@ func (s *sortAllProcessor) fill() (ok bool, _ error) {
 			break
 		}
 
-		if err := s.rows.AddRow(ctx, row); err != nil {
+		if err := s.rows.AddRow(s.Ctx, row); err != nil {
 			return false, err
 		}
 	}
-	s.rows.Sort(ctx)
+	s.rows.Sort(s.Ctx)
 
-	s.i = s.rows.NewFinalIterator(ctx)
+	s.i = s.rows.NewFinalIterator(s.Ctx)
 	s.i.Rewind()
 	return true, nil
 }
@@ -298,6 +297,7 @@ const sortTopKProcName = "sortTopK"
 var errSortTopKZeroK = errors.New("invalid value 0 for k")
 
 func newSortTopKProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SorterSpec,
@@ -313,7 +313,7 @@ func newSortTopKProcessor(
 	ordering := execinfrapb.ConvertToColumnOrdering(spec.OutputOrdering)
 	proc := &sortTopKProcessor{k: k}
 	if err := proc.sorterBase.init(
-		proc, flowCtx, processorID, sortTopKProcName, input, post, out,
+		ctx, proc, flowCtx, processorID, sortTopKProcName, input, post, out,
 		ordering, spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
@@ -400,6 +400,7 @@ var _ execinfra.RowSource = &sortChunksProcessor{}
 const sortChunksProcName = "sortChunks"
 
 func newSortChunksProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.SorterSpec,
@@ -411,7 +412,7 @@ func newSortChunksProcessor(
 
 	proc := &sortChunksProcessor{}
 	if err := proc.sorterBase.init(
-		proc, flowCtx, processorID, sortChunksProcName, input, post, out, ordering, spec.OrderingMatchLen,
+		ctx, proc, flowCtx, processorID, sortChunksProcName, input, post, out, ordering, spec.OrderingMatchLen,
 		execinfra.ProcStateOpts{
 			InputsToDrain: []execinfra.RowSource{input},
 			TrailingMetaCallback: func() []execinfrapb.ProducerMetadata {

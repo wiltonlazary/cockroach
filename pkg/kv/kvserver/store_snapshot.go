@@ -15,7 +15,11 @@ import (
 	"io"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
@@ -23,15 +27,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
-	enginepb "github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 )
@@ -43,21 +53,55 @@ const (
 	// IntersectingSnapshotMsg is part of the error message returned from
 	// canAcceptSnapshotLocked and is exposed here so testing can rely on it.
 	IntersectingSnapshotMsg = "snapshot intersects existing range"
+
+	// tagSnapshotTiming is the tracing span tag that the *snapshotTimingTag
+	// lives under.
+	tagSnapshotTiming = "snapshot_timing_tag"
+
+	// DefaultSnapshotSendLimit is the max number of snapshots concurrently sent.
+	// See server.KVConfig for more info.
+	DefaultSnapshotSendLimit = 2
+
+	// DefaultSnapshotApplyLimit is the number of snapshots concurrently applied.
+	// See server.KVConfig for more info.
+	DefaultSnapshotApplyLimit = 1
+)
+
+// snapshotPrioritizationEnabled will allow the sender and receiver of snapshots
+// to prioritize the snapshots. If disabled, the behavior will be FIFO on both
+// send and receive sides.
+var snapshotPrioritizationEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.snapshot_prioritization.enabled",
+	"if true, then prioritize enqueued snapshots on both the send or receive sides",
+	true,
 )
 
 // incomingSnapshotStream is the minimal interface on a GRPC stream required
 // to receive a snapshot over the network.
 type incomingSnapshotStream interface {
-	Send(*SnapshotResponse) error
-	Recv() (*SnapshotRequest, error)
+	Send(*kvserverpb.SnapshotResponse) error
+	Recv() (*kvserverpb.SnapshotRequest, error)
 }
 
 // outgoingSnapshotStream is the minimal interface on a GRPC stream required
 // to send a snapshot over the network.
 type outgoingSnapshotStream interface {
-	Send(*SnapshotRequest) error
-	Recv() (*SnapshotResponse, error)
+	Send(*kvserverpb.SnapshotRequest) error
+	Recv() (*kvserverpb.SnapshotResponse, error)
 }
+
+// outgoingSnapshotStream is the minimal interface on a GRPC stream required
+// to send a snapshot over the network.
+type outgoingDelegatedStream interface {
+	Send(*kvserverpb.DelegateSnapshotRequest) error
+	Recv() (*kvserverpb.DelegateSnapshotResponse, error)
+}
+
+// snapshotRecordMetrics is a wrapper function that increments a set of metrics
+// related to the number of snapshot bytes sent/received. The definer of the
+// function specifies which metrics are incremented.
+type snapshotRecordMetrics func(inc int64)
 
 // snapshotStrategy is an approach to sending and receiving Range snapshots.
 // Each implementation corresponds to a SnapshotRequest_Strategy, and it is
@@ -66,11 +110,22 @@ type outgoingSnapshotStream interface {
 type snapshotStrategy interface {
 	// Receive streams SnapshotRequests in from the provided stream and
 	// constructs an IncomingSnapshot.
-	Receive(context.Context, incomingSnapshotStream, SnapshotRequest_Header) (IncomingSnapshot, error)
+	Receive(
+		context.Context,
+		incomingSnapshotStream,
+		kvserverpb.SnapshotRequest_Header,
+		snapshotRecordMetrics,
+	) (IncomingSnapshot, error)
 
 	// Send streams SnapshotRequests created from the OutgoingSnapshot in to the
 	// provided stream. On nil error, the number of bytes sent is returned.
-	Send(context.Context, outgoingSnapshotStream, SnapshotRequest_Header, *OutgoingSnapshot) (int64, error)
+	Send(
+		context.Context,
+		outgoingSnapshotStream,
+		kvserverpb.SnapshotRequest_Header,
+		*OutgoingSnapshot,
+		snapshotRecordMetrics,
+	) (int64, error)
 
 	// Status provides a status report on the work performed during the
 	// snapshot. Only valid if the strategy succeeded.
@@ -81,26 +136,14 @@ type snapshotStrategy interface {
 }
 
 func assertStrategy(
-	ctx context.Context, header SnapshotRequest_Header, expect SnapshotRequest_Strategy,
+	ctx context.Context,
+	header kvserverpb.SnapshotRequest_Header,
+	expect kvserverpb.SnapshotRequest_Strategy,
 ) {
 	if header.Strategy != expect {
 		log.Fatalf(ctx, "expected strategy %s, found strategy %s", expect, header.Strategy)
 	}
 }
-
-// Separated locks and snapshots send/receive:
-// When running in a mixed version cluster with 21.1 and 20.2, snapshots sent
-// by 21.1 nodes will attempt to read the lock table key space and send any
-// keys in it. But there will be none, so 20.2 nodes receiving such snapshots
-// are fine. A 21.1 node receiving a snapshot will construct SSTs for the lock
-// table key range which will only contain ClearRange for those ranges.
-//
-// When the cluster transitions to clusterversion.SeparatedLocks, the nodes
-// that see that transition can immediately start writing separated
-// intents/locks. Since the 21.1 nodes that have not seen that transition are
-// always ready to handle separated intents, including receiving them in
-// snapshots, the cluster will behave correctly despite nodes seeing this
-// state transition at different times.
 
 // kvBatchSnapshotStrategy is an implementation of snapshotStrategy that streams
 // batches of KV pairs in the BatchRepr format.
@@ -120,16 +163,17 @@ type kvBatchSnapshotStrategy struct {
 	sstChunkSize int64
 	// Only used on the receiver side.
 	scratch *SSTSnapshotStorageScratch
+	st      *cluster.Settings
 }
 
-// multiSSTWriter is a wrapper around RocksDBSstFileWriter and
-// SSTSnapshotStorageScratch that handles chunking SSTs and persisting them to
-// disk.
+// multiSSTWriter is a wrapper around an SSTWriter and SSTSnapshotStorageScratch
+// that handles chunking SSTs and persisting them to disk.
 type multiSSTWriter struct {
-	scratch   *SSTSnapshotStorageScratch
-	currSST   storage.SSTWriter
-	keyRanges []rditer.KeyRange
-	currRange int
+	st       *cluster.Settings
+	scratch  *SSTSnapshotStorageScratch
+	currSST  storage.SSTWriter
+	keySpans []roachpb.Span
+	currSpan int
 	// The approximate size of the SST chunk to buffer in memory on the receiver
 	// before flushing to disk.
 	sstChunkSize int64
@@ -139,13 +183,15 @@ type multiSSTWriter struct {
 
 func newMultiSSTWriter(
 	ctx context.Context,
+	st *cluster.Settings,
 	scratch *SSTSnapshotStorageScratch,
-	keyRanges []rditer.KeyRange,
+	keySpans []roachpb.Span,
 	sstChunkSize int64,
 ) (multiSSTWriter, error) {
 	msstw := multiSSTWriter{
+		st:           st,
 		scratch:      scratch,
-		keyRanges:    keyRanges,
+		keySpans:     keySpans,
 		sstChunkSize: sstChunkSize,
 	}
 	if err := msstw.initSST(ctx); err != nil {
@@ -159,10 +205,12 @@ func (msstw *multiSSTWriter) initSST(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "failed to create new sst file")
 	}
-	newSST := storage.MakeIngestionSSTWriter(newSSTFile)
+	newSST := storage.MakeIngestionSSTWriter(ctx, msstw.st, newSSTFile)
 	msstw.currSST = newSST
 	if err := msstw.currSST.ClearRawRange(
-		msstw.keyRanges[msstw.currRange].Start, msstw.keyRanges[msstw.currRange].End); err != nil {
+		msstw.keySpans[msstw.currSpan].Key, msstw.keySpans[msstw.currSpan].EndKey,
+		true /* pointKeys */, true, /* rangeKeys */
+	); err != nil {
 		msstw.currSST.Close()
 		return errors.Wrap(err, "failed to clear range on sst file writer")
 	}
@@ -175,13 +223,13 @@ func (msstw *multiSSTWriter) finalizeSST(ctx context.Context) error {
 		return errors.Wrap(err, "failed to finish sst")
 	}
 	msstw.dataSize += msstw.currSST.DataSize
-	msstw.currRange++
+	msstw.currSpan++
 	msstw.currSST.Close()
 	return nil
 }
 
 func (msstw *multiSSTWriter) Put(ctx context.Context, key storage.EngineKey, value []byte) error {
-	for msstw.keyRanges[msstw.currRange].End.Compare(key.Key) <= 0 {
+	for msstw.keySpans[msstw.currSpan].EndKey.Compare(key.Key) <= 0 {
 		// Finish the current SST, write to the file, and move to the next key
 		// range.
 		if err := msstw.finalizeSST(ctx); err != nil {
@@ -191,8 +239,8 @@ func (msstw *multiSSTWriter) Put(ctx context.Context, key storage.EngineKey, val
 			return err
 		}
 	}
-	if msstw.keyRanges[msstw.currRange].Start.Compare(key.Key) > 0 {
-		return errors.AssertionFailedf("client error: expected %s to fall in one of %s", key.Key, msstw.keyRanges)
+	if msstw.keySpans[msstw.currSpan].Key.Compare(key.Key) > 0 {
+		return errors.AssertionFailedf("client error: expected %s to fall in one of %s", key.Key, msstw.keySpans)
 	}
 	if err := msstw.currSST.PutEngineKey(key, value); err != nil {
 		return errors.Wrap(err, "failed to put in sst")
@@ -200,13 +248,40 @@ func (msstw *multiSSTWriter) Put(ctx context.Context, key storage.EngineKey, val
 	return nil
 }
 
+func (msstw *multiSSTWriter) PutRangeKey(
+	ctx context.Context, start, end roachpb.Key, suffix []byte, value []byte,
+) error {
+	if start.Compare(end) >= 0 {
+		return errors.AssertionFailedf("start key %s must be before end key %s", end, start)
+	}
+	for msstw.keySpans[msstw.currSpan].EndKey.Compare(start) <= 0 {
+		// Finish the current SST, write to the file, and move to the next key
+		// range.
+		if err := msstw.finalizeSST(ctx); err != nil {
+			return err
+		}
+		if err := msstw.initSST(ctx); err != nil {
+			return err
+		}
+	}
+	if msstw.keySpans[msstw.currSpan].Key.Compare(start) > 0 ||
+		msstw.keySpans[msstw.currSpan].EndKey.Compare(end) < 0 {
+		return errors.AssertionFailedf("client error: expected %s to fall in one of %s",
+			roachpb.Span{Key: start, EndKey: end}, msstw.keySpans)
+	}
+	if err := msstw.currSST.PutEngineRangeKey(start, end, suffix, value); err != nil {
+		return errors.Wrap(err, "failed to put range key in sst")
+	}
+	return nil
+}
+
 func (msstw *multiSSTWriter) Finish(ctx context.Context) (int64, error) {
-	if msstw.currRange < len(msstw.keyRanges) {
+	if msstw.currSpan < len(msstw.keySpans) {
 		for {
 			if err := msstw.finalizeSST(ctx); err != nil {
 				return 0, err
 			}
-			if msstw.currRange >= len(msstw.keyRanges) {
+			if msstw.currSpan >= len(msstw.keySpans) {
 				break
 			}
 			if err := msstw.initSST(ctx); err != nil {
@@ -221,31 +296,122 @@ func (msstw *multiSSTWriter) Close() {
 	msstw.currSST.Close()
 }
 
+// snapshotTimingTag represents a lazy tracing span tag containing information
+// on how long individual parts of a snapshot take. Individual stopwatches can
+// be added to a snapshotTimingTag.
+type snapshotTimingTag struct {
+	mu struct {
+		syncutil.Mutex
+		stopwatches map[string]*timeutil.StopWatch
+	}
+}
+
+// newSnapshotTimingTag creates a new snapshotTimingTag.
+func newSnapshotTimingTag() *snapshotTimingTag {
+	tag := snapshotTimingTag{}
+	tag.mu.stopwatches = make(map[string]*timeutil.StopWatch)
+	return &tag
+}
+
+// addStopwatch adds the given stopwatch to the tag's map of stopwatches.
+func (tag *snapshotTimingTag) addStopwatch(name string) {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	tag.mu.stopwatches[name] = timeutil.NewStopWatch()
+}
+
+// start begins the stopwatch corresponding to name if the stopwatch
+// exists and shouldRecord is true.
+func (tag *snapshotTimingTag) start(name string) {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	if stopwatch, ok := tag.mu.stopwatches[name]; ok {
+		stopwatch.Start()
+	}
+}
+
+// stop ends the stopwatch corresponding to name if the stopwatch
+// exists and shouldRecord is true.
+func (tag *snapshotTimingTag) stop(name string) {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	if stopwatch, ok := tag.mu.stopwatches[name]; ok {
+		stopwatch.Stop()
+	}
+}
+
+// Render implements the tracing.LazyTag interface. It returns a map of each
+// stopwatch's name to the stopwatch's elapsed time.
+func (tag *snapshotTimingTag) Render() []attribute.KeyValue {
+	tag.mu.Lock()
+	defer tag.mu.Unlock()
+	tags := make([]attribute.KeyValue, 0, len(tag.mu.stopwatches))
+	for name, stopwatch := range tag.mu.stopwatches {
+		tags = append(tags, attribute.KeyValue{
+			Key:   attribute.Key(name),
+			Value: attribute.StringValue(string(humanizeutil.Duration(stopwatch.Elapsed()))),
+		})
+	}
+	return tags
+}
+
 // Receive implements the snapshotStrategy interface.
 //
-// NOTE: This function assumes that the key-value pairs are sent in sorted
-// order. The key-value pairs are sent in the following sorted order:
+// NOTE: This function assumes that the point and range (e.g. MVCC range
+// tombstone) KV pairs are sent grouped by the following key spans in order:
 //
-// 1. Replicated range-id local key range
-// 2. Range-local key range
-// 3. Two lock-table key ranges (optional)
-// 4. User key range
+// 1. Replicated range-id local key span.
+// 2. Range-local key span.
+// 3. Two lock-table key spans (optional).
+// 4. User key span.
+//
+// For each key span above, all point keys are sent first (in sorted order) and
+// then all range keys (in sorted order), possibly mixed in the same batch.
+// However, we currently only expect to see range keys in the user key span.
+//
+// This allows building individual SSTs per key span containing all point/range
+// KVs for that key span, without the SSTs spanning across wide swaths of the
+// key space across to the next key span.
 func (kvSS *kvBatchSnapshotStrategy) Receive(
-	ctx context.Context, stream incomingSnapshotStream, header SnapshotRequest_Header,
+	ctx context.Context,
+	stream incomingSnapshotStream,
+	header kvserverpb.SnapshotRequest_Header,
+	recordBytesReceived snapshotRecordMetrics,
 ) (IncomingSnapshot, error) {
-	assertStrategy(ctx, header, SnapshotRequest_KV_BATCH)
+	assertStrategy(ctx, header, kvserverpb.SnapshotRequest_KV_BATCH)
+
+	// These stopwatches allow us to time the various components of Receive().
+	// - totalTime Stopwatch measures the total time spent within this function.
+	// - sst Stopwatch measures the time it takes to write the data from the
+	//   snapshot into SSTs
+	// - recv Stopwatch records the amount of time spent waiting on the gRPC stream
+	//   and receiving the data from the stream. NB: this value encapsulates wait
+	//   time due to sender-side rate limiting
+	timingTag := newSnapshotTimingTag()
+	timingTag.addStopwatch("totalTime")
+	timingTag.addStopwatch("sst")
+	timingTag.addStopwatch("recv")
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		sp.SetLazyTag(tagSnapshotTiming, timingTag)
+	}
+
+	timingTag.start("totalTime")
 
 	// At the moment we'll write at most five SSTs.
 	// TODO(jeffreyxiao): Re-evaluate as the default range size grows.
-	keyRanges := rditer.MakeReplicatedKeyRanges(header.State.Desc)
-	msstw, err := newMultiSSTWriter(ctx, kvSS.scratch, keyRanges, kvSS.sstChunkSize)
+	keyRanges := rditer.MakeReplicatedKeySpans(header.State.Desc)
+	msstw, err := newMultiSSTWriter(ctx, kvSS.st, kvSS.scratch, keyRanges, kvSS.sstChunkSize)
 	if err != nil {
 		return noSnap, err
 	}
 	defer msstw.Close()
 
+	log.Event(ctx, "waiting for snapshot batches to begin")
+
 	for {
+		timingTag.start("recv")
 		req, err := stream.Recv()
+		timingTag.stop("recv")
 		if err != nil {
 			return noSnap, err
 		}
@@ -255,34 +421,64 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 		}
 
 		if req.KVBatch != nil {
-			batchReader, err := storage.NewRocksDBBatchReader(req.KVBatch)
+			recordBytesReceived(int64(len(req.KVBatch)))
+			batchReader, err := storage.NewPebbleBatchReader(req.KVBatch)
 			if err != nil {
 				return noSnap, errors.Wrap(err, "failed to decode batch")
 			}
-			// All operations in the batch are guaranteed to be puts.
+
+			timingTag.start("sst")
+			// All batch operations are guaranteed to be point key or range key puts.
 			for batchReader.Next() {
-				if batchReader.BatchType() != storage.BatchTypeValue {
-					return noSnap, errors.AssertionFailedf("expected type %d, found type %d", storage.BatchTypeValue, batchReader.BatchType())
-				}
-				key, err := batchReader.EngineKey()
-				if err != nil {
-					return noSnap, errors.Wrap(err, "failed to decode mvcc key")
-				}
-				if err := msstw.Put(ctx, key, batchReader.Value()); err != nil {
-					return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
+				switch batchReader.BatchType() {
+				case storage.BatchTypeValue:
+					key, err := batchReader.EngineKey()
+					if err != nil {
+						return noSnap, err
+					}
+					if err := msstw.Put(ctx, key, batchReader.Value()); err != nil {
+						return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
+					}
+
+				case storage.BatchTypeRangeKeySet:
+					start, err := batchReader.EngineKey()
+					if err != nil {
+						return noSnap, err
+					}
+					end, err := batchReader.EngineEndKey()
+					if err != nil {
+						return noSnap, err
+					}
+					rangeKeys, err := batchReader.EngineRangeKeys()
+					if err != nil {
+						return noSnap, err
+					}
+					for _, rkv := range rangeKeys {
+						err := msstw.PutRangeKey(ctx, start.Key, end.Key, rkv.Version, rkv.Value)
+						if err != nil {
+							return noSnap, errors.Wrapf(err, "writing sst for raft snapshot")
+						}
+					}
+
+				default:
+					return noSnap, errors.AssertionFailedf("unexpected batch entry type %d", batchReader.BatchType())
 				}
 			}
+			timingTag.stop("sst")
 		}
 		if req.Final {
 			// We finished receiving all batches and log entries. It's possible that
-			// we did not receive any key-value pairs for some of the key ranges, but
+			// we did not receive any key-value pairs for some of the key spans, but
 			// we must still construct SSTs with range deletion tombstones to remove
 			// the data.
+			timingTag.start("sst")
 			dataSize, err := msstw.Finish(ctx)
 			if err != nil {
 				return noSnap, errors.Wrapf(err, "finishing sst for raft snapshot")
 			}
 			msstw.Close()
+			timingTag.stop("sst")
+			log.Eventf(ctx, "all data received from snapshot and all SSTs were finalized")
 
 			snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 			if err != nil {
@@ -300,6 +496,8 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 				raftAppliedIndex:  header.State.RaftAppliedIndex,
 			}
 
+			timingTag.stop("totalTime")
+
 			kvSS.status = redact.Sprintf("ssts: %d", len(kvSS.scratch.SSTs()))
 			return inSnap, nil
 		}
@@ -314,68 +512,149 @@ var errMalformedSnapshot = errors.New("malformed snapshot generated")
 func (kvSS *kvBatchSnapshotStrategy) Send(
 	ctx context.Context,
 	stream outgoingSnapshotStream,
-	header SnapshotRequest_Header,
+	header kvserverpb.SnapshotRequest_Header,
 	snap *OutgoingSnapshot,
+	recordBytesSent snapshotRecordMetrics,
 ) (int64, error) {
-	assertStrategy(ctx, header, SnapshotRequest_KV_BATCH)
+	assertStrategy(ctx, header, kvserverpb.SnapshotRequest_KV_BATCH)
+	// bytesSent is updated as key-value batches are sent with sendBatch. It does
+	// not reflect the log entries sent (which are never sent in newer versions of
+	// CRDB, as of VersionUnreplicatedTruncatedState).
+	var bytesSent int64
+	var kvs, rangeKVs int
 
-	// bytesSent is updated as key-value batches are sent with sendBatch. It
-	// does not reflect the log entries sent (which are never sent in newer
-	// versions of CRDB, as of VersionUnreplicatedTruncatedState).
-	bytesSent := int64(0)
+	// These stopwatches allow us to time the various components of Send().
+	// - totalTimeStopwatch measures the total time spent within this function.
+	// - iterStopwatch measures how long it takes to read from the snapshot via
+	//   iter.Next().
+	// - sendStopwatch measure the time it takes to send the snapshot batch data
+	//   over the network, excluding waits due to rate limiting.
+	// - rateLimitStopwatch records the amount of time spent waiting in order to
+	//   enforce the snapshot rate limit
+	timingTag := newSnapshotTimingTag()
+	timingTag.addStopwatch("totalTime")
+	timingTag.addStopwatch("iter")
+	timingTag.addStopwatch("send")
+	timingTag.addStopwatch("rateLimit")
+	if sp := tracing.SpanFromContext(ctx); sp != nil {
+		log.Eventf(ctx, "found span %s", sp.OperationName())
+		sp.SetLazyTag(tagSnapshotTiming, timingTag)
+	}
 
-	// Iterate over all keys using the provided iterator and stream out batches
-	// of key-values.
-	kvs := 0
+	log.Event(ctx, "beginning to send batches of snapshot bytes")
+	timingTag.start("totalTime")
+
+	// Iterate over all keys (point keys and range keys) and stream out batches of
+	// key-values.
 	var b storage.Batch
 	defer func() {
 		if b != nil {
 			b.Close()
 		}
 	}()
-	for iter := snap.Iter; ; iter.Next() {
-		if ok, err := iter.Valid(); err != nil {
-			return 0, err
-		} else if !ok {
-			break
-		}
-		kvs++
-		unsafeKey := iter.UnsafeKey()
-		unsafeValue := iter.UnsafeValue()
-		if b == nil {
-			b = kvSS.newBatch()
-		}
-		if err := b.PutEngineKey(unsafeKey, unsafeValue); err != nil {
-			return 0, err
-		}
 
-		if bLen := int64(b.Len()); bLen >= kvSS.batchSize {
-			if err := kvSS.sendBatch(ctx, stream, b); err != nil {
-				return 0, err
-			}
-			bytesSent += bLen
-			b.Close()
-			b = nil
+	flushBatch := func() error {
+		if err := kvSS.sendBatch(ctx, stream, b, timingTag); err != nil {
+			return err
 		}
+		bLen := int64(b.Len())
+		bytesSent += bLen
+		recordBytesSent(bLen)
+		b.Close()
+		b = nil
+		return nil
+	}
+
+	maybeFlushBatch := func() error {
+		if int64(b.Len()) >= kvSS.batchSize {
+			return flushBatch()
+		}
+		return nil
+	}
+
+	err := rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
+		func(iter storage.EngineIterator, _ roachpb.Span, keyType storage.IterKeyType) error {
+			timingTag.start("iter")
+			defer timingTag.stop("iter")
+
+			var err error
+			switch keyType {
+			case storage.IterKeyTypePointsOnly:
+				for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
+					kvs++
+					if b == nil {
+						b = kvSS.newBatch()
+					}
+					key, err := iter.UnsafeEngineKey()
+					if err != nil {
+						return err
+					}
+					if err = b.PutEngineKey(key, iter.UnsafeValue()); err != nil {
+						return err
+					}
+					if err = maybeFlushBatch(); err != nil {
+						return err
+					}
+				}
+
+			case storage.IterKeyTypeRangesOnly:
+				for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
+					bounds, err := iter.EngineRangeBounds()
+					if err != nil {
+						return err
+					}
+					for _, rkv := range iter.EngineRangeKeys() {
+						rangeKVs++
+						if b == nil {
+							b = kvSS.newBatch()
+						}
+						err := b.PutEngineRangeKey(bounds.Key, bounds.EndKey, rkv.Version, rkv.Value)
+						if err != nil {
+							return err
+						}
+						if err = maybeFlushBatch(); err != nil {
+							return err
+						}
+					}
+				}
+
+			default:
+				return errors.AssertionFailedf("unexpected key type %v", keyType)
+			}
+			return err
+		})
+	if err != nil {
+		return 0, err
 	}
 	if b != nil {
-		if err := kvSS.sendBatch(ctx, stream, b); err != nil {
+		if err = flushBatch(); err != nil {
 			return 0, err
 		}
-		bytesSent += int64(b.Len())
 	}
 
-	kvSS.status = redact.Sprintf("kv pairs: %d", kvs)
+	timingTag.stop("totalTime")
+	log.Eventf(ctx, "finished sending snapshot batches, sent a total of %d bytes", bytesSent)
+
+	kvSS.status = redact.Sprintf("kvs=%d rangeKVs=%d", kvs, rangeKVs)
 	return bytesSent, nil
 }
 
 func (kvSS *kvBatchSnapshotStrategy) sendBatch(
-	ctx context.Context, stream outgoingSnapshotStream, batch storage.Batch,
+	ctx context.Context,
+	stream outgoingSnapshotStream,
+	batch storage.Batch,
+	timerTag *snapshotTimingTag,
 ) error {
-	if err := kvSS.limiter.WaitN(ctx, 1); err != nil {
+	timerTag.start("rateLimit")
+	err := kvSS.limiter.WaitN(ctx, 1)
+	timerTag.stop("rateLimit")
+	if err != nil {
 		return err
 	}
-	return stream.Send(&SnapshotRequest{KVBatch: batch.Repr()})
+	timerTag.start("send")
+	res := stream.Send(&kvserverpb.SnapshotRequest{KVBatch: batch.Repr()})
+	timerTag.stop("send")
+	return res
 }
 
 // Status implements the snapshotStrategy interface.
@@ -389,24 +668,76 @@ func (kvSS *kvBatchSnapshotStrategy) Close(ctx context.Context) {
 		// A failure to clean up the storage is benign except that it will leak
 		// disk space (which is reclaimed on node restart). It is unexpected
 		// though, so log a warning.
-		if err := kvSS.scratch.Clear(); err != nil {
+		if err := kvSS.scratch.Close(); err != nil {
 			log.Warningf(ctx, "error closing kvBatchSnapshotStrategy: %v", err)
 		}
 	}
 }
 
-// reserveSnapshot throttles incoming snapshots. The returned closure is used
-// to cleanup the reservation and release its resources.
-func (s *Store) reserveSnapshot(
-	ctx context.Context, header *SnapshotRequest_Header,
+// reserveReceiveSnapshot throttles incoming snapshots.
+func (s *Store) reserveReceiveSnapshot(
+	ctx context.Context, header *kvserverpb.SnapshotRequest_Header,
 ) (_cleanup func(), _err error) {
-	tBegin := timeutil.Now()
+	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "reserveReceiveSnapshot")
+	defer sp.Finish()
 
+	return s.throttleSnapshot(ctx, s.snapshotApplyQueue,
+		int(header.SenderQueueName), header.SenderQueuePriority,
+		header.RangeSize,
+		header.RaftMessageRequest.RangeID, header.RaftMessageRequest.ToReplica.ReplicaID,
+		s.metrics.RangeSnapshotRecvQueueLength,
+		s.metrics.RangeSnapshotRecvInProgress, s.metrics.RangeSnapshotRecvTotalInProgress,
+	)
+}
+
+// reserveSendSnapshot throttles outgoing snapshots.
+func (s *Store) reserveSendSnapshot(
+	ctx context.Context, req *kvserverpb.DelegateSnapshotRequest, rangeSize int64,
+) (_cleanup func(), _err error) {
+	ctx, sp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "reserveSendSnapshot")
+	defer sp.Finish()
+	if fn := s.cfg.TestingKnobs.BeforeSendSnapshotThrottle; fn != nil {
+		fn()
+	}
+
+	return s.throttleSnapshot(ctx, s.snapshotSendQueue,
+		int(req.SenderQueueName), req.SenderQueuePriority,
+		rangeSize,
+		req.RangeID, req.DelegatedSender.ReplicaID,
+		s.metrics.RangeSnapshotSendQueueLength,
+		s.metrics.RangeSnapshotSendInProgress, s.metrics.RangeSnapshotSendTotalInProgress,
+	)
+}
+
+// throttleSnapshot is a helper function to throttle snapshot sending and
+// receiving. The returned closure is used to cleanup the reservation and
+// release its resources.
+func (s *Store) throttleSnapshot(
+	ctx context.Context,
+	snapshotQueue *multiqueue.MultiQueue,
+	requestSource int,
+	requestPriority float64,
+	rangeSize int64,
+	rangeID roachpb.RangeID,
+	replicaID roachpb.ReplicaID,
+	waitingSnapshotMetric, inProgressSnapshotMetric, totalInProgressSnapshotMetric *metric.Gauge,
+) (cleanup func(), err error) {
+	tBegin := timeutil.Now()
+	var permit *multiqueue.Permit
 	// Empty snapshots are exempt from rate limits because they're so cheap to
 	// apply. This vastly speeds up rebalancing any empty ranges created by a
 	// RESTORE or manual SPLIT AT, since it prevents these empty snapshots from
 	// getting stuck behind large snapshots managed by the replicate queue.
-	if header.RangeSize != 0 {
+	if rangeSize != 0 || s.cfg.TestingKnobs.ThrottleEmptySnapshots {
+		task := snapshotQueue.Add(requestSource, requestPriority)
+		defer func() {
+			if err != nil {
+				snapshotQueue.Cancel(task)
+			}
+		}()
+
+		waitingSnapshotMetric.Inc(1)
+		defer waitingSnapshotMetric.Dec(1)
 		queueCtx := ctx
 		if deadline, ok := queueCtx.Deadline(); ok {
 			// Enforce a more strict timeout for acquiring the snapshot reservation to
@@ -420,41 +751,59 @@ func (s *Store) reserveSnapshot(
 			defer cancel()
 		}
 		select {
-		case s.snapshotApplySem <- struct{}{}:
+		case permit = <-task.GetWaitChan():
+			// Got a spot in the snapshotQueue, continue with sending the snapshot.
+			if fn := s.cfg.TestingKnobs.AfterSendSnapshotThrottle; fn != nil {
+				fn()
+			}
+			log.Event(ctx, "acquired spot in the snapshot snapshotQueue")
 		case <-queueCtx.Done():
+			// We need to cancel the task so that it doesn't ever get a permit.
 			if err := ctx.Err(); err != nil {
 				return nil, errors.Wrap(err, "acquiring snapshot reservation")
 			}
-			return nil, errors.Wrapf(queueCtx.Err(),
+			return nil, errors.Wrapf(
+				queueCtx.Err(),
 				"giving up during snapshot reservation due to %q",
-				snapshotReservationQueueTimeoutFraction.Key())
+				snapshotReservationQueueTimeoutFraction.Key(),
+			)
 		case <-s.stopper.ShouldQuiesce():
 			return nil, errors.Errorf("stopped")
 		}
+
+		// Counts non-empty in-progress snapshots.
+		inProgressSnapshotMetric.Inc(1)
 	}
+	// Counts all in-progress snapshots.
+	totalInProgressSnapshotMetric.Inc(1)
 
 	// The choice here is essentially arbitrary, but with a default range size of 128mb-512mb and the
 	// Raft snapshot rate limiting of 32mb/s, we expect to spend less than 16s per snapshot.
 	// which is what we want to log.
 	const snapshotReservationWaitWarnThreshold = 32 * time.Second
-	if elapsed := timeutil.Since(tBegin); elapsed > snapshotReservationWaitWarnThreshold {
-		replDesc, _ := header.State.Desc.GetReplicaDescriptor(s.StoreID())
+	elapsed := timeutil.Since(tBegin)
+	// NB: this log message is skipped in test builds as many tests do not mock
+	// all of the objects being logged.
+	if elapsed > snapshotReservationWaitWarnThreshold && !buildutil.CrdbTestBuild {
 		log.Infof(
 			ctx,
 			"waited for %.1fs to acquire snapshot reservation to r%d/%d",
 			elapsed.Seconds(),
-			header.State.Desc.RangeID,
-			replDesc.ReplicaID,
+			rangeID,
+			replicaID,
 		)
 	}
 
 	s.metrics.ReservedReplicaCount.Inc(1)
-	s.metrics.Reserved.Inc(header.RangeSize)
+	s.metrics.Reserved.Inc(rangeSize)
 	return func() {
 		s.metrics.ReservedReplicaCount.Dec(1)
-		s.metrics.Reserved.Dec(header.RangeSize)
-		if header.RangeSize != 0 {
-			<-s.snapshotApplySem
+		s.metrics.Reserved.Dec(rangeSize)
+		totalInProgressSnapshotMetric.Dec(1)
+
+		if rangeSize != 0 || s.cfg.TestingKnobs.ThrottleEmptySnapshots {
+			inProgressSnapshotMetric.Dec(1)
+			snapshotQueue.Release(permit)
 		}
 	}, nil
 }
@@ -467,7 +816,7 @@ func (s *Store) reserveSnapshot(
 // Both the store mu and the raft mu for the existing replica (which must exist)
 // must be held.
 func (s *Store) canAcceptSnapshotLocked(
-	ctx context.Context, snapHeader *SnapshotRequest_Header,
+	ctx context.Context, snapHeader *kvserverpb.SnapshotRequest_Header,
 ) (*ReplicaPlaceholder, error) {
 	// TODO(tbg): see the comment on desc.Generation for what seems to be a much
 	// saner way to handle overlap via generational semantics.
@@ -511,7 +860,7 @@ func (s *Store) canAcceptSnapshotLocked(
 		return nil, existingDestroyStatus.err
 	}
 
-	// We have a key range [desc.StartKey,desc.EndKey) which we want to apply a
+	// We have a key span [desc.StartKey,desc.EndKey) which we want to apply a
 	// snapshot for. Is there a conflicting existing placeholder or an
 	// overlapping range?
 	if err := s.checkSnapshotOverlapLocked(ctx, snapHeader); err != nil {
@@ -529,7 +878,7 @@ func (s *Store) canAcceptSnapshotLocked(
 // chance of being abandoned, so they're proactively handed to the replica GC
 // queue.
 func (s *Store) checkSnapshotOverlapLocked(
-	ctx context.Context, snapHeader *SnapshotRequest_Header,
+	ctx context.Context, snapHeader *kvserverpb.SnapshotRequest_Header,
 ) error {
 	desc := *snapHeader.State.Desc
 
@@ -588,8 +937,31 @@ func (s *Store) checkSnapshotOverlapLocked(
 
 // receiveSnapshot receives an incoming snapshot via a pre-opened GRPC stream.
 func (s *Store) receiveSnapshot(
-	ctx context.Context, header *SnapshotRequest_Header, stream incomingSnapshotStream,
+	ctx context.Context, header *kvserverpb.SnapshotRequest_Header, stream incomingSnapshotStream,
 ) error {
+	sp := tracing.SpanFromContext(ctx)
+
+	// Draining nodes will generally not be rebalanced to (see the filtering that
+	// happens in getStoreListFromIDsLocked()), but in case they are, they should
+	// reject the incoming rebalancing snapshots.
+	if s.IsDraining() {
+		switch t := header.Priority; t {
+		case kvserverpb.SnapshotRequest_RECOVERY:
+			// We can not reject Raft snapshots because draining nodes may have
+			// replicas in `StateSnapshot` that need to catch up.
+			//
+			// TODO(aayush): We also do not reject snapshots sent to replace dead
+			// replicas here, but draining stores are still filtered out in
+			// getStoreListFromIDsLocked(). Is that sound? Don't we want to
+			// upreplicate to draining nodes if there are no other candidates?
+		case kvserverpb.SnapshotRequest_REBALANCE:
+			return sendSnapshotError(stream, errors.New(storeDrainingMsg))
+		default:
+			// If this a new snapshot type that this cockroach version does not know
+			// about, we let it through.
+		}
+	}
+
 	if fn := s.cfg.TestingKnobs.ReceiveSnapshot; fn != nil {
 		if err := fn(header); err != nil {
 			return sendSnapshotError(stream, err)
@@ -604,7 +976,7 @@ func (s *Store) receiveSnapshot(
 			header.Type, storeID, header.State.Desc.Replicas())
 	}
 
-	cleanup, err := s.reserveSnapshot(ctx, header)
+	cleanup, err := s.reserveReceiveSnapshot(ctx, header)
 	if err != nil {
 		return err
 	}
@@ -650,7 +1022,7 @@ func (s *Store) receiveSnapshot(
 	// an error.
 	var ss snapshotStrategy
 	switch header.Strategy {
-	case SnapshotRequest_KV_BATCH:
+	case kvserverpb.SnapshotRequest_KV_BATCH:
 		snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 		if err != nil {
 			err = errors.Wrap(err, "invalid snapshot")
@@ -660,6 +1032,7 @@ func (s *Store) receiveSnapshot(
 		ss = &kvBatchSnapshotStrategy{
 			scratch:      s.sstSnapshotStorage.NewScratchSpace(header.State.Desc.RangeID, snapUUID),
 			sstChunkSize: snapshotSSTWriteSyncRate.Get(&s.cfg.Settings.SV),
+			st:           s.ClusterSettings(),
 		}
 		defer ss.Close(ctx)
 	default:
@@ -669,18 +1042,36 @@ func (s *Store) receiveSnapshot(
 		)
 	}
 
-	if err := stream.Send(&SnapshotResponse{Status: SnapshotResponse_ACCEPTED}); err != nil {
+	if err := stream.Send(&kvserverpb.SnapshotResponse{Status: kvserverpb.SnapshotResponse_ACCEPTED}); err != nil {
 		return err
 	}
 	if log.V(2) {
 		log.Infof(ctx, "accepted snapshot reservation for r%d", header.State.Desc.RangeID)
 	}
 
-	inSnap, err := ss.Receive(ctx, stream, *header)
+	recordBytesReceived := func(inc int64) {
+		s.metrics.RangeSnapshotRcvdBytes.Inc(inc)
+
+		switch header.Priority {
+		case kvserverpb.SnapshotRequest_RECOVERY:
+			s.metrics.RangeSnapshotRecoveryRcvdBytes.Inc(inc)
+		case kvserverpb.SnapshotRequest_REBALANCE:
+			s.metrics.RangeSnapshotRebalancingRcvdBytes.Inc(inc)
+		default:
+			// If a snapshot is not a RECOVERY or REBALANCE snapshot, it must be of
+			// type UNKNOWN.
+			s.metrics.RangeSnapshotUnknownRcvdBytes.Inc(inc)
+		}
+	}
+	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
+	defer rSp.Finish() // Ensure that the tracing span is closed, even if ss.Receive errors
+	inSnap, err := ss.Receive(ctx, stream, *header, recordBytesReceived)
 	if err != nil {
 		return err
 	}
 	inSnap.placeholder = placeholder
+
+	rec := sp.GetConfiguredRecording()
 
 	// Use a background context for applying the snapshot, as handleRaftReady is
 	// not prepared to deal with arbitrary context cancellation. Also, we've
@@ -688,22 +1079,46 @@ func (s *Store) receiveSnapshot(
 	// abandoning application half-way through if the caller goes away.
 	applyCtx := s.AnnotateCtx(context.Background())
 	if err := s.processRaftSnapshotRequest(applyCtx, header, inSnap); err != nil {
-		return sendSnapshotError(stream, errors.Wrap(err.GoError(), "failed to apply snapshot"))
+		return sendSnapshotErrorWithTrace(stream,
+			errors.Wrap(err.GoError(), "failed to apply snapshot"), rec,
+		)
 	}
-	return stream.Send(&SnapshotResponse{Status: SnapshotResponse_APPLIED})
+	return stream.Send(&kvserverpb.SnapshotResponse{
+		Status:         kvserverpb.SnapshotResponse_APPLIED,
+		CollectedSpans: rec,
+	})
 }
 
 func sendSnapshotError(stream incomingSnapshotStream, err error) error {
-	return stream.Send(&SnapshotResponse{
-		Status:  SnapshotResponse_ERROR,
-		Message: err.Error(),
+	return sendSnapshotErrorWithTrace(stream, err, nil /* trace */)
+}
+
+func sendSnapshotErrorWithTrace(
+	stream incomingSnapshotStream, err error, trace tracingpb.Recording,
+) error {
+	return stream.Send(&kvserverpb.SnapshotResponse{
+		Status:         kvserverpb.SnapshotResponse_ERROR,
+		Message:        err.Error(),
+		CollectedSpans: trace,
 	})
 }
 
 // SnapshotStorePool narrows StorePool to make sendSnapshot easier to test.
 type SnapshotStorePool interface {
-	throttle(reason throttleReason, why string, toStoreID roachpb.StoreID)
+	Throttle(reason storepool.ThrottleReason, why string, toStoreID roachpb.StoreID)
 }
+
+// minSnapshotRate defines the minimum value that the rate limit for rebalance
+// and recovery snapshots can be configured to. Any value below this lower bound
+// is considered unsafe for use, as it can lead to excessively long-running
+// snapshots. The sender of Raft snapshots holds resources (e.g. LSM snapshots,
+// LSM iterators until #75824 is addressed) and blocks Raft log truncation, so
+// it is not safe to let a single snapshot run for an unlimited period of time.
+//
+// The value was chosen based on a maximum range size of 512mb and a desire to
+// prevent a single snapshot for running for more than 10 minutes. With a rate
+// limit of 1mb/s, a 512mb snapshot will take just under 9 minutes to send.
+const minSnapshotRate = 1 << 20 // 1mb/s
 
 // rebalanceSnapshotRate is the rate at which snapshots can be sent in the
 // context of up-replication or rebalancing (i.e. any snapshot that was not
@@ -713,7 +1128,13 @@ var rebalanceSnapshotRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_rebalance.max_rate",
 	"the rate limit (bytes/sec) to use for rebalance and upreplication snapshots",
 	32<<20, // 32mb/s
-	settings.PositiveInt,
+	func(v int64) error {
+		if v < minSnapshotRate {
+			return errors.Errorf("snapshot rate cannot be set to a value below %s: %s",
+				humanizeutil.IBytes(minSnapshotRate), humanizeutil.IBytes(v))
+		}
+		return nil
+	},
 ).WithPublic()
 
 // recoverySnapshotRate is the rate at which Raft-initiated snapshot can be
@@ -730,7 +1151,13 @@ var recoverySnapshotRate = settings.RegisterByteSizeSetting(
 	"kv.snapshot_recovery.max_rate",
 	"the rate limit (bytes/sec) to use for recovery snapshots",
 	32<<20, // 32mb/s
-	settings.PositiveInt,
+	func(v int64) error {
+		if v < minSnapshotRate {
+			return errors.Errorf("snapshot rate cannot be set to a value below %s: %s",
+				humanizeutil.IBytes(minSnapshotRate), humanizeutil.IBytes(v))
+		}
+		return nil
+	},
 ).WithPublic()
 
 // snapshotSenderBatchSize is the size that key-value batches are allowed to
@@ -749,7 +1176,7 @@ var snapshotSenderBatchSize = settings.RegisterByteSizeSetting(
 // snapshot's total timeout that it is allowed to spend queued on the receiver
 // waiting for a reservation.
 //
-// Enforcement of this snapshotApplySem-scoped timeout is intended to prevent
+// Enforcement of this snapshotApplyQueue-scoped timeout is intended to prevent
 // starvation of snapshots in cases where a queue of snapshots waiting for
 // reservations builds and no single snapshot acquires the semaphore with
 // sufficient time to complete, but each holds the semaphore long enough to
@@ -767,18 +1194,18 @@ var snapshotSenderBatchSize = settings.RegisterByteSizeSetting(
 // that it will itself fail during sending, while the next snapshot wastes
 // enough time waiting for us that it will itself fail, ad infinitum:
 //
-//  t   | snap1 snap2 snap3 snap4 snap5 ...
-//  ----+------------------------------------
-//  0   | send
-//  15  |       queue queue
-//  30  |                   queue
-//  45  | ok    send
-//  60  |                         queue
-//  75  |       fail  fail  send
-//  90  |                   fail  send
-//  105 |
-//  120 |                         fail
-//  135 |
+//	t   | snap1 snap2 snap3 snap4 snap5 ...
+//	----+------------------------------------
+//	0   | send
+//	15  |       queue queue
+//	30  |                   queue
+//	45  | ok    send
+//	60  |                         queue
+//	75  |       fail  fail  send
+//	90  |                   fail  send
+//	105 |
+//	120 |                         fail
+//	135 |
 //
 // If we limit the amount of time we are willing to wait for a reservation to
 // something that is small enough to, on success, give us enough time to
@@ -786,20 +1213,20 @@ var snapshotSenderBatchSize = settings.RegisterByteSizeSetting(
 // timeout, 45s needed to stream the data, we can wait at most 15s for a
 // reservation and still avoid starvation:
 //
-//  t   | snap1 snap2 snap3 snap4 snap5 ...
-//  ----+------------------------------------
-//  0   | send
-//  15  |       queue queue
-//  30  |       fail  fail  send
-//  45  |
-//  60  | ok                      queue
-//  75  |                   ok    send
-//  90  |
-//  105 |
-//  120 |                         ok
-//  135 |
+//	t   | snap1 snap2 snap3 snap4 snap5 ...
+//	----+------------------------------------
+//	0   | send
+//	15  |       queue queue
+//	30  |       fail  fail  send
+//	45  |
+//	60  | ok                      queue
+//	75  |                   ok    send
+//	90  |
+//	105 |
+//	120 |                         ok
+//	135 |
 //
-// In practice, the snapshot reservation logic (reserveSnapshot) doesn't know
+// In practice, the snapshot reservation logic (reserveReceiveSnapshot) doesn't know
 // how long sending the snapshot will actually take. But it knows the timeout it
 // has been given by the snapshotQueue/replicateQueue, which serves as an upper
 // bound, under the assumption that snapshots can make progress in the absence
@@ -812,7 +1239,7 @@ var snapshotSenderBatchSize = settings.RegisterByteSizeSetting(
 // as the average streaming time is less than the guaranteed processing time for
 // any snapshot that succeeds in acquiring a reservation:
 //
-//  guaranteed_processing_time = (1 - reservation_queue_timeout_fraction) x timeout
+//	guaranteed_processing_time = (1 - reservation_queue_timeout_fraction) x timeout
 //
 // The timeout for the snapshot and replicate queues bottoms out at 60s (by
 // default, see kv.queue.process.guaranteed_time_budget). Given a default
@@ -861,12 +1288,12 @@ var snapshotSSTWriteSyncRate = settings.RegisterByteSizeSetting(
 )
 
 func snapshotRateLimit(
-	st *cluster.Settings, priority SnapshotRequest_Priority,
+	st *cluster.Settings, priority kvserverpb.SnapshotRequest_Priority,
 ) (rate.Limit, error) {
 	switch priority {
-	case SnapshotRequest_RECOVERY:
+	case kvserverpb.SnapshotRequest_RECOVERY:
 		return rate.Limit(recoverySnapshotRate.Get(&st.SV)), nil
-	case SnapshotRequest_REBALANCE:
+	case kvserverpb.SnapshotRequest_REBALANCE:
 		return rate.Limit(rebalanceSnapshotRate.Get(&st.SV)), nil
 	default:
 		return 0, errors.Errorf("unknown snapshot priority: %s", priority)
@@ -879,6 +1306,7 @@ func snapshotRateLimit(
 func SendEmptySnapshot(
 	ctx context.Context,
 	st *cluster.Settings,
+	tracer *tracing.Tracer,
 	cc *grpc.ClientConn,
 	now hlc.Timestamp,
 	desc roachpb.RangeDescriptor,
@@ -898,9 +1326,21 @@ func SendEmptySnapshot(
 	var ms enginepb.MVCCStats
 	// Seed an empty range into the new engine.
 	if err := storage.MVCCPutProto(
-		ctx, eng, &ms, keys.RangeDescriptorKey(desc.StartKey), now, nil /* txn */, &desc,
+		ctx, eng, &ms, keys.RangeDescriptorKey(desc.StartKey), now, hlc.ClockTimestamp{}, nil /* txn */, &desc,
 	); err != nil {
 		return err
+	}
+
+	supportsGCHints := st.Version.IsActive(ctx, clusterversion.GCHintInReplicaState)
+	// SendEmptySnapshot is only used by the cockroach debug reset-quorum tool.
+	// It is experimental and unlikely to be used in cluster versions that are
+	// older than GCHintInReplicaState. We do not want the cluster version to
+	// fully dictate the value of the supportsGCHints parameter, since if this
+	// node's view of the version is stale we could regress to a state before the
+	// migration. Instead, we return an error if the cluster version is old.
+	if !supportsGCHints {
+		return errors.Errorf("cluster version is too old %s",
+			st.Version.ActiveVersionOrEmpty(ctx))
 	}
 
 	ms, err = stateloader.WriteInitialReplicaState(
@@ -910,7 +1350,9 @@ func SendEmptySnapshot(
 		desc,
 		roachpb.Lease{},
 		hlc.Timestamp{}, // gcThreshold
+		roachpb.GCHint{},
 		st.Version.ActiveVersionOrEmpty(ctx).Version,
+		supportsGCHints, /* 22.2: GCHintInReplicaState */
 	)
 	if err != nil {
 		return err
@@ -936,6 +1378,10 @@ func SendEmptySnapshot(
 		return err
 	}
 
+	// The snapshot must use a Pebble snapshot, since it requires consistent
+	// iterators.
+	engSnapshot := eng.NewSnapshot()
+
 	// Create an OutgoingSnapshot to send.
 	outgoingSnap, err := snapshot(
 		ctx,
@@ -946,14 +1392,17 @@ func SendEmptySnapshot(
 		// so they cannot be declined. We don't want our operation to be held
 		// up behind a long running snapshot. We want this to go through
 		// quickly.
-		SnapshotRequest_VIA_SNAPSHOT_QUEUE,
-		eng,
+		kvserverpb.SnapshotRequest_VIA_SNAPSHOT_QUEUE,
+		engSnapshot,
 		desc.RangeID,
 		raftentry.NewCache(1), // cache is not used
 		func(func(SideloadStorage) error) error { return nil }, // this is used for sstables, not needed here as there are no logs
 		desc.StartKey,
 	)
 	if err != nil {
+		// Close() is not idempotent, and will be done by outgoingSnap.Close() if
+		// the snapshot was successfully created.
+		engSnapshot.Close()
 		return err
 	}
 	defer outgoingSnap.Close()
@@ -963,7 +1412,7 @@ func SendEmptySnapshot(
 	// Sending it from the current replica ensures that. Otherwise,
 	// it would be a malformed request if it came from a non-member.
 	from := to
-	req := RaftMessageRequest{
+	req := kvserverpb.RaftMessageRequest{
 		RangeID:     desc.RangeID,
 		FromReplica: from,
 		ToReplica:   to,
@@ -976,13 +1425,13 @@ func SendEmptySnapshot(
 		},
 	}
 
-	header := SnapshotRequest_Header{
+	header := kvserverpb.SnapshotRequest_Header{
 		State:                                state,
 		RaftMessageRequest:                   req,
 		RangeSize:                            ms.Total(),
-		Priority:                             SnapshotRequest_RECOVERY,
-		Strategy:                             SnapshotRequest_KV_BATCH,
-		Type:                                 SnapshotRequest_VIA_SNAPSHOT_QUEUE,
+		Priority:                             kvserverpb.SnapshotRequest_RECOVERY,
+		Strategy:                             kvserverpb.SnapshotRequest_KV_BATCH,
+		Type:                                 kvserverpb.SnapshotRequest_VIA_SNAPSHOT_QUEUE,
 		DeprecatedUnreplicatedTruncatedState: true,
 	}
 
@@ -1000,56 +1449,72 @@ func SendEmptySnapshot(
 	return sendSnapshot(
 		ctx,
 		st,
+		tracer,
 		stream,
 		noopStorePool{},
 		header,
 		&outgoingSnap,
 		eng.NewBatch,
 		func() {},
+		nil, /* recordBytesSent */
 	)
 }
 
 // noopStorePool is a hollowed out StorePool that does not throttle. It's used in recovery scenarios.
 type noopStorePool struct{}
 
-func (n noopStorePool) throttle(throttleReason, string, roachpb.StoreID) {}
+func (n noopStorePool) Throttle(storepool.ThrottleReason, string, roachpb.StoreID) {}
 
 // sendSnapshot sends an outgoing snapshot via a pre-opened GRPC stream.
 func sendSnapshot(
 	ctx context.Context,
 	st *cluster.Settings,
+	tracer *tracing.Tracer,
 	stream outgoingSnapshotStream,
 	storePool SnapshotStorePool,
-	header SnapshotRequest_Header,
+	header kvserverpb.SnapshotRequest_Header,
 	snap *OutgoingSnapshot,
 	newBatch func() storage.Batch,
 	sent func(),
+	recordBytesSent snapshotRecordMetrics,
 ) error {
+	if recordBytesSent == nil {
+		// NB: Some tests and an offline tool (ResetQuorum) call into `sendSnapshot`
+		// with a nil metrics tracking function. We pass in a fake metrics tracking function here that isn't
+		// hooked up to anything.
+		recordBytesSent = func(inc int64) {}
+	}
+	ctx, sp := tracing.EnsureChildSpan(ctx, tracer, "sending snapshot")
+	defer sp.Finish()
+
 	start := timeutil.Now()
 	to := header.RaftMessageRequest.ToReplica
-	if err := stream.Send(&SnapshotRequest{Header: &header}); err != nil {
+	if err := stream.Send(&kvserverpb.SnapshotRequest{Header: &header}); err != nil {
 		return err
 	}
+	log.Event(ctx, "sent SNAPSHOT_REQUEST message to server")
 	// Wait until we get a response from the server. The recipient may queue us
 	// (only a limited number of snapshots are allowed concurrently) or flat-out
 	// reject the snapshot. After the initial message exchange, we'll go and send
 	// the actual snapshot (if not rejected).
 	resp, err := stream.Recv()
 	if err != nil {
-		storePool.throttle(throttleFailed, err.Error(), to.StoreID)
+		storePool.Throttle(storepool.ThrottleFailed, err.Error(), to.StoreID)
 		return err
 	}
 	switch resp.Status {
-	case SnapshotResponse_ERROR:
-		storePool.throttle(throttleFailed, resp.Message, to.StoreID)
+	case kvserverpb.SnapshotResponse_ERROR:
+		sp.ImportRemoteRecording(resp.CollectedSpans)
+		storePool.Throttle(storepool.ThrottleFailed, resp.Message, to.StoreID)
 		return errors.Errorf("%s: remote couldn't accept %s with error: %s",
 			to, snap, resp.Message)
-	case SnapshotResponse_ACCEPTED:
-	// This is the response we're expecting. Continue with snapshot sending.
+	case kvserverpb.SnapshotResponse_ACCEPTED:
+		// This is the response we're expecting. Continue with snapshot sending.
+		log.Event(ctx, "received SnapshotResponse_ACCEPTED message from server")
 	default:
 		err := errors.Errorf("%s: server sent an invalid status while negotiating %s: %s",
 			to, snap, resp.Status)
-		storePool.throttle(throttleFailed, err.Error(), to.StoreID)
+		storePool.Throttle(storepool.ThrottleFailed, err.Error(), to.StoreID)
 		return err
 	}
 
@@ -1075,17 +1540,19 @@ func sendSnapshot(
 	// Create a snapshotStrategy based on the desired snapshot strategy.
 	var ss snapshotStrategy
 	switch header.Strategy {
-	case SnapshotRequest_KV_BATCH:
+	case kvserverpb.SnapshotRequest_KV_BATCH:
 		ss = &kvBatchSnapshotStrategy{
 			batchSize: batchSize,
 			limiter:   limiter,
 			newBatch:  newBatch,
+			st:        st,
 		}
 	default:
 		log.Fatalf(ctx, "unknown snapshot strategy: %s", header.Strategy)
 	}
 
-	numBytesSent, err := ss.Send(ctx, stream, header, snap)
+	// Record timings for snapshot send if kv.trace.snapshot.enable_threshold is enabled
+	numBytesSent, err := ss.Send(ctx, stream, header, snap, recordBytesSent)
 	if err != nil {
 		return err
 	}
@@ -1095,10 +1562,10 @@ func sendSnapshot(
 	// the snapshots generated metric gets incremented before the snapshot is
 	// applied.
 	sent()
-	if err := stream.Send(&SnapshotRequest{Final: true}); err != nil {
+	if err := stream.Send(&kvserverpb.SnapshotRequest{Final: true}); err != nil {
 		return err
 	}
-	log.Infof(
+	log.KvDistribution.Infof(
 		ctx,
 		"streamed %s to %s with %s in %.2fs @ %s/s: %s, rate-limit: %s/s, queued: %.2fs",
 		snap,
@@ -1115,6 +1582,7 @@ func sendSnapshot(
 	if err != nil {
 		return errors.Wrapf(err, "%s: remote failed to apply snapshot", to)
 	}
+	sp.ImportRemoteRecording(resp.CollectedSpans)
 	// NB: wait for EOF which ensures that all processing on the server side has
 	// completed (such as defers that might be run after the previous message was
 	// received).
@@ -1125,12 +1593,87 @@ func sendSnapshot(
 		return errors.Newf("%s: expected EOF, got resp=%v", to, unexpectedResp)
 	}
 	switch resp.Status {
-	case SnapshotResponse_ERROR:
+	case kvserverpb.SnapshotResponse_ERROR:
 		return errors.Errorf("%s: remote failed to apply snapshot for reason %s", to, resp.Message)
-	case SnapshotResponse_APPLIED:
+	case kvserverpb.SnapshotResponse_APPLIED:
 		return nil
 	default:
 		return errors.Errorf("%s: server sent an invalid status during finalization: %s",
-			to, resp.Status)
+			to, resp.Status,
+		)
 	}
+}
+
+// delegateSnapshot sends an outgoing delegated snapshot request via a
+// pre-opened GRPC stream. It sends the delegated snapshot request to the
+// sender and waits for confirmation that the snapshot has been applied.
+func delegateSnapshot(
+	ctx context.Context, stream outgoingDelegatedStream, req *kvserverpb.DelegateSnapshotRequest,
+) error {
+
+	delegatedSender := req.DelegatedSender
+	if err := stream.Send(req); err != nil {
+		return err
+	}
+	// Wait for a response from the sender.
+	resp, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	switch resp.SnapResponse.Status {
+	case kvserverpb.SnapshotResponse_ERROR:
+		return errors.Errorf(
+			"%s: sender couldn't accept %s with error: %s", delegatedSender,
+			req, resp.SnapResponse.Message,
+		)
+	case kvserverpb.SnapshotResponse_ACCEPTED:
+		// The sender accepted the request, it will continue with sending.
+		log.VEventf(
+			ctx, 2, "sender %s accepted snapshot request %s", delegatedSender,
+			req,
+		)
+	default:
+		err := errors.Errorf(
+			"%s: server sent an invalid status while negotiating %s: %s",
+			delegatedSender, req, resp.SnapResponse.Status,
+		)
+		return err
+	}
+
+	// Wait for response to see if the receiver successfully applied the snapshot.
+	resp, err = stream.Recv()
+	if err != nil {
+		return errors.Wrapf(err, "%s: remote failed to send snapshot", delegatedSender)
+	}
+	// Wait for EOF to ensure server side processing is complete.
+	if unexpectedResp, err := stream.Recv(); err != io.EOF {
+		if err != nil {
+			return errors.Wrapf(
+				err, "%s: expected EOF, got resp=%v with error",
+				delegatedSender.StoreID, unexpectedResp,
+			)
+		}
+		return errors.Newf(
+			"%s: expected EOF, got resp=%v", delegatedSender.StoreID,
+			unexpectedResp,
+		)
+	}
+	sp := tracing.SpanFromContext(ctx)
+	if sp != nil {
+		sp.ImportRemoteRecording(resp.CollectedSpans)
+	}
+	switch resp.SnapResponse.Status {
+	case kvserverpb.SnapshotResponse_ERROR:
+		return errors.Newf("%s", resp.SnapResponse.Message)
+	case kvserverpb.SnapshotResponse_APPLIED:
+		// This is the response we're expecting. Snapshot successfully applied.
+		log.VEventf(ctx, 2, "%s: delegated snapshot was successfully applied", delegatedSender)
+		return nil
+	default:
+		return errors.Errorf(
+			"%s: server sent an invalid status during finalization: %s",
+			delegatedSender, resp.SnapResponse.Status,
+		)
+	}
+
 }

@@ -12,8 +12,8 @@ package clisqlexec_test
 
 import (
 	"bytes"
+	"context"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"reflect"
 	"testing"
@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cli"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlexec"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 )
@@ -32,13 +32,15 @@ var testExecCtx = clisqlexec.Context{
 
 func makeSQLConn(url string) clisqlclient.Conn {
 	var sqlConnCtx clisqlclient.Context
-	return sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard, url)
+	return sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url)
 }
 
 func runQueryAndFormatResults(
 	conn clisqlclient.Conn, w io.Writer, fn clisqlclient.QueryFn,
 ) (err error) {
-	return testExecCtx.RunQueryAndFormatResults(conn, w, ioutil.Discard, fn)
+	return testExecCtx.RunQueryAndFormatResults(
+		context.Background(),
+		conn, w, io.Discard, io.Discard, fn)
 }
 
 func TestRunQuery(t *testing.T) {
@@ -47,7 +49,7 @@ func TestRunQuery(t *testing.T) {
 	c := cli.NewCLITest(cli.TestCLIParams{T: t})
 	defer c.Cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())
@@ -74,7 +76,12 @@ SET
 	b.Reset()
 
 	// Use system database for sample query/output as they are fairly fixed.
-	cols, rows, err := testExecCtx.RunQuery(conn, clisqlclient.MakeQuery(`SHOW COLUMNS FROM system.namespace`), false)
+	cols, rows, err := testExecCtx.RunQuery(
+		context.Background(),
+		conn,
+		clisqlclient.MakeQuery(`SHOW COLUMNS FROM system.namespace`),
+		false, /* showMoreChars */
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,10 +100,10 @@ SET
 	}
 
 	expectedRows := [][]string{
-		{`parentID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
-		{`parentSchemaID`, `INT8`, `false`, `NULL`, ``, `{primary}`, `false`},
-		{`name`, `STRING`, `false`, `NULL`, ``, `{primary}`, `false`},
-		{`id`, `INT8`, `true`, `NULL`, ``, `{primary}`, `false`},
+		{`parentID`, `INT8`, `f`, `NULL`, ``, `{primary}`, `f`},
+		{`parentSchemaID`, `INT8`, `f`, `NULL`, ``, `{primary}`, `f`},
+		{`name`, `STRING`, `f`, `NULL`, ``, `{primary}`, `f`},
+		{`id`, `INT8`, `t`, `NULL`, ``, `{primary}`, `f`},
 	}
 	if !reflect.DeepEqual(expectedRows, rows) {
 		t.Fatalf("expected:\n%v\ngot:\n%v", expectedRows, rows)
@@ -110,10 +117,10 @@ SET
 	expected = `
    column_name   | data_type | is_nullable | column_default | generation_expression |  indices  | is_hidden
 -----------------+-----------+-------------+----------------+-----------------------+-----------+------------
-  parentID       | INT8      |    false    | NULL           |                       | {primary} |   false
-  parentSchemaID | INT8      |    false    | NULL           |                       | {primary} |   false
-  name           | STRING    |    false    | NULL           |                       | {primary} |   false
-  id             | INT8      |    true     | NULL           |                       | {primary} |   false
+  parentID       | INT8      |      f      | NULL           |                       | {primary} |     f
+  parentSchemaID | INT8      |      f      | NULL           |                       | {primary} |     f
+  name           | STRING    |      f      | NULL           |                       | {primary} |     f
+  id             | INT8      |      t      | NULL           |                       | {primary} |     f
 (4 rows)
 `
 
@@ -172,7 +179,7 @@ func TestUtfName(t *testing.T) {
 	c := cli.NewCLITest(cli.TestCLIParams{T: t})
 	defer c.Cleanup()
 
-	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(security.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 
 	conn := makeSQLConn(url.String())

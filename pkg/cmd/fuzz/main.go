@@ -11,13 +11,16 @@
 // fuzz builds and executes fuzz tests.
 //
 // Fuzz tests can be added to CockroachDB by adding a function of the form:
-//   func FuzzXXX(data []byte) int
+//
+//	func FuzzXXX(data []byte) int
+//
 // To help the fuzzer increase coverage, this function should return 1 on
 // interesting input (for example, a parse succeeded) and 0 otherwise. Panics
 // will be detected and reported.
 //
 // To exclude this file except during fuzzing, tag it with:
-//   // +build gofuzz
+//
+//	// +build gofuzz
 package main
 
 import (
@@ -25,7 +28,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -200,7 +202,7 @@ var fuzzFuncRE = regexp.MustCompile(`(?m)^func (Fuzz\w*)\(\w+ \[\]byte\) int {$`
 func findFuncs(pkg *packages.Package) ([]string, error) {
 	var ret []string
 	for _, file := range pkg.GoFiles {
-		content, err := ioutil.ReadFile(file)
+		content, err := os.ReadFile(file)
 		if err != nil {
 			return nil, err
 		}

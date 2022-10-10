@@ -13,7 +13,7 @@ package diagnostics
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -25,13 +25,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics/diagnosticspb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -71,10 +73,14 @@ type Reporter struct {
 	Config     *base.Config
 	Settings   *cluster.Settings
 
-	// ClusterID is not yet available at the time the reporter is created, so
-	// instead initialize with a function that gets it dynamically.
-	ClusterID func() uuid.UUID
-	TenantID  roachpb.TenantID
+	// StorageClusterID is the cluster ID of the underlying storage
+	// cluster. It is not yet available at the time the reporter is
+	// created, so instead initialize with a function that gets it
+	// dynamically.
+	StorageClusterID func() uuid.UUID
+	TenantID         roachpb.TenantID
+	// LogicalClusterID is the tenant-specific logical cluster ID.
+	LogicalClusterID func() uuid.UUID
 
 	// SQLInstanceID is not yet available at the time the reporter is created,
 	// so instead initialize with a function that gets it dynamically.
@@ -154,7 +160,7 @@ func (r *Reporter) ReportDiagnostics(ctx context.Context) {
 		return
 	}
 	defer res.Body.Close()
-	b, err = ioutil.ReadAll(res.Body)
+	b, err = io.ReadAll(res.Body)
 	if err != nil || res.StatusCode != http.StatusOK {
 		log.Warningf(ctx, "failed to report node usage metrics: status: %s, body: %s, "+
 			"error: %v", res.Status, b, err)
@@ -199,7 +205,7 @@ func (r *Reporter) CreateReport(
 	// flattened for quick reads, but we'd rather only report the non-defaults.
 	if it, err := r.InternalExec.QueryIteratorEx(
 		ctx, "read-setting", nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"SELECT name FROM system.settings",
 	); err != nil {
 		log.Warningf(ctx, "failed to read settings: %s", err)
@@ -224,7 +230,7 @@ func (r *Reporter) CreateReport(
 		ctx,
 		"read-zone-configs",
 		nil, /* txn */
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"SELECT id, config FROM system.zones",
 	); err != nil {
 		log.Warningf(ctx, "%v", err)
@@ -302,7 +308,8 @@ func (r *Reporter) populateNodeInfo(
 		info.Node.KeyCount += info.Stores[i].KeyCount
 		info.Stores[i].RangeCount = int64(r.Metrics["replicas"])
 		info.Node.RangeCount += info.Stores[i].RangeCount
-		bytes := int64(r.Metrics["sysbytes"] + r.Metrics["intentbytes"] + r.Metrics["valbytes"] + r.Metrics["keybytes"])
+		bytes := int64(r.Metrics["sysbytes"] + r.Metrics["valbytes"] + r.Metrics["keybytes"] +
+			r.Metrics["rangevalbytes"] + r.Metrics["rangekeybytes"])
 		info.Stores[i].Bytes = bytes
 		info.Node.Bytes += bytes
 		info.Stores[i].EncryptionAlgorithm = int64(r.Metrics["rocksdb.encryption.algorithm"])
@@ -324,16 +331,18 @@ func (r *Reporter) collectSchemaInfo(ctx context.Context) ([]descpb.TableDescrip
 	tables := make([]descpb.TableDescriptor, 0, len(kvs))
 	redactor := stringRedactor{}
 	for _, kv := range kvs {
-		var desc descpb.Descriptor
-		if err := kv.ValueProto(&desc); err != nil {
+		b, err := descbuilder.FromSerializedValue(kv.Value)
+		if err != nil {
 			return nil, errors.Wrapf(err, "%s: unable to unmarshal SQL descriptor", kv.Key)
 		}
-		t, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, kv.Value.Timestamp)
-		if t != nil && t.ParentID != keys.SystemDatabaseID {
-			if err := reflectwalk.Walk(t, redactor); err != nil {
-				panic(err) // stringRedactor never returns a non-nil err
+		if b != nil && b.DescriptorType() == catalog.Table {
+			t := b.BuildImmutable().(catalog.TableDescriptor).TableDesc()
+			if t.ParentID != keys.SystemDatabaseID {
+				if err := reflectwalk.Walk(t, redactor); err != nil {
+					panic(err) // stringRedactor never returns a non-nil err
+				}
+				tables = append(tables, *t)
 			}
-			tables = append(tables, *t)
 		}
 	}
 	return tables, nil
@@ -343,10 +352,11 @@ func (r *Reporter) collectSchemaInfo(ctx context.Context) ([]descpb.TableDescrip
 // If an empty updates URL is set (via empty environment variable), returns nil.
 func (r *Reporter) buildReportingURL(report *diagnosticspb.DiagnosticReport) *url.URL {
 	clusterInfo := ClusterInfo{
-		ClusterID:  r.ClusterID(),
-		TenantID:   r.TenantID,
-		IsInsecure: r.Config.Insecure,
-		IsInternal: sql.ClusterIsInternal(&r.Settings.SV),
+		StorageClusterID: r.StorageClusterID(),
+		LogicalClusterID: r.LogicalClusterID(),
+		TenantID:         r.TenantID,
+		IsInsecure:       r.Config.Insecure,
+		IsInternal:       sql.ClusterIsInternal(&r.Settings.SV),
 	}
 
 	url := reportingURL

@@ -12,8 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	"io"
 	"strings"
 	"testing"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher/systemconfigwatchertest"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -151,24 +151,25 @@ func TestTenantHTTP(t *testing.T) {
 		})
 	require.NoError(t, err)
 
-	httpClient, err := tenant.RPCContext().GetHTTPClient()
-	require.NoError(t, err)
-
 	t.Run("prometheus", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant.HTTPAddr() + "/_status/vars")
-		defer http.DefaultClient.CloseIdleConnections()
+		httpClient, err := tenant.GetUnauthenticatedHTTPClient()
+		require.NoError(t, err)
+		defer httpClient.CloseIdleConnections()
+		resp, err := httpClient.Get(tenant.AdminURL() + "/_status/vars")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "sql_ddl_started_count_internal")
 	})
 	t.Run("pprof", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant.HTTPAddr() + "/debug/pprof/goroutine?debug=2")
-		defer http.DefaultClient.CloseIdleConnections()
+		httpClient, err := tenant.GetAdminHTTPClient()
+		require.NoError(t, err)
+		defer httpClient.CloseIdleConnections()
+		resp, err := httpClient.Get(tenant.AdminURL() + "/debug/pprof/goroutine?debug=2")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "goroutine")
 	})
@@ -180,14 +181,18 @@ func TestNonExistentTenant(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{})
+	tc := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DisableDefaultTestTenant: true,
+		},
+	})
 	defer tc.Stopper().Stop(ctx)
 
 	_, err := tc.Server(0).StartTenant(ctx,
 		base.TestTenantArgs{
-			TenantID:        serverutils.TestTenantID(),
-			Existing:        true,
-			SkipTenantCheck: true,
+			TenantID:            serverutils.TestTenantID(),
+			DisableCreateTenant: true,
+			SkipTenantCheck:     true,
 		})
 	require.Error(t, err)
 	require.Equal(t, "system DB uninitialized, check if tenant is non existent", err.Error())
@@ -249,4 +254,9 @@ func TestNoInflightTracesVirtualTableOnTenant(t *testing.T) {
 		"select * from crdb_internal.cluster_inflight_traces WHERE trace_id = 4;")
 	require.Error(t, err, "cluster_inflight_traces should be unsupported")
 	require.Contains(t, err.Error(), "table crdb_internal.cluster_inflight_traces is not implemented on tenants")
+}
+
+func TestSystemConfigWatcherCache(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	systemconfigwatchertest.TestSystemConfigWatcher(t, false /* skipSecondary */)
 }

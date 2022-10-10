@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/local"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -125,10 +126,10 @@ func (c *SyncedCluster) localVMDir(n Node) string {
 // TargetNodes is the fully expanded, ordered list of nodes that any given
 // roachprod command is intending to target.
 //
-//  $ roachprod create local -n 4
-//  $ roachprod start local          # [1, 2, 3, 4]
-//  $ roachprod start local:2-4      # [2, 3, 4]
-//  $ roachprod start local:2,1,4    # [1, 2, 4]
+//	$ roachprod create local -n 4
+//	$ roachprod start local          # [1, 2, 3, 4]
+//	$ roachprod start local:2-4      # [2, 3, 4]
+//	$ roachprod start local:2,1,4    # [1, 2, 4]
 func (c *SyncedCluster) TargetNodes() Nodes {
 	return append(Nodes{}, c.Nodes...)
 }
@@ -169,25 +170,25 @@ func (c *SyncedCluster) GetInternalIP(ctx context.Context, n Node) (string, erro
 // correct process, when monitoring or stopping.
 //
 // Normally, the value is of the form:
-//   [<local-cluster-name>/]<node-id>[/tag]
+//
+//	[<local-cluster-name>/]<node-id>[/tag]
 //
 // Examples:
 //
-//  - non-local cluster without tags:
-//      ROACHPROD=1
+//   - non-local cluster without tags:
+//     ROACHPROD=1
 //
-//  - non-local cluster with tag foo:
-//      ROACHPROD=1/foo
+//   - non-local cluster with tag foo:
+//     ROACHPROD=1/foo
 //
-//  - non-local cluster with hierarchical tag foo/bar:
-//      ROACHPROD=1/foo/bar
+//   - non-local cluster with hierarchical tag foo/bar:
+//     ROACHPROD=1/foo/bar
 //
-//  - local cluster:
-//      ROACHPROD=local-foo/1
+//   - local cluster:
+//     ROACHPROD=local-foo/1
 //
-//  - local cluster with tag bar:
-//      ROACHPROD=local-foo/1/bar
-//
+//   - local cluster with tag bar:
+//     ROACHPROD=local-foo/1/bar
 func (c *SyncedCluster) roachprodEnvValue(node Node) string {
 	var parts []string
 	if c.IsLocal() {
@@ -223,7 +224,16 @@ func (c *SyncedCluster) newSession(node Node) (session, error) {
 //
 // When running roachprod stop without other flags, the signal is 9 (SIGKILL)
 // and wait is true.
-func (c *SyncedCluster) Stop(ctx context.Context, l *logger.Logger, sig int, wait bool) error {
+//
+// If maxWait is non-zero, Stop stops waiting after that approximate
+// number of seconds.
+func (c *SyncedCluster) Stop(
+	ctx context.Context, l *logger.Logger, sig int, wait bool, maxWait int,
+) error {
+	if sig == 9 {
+		// `kill -9` without wait is never what a caller wants. See #77334.
+		wait = true
+	}
 	display := fmt.Sprintf("%s: stopping", c.Name)
 	if wait {
 		display += " and waiting"
@@ -240,15 +250,22 @@ func (c *SyncedCluster) Stop(ctx context.Context, l *logger.Logger, sig int, wai
 			waitCmd = fmt.Sprintf(`
   for pid in ${pids}; do
     echo "${pid}: checking" >> %[1]s/roachprod.log
+    waitcnt=0
     while kill -0 ${pid}; do
+      if [ %[2]d -gt 0 -a $waitcnt -gt %[2]d ]; then
+         echo "${pid}: max %[2]d attempts reached, aborting wait" >>%[1]s/roachprod.log
+         break
+      fi
       kill -0 ${pid} >> %[1]s/roachprod.log 2>&1
       echo "${pid}: still alive [$?]" >> %[1]s/roachprod.log
       ps axeww -o pid -o command >> %[1]s/roachprod.log
       sleep 1
+      waitcnt=$(expr $waitcnt + 1)
     done
     echo "${pid}: dead" >> %[1]s/roachprod.log
   done`,
 				c.LogDir(c.Nodes[i]), // [1]
+				maxWait,              // [2]
 			)
 		}
 
@@ -277,7 +294,7 @@ fi`,
 // Wipe TODO(peter): document
 func (c *SyncedCluster) Wipe(ctx context.Context, l *logger.Logger, preserveCerts bool) error {
 	display := fmt.Sprintf("%s: wiping", c.Name)
-	if err := c.Stop(ctx, l, 9, true /* wait */); err != nil {
+	if err := c.Stop(ctx, l, 9, true /* wait */, 0 /* maxWait */); err != nil {
 		return err
 	}
 	return c.Parallel(l, display, len(c.Nodes), 0, func(i int) ([]byte, error) {
@@ -293,6 +310,7 @@ func (c *SyncedCluster) Wipe(ctx context.Context, l *logger.Logger, preserveCert
 			dirs := []string{"data", "logs"}
 			if !preserveCerts {
 				dirs = append(dirs, "certs*")
+				dirs = append(dirs, "tenant-certs*")
 			}
 			for _, dir := range dirs {
 				cmd += fmt.Sprintf(`rm -fr %s/%s ;`, c.localVMDir(c.Nodes[i]), dir)
@@ -304,20 +322,30 @@ sudo rm -fr logs &&
 `
 			if !preserveCerts {
 				cmd += "sudo rm -fr certs* ;\n"
+				cmd += "sudo rm -fr tenant-certs* ;\n"
 			}
 		}
 		return sess.CombinedOutput(ctx, cmd)
 	})
 }
 
+// NodeStatus contains details about the status of a node.
+type NodeStatus struct {
+	NodeID  int
+	Running bool
+	Version string
+	Pid     string
+	Err     error
+}
+
 // Status TODO(peter): document
-func (c *SyncedCluster) Status(ctx context.Context, l *logger.Logger) error {
+func (c *SyncedCluster) Status(ctx context.Context, l *logger.Logger) ([]NodeStatus, error) {
 	display := fmt.Sprintf("%s: status", c.Name)
-	results := make([]string, len(c.Nodes))
+	results := make([]NodeStatus, len(c.Nodes))
 	if err := c.Parallel(l, display, len(c.Nodes), 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(c.Nodes[i])
 		if err != nil {
-			results[i] = err.Error()
+			results[i] = NodeStatus{Err: err}
 			return nil, nil
 		}
 		defer sess.Close()
@@ -342,17 +370,19 @@ fi
 		}
 		msg = strings.TrimSpace(string(out))
 		if msg == "" {
-			msg = "not running"
+			results[i] = NodeStatus{Running: false}
+			return nil, nil
 		}
-		results[i] = msg
+		info := strings.Split(msg, " ")
+		results[i] = NodeStatus{Running: true, Version: info[0], Pid: info[1]}
 		return nil, nil
 	}); err != nil {
-		return err
+		return nil, err
 	}
-	for i, r := range results {
-		l.Printf("  %2d: %s\n", c.Nodes[i], r)
+	for i := 0; i < len(results); i++ {
+		results[i].NodeID = int(c.Nodes[i])
 	}
-	return nil
+	return results, nil
 }
 
 // NodeMonitorInfo is a message describing a cockroach process' status.
@@ -576,8 +606,10 @@ func runCmdOnSingleNode(
 
 	sess.SetWithExitStatus(true)
 	var stdoutBuffer, stderrBuffer bytes.Buffer
-	sess.SetStdout(&stdoutBuffer)
-	sess.SetStderr(&stderrBuffer)
+	multStdout := io.MultiWriter(&stdoutBuffer, l.Stdout)
+	multStderr := io.MultiWriter(&stderrBuffer, l.Stderr)
+	sess.SetStdout(multStdout)
+	sess.SetStderr(multStderr)
 
 	// Argument template expansion is node specific (e.g. for {store-dir}).
 	e := expander{
@@ -743,6 +775,35 @@ func (c *SyncedCluster) RunWithDetails(
 	return results, nil
 }
 
+var roachprodRetryOptions = retry.Options{
+	InitialBackoff: 10 * time.Second,
+	Multiplier:     2,
+	MaxBackoff:     5 * time.Minute,
+	MaxRetries:     10,
+}
+
+// RepeatRun is the same function as c.Run, but with an automatic retry loop.
+func (c *SyncedCluster) RepeatRun(
+	ctx context.Context, l *logger.Logger, stdout, stderr io.Writer, nodes Nodes, title,
+	cmd string,
+) error {
+	var lastError error
+	for attempt, r := 0, retry.StartWithCtx(ctx, roachprodRetryOptions); r.Next(); {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		attempt++
+		l.Printf("attempt %d - %s", attempt, title)
+		lastError = c.Run(ctx, l, stdout, stderr, nodes, title, cmd)
+		if lastError != nil {
+			l.Printf("error - retrying: %s", lastError)
+			continue
+		}
+		return nil
+	}
+	return errors.Wrapf(lastError, "all attempts failed for %s", title)
+}
+
 // Wait TODO(peter): document
 func (c *SyncedCluster) Wait(ctx context.Context, l *logger.Logger) error {
 	display := fmt.Sprintf("%s: waiting for nodes to start", c.Name)
@@ -789,12 +850,12 @@ func (c *SyncedCluster) Wait(ctx context.Context, l *logger.Logger) error {
 // added to the hosts via the c.AuthorizedKeys field. It does so in the following
 // steps:
 //
-//   1. Creates an ssh key pair on the first host to be used on all hosts if
-//      none exists.
-//   2. Distributes the public key, private key, and authorized_keys file from
-//      the first host to the others.
-//   3. Merges the data in c.AuthorizedKeys with the existing authorized_keys
-//      files on all hosts.
+//  1. Creates an ssh key pair on the first host to be used on all hosts if
+//     none exists.
+//  2. Distributes the public key, private key, and authorized_keys file from
+//     the first host to the others.
+//  3. Merges the data in c.AuthorizedKeys with the existing authorized_keys
+//     files on all hosts.
 //
 // This call strives to be idempotent.
 func (c *SyncedCluster) SetupSSH(ctx context.Context, l *logger.Logger) error {
@@ -1019,79 +1080,32 @@ fi
 	return nil
 }
 
+const (
+	certsTarName       = "certs.tar"
+	tenantCertsTarName = "tenant-certs.tar"
+)
+
 // DistributeCerts will generate and distribute certificates to all of the
 // nodes.
 func (c *SyncedCluster) DistributeCerts(ctx context.Context, l *logger.Logger) error {
-	dir := ""
-	if c.IsLocal() {
-		dir = c.localVMDir(1)
-	}
-
-	// Check to see if the certs have already been initialized.
-	var existsErr error
-	display := fmt.Sprintf("%s: checking certs", c.Name)
-	if err := c.Parallel(l, display, 1, 0, func(i int) ([]byte, error) {
-		sess, err := c.newSession(1)
-		if err != nil {
-			return nil, err
-		}
-		defer sess.Close()
-		_, existsErr = sess.CombinedOutput(ctx, `test -e `+filepath.Join(dir, `certs.tar`))
-		return nil, nil
-	}); err != nil {
-		return err
-	}
-	if existsErr == nil {
+	if c.checkForCertificates(ctx, l) {
 		return nil
 	}
 
-	// Gather the internal IP addresses for every node in the cluster, even
-	// if it won't be added to the cluster itself we still add the IP address
-	// to the node cert.
-	var msg string
-	display = fmt.Sprintf("%s: initializing certs", c.Name)
-	nodes := allNodes(len(c.VMs))
-	var ips []string
-	if !c.IsLocal() {
-		ips = make([]string, len(nodes))
-		if err := c.Parallel(l, "", len(nodes), 0, func(i int) ([]byte, error) {
-			var err error
-			ips[i], err = c.GetInternalIP(ctx, nodes[i])
-			return nil, errors.Wrapf(err, "IPs")
-		}); err != nil {
-			return err
-		}
+	nodeNames, err := c.createNodeCertArguments(ctx, l)
+	if err != nil {
+		return err
 	}
 
 	// Generate the ca, client and node certificates on the first node.
+	var msg string
+	display := fmt.Sprintf("%s: initializing certs", c.Name)
 	if err := c.Parallel(l, display, 1, 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(1)
 		if err != nil {
 			return nil, err
 		}
 		defer sess.Close()
-
-		var nodeNames []string
-		if c.IsLocal() {
-			// For local clusters, we only need to add one of the VM IP addresses.
-			nodeNames = append(nodeNames, "$(hostname)", c.VMs[0].PublicIP)
-		} else {
-			// Add both the local and external IP addresses, as well as the
-			// hostnames to the node certificate.
-			nodeNames = append(nodeNames, ips...)
-			for i := range c.VMs {
-				nodeNames = append(nodeNames, c.VMs[i].PublicIP)
-			}
-			for i := range c.VMs {
-				nodeNames = append(nodeNames, fmt.Sprintf("%s-%04d", c.Name, i+1))
-				// On AWS nodes internally have a DNS name in the form ip-<ip address>
-				// where dots have been replaces with dashes.
-				// See https://docs.aws.amazon.com/vpc/latest/userguide/vpc-dns.html#vpc-dns-hostnames
-				if c.VMs[i].Provider == aws.ProviderName {
-					nodeNames = append(nodeNames, "ip-"+strings.ReplaceAll(ips[i], ".", "-"))
-				}
-			}
-		}
 
 		var cmd string
 		if c.IsLocal() {
@@ -1103,9 +1117,9 @@ mkdir -p certs
 %[1]s cert create-ca --certs-dir=certs --ca-key=certs/ca.key
 %[1]s cert create-client root --certs-dir=certs --ca-key=certs/ca.key
 %[1]s cert create-client testuser --certs-dir=certs --ca-key=certs/ca.key
-%[1]s cert create-node localhost %[2]s --certs-dir=certs --ca-key=certs/ca.key
-tar cvf certs.tar certs
-`, cockroachNodeBinary(c, 1), strings.Join(nodeNames, " "))
+%[1]s cert create-node %[2]s --certs-dir=certs --ca-key=certs/ca.key
+tar cvf %[3]s certs
+`, cockroachNodeBinary(c, 1), strings.Join(nodeNames, " "), certsTarName)
 		if out, err := sess.CombinedOutput(ctx, cmd); err != nil {
 			msg = fmt.Sprintf("%s: %v", out, err)
 		}
@@ -1119,42 +1133,243 @@ tar cvf certs.tar certs
 		exit.WithCode(exit.UnspecifiedError())
 	}
 
-	var tmpfileName string
-	if c.IsLocal() {
-		tmpfileName = os.ExpandEnv(filepath.Join(dir, "certs.tar"))
-	} else {
-		// Retrieve the certs.tar that was created on the first node.
-		tmpfile, err := ioutil.TempFile("", "certs")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			exit.WithCode(exit.UnspecifiedError())
-		}
-		_ = tmpfile.Close()
-		defer func() {
-			_ = os.Remove(tmpfile.Name()) // clean up
-		}()
-
-		if err := func() error {
-			return c.scp(fmt.Sprintf("%s@%s:certs.tar", c.user(1), c.Host(1)), tmpfile.Name())
-		}(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			exit.WithCode(exit.UnspecifiedError())
-		}
-
-		tmpfileName = tmpfile.Name()
-	}
-
-	// Read the certs.tar file we just downloaded. We'll be piping it to the
-	// other nodes in the cluster.
-	certsTar, err := ioutil.ReadFile(tmpfileName)
+	tarfile, cleanup, err := c.getFileFromFirstNode(certsTarName)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		exit.WithCode(exit.UnspecifiedError())
+		return err
 	}
+	defer cleanup()
 
 	// Skip the first node which is where we generated the certs.
-	display = c.Name + ": distributing certs"
-	nodes = nodes[1:]
+	nodes := allNodes(len(c.VMs))[1:]
+	return c.distributeLocalCertsTar(ctx, l, tarfile, nodes, 0)
+}
+
+// DistributeTenantCerts will generate and distribute certificates to all of the
+// nodes, using the host cluster to generate tenant certificates.
+func (c *SyncedCluster) DistributeTenantCerts(
+	ctx context.Context, l *logger.Logger, hostCluster *SyncedCluster, tenantID int,
+) error {
+	if hostCluster.checkForTenantCertificates(ctx, l) {
+		return nil
+	}
+
+	if !hostCluster.checkForCertificates(ctx, l) {
+		return errors.New("host cluster missing certificate bundle")
+	}
+
+	nodeNames, err := c.createNodeCertArguments(ctx, l)
+	if err != nil {
+		return err
+	}
+
+	if err := hostCluster.createTenantCertBundle(ctx, l, tenantCertsTarName, tenantID, nodeNames); err != nil {
+		return err
+	}
+
+	tarfile, cleanup, err := hostCluster.getFileFromFirstNode(tenantCertsTarName)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return c.distributeLocalCertsTar(ctx, l, tarfile, allNodes(len(c.VMs)), 1)
+}
+
+// createTenantCertBundle creates a client cert bundle with the given name using
+// the first node in the cluster. The nodeNames provided are added to all node
+// and tenant-client certs.
+//
+// This function assumes it is running on a host cluster node that already has
+// had the main cert bundle created.
+func (c *SyncedCluster) createTenantCertBundle(
+	ctx context.Context, l *logger.Logger, bundleName string, tenantID int, nodeNames []string,
+) error {
+	display := fmt.Sprintf("%s: initializing tenant certs", c.Name)
+	return c.Parallel(l, display, 1, 0, func(i int) ([]byte, error) {
+		node := c.Nodes[i]
+		sess, err := c.newSession(node)
+		if err != nil {
+			return nil, err
+		}
+		defer sess.Close()
+
+		var tenantScopeArg string
+		if c.cockroachBinSupportsTenantScope(ctx, node) {
+			tenantScopeArg = fmt.Sprintf("--tenant-scope %d", tenantID)
+		}
+
+		cmd := "set -e;"
+		if c.IsLocal() {
+			cmd += fmt.Sprintf(`cd %s ; `, c.localVMDir(1))
+		}
+		cmd += fmt.Sprintf(`
+CERT_DIR=tenant-certs/certs
+CA_KEY=certs/ca.key
+
+rm -fr $CERT_DIR
+mkdir -p $CERT_DIR
+cp certs/ca.crt $CERT_DIR
+SHARED_ARGS="--certs-dir=$CERT_DIR --ca-key=$CA_KEY"
+%[1]s cert create-node %[2]s $SHARED_ARGS
+%[1]s cert create-tenant-client %[3]d %[2]s $SHARED_ARGS
+%[1]s cert create-client root %[4]s $SHARED_ARGS
+%[1]s cert create-client testuser %[4]s $SHARED_ARGS
+tar cvf %[5]s $CERT_DIR
+`,
+			cockroachNodeBinary(c, node),
+			strings.Join(nodeNames, " "),
+			tenantID,
+			tenantScopeArg,
+			bundleName,
+		)
+
+		if out, err := sess.CombinedOutput(ctx, cmd); err != nil {
+			return nil, errors.Wrapf(err, "certificate creation error: %s", out)
+		}
+		return nil, nil
+	})
+}
+
+// cockroachBinSupportsTenantScope is a hack to figure out if the version of
+// cockroach on the node supports tenant scoped certificates. We can't use a
+// version comparison here because we need to compare alpha build versions which
+// are compared lexicographically. This is a problem because our alpha versions
+// contain an integer count of commits, which does not sort correctly.  Once
+// this feature ships in a release, it will be easier to do a version comparison
+// on whether this command line flag is supported.
+func (c *SyncedCluster) cockroachBinSupportsTenantScope(ctx context.Context, node Node) bool {
+	sess, err := c.newSession(node)
+	if err != nil {
+		return false
+	}
+	defer sess.Close()
+
+	cmd := fmt.Sprintf("%s cert create-client --help | grep '\\--tenant-scope'", cockroachNodeBinary(c, node))
+	return sess.Run(ctx, cmd) == nil
+}
+
+// getFile retrieves the given file from the first node in the cluster. The
+// filename is assumed to be relative from the home directory of the node's
+// user.
+func (c *SyncedCluster) getFileFromFirstNode(name string) (string, func(), error) {
+	var tmpfileName string
+	cleanup := func() {}
+	if c.IsLocal() {
+		tmpfileName = os.ExpandEnv(filepath.Join(c.localVMDir(1), name))
+	} else {
+		tmpfile, err := os.CreateTemp("", name)
+		if err != nil {
+			return "", nil, err
+		}
+		_ = tmpfile.Close()
+		cleanup = func() {
+			_ = os.Remove(tmpfile.Name()) // clean up
+		}
+
+		srcFileName := fmt.Sprintf("%s@%s:%s", c.user(1), c.Host(1), name)
+		if err := c.scp(srcFileName, tmpfile.Name()); err != nil {
+			cleanup()
+			return "", nil, err
+		}
+		tmpfileName = tmpfile.Name()
+	}
+	return tmpfileName, cleanup, nil
+}
+
+// checkForCertificates checks if the cluster already has a certs bundle created
+// on the first node.
+func (c *SyncedCluster) checkForCertificates(ctx context.Context, l *logger.Logger) bool {
+	dir := ""
+	if c.IsLocal() {
+		dir = c.localVMDir(1)
+	}
+	return c.fileExistsOnFirstNode(ctx, l, filepath.Join(dir, certsTarName))
+}
+
+// checkForTenantCertificates checks if the cluster already has a tenant-certs bundle created
+// on the first node.
+func (c *SyncedCluster) checkForTenantCertificates(ctx context.Context, l *logger.Logger) bool {
+	dir := ""
+	if c.IsLocal() {
+		dir = c.localVMDir(1)
+	}
+	return c.fileExistsOnFirstNode(ctx, l, filepath.Join(dir, tenantCertsTarName))
+}
+
+func (c *SyncedCluster) fileExistsOnFirstNode(
+	ctx context.Context, l *logger.Logger, path string,
+) bool {
+	var existsErr error
+	display := fmt.Sprintf("%s: checking %s", c.Name, path)
+	if err := c.Parallel(l, display, 1, 0, func(i int) ([]byte, error) {
+		sess, err := c.newSession(c.Nodes[i])
+		if err != nil {
+			return nil, err
+		}
+		defer sess.Close()
+		_, existsErr = sess.CombinedOutput(ctx, `test -e `+path)
+		return nil, nil
+	}); err != nil {
+		return false
+	}
+	return existsErr == nil
+}
+
+// createNodeCertArguments returns a list of strings appropriate for use as
+// SubjectAlternativeName arguments to the ./cockroach cert create-node command.
+func (c *SyncedCluster) createNodeCertArguments(
+	ctx context.Context, l *logger.Logger,
+) ([]string, error) {
+	// Gather the internal IP addresses for every node in the cluster, even
+	// if it won't be added to the cluster itself we still add the IP address
+	// to the node cert.
+	var ips []string
+	nodes := allNodes(len(c.VMs))
+	if !c.IsLocal() {
+		ips = make([]string, len(nodes))
+		if err := c.Parallel(l, "", len(nodes), 0, func(i int) ([]byte, error) {
+			var err error
+			ips[i], err = c.GetInternalIP(ctx, nodes[i])
+			return nil, errors.Wrapf(err, "IPs")
+		}); err != nil {
+			return nil, err
+		}
+	}
+	nodeNames := []string{"localhost"}
+	if c.IsLocal() {
+		// For local clusters, we only need to add one of the VM IP addresses.
+		nodeNames = append(nodeNames, "$(hostname)", c.VMs[0].PublicIP)
+	} else {
+		// Add both the local and external IP addresses, as well as the
+		// hostnames to the node certificate.
+		nodeNames = append(nodeNames, ips...)
+		for i := range c.VMs {
+			nodeNames = append(nodeNames, c.VMs[i].PublicIP)
+		}
+		for i := range c.VMs {
+			nodeNames = append(nodeNames, fmt.Sprintf("%s-%04d", c.Name, i+1))
+			// On AWS nodes internally have a DNS name in the form ip-<ip address>
+			// where dots have been replaces with dashes.
+			// See https://docs.aws.amazon.com/vpc/latest/userguide/vpc-dns.html#vpc-dns-hostnames
+			if c.VMs[i].Provider == aws.ProviderName {
+				nodeNames = append(nodeNames, "ip-"+strings.ReplaceAll(ips[i], ".", "-"))
+			}
+		}
+	}
+	return nodeNames, nil
+}
+
+// distributeLocalTar distributes the given file to the given nodes and untars it.
+func (c *SyncedCluster) distributeLocalCertsTar(
+	ctx context.Context, l *logger.Logger, filename string, nodes Nodes, stripComponents int,
+) error {
+	// Read the certs.tar file we just downloaded. We'll be piping it to the
+	// other nodes in the cluster.
+	certsTar, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	display := c.Name + ": distributing certs"
 	return c.Parallel(l, display, len(nodes), 0, func(i int) ([]byte, error) {
 		sess, err := c.newSession(nodes[i])
 		if err != nil {
@@ -1165,9 +1380,13 @@ tar cvf certs.tar certs
 		sess.SetStdin(bytes.NewReader(certsTar))
 		var cmd string
 		if c.IsLocal() {
-			cmd = fmt.Sprintf(`cd %s ; `, c.localVMDir(nodes[i]))
+			cmd = fmt.Sprintf("cd %s ; ", c.localVMDir(nodes[i]))
 		}
-		cmd += `tar xf -`
+		if stripComponents > 0 {
+			cmd += fmt.Sprintf("tar --strip-components=%d -xf -", stripComponents)
+		} else {
+			cmd += "tar xf -"
+		}
 		if out, err := sess.CombinedOutput(ctx, cmd); err != nil {
 			return nil, errors.Wrapf(err, "~ %s\n%s", cmd, out)
 		}
@@ -1189,8 +1408,37 @@ func formatProgress(p float64) string {
 	return fmt.Sprintf("[%s%s] %.0f%%", progressDone[i:], progressTodo[:i], 100*p)
 }
 
+// PutString into the specified file on the specified remote node(s).
+func (c *SyncedCluster) PutString(
+	ctx context.Context, l *logger.Logger, nodes Nodes, content string, dest string, mode os.FileMode,
+) error {
+	if ctx.Err() != nil {
+		return errors.Wrap(ctx.Err(), "syncedCluster.PutString")
+	}
+
+	temp, err := os.CreateTemp("", filepath.Base(dest))
+	if err != nil {
+		return errors.Wrap(err, "cluster.PutString")
+	}
+	if _, err := temp.WriteString(content); err != nil {
+		return errors.Wrap(err, "cluster.PutString")
+	}
+	temp.Close()
+	src := temp.Name()
+
+	if err := os.Chmod(src, mode); err != nil {
+		return errors.Wrap(err, "cluster.PutString")
+	}
+	// NB: we intentionally don't remove the temp files. This is because roachprod
+	// will symlink them when running locally.
+
+	return errors.Wrap(c.Put(ctx, l, nodes, src, dest), "syncedCluster.PutString")
+}
+
 // Put TODO(peter): document
-func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest string) error {
+func (c *SyncedCluster) Put(
+	ctx context.Context, l *logger.Logger, nodes Nodes, src string, dest string,
+) error {
 	// Check if source file exists and if it's a symlink.
 	var potentialSymlinkPath string
 	var err error
@@ -1221,24 +1469,24 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 			detail = " (scp)"
 		}
 	}
-	l.Printf("%s: putting%s %s %s\n", c.Name, detail, src, dest)
+	l.Printf("%s: putting%s %s %s on nodes %v\n", c.Name, detail, src, dest, nodes)
 
 	type result struct {
 		index int
 		err   error
 	}
 
-	results := make(chan result, len(c.Nodes))
-	lines := make([]string, len(c.Nodes))
+	results := make(chan result, len(nodes))
+	lines := make([]string, len(nodes))
 	var linesMu syncutil.Mutex
 	var wg sync.WaitGroup
-	wg.Add(len(c.Nodes))
+	wg.Add(len(nodes))
 
 	// Each destination for the copy needs a source to copy from. We create a
 	// channel that has capacity for each destination. If we try to add a source
 	// and the channel is full we can simply drop that source as we know we won't
 	// need to use it.
-	sources := make(chan int, len(c.Nodes))
+	sources := make(chan int, len(nodes))
 	pushSource := func(i int) {
 		select {
 		case sources <- i:
@@ -1252,7 +1500,7 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 	} else {
 		// In non-treedist mode, add the local source N times (once for each
 		// destination).
-		for range c.Nodes {
+		for range nodes {
 			pushSource(-1)
 		}
 	}
@@ -1264,16 +1512,16 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 		// Expand the destination to allow, for example, putting directly
 		// into {store-dir}.
 		e := expander{
-			node: c.Nodes[i],
+			node: nodes[i],
 		}
 		dest, err := e.expand(ctx, l, c, dest)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s@%s:%s", c.user(c.Nodes[i]), c.Host(c.Nodes[i]), dest), nil
+		return fmt.Sprintf("%s@%s:%s", c.user(nodes[i]), c.Host(nodes[i]), dest), nil
 	}
 
-	for i := range c.Nodes {
+	for i := range nodes {
 		go func(i int, dest string) {
 			defer wg.Done()
 
@@ -1281,7 +1529,7 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 				// Expand the destination to allow, for example, putting directly
 				// into {store-dir}.
 				e := expander{
-					node: c.Nodes[i],
+					node: nodes[i],
 				}
 				var err error
 				dest, err = e.expand(ctx, l, c, dest)
@@ -1306,7 +1554,7 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 				if filepath.IsAbs(dest) {
 					to = dest
 				} else {
-					to = filepath.Join(c.localVMDir(c.Nodes[i]), dest)
+					to = filepath.Join(c.localVMDir(nodes[i]), dest)
 				}
 				// Remove the destination if it exists, ignoring errors which we'll
 				// handle via the os.Symlink() call.
@@ -1404,7 +1652,7 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 		if !config.Quiet {
 			linesMu.Lock()
 			for i := range lines {
-				fmt.Fprintf(&writer, "  %2d: ", c.Nodes[i])
+				fmt.Fprintf(&writer, "  %2d: ", nodes[i])
 				if lines[i] != "" {
 					fmt.Fprintf(&writer, "%s", lines[i])
 				} else {
@@ -1422,7 +1670,7 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 		l.Printf("\n")
 		linesMu.Lock()
 		for i := range lines {
-			l.Printf("  %2d: %s", c.Nodes[i], lines[i])
+			l.Printf("  %2d: %s", nodes[i], lines[i])
 		}
 		linesMu.Unlock()
 	}
@@ -1438,9 +1686,9 @@ func (c *SyncedCluster) Put(ctx context.Context, l *logger.Logger, src, dest str
 // For example, if dest is "tpcc-test.logs" then the logs for each node will be
 // stored like:
 //
-//  tpcc-test.logs/1.logs/...
-//  tpcc-test.logs/2.logs/...
-//  ...
+//	tpcc-test.logs/1.logs/...
+//	tpcc-test.logs/2.logs/...
+//	...
 //
 // Log file syncing uses rsync which attempts to be efficient when deciding
 // which files to update. The logs are merged by calling
@@ -1581,14 +1829,14 @@ func (c *SyncedCluster) Logs(
 }
 
 // Get TODO(peter): document
-func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
+func (c *SyncedCluster) Get(l *logger.Logger, nodes Nodes, src, dest string) error {
 	// TODO(peter): Only get 10 nodes at a time. When a node completes, output a
 	// line indicating that.
 	var detail string
 	if !c.IsLocal() {
 		detail = " (scp)"
 	}
-	l.Printf("%s: getting%s %s %s\n", c.Name, detail, src, dest)
+	l.Printf("%s: getting%s %s %s on nodes %v\n", c.Name, detail, src, dest, nodes)
 
 	type result struct {
 		index int
@@ -1596,20 +1844,20 @@ func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
 	}
 
 	var writer ui.Writer
-	results := make(chan result, len(c.Nodes))
-	lines := make([]string, len(c.Nodes))
+	results := make(chan result, len(nodes))
+	lines := make([]string, len(nodes))
 	var linesMu syncutil.Mutex
 
 	var wg sync.WaitGroup
-	for i := range c.Nodes {
+	for i := range nodes {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 
 			src := src
 			dest := dest
-			if len(c.Nodes) > 1 {
-				base := fmt.Sprintf("%d.%s", c.Nodes[i], filepath.Base(dest))
+			if len(nodes) > 1 {
+				base := fmt.Sprintf("%d.%s", nodes[i], filepath.Base(dest))
 				dest = filepath.Join(filepath.Dir(dest), base)
 			}
 
@@ -1621,7 +1869,7 @@ func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
 
 			if c.IsLocal() {
 				if !filepath.IsAbs(src) {
-					src = filepath.Join(c.localVMDir(c.Nodes[i]), src)
+					src = filepath.Join(c.localVMDir(nodes[i]), src)
 				}
 
 				var copy func(src, dest string, info os.FileInfo) error
@@ -1692,7 +1940,7 @@ func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
 				return
 			}
 
-			err := c.scp(fmt.Sprintf("%s@%s:%s", c.user(c.Nodes[0]), c.Host(c.Nodes[i]), src), dest)
+			err := c.scp(fmt.Sprintf("%s@%s:%s", c.user(nodes[0]), c.Host(nodes[i]), src), dest)
 			if err == nil {
 				// Make sure all created files and directories are world readable.
 				// The CRDB process intentionally sets a 0007 umask (resulting in
@@ -1759,7 +2007,7 @@ func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
 		if !config.Quiet && l.File == nil {
 			linesMu.Lock()
 			for i := range lines {
-				fmt.Fprintf(&writer, "  %2d: ", c.Nodes[i])
+				fmt.Fprintf(&writer, "  %2d: ", nodes[i])
 				if lines[i] != "" {
 					fmt.Fprintf(&writer, "%s", lines[i])
 				} else {
@@ -1777,7 +2025,7 @@ func (c *SyncedCluster) Get(l *logger.Logger, src, dest string) error {
 		l.Printf("\n")
 		linesMu.Lock()
 		for i := range lines {
-			l.Printf("  %2d: %s", c.Nodes[i], lines[i])
+			l.Printf("  %2d: %s", nodes[i], lines[i])
 		}
 		linesMu.Unlock()
 	}
@@ -1973,7 +2221,7 @@ func (c *SyncedCluster) ParallelE(
 	var writer ui.Writer
 	out := l.Stdout
 	if display == "" {
-		out = ioutil.Discard
+		out = io.Discard
 	}
 
 	var ticker *time.Ticker
@@ -1982,6 +2230,9 @@ func (c *SyncedCluster) ParallelE(
 	} else {
 		ticker = time.NewTicker(1000 * time.Millisecond)
 		fmt.Fprintf(out, "%s", display)
+		if l.File != nil {
+			fmt.Fprintf(out, "\n")
+		}
 	}
 	defer ticker.Stop()
 	complete := make([]bool, count)
@@ -2039,29 +2290,19 @@ func (c *SyncedCluster) ParallelE(
 
 // Init initializes the cluster. It does it through node 1 (as per TargetNodes)
 // to maintain parity with auto-init behavior of `roachprod start` (when
-// --skip-init) is not specified. The implementation should be kept in
-// sync with Start().
+// --skip-init) is not specified.
 func (c *SyncedCluster) Init(ctx context.Context, l *logger.Logger) error {
-	// See Start(). We reserve a few special operations for the first node, so we
+	// We reserve a few special operations for the first node, so we
 	// strive to maintain the same here for interoperability.
-	const firstNodeIdx = 0
+	const firstNodeIdx = 1
 
-	l.Printf("%s: initializing cluster\n", c.Name)
-	initOut, err := c.initializeCluster(ctx, firstNodeIdx)
-	if err != nil {
+	if err := c.initializeCluster(ctx, l, firstNodeIdx); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to initialize cluster.")
 	}
-	if initOut != "" {
-		l.Printf(initOut)
-	}
 
-	l.Printf("%s: setting cluster settings", c.Name)
-	clusterSettingsOut, err := c.setClusterSettings(ctx, l, firstNodeIdx)
-	if err != nil {
+	if err := c.setClusterSettings(ctx, l, firstNodeIdx); err != nil {
 		return errors.WithDetail(err, "install.Init() failed: unable to set cluster settings.")
 	}
-	if clusterSettingsOut != "" {
-		l.Printf(clusterSettingsOut)
-	}
+
 	return nil
 }

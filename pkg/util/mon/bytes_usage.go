@@ -21,11 +21,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // BoundAccount and BytesMonitor together form the mechanism by which
@@ -197,7 +199,7 @@ type BytesMonitor struct {
 	}
 
 	// name identifies this monitor in logging messages.
-	name string
+	name redact.RedactableString
 
 	// resource specifies what kind of resource the monitor is tracking
 	// allocations for. Specific behavior is delegated to this resource (e.g.
@@ -210,7 +212,7 @@ type BytesMonitor struct {
 	// pool, reserved determines the maximum allocation capacity of this
 	// monitor. The reserved bytes are released to their owner monitor
 	// upon Stop.
-	reserved BoundAccount
+	reserved *BoundAccount
 
 	// limit specifies a hard limit on the number of bytes a monitor allows to
 	// be allocated. Note that this limit will not be observed if allocations
@@ -223,6 +225,10 @@ type BytesMonitor struct {
 	// poolAllocationSize specifies the allocation unit for requests to the
 	// pool.
 	poolAllocationSize int64
+
+	// relinquishAllOnReleaseBytes, if true, indicates that the monitor should
+	// relinquish all bytes on releaseBytes() call.
+	relinquishAllOnReleaseBytes bool
 
 	// noteworthyUsageBytes is the size beyond which total allocations start to
 	// become reported in the logs.
@@ -246,24 +252,25 @@ var DefaultPoolAllocationSize = envutil.EnvOrDefaultInt64("COCKROACH_ALLOCATION_
 
 // NewMonitor creates a new monitor.
 // Arguments:
-// - name is used to annotate log messages, can be used to distinguish
-//   monitors.
 //
-// - resource specifies what kind of resource the monitor is tracking
-//   allocations for (e.g. memory or disk).
+//   - name is used to annotate log messages, can be used to distinguish
+//     monitors.
 //
-// - curCount and maxHist are the metric objects to update with usage
-//   statistics. Can be nil.
+//   - resource specifies what kind of resource the monitor is tracking
+//     allocations for (e.g. memory or disk).
 //
-// - increment is the block size used for upstream allocations from
-//   the pool. Note: if set to 0 or lower, the default pool allocation
-//   size is used.
+//   - curCount and maxHist are the metric objects to update with usage
+//     statistics. Can be nil.
 //
-// - noteworthy determines the minimum total allocated size beyond
-//   which the monitor starts to log increases. Use 0 to always log
-//   or math.MaxInt64 to never log.
+//   - increment is the block size used for upstream allocations from
+//     the pool. Note: if set to 0 or lower, the default pool allocation
+//     size is used.
+//
+//   - noteworthy determines the minimum total allocated size beyond
+//     which the monitor starts to log increases. Use 0 to always log
+//     or math.MaxInt64 to never log.
 func NewMonitor(
-	name string,
+	name redact.RedactableString,
 	res Resource,
 	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
@@ -278,7 +285,7 @@ func NewMonitor(
 // NewMonitorWithLimit creates a new monitor with a limit local to this
 // monitor.
 func NewMonitorWithLimit(
-	name string,
+	name redact.RedactableString,
 	res Resource,
 	limit int64,
 	curCount *metric.Gauge,
@@ -308,29 +315,48 @@ func NewMonitorWithLimit(
 
 // NewMonitorInheritWithLimit creates a new monitor with a limit local to this
 // monitor with all other attributes inherited from the passed in monitor.
-func NewMonitorInheritWithLimit(name string, limit int64, m *BytesMonitor) *BytesMonitor {
+// Note on metrics and inherited monitors.
+// When using pool to share resource, downstream monitors must not use the
+// same metric objects as pool monitor to avoid reporting the same allocation
+// multiple times. Downstream monitors should use their own metrics as needed
+// by using BytesMonitor.SetMetrics function.
+// Also note that because monitors pre-allocate resources from pool in chunks,
+// those chunks would be reported as used by pool while downstream monitors will
+// not.
+func NewMonitorInheritWithLimit(
+	name redact.RedactableString, limit int64, m *BytesMonitor,
+) *BytesMonitor {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return NewMonitorWithLimit(
 		name,
 		m.resource,
 		limit,
-		m.mu.curBytesCount,
-		m.mu.maxBytesHist,
+		nil, // curCount is not inherited as we don't want to double count allocations
+		nil, // maxHist is not inherited as we don't want to double count allocations
 		m.poolAllocationSize,
 		m.noteworthyUsageBytes,
 		m.settings,
 	)
 }
 
+// noReserved is safe to be used by multiple monitors as the "reserved" account
+// since only its 'used' field will ever be read.
+var noReserved = BoundAccount{}
+
+// StartNoReserved is the same as Start when there is no pre-reserved budget.
+func (mm *BytesMonitor) StartNoReserved(ctx context.Context, pool *BytesMonitor) {
+	mm.Start(ctx, pool, &noReserved)
+}
+
 // Start begins a monitoring region.
 // Arguments:
-// - pool is the upstream monitor that provision allocations exceeding the
-//   pre-reserved budget. If pool is nil, no upstream allocations are possible
-//   and the pre-reserved budget determines the entire capacity of this monitor.
+//   - pool is the upstream monitor that provision allocations exceeding the
+//     pre-reserved budget. If pool is nil, no upstream allocations are possible
+//     and the pre-reserved budget determines the entire capacity of this monitor.
 //
 // - reserved is the pre-reserved budget (see above).
-func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved BoundAccount) {
+func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved *BoundAccount) {
 	if mm.mu.curAllocated != 0 {
 		panic(fmt.Sprintf("%s: started with %d bytes left over", mm.name, mm.mu.curAllocated))
 	}
@@ -342,7 +368,7 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 	mm.mu.curBudget = pool.MakeBoundAccount()
 	mm.reserved = reserved
 	if log.V(2) {
-		poolname := "(none)"
+		poolname := redact.RedactableString("(none)")
 		if pool != nil {
 			poolname = pool.name
 		}
@@ -357,7 +383,7 @@ func (mm *BytesMonitor) Start(ctx context.Context, pool *BytesMonitor, reserved 
 // "detached" mode without a pool and without a maximum budget.
 func NewUnlimitedMonitor(
 	ctx context.Context,
-	name string,
+	name redact.RedactableString,
 	res Resource,
 	curCount *metric.Gauge,
 	maxHist *metric.Histogram,
@@ -374,7 +400,7 @@ func NewUnlimitedMonitor(
 		limit:                math.MaxInt64,
 		noteworthyUsageBytes: noteworthy,
 		poolAllocationSize:   DefaultPoolAllocationSize,
-		reserved:             MakeStandaloneBudget(math.MaxInt64),
+		reserved:             NewStandaloneBudget(math.MaxInt64),
 		settings:             settings,
 	}
 	m.mu.curBytesCount = curCount
@@ -396,7 +422,12 @@ func (mm *BytesMonitor) Stop(ctx context.Context) {
 
 // Name returns the name of the monitor.
 func (mm *BytesMonitor) Name() string {
-	return mm.name
+	return string(mm.name)
+}
+
+// Limit returns the memory limit of the monitor.
+func (mm *BytesMonitor) Limit() int64 {
+	return mm.limit
 }
 
 const bytesMaxUsageLoggingThreshold = 100 * 1024
@@ -414,7 +445,7 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 		logcrash.ReportOrPanic(
 			ctx, &mm.settings.SV,
 			"%s: unexpected %d leftover bytes",
-			log.Safe(mm.name), log.Safe(mm.mu.curAllocated))
+			mm.name, mm.mu.curAllocated)
 		mm.releaseBytes(ctx, mm.mu.curAllocated)
 	}
 
@@ -433,7 +464,9 @@ func (mm *BytesMonitor) doStop(ctx context.Context, check bool) {
 	mm.mu.curBudget.mon = nil
 
 	// Release the reserved budget to its original pool, if any.
-	mm.reserved.Clear(ctx)
+	if mm.reserved != &noReserved {
+		mm.reserved.Clear(ctx)
+	}
 }
 
 // MaximumBytes returns the maximum number of bytes that were allocated by this
@@ -470,29 +503,43 @@ func (mm *BytesMonitor) Resource() Resource {
 // at once when it completes its work. Internally, BoundAccount amortizes
 // allocations from whichever BoundAccount it is associated with by allocating
 // additional memory and parceling it out (see BoundAccount.reserved). A nil
-// BoundAccount acts as an unlimited account for which growing and shrinking
-// are noops.
+// BoundAccount acts as an unlimited account for which growing and shrinking are
+// noops.
 //
 // See the comments in bytes_usage.go for a fuller picture of how these accounts
 // are used in CockroachDB.
+//
+// A normal BoundAccount is not safe for concurrent use by multiple goroutines,
+// however if the Mu field is set to a non-nil mutex, some methods such as Grow,
+// Shrink, and Resize calls will lock and unlock that mutex making them safe;
+// such methods are identified in their comments.
 type BoundAccount struct {
 	used int64
 	// reserved is a small buffer to amortize the cost of growing an account. It
 	// decreases as used increases (and vice-versa).
 	reserved int64
 	mon      *BytesMonitor
+
+	earmark int64
+
+	// Mu, if non-nil, is used in some methods such as Grow and Shrink.
+	Mu *syncutil.Mutex
 }
 
-// MakeStandaloneBudget creates a BoundAccount suitable for root
-// monitors.
-func MakeStandaloneBudget(capacity int64) BoundAccount {
-	return BoundAccount{used: capacity}
+// NewStandaloneBudget creates a BoundAccount suitable for root monitors.
+func NewStandaloneBudget(capacity int64) *BoundAccount {
+	return &BoundAccount{used: capacity}
 }
 
 // Used returns the number of bytes currently allocated through this account.
+// If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) Used() int64 {
 	if b == nil {
 		return 0
+	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
 	}
 	return b.used
 }
@@ -528,6 +575,30 @@ func (b *BoundAccount) Init(ctx context.Context, mon *BytesMonitor) {
 	b.mon = mon
 }
 
+// Reserve requests an allocation of some amount from the monitor just like Grow
+// but does not mark it as used immediately, instead keeping it in the local
+// reservation by use by future Grow() calls, and configuring the account to
+// consider that amount "earmarked" for this account, meaning that that Shrink()
+// calls will not release it back to the parent monitor.
+//
+// If Mu is set, it is safe for use by concurrent goroutines.
+func (b *BoundAccount) Reserve(ctx context.Context, x int64) error {
+	if b == nil {
+		return nil
+	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
+	}
+	minExtra := b.mon.roundSize(x)
+	if err := b.mon.reserveBytes(ctx, minExtra); err != nil {
+		return err
+	}
+	b.reserved += minExtra
+	b.earmark += x
+	return nil
+}
+
 // Empty shrinks the account to use 0 bytes. Previously used memory is returned
 // to the reserved buffer, which is subsequently released such that at most
 // poolAllocationSize is reserved.
@@ -550,7 +621,7 @@ func (b *BoundAccount) Clear(ctx context.Context) {
 		return
 	}
 	if b.mon == nil {
-		// An account created by MakeStandaloneBudget is disconnected from any
+		// An account created by NewStandaloneBudget is disconnected from any
 		// monitor -- "bytes out of the aether". This needs not be closed.
 		return
 	}
@@ -565,7 +636,7 @@ func (b *BoundAccount) Close(ctx context.Context) {
 		return
 	}
 	if b.mon == nil {
-		// An account created by MakeStandaloneBudget is disconnected from any
+		// An account created by NewStandaloneBudget is disconnected from any
 		// monitor -- "bytes out of the aether". This needs not be closed.
 		return
 	}
@@ -584,9 +655,15 @@ func (b *BoundAccount) Close(ctx context.Context) {
 // If one is interested in specifying the new size of the account as a whole (as
 // opposed to resizing one object among many in the account), ResizeTo() should
 // be used.
+//
+// If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) Resize(ctx context.Context, oldSz, newSz int64) error {
 	if b == nil {
 		return nil
+	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
 	}
 	delta := newSz - oldSz
 	switch {
@@ -599,9 +676,15 @@ func (b *BoundAccount) Resize(ctx context.Context, oldSz, newSz int64) error {
 }
 
 // ResizeTo resizes (grows or shrinks) the account to a specified size.
+//
+// If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) ResizeTo(ctx context.Context, newSz int64) error {
 	if b == nil {
 		return nil
+	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
 	}
 	if newSz == b.used {
 		// Performance optimization to avoid an unnecessary dispatch.
@@ -611,12 +694,18 @@ func (b *BoundAccount) ResizeTo(ctx context.Context, newSz int64) error {
 }
 
 // Grow is an accessor for b.mon.GrowAccount.
+//
+// If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) Grow(ctx context.Context, x int64) error {
 	if b == nil {
 		return nil
 	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
+	}
 	if b.reserved < x {
-		minExtra := b.mon.roundSize(x)
+		minExtra := b.mon.roundSize(x - b.reserved)
 		if err := b.mon.reserveBytes(ctx, minExtra); err != nil {
 			return err
 		}
@@ -628,9 +717,15 @@ func (b *BoundAccount) Grow(ctx context.Context, x int64) error {
 }
 
 // Shrink releases part of the cumulated allocations by the specified size.
+//
+// If Mu is set, it is safe for use by concurrent goroutines.
 func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
-	if b == nil {
+	if b == nil || delta == 0 {
 		return
+	}
+	if b.Mu != nil {
+		b.Mu.Lock()
+		defer b.Mu.Unlock()
 	}
 	if b.used < delta {
 		logcrash.ReportOrPanic(ctx, &b.mon.settings.SV,
@@ -640,7 +735,7 @@ func (b *BoundAccount) Shrink(ctx context.Context, delta int64) {
 	}
 	b.used -= delta
 	b.reserved += delta
-	if b.reserved > b.mon.poolAllocationSize {
+	if b.reserved > b.mon.poolAllocationSize && (b.earmark == 0 || b.used+b.mon.poolAllocationSize > b.earmark) {
 		b.mon.releaseBytes(ctx, b.reserved-b.mon.poolAllocationSize)
 		b.reserved = b.mon.poolAllocationSize
 	}
@@ -766,13 +861,22 @@ func (mm *BytesMonitor) releaseBudget(ctx context.Context) {
 	mm.mu.curBudget.Clear(ctx)
 }
 
+// RelinquishAllOnReleaseBytes makes it so that the monitor doesn't keep any
+// margin bytes when the bytes are released from it.
+func (mm *BytesMonitor) RelinquishAllOnReleaseBytes() {
+	mm.relinquishAllOnReleaseBytes = true
+}
+
 // adjustBudget ensures that the monitor does not keep many more bytes reserved
 // from the pool than it currently has allocated. Bytes are relinquished when
 // there are at least maxAllocatedButUnusedBlocks*poolAllocationSize bytes
-// reserved but unallocated.
+// reserved but unallocated (if relinquishAllOnReleaseBytes is false).
 func (mm *BytesMonitor) adjustBudget(ctx context.Context) {
 	// NB: mm.mu Already locked by releaseBytes().
-	margin := mm.poolAllocationSize * int64(maxAllocatedButUnusedBlocks)
+	var margin int64
+	if !mm.relinquishAllOnReleaseBytes {
+		margin = mm.poolAllocationSize * int64(maxAllocatedButUnusedBlocks)
+	}
 
 	neededBytes := mm.mu.curAllocated
 	if neededBytes <= mm.reserved.used {
@@ -785,12 +889,12 @@ func (mm *BytesMonitor) adjustBudget(ctx context.Context) {
 	}
 }
 
-// ReadAll is like io.ReadAll except it additionally asks the BoundAccount acct
+// ReadAll is like ioctx.ReadAll except it additionally asks the BoundAccount acct
 // permission, if it is non-nil, it grows its buffer while reading. When the
 // caller releases the returned slice it shrink the bound account by its cap.
-func ReadAll(ctx context.Context, r io.Reader, acct *BoundAccount) ([]byte, error) {
+func ReadAll(ctx context.Context, r ioctx.ReaderCtx, acct *BoundAccount) ([]byte, error) {
 	if acct == nil {
-		b, err := io.ReadAll(r)
+		b, err := ioctx.ReadAll(ctx, r)
 		return b, err
 	}
 
@@ -828,7 +932,7 @@ func ReadAll(ctx context.Context, r io.Reader, acct *BoundAccount) ([]byte, erro
 		}
 
 		// Read into our buffer until we get an error.
-		n, err := r.Read(b[len(b):cap(b)])
+		n, err := r.Read(ctx, b[len(b):cap(b)])
 		b = b[:len(b)+n]
 		if err != nil {
 			if err == io.EOF {

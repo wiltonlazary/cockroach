@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -7,7 +8,6 @@ go_library(
         "encrypted_fs.go",
         "pebble_key_manager.go",
     ],
-    cdeps = [],
     importpath = "github.com/cockroachdb/cockroach/pkg/ccl/storageccl/engineccl",
     visibility = ["//visibility:public"],
     deps = [
@@ -15,7 +15,6 @@ go_library(
         "//pkg/ccl/storageccl/engineccl/enginepbccl",
         "//pkg/storage",
         "//pkg/storage/enginepb",
-        "//pkg/storage/fs",
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/syncutil",
@@ -37,6 +36,7 @@ go_test(
         "main_test.go",
         "pebble_key_manager_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":engineccl"],
     deps = [
@@ -44,11 +44,12 @@ go_test(
         "//pkg/ccl/baseccl",
         "//pkg/ccl/storageccl/engineccl/enginepbccl",
         "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/storage",
         "//pkg/storage/enginepb",
         "//pkg/testutils",
+        "//pkg/testutils/storageutils",
         "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/leaktest",
@@ -60,8 +61,11 @@ go_test(
         "@com_github_cockroachdb_errors//oserror",
         "@com_github_cockroachdb_pebble//:pebble",
         "@com_github_cockroachdb_pebble//vfs",
+        "@com_github_cockroachdb_pebble//vfs/atomicfs",
         "@com_github_gogo_protobuf//proto",
         "@com_github_kr_pretty//:pretty",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

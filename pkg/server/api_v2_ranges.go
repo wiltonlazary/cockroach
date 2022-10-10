@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -75,7 +74,7 @@ type nodesResponse struct {
 
 // swagger:operation GET /nodes/ listNodes
 //
-// List nodes
+// # List nodes
 //
 // List all nodes on this cluster.
 //
@@ -83,25 +82,27 @@ type nodesResponse struct {
 //
 // ---
 // parameters:
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation offset for results after a past limited run.
-//   required: false
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of results to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation offset for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // security:
 // - api_session: []
 // responses:
-//   "200":
-//     description: List nodes response.
-//     schema:
-//       "$ref": "#/definitions/nodesResponse"
+//
+//	"200":
+//	  description: List nodes response.
+//	  schema:
+//	    "$ref": "#/definitions/nodesResponse"
 func (a *apiV2Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit, offset := getSimplePaginationValues(r)
@@ -165,7 +166,7 @@ type rangeResponse struct {
 
 // swagger:operation GET /ranges/{range_id}/ listRange
 //
-// Get info about a range
+// # Get info about a range
 //
 // Retrieves more information about a specific range.
 //
@@ -173,19 +174,21 @@ type rangeResponse struct {
 //
 // ---
 // parameters:
-// - name: range_id
-//   in: path
-//   type: integer
-//   required: true
+//   - name: range_id
+//     in: path
+//     type: integer
+//     required: true
+//
 // produces:
 // - application/json
 // security:
 // - api_session: []
 // responses:
-//   "200":
-//     description: List range response
-//     schema:
-//       "$ref": "#/definitions/rangeResponse"
+//
+//	"200":
+//	  description: List range response
+//	  schema:
+//	    "$ref": "#/definitions/rangeResponse"
 func (a *apiV2Server) listRange(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ctx = apiToOutgoingGatewayCtx(ctx, r)
@@ -326,7 +329,7 @@ type nodeRangesResponse struct {
 
 // swagger:operation GET /nodes/{node_id}/ranges/ listNodeRanges
 //
-// List ranges on a node
+// # List ranges on a node
 //
 // Lists information about ranges on a specified node. If a list of range IDs
 // is specified, only information about those ranges is returned.
@@ -335,38 +338,40 @@ type nodeRangesResponse struct {
 //
 // ---
 // parameters:
-// - name: node_id
-//   in: path
-//   type: integer
-//   description: ID of node to query, or `local` for local node.
-//   required: true
-// - name: ranges
-//   in: query
-//   type: array
-//   required: false
-//   description: IDs of ranges to return information for. All ranges returned
-//     if unspecified.
-//   items:
+//   - name: node_id
+//     in: path
 //     type: integer
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: offset
-//   type: integer
-//   in: query
-//   description: Continuation offset for results after a past limited run.
-//   required: false
+//     description: ID of node to query, or `local` for local node.
+//     required: true
+//   - name: ranges
+//     in: query
+//     type: array
+//     required: false
+//     description: IDs of ranges to return information for. All ranges returned
+//     if unspecified.
+//     items:
+//     type: integer
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of results to return in this call.
+//     required: false
+//   - name: offset
+//     type: integer
+//     in: query
+//     description: Continuation offset for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // security:
 // - api_session: []
 // responses:
-//   "200":
-//     description: Node ranges response.
-//     schema:
-//       "$ref": "#/definitions/nodeRangesResponse"
+//
+//	"200":
+//	  description: Node ranges response.
+//	  schema:
+//	    "$ref": "#/definitions/nodeRangesResponse"
 func (a *apiV2Server) listNodeRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ctx = apiToOutgoingGatewayCtx(ctx, r)
@@ -415,16 +420,33 @@ type responseError struct {
 //
 // swagger:model hotRangesResponse
 type hotRangesResponse struct {
-	RangesByNodeID map[string][]rangeDescriptorInfo `json:"ranges_by_node_id"`
-	Errors         []responseError                  `json:"response_error,omitempty"`
+	Ranges []hotRangeInfo  `json:"ranges"`
+	Errors []responseError `json:"response_error,omitempty"`
 	// Continuation token for the next paginated call. Use as the `start`
 	// parameter.
 	Next string `json:"next,omitempty"`
 }
 
+// Hot range details struct describes common information about hot range,
+// (ie its range ID, QPS, table name, etc.).
+//
+// swagger:model hotRangeInfo
+type hotRangeInfo struct {
+	RangeID           roachpb.RangeID  `json:"range_id"`
+	NodeID            roachpb.NodeID   `json:"node_id"`
+	QPS               float64          `json:"qps"`
+	LeaseholderNodeID roachpb.NodeID   `json:"leaseholder_node_id"`
+	TableName         string           `json:"table_name"`
+	DatabaseName      string           `json:"database_name"`
+	IndexName         string           `json:"index_name"`
+	SchemaName        string           `json:"schema_name"`
+	ReplicaNodeIDs    []roachpb.NodeID `json:"replica_node_ids"`
+	StoreID           roachpb.StoreID  `json:"store_id"`
+}
+
 // swagger:operation GET /ranges/hot/ listHotRanges
 //
-// List hot ranges
+// # List hot ranges
 //
 // Lists information about hot ranges. If a list of range IDs
 // is specified, only information about those ranges is returned.
@@ -433,40 +455,40 @@ type hotRangesResponse struct {
 //
 // ---
 // parameters:
-// - name: node_id
-//   in: query
-//   type: integer
-//   description: ID of node to query, or `local` for local node. If
+//   - name: node_id
+//     in: query
+//     type: integer
+//     description: ID of node to query, or `local` for local node. If
 //     unspecified, all nodes are queried.
-//   required: false
-// - name: limit
-//   type: integer
-//   in: query
-//   description: Maximum number of results to return in this call.
-//   required: false
-// - name: start
-//   type: string
-//   in: query
-//   description: Continuation token for results after a past limited run.
-//   required: false
+//     required: false
+//   - name: limit
+//     type: integer
+//     in: query
+//     description: Maximum number of results to return in this call.
+//     required: false
+//   - name: start
+//     type: string
+//     in: query
+//     description: Continuation token for results after a past limited run.
+//     required: false
+//
 // produces:
 // - application/json
 // security:
 // - api_session: []
 // responses:
-//   "200":
-//     description: Hot ranges response.
-//     schema:
-//       "$ref": "#/definitions/hotRangesResponse"
+//
+//	"200":
+//	  description: Hot ranges response.
+//	  schema:
+//	    "$ref": "#/definitions/hotRangesResponse"
 func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ctx = apiToOutgoingGatewayCtx(ctx, r)
 	nodeIDStr := r.URL.Query().Get("node_id")
 	limit, start := getRPCPaginationValues(r)
 
-	response := &hotRangesResponse{
-		RangesByNodeID: make(map[string][]rangeDescriptorInfo),
-	}
+	response := &hotRangesResponse{}
 	var requestedNodes []roachpb.NodeID
 	if len(nodeIDStr) > 0 {
 		requestedNodeID, _, err := a.status.parseNodeID(nodeIDStr)
@@ -484,32 +506,30 @@ func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 	remoteRequest := serverpb.HotRangesRequest{NodeID: "local"}
 	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
 		status := client.(serverpb.StatusClient)
-		resp, err := status.HotRanges(ctx, &remoteRequest)
+		resp, err := status.HotRangesV2(ctx, &remoteRequest)
 		if err != nil || resp == nil {
 			return nil, err
 		}
-		rangeDescriptorInfos := make([]rangeDescriptorInfo, 0)
-		for _, store := range resp.HotRangesByNodeID[nodeID].Stores {
-			for _, hotRange := range store.HotRanges {
-				var r rangeDescriptorInfo
-				r.init(&hotRange.Desc)
-				r.StoreID = int32(store.StoreID)
-				r.QueriesPerSecond = hotRange.QueriesPerSecond
-				rangeDescriptorInfos = append(rangeDescriptorInfos, r)
+
+		var hotRangeInfos = make([]hotRangeInfo, len(resp.Ranges))
+		for i, r := range resp.Ranges {
+			hotRangeInfos[i] = hotRangeInfo{
+				RangeID:           r.RangeID,
+				NodeID:            r.NodeID,
+				QPS:               r.QPS,
+				LeaseholderNodeID: r.LeaseholderNodeID,
+				TableName:         r.TableName,
+				DatabaseName:      r.DatabaseName,
+				IndexName:         r.IndexName,
+				ReplicaNodeIDs:    r.ReplicaNodeIds,
+				SchemaName:        r.SchemaName,
+				StoreID:           r.StoreID,
 			}
 		}
-		sort.Slice(rangeDescriptorInfos, func(i, j int) bool {
-			if rangeDescriptorInfos[i].StoreID == rangeDescriptorInfos[j].StoreID {
-				return rangeDescriptorInfos[i].RangeID < rangeDescriptorInfos[j].RangeID
-			}
-			return rangeDescriptorInfos[i].StoreID < rangeDescriptorInfos[j].StoreID
-		})
-		return rangeDescriptorInfos, nil
+		return hotRangeInfos, nil
 	}
 	responseFn := func(nodeID roachpb.NodeID, resp interface{}) {
-		if hotRangesResp, ok := resp.([]rangeDescriptorInfo); ok {
-			response.RangesByNodeID[nodeID.String()] = hotRangesResp
-		}
+		response.Ranges = append(response.Ranges, resp.([]hotRangeInfo)...)
 	}
 	errorFn := func(nodeID roachpb.NodeID, err error) {
 		response.Errors = append(response.Errors, responseError{

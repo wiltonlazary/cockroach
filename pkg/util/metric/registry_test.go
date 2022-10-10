@@ -76,7 +76,7 @@ func TestRegistry(t *testing.T) {
 	topCounter := NewCounter(Metadata{Name: "top.counter"})
 	r.AddMetric(topCounter)
 
-	r.AddMetric(NewHistogram(Metadata{Name: "top.histogram"}, time.Minute, 1000, 3))
+	r.AddMetric(NewHistogram(Metadata{Name: "top.histogram"}, time.Minute, Count1KBuckets))
 
 	r.AddMetric(NewGauge(Metadata{Name: "bottom.gauge"}))
 	ms := &struct {
@@ -103,7 +103,7 @@ func TestRegistry(t *testing.T) {
 		StructGauge:     NewGauge(Metadata{Name: "struct.gauge"}),
 		StructGauge64:   NewGaugeFloat64(Metadata{Name: "struct.gauge64"}),
 		StructCounter:   NewCounter(Metadata{Name: "struct.counter"}),
-		StructHistogram: NewHistogram(Metadata{Name: "struct.histogram"}, time.Minute, 1000, 3),
+		StructHistogram: NewHistogram(Metadata{Name: "struct.histogram"}, time.Minute, Count1KBuckets),
 		NestedStructGauge: NestedStruct{
 			NestedStructGauge: NewGauge(Metadata{Name: "nested.struct.gauge"}),
 		},
@@ -122,7 +122,7 @@ func TestRegistry(t *testing.T) {
 		privateStructGauge:     NewGauge(Metadata{Name: "private.struct.gauge"}),
 		privateStructGauge64:   NewGaugeFloat64(Metadata{Name: "private.struct.gauge64"}),
 		privateStructCounter:   NewCounter(Metadata{Name: "private.struct.counter"}),
-		privateStructHistogram: NewHistogram(Metadata{Name: "private.struct.histogram"}, time.Minute, 1000, 3),
+		privateStructHistogram: NewHistogram(Metadata{Name: "private.struct.histogram"}, time.Minute, Count1KBuckets),
 		privateNestedStructGauge: NestedStruct{
 			NestedStructGauge: NewGauge(Metadata{Name: "private.nested.struct.gauge"}),
 		},
@@ -162,6 +162,25 @@ func TestRegistry(t *testing.T) {
 	})
 	if len(expNames) > 0 {
 		t.Fatalf("missed names: %v", expNames)
+	}
+
+	// Test Select
+	selectExpNames := map[string]struct{}{
+		"top.histogram":   {},
+		"top.gauge":       {},
+		"not.in.registry": {},
+	}
+
+	r.Select(
+		selectExpNames,
+		func(name string, _ interface{}) {
+			if _, exist := selectExpNames[name]; !exist {
+				t.Errorf("unexpected name: %s", name)
+			}
+			delete(selectExpNames, name)
+		})
+	if len(selectExpNames) != 1 {
+		t.Fatalf("missed or selected names not in registry: %v", selectExpNames)
 	}
 
 	// Test get functions

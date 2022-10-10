@@ -13,6 +13,7 @@ package physical
 import (
 	"bytes"
 	"fmt"
+	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
@@ -51,7 +52,7 @@ type Required struct {
 	// that only the hinted number of rows will be needed.
 	// A LimitHint of 0 indicates "no limit". The LimitHint is an intermediate
 	// float64 representation, and can be converted to an integer number of rows
-	// using math.Ceil.
+	// using LimitHintInt64.
 	LimitHint float64
 
 	// Distribution specifies the physical distribution of result rows. This is
@@ -121,12 +122,23 @@ func (p *Required) Equals(rhs *Required) bool {
 		p.LimitHint == rhs.LimitHint && p.Distribution.Equals(rhs.Distribution)
 }
 
+// LimitHintInt64 returns the limit hint converted to an int64.
+func (p *Required) LimitHintInt64() int64 {
+	h := int64(math.Ceil(p.LimitHint))
+	if h < 0 {
+		// If we have an overflow, then disable the limit hint.
+		h = 0
+	}
+	return h
+}
+
 // Presentation specifies the naming, membership (including duplicates), and
 // order of result columns that are required of or provided by an operator.
 // While it cannot add unique columns, Presentation can rename, reorder,
 // duplicate and discard columns. If Presentation is not defined, then no
 // particular column presentation is required or provided. For example:
-//   a.y:2 a.x:1 a.y:2 column1:3
+//
+//	a.y:2 a.x:1 a.y:2 column1:3
 type Presentation []opt.AliasedColumn
 
 // Any is true if any column presentation is allowed or can be provided.

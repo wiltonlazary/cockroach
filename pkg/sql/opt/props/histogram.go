@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -36,7 +37,7 @@ import (
 // a relational expression.
 // Histograms are immutable.
 type Histogram struct {
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 	col     opt.ColumnID
 	buckets []cat.HistogramBucket
 }
@@ -50,9 +51,7 @@ func (h *Histogram) String() string {
 }
 
 // Init initializes the histogram with data from the catalog.
-func (h *Histogram) Init(
-	evalCtx *tree.EvalContext, col opt.ColumnID, buckets []cat.HistogramBucket,
-) {
+func (h *Histogram) Init(evalCtx *eval.Context, col opt.ColumnID, buckets []cat.HistogramBucket) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*h = Histogram{
@@ -375,6 +374,8 @@ func (h *Histogram) InvertedFilter(spans inverted.Spans) *Histogram {
 
 func makeSpanFromInvertedSpan(invSpan inverted.Span) *constraint.Span {
 	var span constraint.Span
+	// The statistics use the Bytes type for the encoded key, so we use DBytes
+	// here.
 	span.Init(
 		constraint.MakeKey(tree.NewDBytes(tree.DBytes(invSpan.Start))),
 		constraint.IncludeBoundary,
@@ -433,6 +434,9 @@ func (h *Histogram) addBucket(bucket *cat.HistogramBucket, desc bool) {
 // ApplySelectivity reduces the size of each histogram bucket according to
 // the given selectivity, and returns a new histogram with the results.
 func (h *Histogram) ApplySelectivity(selectivity Selectivity) *Histogram {
+	if selectivity == ZeroSelectivity {
+		return nil
+	}
 	res := h.copy()
 	for i := range res.buckets {
 		b := &res.buckets[i]
@@ -551,9 +555,10 @@ func makeSpanFromBucket(iter *histogramIter, prefix []tree.Datum) (span constrai
 // values are integers).
 //
 // The following spans will filter the bucket as shown:
-//   [/0 - /5]   => {NumEq: 1, NumRange: 5, UpperBound: 5}
-//   [/2 - /10]  => {NumEq: 5, NumRange: 8, UpperBound: 10}
-//   [/20 - /30] => error
+//
+//	[/0 - /5]   => {NumEq: 1, NumRange: 5, UpperBound: 5}
+//	[/2 - /10]  => {NumEq: 5, NumRange: 8, UpperBound: 10}
+//	[/20 - /30] => error
 //
 // Note that the calculations for NumEq and NumRange depend on the data type.
 // For discrete data types such as integers and dates, it is always possible
@@ -563,14 +568,13 @@ func makeSpanFromBucket(iter *histogramIter, prefix []tree.Datum) (span constrai
 // bound. For example, given the same bucket as in the above example, but with
 // floating point values instead of integers:
 //
-//   [/0 - /5]   => {NumEq: 0, NumRange: 5, UpperBound: 5.0}
-//   [/2 - /10]  => {NumEq: 5, NumRange: 8, UpperBound: 10.0}
-//   [/20 - /30] => error
+//	[/0 - /5]   => {NumEq: 0, NumRange: 5, UpperBound: 5.0}
+//	[/2 - /10]  => {NumEq: 5, NumRange: 8, UpperBound: 10.0}
+//	[/20 - /30] => error
 //
 // For non-numeric types such as strings, it is not possible to estimate
 // the size of NumRange if the bucket is cut off in the middle. In this case,
 // we use the heuristic that NumRange is reduced by half.
-//
 func getFilteredBucket(
 	iter *histogramIter, keyCtx *constraint.KeyContext, filteredSpan *constraint.Span, colOffset int,
 ) *cat.HistogramBucket {
@@ -603,12 +607,18 @@ func getFilteredBucket(
 
 	// Determine whether this span includes the original upper bound of the
 	// bucket.
-	isSpanEndBoundaryInclusive := filteredSpan.EndBoundary() == constraint.IncludeBoundary
-	includesOriginalUpperBound := isSpanEndBoundaryInclusive && cmpSpanEndBucketEnd == 0
-	if iter.desc {
-		isSpanStartBoundaryInclusive := filteredSpan.StartBoundary() == constraint.IncludeBoundary
-		includesOriginalUpperBound = isSpanStartBoundaryInclusive && cmpSpanStartBucketStart == 0
+	var keyLength, cmp int
+	var keyBoundaryInclusive bool
+	if !iter.desc {
+		keyLength = filteredSpan.EndKey().Length()
+		keyBoundaryInclusive = filteredSpan.EndBoundary() == constraint.IncludeBoundary
+		cmp = cmpSpanEndBucketEnd
+	} else {
+		keyLength = filteredSpan.StartKey().Length()
+		keyBoundaryInclusive = filteredSpan.StartBoundary() == constraint.IncludeBoundary
+		cmp = cmpSpanStartBucketStart
 	}
+	includesOriginalUpperBound := cmp == 0 && ((colOffset < keyLength-1) || keyBoundaryInclusive)
 
 	// Calculate the new value for numEq.
 	var numEq float64
@@ -684,36 +694,35 @@ func getFilteredBucket(
 // below, where [\bear - \bobcat] represents the before range and
 // [\bluejay - \boar] represents the after range.
 //
-//   bear    := [18  98  101 97  114 0   1          ]
-//           => [101 97  114 0   0   0   0   0      ]
+//	bear    := [18  98  101 97  114 0   1          ]
+//	        => [101 97  114 0   0   0   0   0      ]
 //
-//   bluejay := [18  98  108 117 101 106 97  121 0 1]
-//           => [108 117 101 106 97  121 0   0      ]
+//	bluejay := [18  98  108 117 101 106 97  121 0 1]
+//	        => [108 117 101 106 97  121 0   0      ]
 //
-//   boar    := [18  98  111 97  114 0   1          ]
-//           => [111 97  114 0   0   0   0   0      ]
+//	boar    := [18  98  111 97  114 0   1          ]
+//	        => [111 97  114 0   0   0   0   0      ]
 //
-//   bobcat  := [18  98  111 98  99  97  116 0   1  ]
-//           => [111 98  99  97  116 0   0   0      ]
+//	bobcat  := [18  98  111 98  99  97  116 0   1  ]
+//	        => [111 98  99  97  116 0   0   0      ]
 //
 // We can now find the range before/after by finding the difference between
 // the lower and upper bounds:
 //
-//	 rangeBefore := [111 98  99  97  116 0   1   0] -
-//                  [101 97  114 0   1   0   0   0]
+//		 rangeBefore := [111 98  99  97  116 0   1   0] -
+//	                 [101 97  114 0   1   0   0   0]
 //
-//   rangeAfter  := [111 97  114 0   1   0   0   0] -
-//                  [108 117 101 106 97  121 0   1]
+//	  rangeAfter  := [111 97  114 0   1   0   0   0] -
+//	                 [108 117 101 106 97  121 0   1]
 //
 // Subtracting the uint64 representations of the byte arrays, the resulting
 // rangeBefore and rangeAfter are:
 //
-//	 rangeBefore := 8,026,086,756,136,779,776 - 7,305,245,414,897,221,632
-//               := 720,841,341,239,558,100
+//		 rangeBefore := 8,026,086,756,136,779,776 - 7,305,245,414,897,221,632
+//	              := 720,841,341,239,558,100
 //
-//	 rangeAfter := 8,025,821,355,276,500,992 - 7,815,264,235,947,622,400
-//              := 210,557,119,328,878,600
-//
+//		 rangeAfter := 8,025,821,355,276,500,992 - 7,815,264,235,947,622,400
+//	             := 210,557,119,328,878,600
 func getRangesBeforeAndAfter(
 	beforeLowerBound, beforeUpperBound, afterLowerBound, afterUpperBound tree.Datum, swap bool,
 ) (rangeBefore, rangeAfter float64, ok bool) {
@@ -922,11 +931,15 @@ func getFixedLenArr(byteArr []byte, ind, fixLen int) []byte {
 }
 
 // histogramWriter prints histograms with the following formatting:
-//   NumRange1    NumEq1     NumRange2    NumEq2    ....
+//
+//	NumRange1    NumEq1     NumRange2    NumEq2    ....
+//
 // <----------- UpperBound1 ----------- UpperBound2 ....
 //
 // For example:
-//   0  1  90  10   0  20
+//
+//	0  1  90  10   0  20
+//
 // <--- 0 ---- 100 --- 200
 //
 // This describes a histogram with 3 buckets. The first bucket contains 1 value

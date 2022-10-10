@@ -19,6 +19,13 @@ eexpect "1 row"
 eexpect ":/# "
 end_test
 
+
+start_test "Check that tables are pretty-printed when output is not a terminal but --format=ndjson is specified."
+send "echo 'select 1 as WOO;' | $argv sql --format=ndjson | cat\r"
+eexpect "{\"woo\":\"1\"}"
+eexpect ":/# "
+end_test
+
 start_test "Check that tables are pretty-printed when input is not a terminal and --format=table is not specified, but output is a terminal."
 send "echo begin; echo 'select 1 as WOO;' | $argv sql\r"
 eexpect "woo"
@@ -35,7 +42,7 @@ eexpect ":/# "
 end_test
 
 start_test "Check that tables are pretty-printed when input and output are a terminal and --format=table is not specified."
-send "$argv sql\r"
+send "$argv sql --no-line-editor\r"
 eexpect root@
 send "select 1 as WOO;\r"
 eexpect "?-*-\r\n"
@@ -57,7 +64,7 @@ send "\\q\r"
 eexpect ":/# "
 
 start_test "Check that tables are not pretty-printed when output is a terminal and --format=tsv is specified."
-send "$argv sql --format=tsv\r"
+send "$argv sql --no-line-editor --format=tsv\r"
 eexpect root@
 send "select 42 as woo; select 1 as woo;\r"
 eexpect "woo\r\n42\r\n"

@@ -10,11 +10,6 @@
 
 package catpb
 
-import (
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/errors"
-)
-
 // RegionName is an alias for a region stored on the database.
 type RegionName string
 
@@ -35,24 +30,12 @@ func (regions RegionNames) ToStrings() []string {
 	return ret
 }
 
-// TelemetryName returns the name to use for the given locality.
-func (cfg *LocalityConfig) TelemetryName() (string, error) {
-	switch l := cfg.Locality.(type) {
-	case *LocalityConfig_Global_:
-		return tree.TelemetryNameGlobal, nil
-	case *LocalityConfig_RegionalByTable_:
-		if l.RegionalByTable.Region != nil {
-			return tree.TelemetryNameRegionalByTableIn, nil
+// Contains returns true if the NameList contains the name.
+func (regions RegionNames) Contains(name RegionName) bool {
+	for _, r := range regions {
+		if r == name {
+			return true
 		}
-		return tree.TelemetryNameRegionalByTable, nil
-	case *LocalityConfig_RegionalByRow_:
-		if l.RegionalByRow.As != nil {
-			return tree.TelemetryNameRegionalByRowAs, nil
-		}
-		return tree.TelemetryNameRegionalByRow, nil
 	}
-	return "", errors.AssertionFailedf(
-		"unknown locality config TelemetryName: type %T",
-		cfg.Locality,
-	)
+	return false
 }

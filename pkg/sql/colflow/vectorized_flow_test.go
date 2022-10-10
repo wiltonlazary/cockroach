@@ -28,12 +28,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,34 +86,39 @@ func intCols(numCols int) []*types.T {
 // not important). If it drains the depicted inbox, that is pulling from node 2
 // which is in turn pulling from an outbox, a cycle is created and the flow is
 // blocked.
-//          +------------+
-//          |  Node 3    |
-//          +-----+------+
-//                ^
-//      Node 1    |           Node 2
+//
+//	    +------------+
+//	    |  Node 3    |
+//	    +-----+------+
+//	          ^
+//	Node 1    |           Node 2
+//
 // +------------------------+-----------------+
-//          +------------+  |
-//     Spec C +--------+ |  |
-//          | |  noop  | |  |
-//          | +---+----+ |  |
-//          |     ^      |  |
-//          |  +--+---+  |  |
-//          |  |outbox|  +<----------+
-//          |  +------+  |  |        |
-//          +------------+  |        |
+//
+//	     +------------+  |
+//	Spec C +--------+ |  |
+//	     | |  noop  | |  |
+//	     | +---+----+ |  |
+//	     |     ^      |  |
+//	     |  +--+---+  |  |
+//	     |  |outbox|  +<----------+
+//	     |  +------+  |  |        |
+//	     +------------+  |        |
+//
 // Drain cycle!---+         |   +----+-----------------+
-//                v         |   |Any group of operators|
-//          +------------+  |   +----+-----------------+
-//          |  +------+  |  |        ^
-//     Spec A  |inbox +--------------+
-//          |  +------+  |  |
-//          +------------+  |
-//                ^         |
-//                |         |
-//          +-----+------+  |
-//     Spec B    noop    |  |
-//          |materializer|  +
-//          +------------+
+//
+//	           v         |   |Any group of operators|
+//	     +------------+  |   +----+-----------------+
+//	     |  +------+  |  |        ^
+//	Spec A  |inbox +--------------+
+//	     |  +------+  |  |
+//	     +------------+  |
+//	           ^         |
+//	           |         |
+//	     +-----+------+  |
+//	Spec B    noop    |  |
+//	     |materializer|  +
+//	     +------------+
 func TestDrainOnlyInputDAG(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -218,20 +224,21 @@ func TestDrainOnlyInputDAG(t *testing.T) {
 	}
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 	f := &flowinfra.FlowBase{
 		FlowCtx: execinfra.FlowCtx{
 			Cfg:     &execinfra.ServerConfig{},
 			EvalCtx: &evalCtx,
+			Mon:     evalCtx.TestingMon,
 			NodeID:  base.TestingIDContainer,
 		},
 	}
 	var wg sync.WaitGroup
 	vfc := newVectorizedFlowCreator(
 		&vectorizedFlowCreatorHelper{f: f}, componentCreator, false, false, &wg, &execinfra.RowChannel{},
-		nil /* batchSyncFlowConsumer */, nil /* nodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
+		nil /* batchSyncFlowConsumer */, nil /* podNodeDialer */, execinfrapb.FlowID{}, colcontainer.DiskQueueCfg{},
 		nil /* fdSemaphore */, descs.DistSQLTypeResolver{}, admission.WorkInfo{},
 	)
 
@@ -250,7 +257,7 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	ctx := context.Background()
 	defer evalCtx.Stop(ctx)
 
@@ -262,7 +269,7 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	defer ngn.Close()
 	defer dirCleanup()
 
-	newVectorizedFlow := func() *vectorizedFlow {
+	newVectorizedFlow := func(queriesSpilled *metric.Counter) *vectorizedFlow {
 		return NewVectorizedFlow(
 			&flowinfra.FlowBase{
 				FlowCtx: execinfra.FlowCtx{
@@ -270,9 +277,12 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 						TempFS:          ngn,
 						TempStoragePath: tempPath,
 						VecFDSemaphore:  &colexecop.TestingSemaphore{},
-						Metrics:         &execinfra.DistSQLMetrics{},
+						Metrics: &execinfra.DistSQLMetrics{
+							QueriesSpilled: queriesSpilled,
+						},
 					},
 					EvalCtx:     &evalCtx,
+					Mon:         evalCtx.TestingMon,
 					NodeID:      base.TestingIDContainer,
 					DiskMonitor: execinfra.NewTestDiskMonitor(ctx, st),
 				},
@@ -294,7 +304,8 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	// LazilyCreated asserts that a directory is not created during flow Setup
 	// but is done so when an operator spills to disk.
 	t.Run("LazilyCreated", func(t *testing.T) {
-		vf := newVectorizedFlow()
+		spilledCounter := metric.NewCounter(metric.Metadata{})
+		vf := newVectorizedFlow(spilledCounter)
 		var creator *vectorizedFlowCreator
 		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
 			creator = c
@@ -305,6 +316,9 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 
 		// No directory should have been created.
 		checkDirs(t, 0)
+
+		// The spilling hasn't happened yet.
+		require.Equal(t, int64(0), spilledCounter.Count())
 
 		// After the call to Setup, creator should be non-nil (i.e. the testing knob
 		// should have been called).
@@ -317,6 +331,9 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		// We should now have one directory, the flow's temporary storage directory.
 		checkDirs(t, 1)
 
+		// The metric must have been incremented.
+		require.Equal(t, int64(1), spilledCounter.Count())
+
 		// Another operator calling GetPath again should not create a new
 		// directory.
 		creator.diskQueueCfg.GetPather.GetPath(ctx)
@@ -328,7 +345,8 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 	})
 
 	t.Run("DirCreationRace", func(t *testing.T) {
-		vf := newVectorizedFlow()
+		spilledCounter := metric.NewCounter(metric.Metadata{})
+		vf := newVectorizedFlow(spilledCounter)
 		var creator *vectorizedFlowCreator
 		vf.testingKnobs.onSetupFlow = func(c *vectorizedFlowCreator) {
 			creator = c
@@ -350,5 +368,8 @@ func TestVectorizedFlowTempDirectory(t *testing.T) {
 		require.NoError(t, <-errCh)
 		vf.Cleanup(ctx)
 		checkDirs(t, 0)
+
+		// The metric must have been incremented exactly once.
+		require.Equal(t, int64(1), spilledCounter.Count())
 	})
 }

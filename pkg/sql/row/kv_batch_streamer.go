@@ -13,42 +13,26 @@ package row
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvstreamer"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/errors"
 )
 
-// CanUseStreamer returns whether the kvstreamer.Streamer API should be used.
-func CanUseStreamer(ctx context.Context, settings *cluster.Settings) bool {
-	// TODO(yuzefovich): remove the version gate in 22.2 cycle.
-	return settings.Version.IsActive(ctx, clusterversion.TargetBytesAvoidExcess) &&
-		useStreamerEnabled.Get(&settings.SV)
-}
+// txnKVStreamer handles retrieval of key/values.
+type txnKVStreamer struct {
+	streamer   *kvstreamer.Streamer
+	keyLocking lock.Strength
 
-// useStreamerEnabled determines whether the Streamer API should be used.
-// TODO(yuzefovich): remove this in 22.2.
-var useStreamerEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
-	"sql.distsql.use_streamer.enabled",
-	"determines whether the usage of the Streamer API is allowed. "+
-		"Enabling this will increase the speed of lookup/index joins "+
-		"while adhering to memory limits.",
-	true,
-)
+	spans       roachpb.Spans
+	spanIDs     []int
+	reqsScratch []roachpb.RequestUnion
 
-// TxnKVStreamer handles retrieval of key/values.
-type TxnKVStreamer struct {
-	streamer *kvstreamer.Streamer
-	spans    roachpb.Spans
-
-	// numOutstandingRequests tracks the number of requests that haven't been
-	// fully responded to yet.
-	numOutstandingRequests int
+	acc *mon.BoundAccount
 
 	// getResponseScratch is reused to return the result of Get requests.
 	getResponseScratch [1]roachpb.KeyValue
@@ -56,140 +40,143 @@ type TxnKVStreamer struct {
 	results         []kvstreamer.Result
 	lastResultState struct {
 		kvstreamer.Result
-		// numEmitted tracks the number of times this result has been fully
-		// emitted.
-		numEmitted int
 		// Used only for ScanResponses.
 		remainingBatches [][]byte
 	}
 }
 
-var _ KVBatchFetcher = &TxnKVStreamer{}
+var _ KVBatchFetcher = &txnKVStreamer{}
 
-// NewTxnKVStreamer creates a new TxnKVStreamer.
-func NewTxnKVStreamer(
+// newTxnKVStreamer creates a new txnKVStreamer.
+func newTxnKVStreamer(
+	streamer *kvstreamer.Streamer, lockStrength descpb.ScanLockingStrength, acc *mon.BoundAccount,
+) KVBatchFetcher {
+	return &txnKVStreamer{
+		streamer:   streamer,
+		keyLocking: getKeyLockingStrength(lockStrength),
+		acc:        acc,
+	}
+}
+
+// SetupNextFetch implements the KVBatchFetcher interface.
+func (f *txnKVStreamer) SetupNextFetch(
 	ctx context.Context,
-	streamer *kvstreamer.Streamer,
 	spans roachpb.Spans,
-	lockStrength descpb.ScanLockingStrength,
-) (*TxnKVStreamer, error) {
+	spanIDs []int,
+	bytesLimit rowinfra.BytesLimit,
+	_ rowinfra.KeyLimit,
+) error {
+	if bytesLimit != rowinfra.NoBytesLimit {
+		return errors.AssertionFailedf("unexpected non-zero bytes limit for txnKVStreamer")
+	}
+	f.reset(ctx)
 	if log.ExpensiveLogEnabled(ctx, 2) {
 		log.VEventf(ctx, 2, "Scan %s", spans)
 	}
-	keyLocking := getKeyLockingStrength(lockStrength)
-	reqs := spansToRequests(spans, false /* reverse */, keyLocking)
-	if err := streamer.Enqueue(ctx, reqs, nil /* enqueueKeys */); err != nil {
-		return nil, err
+	// Make sure to nil out the requests past the length that will be used in
+	// spansToRequests so that we lose references to the underlying Get and Scan
+	// requests (which could keep large byte slices alive) from the previous
+	// iteration.
+	//
+	// Note that we could not do this nil-ing out after Enqueue() returned on
+	// the previous iteration because in some cases the streamer will hold on to
+	// the slice (which is the case when the requests are contained within a
+	// single range). At the same time we don't want to push the responsibility
+	// of nil-ing the slice out because we (i.e. the txnKVStreamer) are the ones
+	// that keep the slice for reuse, and the streamer doesn't know anything
+	// about the slice reuse.
+	reqsScratch := f.reqsScratch[:cap(f.reqsScratch)]
+	for i := len(spans); i < len(reqsScratch); i++ {
+		reqsScratch[i] = roachpb.RequestUnion{}
 	}
-	return &TxnKVStreamer{
-		streamer:               streamer,
-		spans:                  spans,
-		numOutstandingRequests: len(spans),
-	}, nil
+	reqs := spansToRequests(spans, false /* reverse */, f.keyLocking, reqsScratch)
+	if err := f.streamer.Enqueue(ctx, reqs); err != nil {
+		return err
+	}
+	f.spans = spans
+	f.spanIDs = spanIDs
+	// Keep the reference to the requests slice in order to reuse in the future.
+	f.reqsScratch = reqs
+	reqsScratchMemUsage := requestUnionOverhead * int64(cap(f.reqsScratch))
+	return f.acc.ResizeTo(ctx, reqsScratchMemUsage)
+}
+
+func (f *txnKVStreamer) getSpanID(resultPosition int) int {
+	if f.spanIDs == nil {
+		return resultPosition
+	}
+	return f.spanIDs[resultPosition]
 }
 
 // proceedWithLastResult processes the result which must be already set on the
 // lastResultState and emits the first part of the response (the only part for
 // GetResponses).
-func (f *TxnKVStreamer) proceedWithLastResult(
+func (f *txnKVStreamer) proceedWithLastResult(
 	ctx context.Context,
-) (skip bool, kvs []roachpb.KeyValue, batchResp []byte, err error) {
+) (skip bool, _ kvBatchFetcherResponse, _ error) {
 	result := f.lastResultState.Result
+	ret := kvBatchFetcherResponse{
+		moreKVs: true,
+		spanID:  f.getSpanID(result.Position),
+	}
 	if get := result.GetResp; get != nil {
-		if get.IntentValue != nil {
-			return false, nil, nil, errors.AssertionFailedf(
-				"unexpectedly got an IntentValue back from a SQL GetRequest %v", *get.IntentValue,
-			)
-		}
+		// No need to check get.IntentValue since the Streamer guarantees that
+		// it is nil.
 		if get.Value == nil {
 			// Nothing found in this particular response, so we skip it.
 			f.releaseLastResult(ctx)
-			return true, nil, nil, nil
+			return true, kvBatchFetcherResponse{}, nil
 		}
-		pos := result.EnqueueKeysSatisfied[f.lastResultState.numEmitted]
-		origSpan := f.spans[pos]
-		f.lastResultState.numEmitted++
-		f.numOutstandingRequests--
+		origSpan := f.spans[result.Position]
 		f.getResponseScratch[0] = roachpb.KeyValue{Key: origSpan.Key, Value: *get.Value}
-		return false, f.getResponseScratch[:], nil, nil
+		ret.kvs = f.getResponseScratch[:]
+		return false, ret, nil
 	}
 	scan := result.ScanResp
 	if len(scan.BatchResponses) > 0 {
-		batchResp, f.lastResultState.remainingBatches = scan.BatchResponses[0], scan.BatchResponses[1:]
+		ret.batchResponse, f.lastResultState.remainingBatches = scan.BatchResponses[0], scan.BatchResponses[1:]
 	}
-	if len(f.lastResultState.remainingBatches) == 0 {
-		f.processedScanResponse()
-	}
-	return false, scan.Rows, batchResp, nil
+	// We're consciously ignoring scan.Rows argument since the Streamer
+	// guarantees to always produce Scan responses using BATCH_RESPONSE format.
+	//
+	// Note that ret.batchResponse might be nil when the ScanResponse is empty,
+	// and the caller (the KVFetcher) will skip over it.
+	return false, ret, nil
 }
 
-// processedScanResponse updates the lastResultState before emitting the last
-// part of the ScanResponse. This method should be called for each request that
-// the ScanResponse satisfies.
-func (f *TxnKVStreamer) processedScanResponse() {
-	f.lastResultState.numEmitted++
-	if f.lastResultState.ScanResp.Complete {
-		f.numOutstandingRequests--
-	}
-}
-
-func (f *TxnKVStreamer) releaseLastResult(ctx context.Context) {
+func (f *txnKVStreamer) releaseLastResult(ctx context.Context) {
 	f.lastResultState.Release(ctx)
 	f.lastResultState.Result = kvstreamer.Result{}
 }
 
-// nextBatch returns the next batch of key/value pairs. If there are none
-// available, a fetch is initiated. When there are no more keys, ok is false.
-func (f *TxnKVStreamer) nextBatch(
-	ctx context.Context,
-) (ok bool, kvs []roachpb.KeyValue, batchResp []byte, err error) {
-	if f.numOutstandingRequests == 0 {
-		// All requests have already been responded to.
-		f.releaseLastResult(ctx)
-		return false, nil, nil, nil
-	}
-
+// nextBatch implements the KVBatchFetcher interface.
+func (f *txnKVStreamer) nextBatch(ctx context.Context) (kvBatchFetcherResponse, error) {
 	// Check whether there are more batches in the current ScanResponse.
 	if len(f.lastResultState.remainingBatches) > 0 {
-		batchResp, f.lastResultState.remainingBatches = f.lastResultState.remainingBatches[0], f.lastResultState.remainingBatches[1:]
-		if len(f.lastResultState.remainingBatches) == 0 {
-			f.processedScanResponse()
+		ret := kvBatchFetcherResponse{
+			moreKVs: true,
+			spanID:  f.getSpanID(f.lastResultState.Result.Position),
 		}
-		return true, nil, batchResp, nil
-	}
-
-	// Check whether the current result satisfies multiple requests.
-	if f.lastResultState.numEmitted < len(f.lastResultState.EnqueueKeysSatisfied) {
-		// Note that we should never get an error here since we're processing
-		// the same result again.
-		_, kvs, batchResp, err = f.proceedWithLastResult(ctx)
-		return true, kvs, batchResp, err
+		ret.batchResponse, f.lastResultState.remainingBatches = f.lastResultState.remainingBatches[0], f.lastResultState.remainingBatches[1:]
+		return ret, nil
 	}
 
 	// Release the current result.
-	if f.lastResultState.numEmitted == len(f.lastResultState.EnqueueKeysSatisfied) && f.lastResultState.numEmitted > 0 {
-		f.releaseLastResult(ctx)
-	}
+	f.releaseLastResult(ctx)
 
 	// Process the next result we have already received from the streamer.
 	for len(f.results) > 0 {
 		// Peel off the next result and set it into lastResultState.
 		f.lastResultState.Result = f.results[0]
-		f.lastResultState.numEmitted = 0
 		f.lastResultState.remainingBatches = nil
 		// Lose the reference to that result and advance the results slice for
 		// the next iteration.
 		f.results[0] = kvstreamer.Result{}
 		f.results = f.results[1:]
-		var skip bool
-		skip, kvs, batchResp, err = f.proceedWithLastResult(ctx)
-		if err != nil {
-			return false, nil, nil, err
+		skip, ret, err := f.proceedWithLastResult(ctx)
+		if !skip || err != nil {
+			return ret, err
 		}
-		if skip {
-			continue
-		}
-		return true, kvs, batchResp, nil
 	}
 
 	// Get more results from the streamer. This call will block until some
@@ -198,18 +185,25 @@ func (f *TxnKVStreamer) nextBatch(
 	// The memory accounting for the returned results has already been performed
 	// by the streamer against its own budget, so we don't have to concern
 	// ourselves with the memory accounting here.
+	var err error
 	f.results, err = f.streamer.GetResults(ctx)
 	if len(f.results) == 0 || err != nil {
-		return false, nil, nil, err
+		return kvBatchFetcherResponse{moreKVs: false}, err
 	}
 	return f.nextBatch(ctx)
 }
 
-// close releases the resources of this TxnKVStreamer.
-func (f *TxnKVStreamer) close(ctx context.Context) {
+// reset releases all of the results from the last fetch.
+func (f *txnKVStreamer) reset(ctx context.Context) {
 	f.lastResultState.Release(ctx)
 	for _, r := range f.results {
 		r.Release(ctx)
 	}
-	*f = TxnKVStreamer{}
+}
+
+// close releases the resources of this txnKVStreamer.
+func (f *txnKVStreamer) close(ctx context.Context) {
+	f.reset(ctx)
+	f.streamer.Close(ctx)
+	*f = txnKVStreamer{}
 }

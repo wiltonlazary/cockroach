@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -12,12 +13,14 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/keys",
-        "//pkg/security",
+        "//pkg/security/username",
         "//pkg/sql/catalog",
-        "//pkg/sql/catalog/catconstants",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/privilege",
-        "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/catconstants",
+        "//pkg/sql/syntheticprivilege",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -27,15 +30,18 @@ go_test(
         "default_privilege_test.go",
         "fix_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":catprivilege"],
     deps = [
         "//pkg/keys",
-        "//pkg/security",
-        "//pkg/sql/catalog/catalogkeys",
+        "//pkg/security/username",
+        "//pkg/sql/catalog/bootstrap",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/privilege",
-        "//pkg/sql/sem/tree",
         "//pkg/util/leaktest",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

@@ -20,39 +20,49 @@ func init() {
 	opRegistry.register((*scpb.Sequence)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_TXN_DROPPED),
 			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.Sequence) scop.Op {
+			to(scpb.Status_TXN_DROPPED,
+				emit(func(this *scpb.Sequence) *scop.NotImplemented {
 					return notImplemented(this)
+				}),
+			),
+			to(scpb.Status_PUBLIC,
+				emit(func(this *scpb.Sequence) *scop.MarkDescriptorAsPublic {
+					return &scop.MarkDescriptorAsPublic{
+						DescriptorID: this.SequenceID,
+					}
 				}),
 			),
 		),
 		toAbsent(scpb.Status_PUBLIC,
 			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Sequence) scop.Op {
-					return &scop.MarkDescriptorAsDroppedSynthetically{
-						DescID: this.SequenceID,
+				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
+					return &scop.MarkDescriptorAsSyntheticallyDropped{
+						DescriptorID: this.SequenceID,
 					}
 				}),
 			),
 			to(scpb.Status_DROPPED,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.Sequence) scop.Op {
+				emit(func(this *scpb.Sequence) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.SequenceID,
+						DescriptorID: this.SequenceID,
+					}
+				}),
+				emit(func(this *scpb.Sequence) *scop.RemoveAllTableComments {
+					return &scop.RemoveAllTableComments{
+						TableID: this.SequenceID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PostCommitPhase),
-				emit(func(this *scpb.Sequence, ts scpb.TargetState) scop.Op {
-					return newLogEventOp(this, ts)
+				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
-				emit(func(this *scpb.Sequence) scop.Op {
-					return &scop.CreateGcJobForTable{
-						TableID: this.SequenceID,
+				emit(func(this *scpb.Sequence, md *targetsWithElementMap) *scop.CreateGCJobForTable {
+					return &scop.CreateGCJobForTable{
+						TableID:             this.SequenceID,
+						StatementForDropJob: statementForDropJob(this, md),
 					}
 				}),
 			),

@@ -12,7 +12,9 @@ package cockroach.ccl.streamingccl;
 option go_package = "streampb";
 
 
+import "roachpb/api.proto";
 import "roachpb/data.proto";
+import "jobs/jobspb/jobs.proto";
 import "roachpb/metadata.proto";
 import "util/hlc/timestamp.proto";
 import "util/unresolved_addr.proto";
@@ -68,19 +70,14 @@ message ReplicationStreamSpec {
 message StreamEvent {
   message Batch {
     repeated roachpb.KeyValue key_values = 1 [(gogoproto.nullable) = false];
-    // TODO: Add RangeFeedSStable once that's available.
-  }
-
-  // SpanCheckpoint represents a checkpoint record for completed span.
-  // All events up to timestamp must already have been emitted.
-  message SpanCheckpoint {
-    roachpb.Span span = 1 [(gogoproto.nullable) = false];
-    util.hlc.Timestamp timestamp = 2 [(gogoproto.nullable) = false];
+    repeated roachpb.RangeFeedSSTable ssts = 2 [(gogoproto.nullable) = false];
+    repeated roachpb.RangeFeedDeleteRange del_ranges = 3 [(gogoproto.nullable) = false];
   }
 
   // Checkpoint represents stream checkpoint.
   message StreamCheckpoint {
-    repeated SpanCheckpoint spans = 1  [(gogoproto.nullable) = false];
+    reserved 1;
+    repeated cockroach.sql.jobs.jobspb.ResolvedSpan resolved_spans = 2  [(gogoproto.nullable) = false];
   }
 
   // Only 1 field ought to be set.
@@ -106,4 +103,44 @@ message StreamReplicationStatus {
   // Current protected timestamp for spans being replicated. It is absent
   // when the replication stream is 'STOPPED'.
   util.hlc.Timestamp protected_timestamp = 2;
+}
+
+message StreamIngestionStats {
+  // The status of current stream producer job.
+  StreamReplicationStatus producer_status = 1;
+
+  // The error when trying to reach the current stream producer job.
+  string producer_error = 2;
+
+  // Stream ingestion details.
+  cockroach.sql.jobs.jobspb.StreamIngestionDetails ingestion_details = 3;
+
+  // Stream ingestion progress, including each partition ingestion progress.
+  cockroach.sql.jobs.jobspb.StreamIngestionProgress ingestion_progress = 4;
+
+  message ReplicationLagInfo {
+    // The timestamp at which we have confirmed all partitions have ingested to.
+    // The cutover can only happen when this timestamp is not less than the
+    // above cutover timestamp, i.e., this is max timestamp we can cut over.
+    util.hlc.Timestamp min_ingested_timestamp = 1 [(gogoproto.nullable) = false];
+
+    // The difference between destination cluster's current time and
+    // the ingestion high watermark.
+    google.protobuf.Duration replication_lag = 2
+    [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
+
+    util.hlc.Timestamp latest_checkpointed_timestamp = 3 [(gogoproto.nullable) = false];
+    util.hlc.Timestamp earliest_checkpointed_timestamp = 4 [(gogoproto.nullable) = false];
+    reserved 5;
+    reserved 6;
+
+    // Lag between the slowest ingested timestamp to the fastest ingested timestamp
+    // among all partitions.
+    google.protobuf.Duration slowest_fastest_ingestion_lag = 7
+    [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
+  }
+
+  // Current replication lag information. It is absent if no ingestion progress
+  // has been recorded yet.
+  ReplicationLagInfo replication_lag_info = 5;
 }

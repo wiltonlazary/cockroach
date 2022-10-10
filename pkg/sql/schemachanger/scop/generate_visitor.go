@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"strings"
@@ -40,15 +39,22 @@ func run() error {
 	}
 	pkg, opType, in, out := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
 
-	source, err := ioutil.ReadFile(in)
+	source, err := os.ReadFile(in)
 	if err != nil {
 		return err
 	}
+	ignoreList := map[string]struct{}{
+		"EventBase": {},
+	}
+
 	opPattern := regexp.MustCompile(`type (\w+) struct {`)
 	var ops []string
 	for _, line := range strings.Split(string(source), "\n") {
 		line = strings.TrimSpace(line)
 		if matches := opPattern.FindStringSubmatch(line); len(matches) > 0 {
+			if _, found := ignoreList[matches[1]]; found {
+				continue
+			}
 			ops = append(ops, matches[1])
 		}
 	}

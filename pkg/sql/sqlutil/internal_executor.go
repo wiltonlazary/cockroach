@@ -144,6 +144,17 @@ type InternalExecutor interface {
 		qargs ...interface{},
 	) (InternalRows, error)
 
+	// QueryBufferedExWithCols is like QueryBufferedEx, additionally returning the computed
+	// ResultColumns of the input query.
+	QueryBufferedExWithCols(
+		ctx context.Context,
+		opName string,
+		txn *kv.Txn,
+		session sessiondata.InternalExecutorOverride,
+		stmt string,
+		qargs ...interface{},
+	) ([]tree.Datums, colinfo.ResultColumns, error)
+
 	// WithSyntheticDescriptors sets the synthetic descriptors before running the
 	// the provided closure and resets them afterward. Used for queries/statements
 	// that need to use in-memory synthetic descriptors different from descriptors
@@ -177,6 +188,11 @@ type InternalRows interface {
 	// invalidate it).
 	Cur() tree.Datums
 
+	// RowsAffected() returns the count of rows affected by the statement.
+	// This is only guaranteed to be accurate after Next() has returned
+	// false (no more rows).
+	RowsAffected() int
+
 	// Close closes this iterator, releasing any resources it held open. Close
 	// is idempotent and *must* be called once the caller is done with the
 	// iterator.
@@ -191,11 +207,30 @@ type InternalRows interface {
 	Types() colinfo.ResultColumns
 }
 
-// SessionBoundInternalExecutorFactory is a function that produces a "session
-// bound" internal executor.
-type SessionBoundInternalExecutorFactory func(
-	context.Context, *sessiondata.SessionData,
-) InternalExecutor
+// InternalExecutorFactory is an interface that allow the creation of an
+// internal executor, and run sql statement without a txn with the internal
+// executor.
+type InternalExecutorFactory interface {
+	// NewInternalExecutor constructs a new internal executor.
+	// TODO (janexing): this should be deprecated soon.
+	NewInternalExecutor(sd *sessiondata.SessionData) InternalExecutor
+	// RunWithoutTxn is to create an internal executor without binding to a txn,
+	// and run the passed function with this internal executor.
+	RunWithoutTxn(ctx context.Context, run func(ctx context.Context, ie InternalExecutor) error) error
+
+	// TxnWithExecutor enables callers to run transactions with a *Collection such that all
+	// retrieved immutable descriptors are properly leased and all mutable
+	// descriptors are handled. The function deals with verifying the two version
+	// invariant and retrying when it is violated. Callers need not worry that they
+	// write mutable descriptors multiple times. The call will explicitly wait for
+	// the leases to drain on old versions of descriptors modified or deleted in the
+	// transaction; callers do not need to call lease.WaitForOneVersion.
+	// It also enables using internal executor to run sql queries in a txn manner.
+	//
+	// The passed transaction is pre-emptively anchored to the system config key on
+	// the system tenant.
+	TxnWithExecutor(context.Context, *kv.DB, *sessiondata.SessionData, func(context.Context, *kv.Txn, InternalExecutor) error, ...TxnOption) error
+}
 
 // InternalExecFn is the type of functions that operates using an internalExecutor.
 type InternalExecFn func(ctx context.Context, txn *kv.Txn, ie InternalExecutor) error
@@ -204,3 +239,37 @@ type InternalExecFn func(ctx context.Context, txn *kv.Txn, ie InternalExecutor) 
 // passes the fn the exported InternalExecutor instead of the whole unexported
 // extendedEvalContenxt, so it can be implemented outside pkg/sql.
 type HistoricalInternalExecTxnRunner func(ctx context.Context, fn InternalExecFn) error
+
+// TxnOption is used to configure a Txn or TxnWithExecutor.
+type TxnOption interface {
+	Apply(*TxnConfig)
+}
+
+// TxnConfig is the config to be set for txn.
+type TxnConfig struct {
+	steppingEnabled bool
+}
+
+// GetSteppingEnabled return the steppingEnabled setting from the txn config.
+func (tc *TxnConfig) GetSteppingEnabled() bool {
+	return tc.steppingEnabled
+}
+
+type txnOptionFn func(options *TxnConfig)
+
+// Apply is to apply the txn config.
+func (f txnOptionFn) Apply(options *TxnConfig) { f(options) }
+
+var steppingEnabled = txnOptionFn(func(o *TxnConfig) {
+	o.steppingEnabled = true
+})
+
+// SteppingEnabled creates a TxnOption to determine whether the underlying
+// transaction should have stepping enabled. If stepping is enabled, the
+// transaction will implicitly use lower admission priority. However, the
+// user will need to remember to Step the Txn to make writes visible. The
+// InternalExecutor will automatically (for better or for worse) step the
+// transaction when executing each statement.
+func SteppingEnabled() TxnOption {
+	return steppingEnabled
+}

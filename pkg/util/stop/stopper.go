@@ -110,54 +110,54 @@ func (f CloserFn) Close() {
 // A Stopper provides control over the lifecycle of goroutines started
 // through it via its RunTask, RunAsyncTask, and other similar methods.
 //
-// When Stop is invoked, the Stopper
+// # When Stop is invoked, the Stopper
 //
-// - it invokes Quiesce, which causes the Stopper to refuse new work
-//   (that is, its Run* family of methods starts returning ErrUnavailable),
-//   closes the channel returned by ShouldQuiesce, and blocks until
-//   until no more tasks are tracked, then
-// - it runs all of the methods supplied to AddCloser, then
-// - closes the IsStopped channel.
+//   - it invokes Quiesce, which causes the Stopper to refuse new work
+//     (that is, its Run* family of methods starts returning ErrUnavailable),
+//     closes the channel returned by ShouldQuiesce, and blocks until
+//     until no more tasks are tracked, then
+//   - it runs all of the methods supplied to AddCloser, then
+//   - closes the IsStopped channel.
 //
 // When ErrUnavailable is returned from a task, the caller needs
 // to handle it appropriately by terminating any work that it had
 // hoped to defer to the task (which is guaranteed to never have been
 // invoked). A simple example of this can be seen in the below snippet:
 //
-//     var wg sync.WaitGroup
-//     wg.Add(1)
-//     if err := s.RunAsyncTask("foo", func(ctx context.Context) {
-//       defer wg.Done()
-//     }); err != nil {
-//       // Task never ran.
-//       wg.Done()
-//     }
+//	var wg sync.WaitGroup
+//	wg.Add(1)
+//	if err := s.RunAsyncTask("foo", func(ctx context.Context) {
+//	  defer wg.Done()
+//	}); err != nil {
+//	  // Task never ran.
+//	  wg.Done()
+//	}
 //
 // To ensure that tasks that do get started are sensitive to Quiesce,
 // they need to observe the ShouldQuiesce channel similar to how they
 // are expected to observe context cancellation:
 //
-//     func x() {
-//       select {
-//       case <-s.ShouldQuiesce:
-//         return
-//       case <-ctx.Done():
-//         return
-//       case <-someChan:
-//         // Do work.
-//       }
-//     }
+//	func x() {
+//	  select {
+//	  case <-s.ShouldQuiesce:
+//	    return
+//	  case <-ctx.Done():
+//	    return
+//	  case <-someChan:
+//	    // Do work.
+//	  }
+//	}
 //
 // TODO(tbg): many improvements here are possible:
-// - propagate quiescing via context cancellation
-// - better API around refused tasks
-// - all the other things mentioned in:
+//   - propagate quiescing via context cancellation
+//   - better API around refused tasks
+//   - all the other things mentioned in:
 //     https://github.com/cockroachdb/cockroach/issues/58164
 type Stopper struct {
-	quiescer chan struct{}     // Closed when quiescing
-	stopped  chan struct{}     // Closed when stopped completely
-	onPanic  func(interface{}) // called with recover() on panic on any goroutine
-	tracer   *tracing.Tracer   // tracer used to create spans for tasks
+	quiescer chan struct{}                      // Closed when quiescing
+	stopped  chan struct{}                      // Closed when stopped completely
+	onPanic  func(context.Context, interface{}) // called with recover() on panic on any goroutine
+	tracer   *tracing.Tracer                    // tracer used to create spans for tasks
 
 	mu struct {
 		syncutil.RWMutex
@@ -185,7 +185,7 @@ type Option interface {
 	apply(*Stopper)
 }
 
-type optionPanicHandler func(interface{})
+type optionPanicHandler func(context.Context, interface{})
 
 var _ Option = optionPanicHandler(nil)
 
@@ -198,7 +198,7 @@ func (oph optionPanicHandler) apply(stopper *Stopper) {
 //
 // When Stop() is invoked during stack unwinding, OnPanic is also invoked, but
 // Stop() may not have carried out its duties.
-func OnPanic(handler func(interface{})) Option {
+func OnPanic(handler func(context.Context, interface{})) Option {
 	return optionPanicHandler(handler)
 }
 
@@ -237,14 +237,11 @@ func NewStopper(options ...Option) *Stopper {
 	return s
 }
 
-// Recover is used internally by Stopper to provide a hook for recovery of
-// panics on goroutines started by the Stopper. It can also be invoked
-// explicitly (via "defer s.Recover()") on goroutines that are created outside
-// of Stopper.
-func (s *Stopper) Recover(ctx context.Context) {
+// recover reports the current panic, if any, any panics again.
+func (s *Stopper) recover(ctx context.Context) {
 	if r := recover(); r != nil {
 		if s.onPanic != nil {
-			s.onPanic(r)
+			s.onPanic(ctx, r)
 			return
 		}
 		logcrash.ReportPanicWithGlobalSettings(ctx, r, 1)
@@ -321,7 +318,7 @@ func (s *Stopper) RunTask(ctx context.Context, taskName string, f func(context.C
 	}
 
 	// Call f.
-	defer s.Recover(ctx)
+	defer s.recover(ctx)
 	defer s.runPostlude()
 
 	f(ctx)
@@ -338,7 +335,7 @@ func (s *Stopper) RunTaskWithErr(
 	}
 
 	// Call f.
-	defer s.Recover(ctx)
+	defer s.recover(ctx)
 	defer s.runPostlude()
 
 	return f(ctx)
@@ -464,7 +461,7 @@ func (s *Stopper) RunAsyncTaskEx(ctx context.Context, opt TaskOpts, f func(conte
 	//
 	// Note that we have to create the child in this parent goroutine; we can't
 	// defer the creation to the spawned async goroutine since the parent span
-	// might get Finish()ed by then. However, we'll update the child'd goroutine
+	// might get Finish()ed by then. However, we'll update the child's goroutine
 	// ID.
 	var sp *tracing.Span
 	switch opt.SpanOpt {
@@ -481,16 +478,14 @@ func (s *Stopper) RunAsyncTaskEx(ctx context.Context, opt TaskOpts, f func(conte
 	// Call f on another goroutine.
 	taskStarted = true // Another goroutine now takes ownership of the alloc, if any.
 	go func() {
-		defer s.Recover(ctx)
+		defer sp.Finish()
 		defer s.runPostlude()
-		if sp != nil {
-			defer sp.Finish()
-			sp.UpdateGoroutineIDToCurrent()
-		}
+		defer s.recover(ctx)
 		if alloc != nil {
 			defer alloc.Release()
 		}
 
+		sp.UpdateGoroutineIDToCurrent()
 		f(ctx)
 	}()
 	return nil
@@ -535,7 +530,7 @@ func (s *Stopper) Stop(ctx context.Context) {
 	}
 
 	defer func() {
-		s.Recover(ctx)
+		s.recover(ctx)
 		unregister(s)
 		close(s.stopped)
 	}()
@@ -590,7 +585,10 @@ func (s *Stopper) Quiesce(ctx context.Context) {
 	defer time.AfterFunc(5*time.Second, func() {
 		log.Infof(ctx, "quiescing...")
 	}).Stop()
-	defer s.Recover(ctx)
+	defer time.AfterFunc(2*time.Minute, func() {
+		log.DumpStacks(ctx, "slow quiesce")
+	}).Stop()
+	defer s.recover(ctx)
 
 	func() {
 		s.mu.Lock()

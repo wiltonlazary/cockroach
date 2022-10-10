@@ -11,10 +11,14 @@
 package kvserver
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/tenantrate"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -37,7 +41,7 @@ type StoreTestingKnobs struct {
 	ConsistencyTestingKnobs ConsistencyTestingKnobs
 	TenantRateKnobs         tenantrate.TestingKnobs
 	StorageKnobs            storage.TestingKnobs
-	AllocatorKnobs          *AllocatorTestingKnobs
+	AllocatorKnobs          *allocator.TestingKnobs
 
 	// TestingRequestFilter is called before evaluating each request on a
 	// replica. The filter is run before the request acquires latches, so
@@ -75,6 +79,10 @@ type StoreTestingKnobs struct {
 	// rocksdb but before in-memory side effects have been processed.
 	// It is only called on the replica the proposed the command.
 	TestingPostApplyFilter kvserverbase.ReplicaApplyFilter
+
+	// TestingResponseErrorEvent is called when an error is returned applying
+	// a command.
+	TestingResponseErrorEvent func(context.Context, *roachpb.BatchRequest, error)
 
 	// TestingResponseFilter is called after the replica processes a
 	// command in order for unittests to modify the batch response,
@@ -260,10 +268,13 @@ type StoreTestingKnobs struct {
 	// in handleRaftReady to refreshReasonNewLeaderOrConfigChange.
 	EnableUnconditionalRefreshesInRaftReady bool
 
+	// SendSnapshot is run after receiving a DelegateRaftSnapshot request but
+	// before any throttling or sending logic.
+	SendSnapshot func()
 	// ReceiveSnapshot is run after receiving a snapshot header but before
 	// acquiring snapshot quota or doing shouldAcceptSnapshotData checks. If an
 	// error is returned from the hook, it's sent as an ERROR SnapshotResponse.
-	ReceiveSnapshot func(*SnapshotRequest_Header) error
+	ReceiveSnapshot func(*kvserverpb.SnapshotRequest_Header) error
 	// ReplicaAddSkipLearnerRollback causes replica addition to skip the learner
 	// rollback that happens when either the initial snapshot or the promotion of
 	// a learner to a voter fails.
@@ -298,9 +309,12 @@ type StoreTestingKnobs struct {
 	// through a joint configuration, even when this isn't necessary (because
 	// the replication change affects only one replica).
 	ReplicationAlwaysUseJointConfig func() bool
+	// BeforeRemovingDemotedLearner is run before a demoted learner (i.e. a
+	// learner that results from a range exiting its joint config) is removed.
+	BeforeRemovingDemotedLearner func()
 	// BeforeSnapshotSSTIngestion is run just before the SSTs are ingested when
 	// applying a snapshot.
-	BeforeSnapshotSSTIngestion func(IncomingSnapshot, SnapshotRequest_Type, []string) error
+	BeforeSnapshotSSTIngestion func(IncomingSnapshot, kvserverpb.SnapshotRequest_Type, []string) error
 	// OnRelocatedOne intercepts the return values of s.relocateOne after they
 	// have successfully been put into effect.
 	OnRelocatedOne func(_ []roachpb.ReplicationChange, leaseTarget *roachpb.ReplicationTarget)
@@ -326,6 +340,11 @@ type StoreTestingKnobs struct {
 	// heartbeats and then expect other replicas to take the lease without
 	// worrying about Raft).
 	AllowLeaseRequestProposalsWhenNotLeader bool
+	// LeaseTransferRejectedRetryLoopCount, if set, configures the maximum number
+	// of retries for the retry loop used during lease transfers. This retry loop
+	// retries after transfer attempts are rejected because the transfer is deemed
+	// to be unsafe.
+	LeaseTransferRejectedRetryLoopCount int
 	// DontCloseTimestamps inhibits the propBuf's closing of timestamps. All Raft
 	// commands will carry an empty closed timestamp.
 	DontCloseTimestamps bool
@@ -343,6 +362,9 @@ type StoreTestingKnobs struct {
 	// SpanConfigUpdateInterceptor is called after the store hears about a span
 	// config update.
 	SpanConfigUpdateInterceptor func(spanconfig.Update)
+	// SetSpanConfigInterceptor is called before updating a replica's embedded
+	// SpanConfig. The returned SpanConfig is used instead.
+	SetSpanConfigInterceptor func(*roachpb.RangeDescriptor, roachpb.SpanConfig) roachpb.SpanConfig
 	// If set, use the given version as the initial replica version when
 	// bootstrapping ranges. This is used for testing the migration
 	// infrastructure.
@@ -374,7 +396,53 @@ type StoreTestingKnobs struct {
 	// UseSystemConfigSpanForQueues uses the system config span infrastructure
 	// for internal queues (as opposed to the span configs infrastructure). This
 	// is used only for (old) tests written with the system config span in mind.
+	//
+	// TODO(irfansharif): Get rid of this knob, maybe by first moving
+	// DisableSpanConfigs into a testing knob instead of a server arg.
 	UseSystemConfigSpanForQueues bool
+	// IgnoreStrictGCEnforcement is used by tests to op out of strict GC
+	// enforcement.
+	IgnoreStrictGCEnforcement bool
+	// ThrottleEmptySnapshots includes empty snapshots for throttling.
+	ThrottleEmptySnapshots bool
+	// BeforeSendSnapshotThrottle intercepts replicas before entering send
+	// snapshot throttling.
+	BeforeSendSnapshotThrottle func()
+	// AfterSendSnapshotThrottle intercepts replicas after receiving a spot in the
+	// send snapshot semaphore.
+	AfterSendSnapshotThrottle func()
+
+	// This method, if set, gets to see (and mutate, if desired) any local
+	// StoreDescriptor before it is being sent out on the Gossip network.
+	StoreGossipIntercept func(descriptor *roachpb.StoreDescriptor)
+
+	// EnqueueReplicaInterceptor intercepts calls to `store.Enqueue()`.
+	EnqueueReplicaInterceptor func(queueName string, replica *Replica)
+
+	// GlobalMVCCRangeTombstone will write a global MVCC range tombstone across
+	// the entire user keyspace during cluster bootstrapping. This will be written
+	// below all other data, and thus won't affect query results, but it does
+	// activate MVCC range tombstone code paths in the storage layer for testing.
+	//
+	// This must typically be combined with the following knobs to prevent
+	// various components choking on the range tombstone:
+	//
+	// - rangefeed.TestingKnobs.IgnoreOnDeleteRangeError
+	// - kvserverbase.BatchEvalTestingKnobs.DisableInitPutFailOnTombstones
+	GlobalMVCCRangeTombstone bool
+
+	// LeaseUpgradeInterceptor intercepts leases that get upgraded to
+	// epoch-based ones.
+	LeaseUpgradeInterceptor func(*roachpb.Lease)
+
+	// MVCCGCQueueLeaseCheckInterceptor intercepts calls to Replica.LeaseStatusAt when
+	// making high priority replica scans.
+	MVCCGCQueueLeaseCheckInterceptor func(ctx context.Context, replica *Replica, now hlc.ClockTimestamp) bool
+
+	// SmallEngineBlocks will configure the engine with a very small block size of
+	// 1 byte, resulting in each key having its own block. This can provoke bugs
+	// in time-bound iterators.
+	SmallEngineBlocks bool
 }
 
 // ModuleTestingKnobs is part of the base.ModuleTestingKnobs interface.
@@ -391,21 +459,13 @@ type NodeLivenessTestingKnobs struct {
 	RenewalDuration time.Duration
 	// StorePoolNodeLivenessFn is the function used by the StorePool to determine
 	// whether a node is live or not.
-	StorePoolNodeLivenessFn NodeLivenessFunc
+	StorePoolNodeLivenessFn storepool.NodeLivenessFunc
 }
 
 var _ base.ModuleTestingKnobs = NodeLivenessTestingKnobs{}
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (NodeLivenessTestingKnobs) ModuleTestingKnobs() {}
-
-// AllocatorTestingKnobs allows tests to override the behavior of `Allocator`.
-type AllocatorTestingKnobs struct {
-	// AllowLeaseTransfersToReplicasNeedingSnapshots permits lease transfer
-	// targets produced by the Allocator to include replicas that may be waiting
-	// for snapshots.
-	AllowLeaseTransfersToReplicasNeedingSnapshots bool
-}
 
 // PinnedLeasesKnob is a testing know for controlling what store can acquire a
 // lease for specific ranges.
@@ -452,14 +512,13 @@ func (p *PinnedLeasesKnob) rejectLeaseIfPinnedElsewhere(r *Replica) *roachpb.Err
 	if err != nil {
 		return roachpb.NewError(err)
 	}
-	var pinned *roachpb.ReplicaDescriptor
-	if pinnedRep, ok := r.descRLocked().GetReplicaDescriptor(pinnedStore); ok {
-		pinned = &pinnedRep
-	}
+	pinned, _ := r.descRLocked().GetReplicaDescriptor(pinnedStore)
 	return roachpb.NewError(&roachpb.NotLeaseHolderError{
-		Replica:     repDesc,
-		LeaseHolder: pinned,
-		RangeID:     r.RangeID,
-		CustomMsg:   "injected: lease pinned to another store",
+		Replica: repDesc,
+		Lease: &roachpb.Lease{
+			Replica: pinned,
+		},
+		RangeID:   r.RangeID,
+		CustomMsg: "injected: lease pinned to another store",
 	})
 }

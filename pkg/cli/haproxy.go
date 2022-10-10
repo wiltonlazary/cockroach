@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"sort"
@@ -28,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -75,11 +75,11 @@ func nodeStatusesToNodeInfos(nodes *serverpb.NodesResponse) []haProxyNodeInfo {
 
 	httpAddr := ""
 	httpPort := base.DefaultHTTPPort
-	fs.Var(addrSetter{&httpAddr, &httpPort}, cliflags.ListenHTTPAddr.Name, "" /* usage */)
+	fs.Var(addr.NewAddrSetter(&httpAddr, &httpPort), cliflags.ListenHTTPAddr.Name, "" /* usage */)
 	fs.Var(aliasStrVar{&httpPort}, cliflags.ListenHTTPPort.Name, "" /* usage */)
 
 	// Discard parsing output.
-	fs.SetOutput(ioutil.Discard)
+	fs.SetOutput(io.Discard)
 
 	nodeInfos := make([]haProxyNodeInfo, 0, len(nodes.Nodes))
 
@@ -221,12 +221,11 @@ func runGenHAProxyCmd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	conn, _, finish, err := getClientGRPCConn(ctx, serverCfg)
+	c, finish, err := getStatusClient(ctx, serverCfg)
 	if err != nil {
 		return err
 	}
 	defer finish()
-	c := serverpb.NewStatusClient(conn)
 
 	nodeStatuses, err := c.Nodes(ctx, &serverpb.NodesRequest{})
 	if err != nil {

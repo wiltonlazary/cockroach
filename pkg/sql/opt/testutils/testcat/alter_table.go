@@ -16,6 +16,7 @@ import (
 	"sort"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -25,9 +26,8 @@ import (
 // AlterTable is a partial implementation of the ALTER TABLE statement.
 //
 // Supported commands:
-//  - INJECT STATISTICS: imports table statistics from a JSON object.
-//  - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
-//
+//   - INJECT STATISTICS: imports table statistics from a JSON object.
+//   - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
 func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	tn := stmt.Table.ToTableName()
 	// Update the table name to include catalog and schema if not provided.
@@ -58,14 +58,12 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 func injectTableStats(tt *Table, statsExpr tree.Expr) {
 	ctx := context.Background()
 	semaCtx := tree.MakeSemaContext()
-	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-	typedExpr, err := tree.TypeCheckAndRequire(
-		ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
-	)
+	evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
+	typedExpr, err := tree.TypeCheckAndRequire(ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS")
 	if err != nil {
 		panic(err)
 	}
-	val, err := typedExpr.Eval(&evalCtx)
+	val, err := eval.Expr(ctx, &evalCtx, typedExpr)
 	if err != nil {
 		panic(err)
 	}

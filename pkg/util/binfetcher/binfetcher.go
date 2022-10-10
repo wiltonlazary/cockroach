@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -147,9 +146,9 @@ var httpClient = httputil.NewClientWithTimeout(300 * time.Second)
 //
 // `version` can be:
 //
-// - a SHA from the master branch, e.g. bd828feaa309578142fe7ad2d89ee1b70adbd52d
-// - the string "LATEST" for the most recent SHA from the master branch. Note that
-//   caching is disabled in that case.
+//   - a SHA from the master branch, e.g. bd828feaa309578142fe7ad2d89ee1b70adbd52d
+//   - the string "LATEST" for the most recent SHA from the master branch. Note that
+//     caching is disabled in that case.
 //
 // Returns the path to the (executable) binary.
 func Download(ctx context.Context, opts Options) (string, error) {
@@ -175,7 +174,7 @@ func Download(ctx context.Context, opts Options) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		return "", errors.Errorf("unexpected HTTP response from %s: %d\n%s", opts.URL.String(), resp.StatusCode, body)
 	}
 	if opts.Version == "LATEST" {

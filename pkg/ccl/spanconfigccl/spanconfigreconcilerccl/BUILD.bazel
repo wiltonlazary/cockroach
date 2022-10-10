@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_test")
 
 go_test(
@@ -6,6 +7,7 @@ go_test(
         "datadriven_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     deps = [
         "//pkg/base",
@@ -13,14 +15,14 @@ go_test(
         "//pkg/ccl/partitionccl",
         "//pkg/ccl/utilccl",
         "//pkg/jobs",
-        "//pkg/keys",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/roachpb",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/spanconfig",
         "//pkg/spanconfig/spanconfigtestutils",
         "//pkg/spanconfig/spanconfigtestutils/spanconfigtestcluster",
+        "//pkg/sql/sqlliveness/sqllivenesstestutils",
         "//pkg/testutils",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
@@ -33,3 +35,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

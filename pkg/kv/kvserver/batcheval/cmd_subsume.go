@@ -13,6 +13,7 @@ package batcheval
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval/result"
@@ -29,7 +30,11 @@ func init() {
 }
 
 func declareKeysSubsume(
-	_ ImmutableRangeState, _ *roachpb.Header, _ roachpb.Request, latchSpans, _ *spanset.SpanSet,
+	_ ImmutableRangeState,
+	_ *roachpb.Header,
+	_ roachpb.Request,
+	latchSpans, _ *spanset.SpanSet,
+	_ time.Duration,
 ) {
 	// Subsume must not run concurrently with any other command. It declares a
 	// non-MVCC write over every addressable key in the range; this guarantees
@@ -46,15 +51,15 @@ func declareKeysSubsume(
 //
 // Specifically, the receiving replica guarantees that:
 //
-//   1. it is the leaseholder at the time the request executes,
-//   2. when it responds, there are no commands in flight with a timestamp
-//      greater than the FreezeStart timestamp provided in the response,
-//   3. the MVCC statistics in the response reflect the latest writes,
-//   4. it, and all future leaseholders for the range, will not process another
-//      command until they refresh their range descriptor with a consistent read
-//      from meta2, and
-//   5. if it or any future leaseholder for the range finds that its range
-//      descriptor has been deleted, it self destructs.
+//  1. it is the leaseholder at the time the request executes,
+//  2. when it responds, there are no commands in flight with a timestamp
+//     greater than the FreezeStart timestamp provided in the response,
+//  3. the MVCC statistics in the response reflect the latest writes,
+//  4. it, and all future leaseholders for the range, will not process another
+//     command until they refresh their range descriptor with a consistent read
+//     from meta2, and
+//  5. if it or any future leaseholder for the range finds that its range
+//     descriptor has been deleted, it self destructs.
 //
 // To achieve guarantees four and five, when issuing a Subsume request, the
 // caller must have a merge transaction open that has already placed deletion
@@ -147,7 +152,7 @@ func Subsume(
 	// think about.
 	priorReadSum.Merge(rspb.FromTimestamp(reply.FreezeStart.ToTimestamp()))
 	reply.ReadSummary = &priorReadSum
-	reply.ClosedTimestamp = cArgs.EvalCtx.GetClosedTimestamp(ctx)
+	reply.ClosedTimestamp = cArgs.EvalCtx.GetCurrentClosedTimestamp(ctx)
 
 	return result.Result{}, nil
 }

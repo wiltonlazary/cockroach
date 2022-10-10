@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/partialidx"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/errors"
 )
 
@@ -25,8 +25,7 @@ import (
 // iteration. For example, the iterator would skip over inverted and partial
 // indexes given these flags:
 //
-//   flags := rejectInvertedIndexes|rejectPartialIndexes
-//
+//	flags := rejectInvertedIndexes|rejectPartialIndexes
 type indexRejectFlags int8
 
 const (
@@ -51,7 +50,7 @@ const (
 // scanIndexIter is a helper struct that facilitates iteration over the indexes
 // of a Scan operator table.
 type scanIndexIter struct {
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 	f       *norm.Factory
 	im      *partialidx.Implicator
 	tabMeta *opt.TableMeta
@@ -86,7 +85,7 @@ type scanIndexIter struct {
 
 // Init initializes a new scanIndexIter.
 func (it *scanIndexIter) Init(
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	f *norm.Factory,
 	mem *memo.Memo,
 	im *partialidx.Implicator,
@@ -119,10 +118,10 @@ func (it *scanIndexIter) Init(
 //
 // Consider the indexes and query:
 //
-//   CREATE INDEX idx1 ON t (a) WHERE c > 0
-//   CREATE INDEX idx2 ON t (b) WHERE c > 0
+//	CREATE INDEX idx1 ON t (a) WHERE c > 0
+//	CREATE INDEX idx2 ON t (b) WHERE c > 0
 //
-//   SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 0
+//	SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 0
 //
 // The optimal query plan is a zigzag join over idx1 and idx2. Planning a zigzag
 // join requires a nested loop over the indexes of a table. The outer loop will
@@ -143,10 +142,10 @@ func (it *scanIndexIter) Init(
 //
 // Consider the indexes and query:
 //
-//   CREATE INDEX idx1 ON t (a) WHERE b > 0
-//   CREATE INDEX idx2 ON t (c) WHERE d > 0
+//	CREATE INDEX idx1 ON t (a) WHERE b > 0
+//	CREATE INDEX idx2 ON t (c) WHERE d > 0
 //
-//   SELECT * FROM t WHERE a = 1 AND b > 0 AND c = 2 AND d > 0
+//	SELECT * FROM t WHERE a = 1 AND b > 0 AND c = 2 AND d > 0
 //
 // The optimal query plan is a zigzag join over idx1 and idx2 with no remaining
 // Select filters. If the original filters were passed to the inner loop's Init,
@@ -219,12 +218,20 @@ func (it *scanIndexIter) ForEachStartingAfter(ord int, f enumerateIndexFunc) {
 			continue
 		}
 
-		// If we are forcing a specific index, ignore all other indexes.
-		if it.scanPrivate.Flags.ForceIndex && ord != it.scanPrivate.Flags.Index {
-			continue
-		}
-
 		index := it.tabMeta.Table.Index(ord)
+		if it.scanPrivate.Flags.ForceIndex {
+			// If we are forcing a specific index, ignore all other indexes.
+			if ord != it.scanPrivate.Flags.Index {
+				continue
+			}
+		} else {
+			// If we are not forcing any specific index and not visible index feature is
+			// enabled here, ignore not visible indexes.
+			if index.IsNotVisible() && !it.scanPrivate.Flags.DisableNotVisibleIndex &&
+				!it.evalCtx.SessionData().OptimizerUseNotVisibleIndexes {
+				continue
+			}
+		}
 
 		// Skip over inverted indexes if rejectInvertedIndexes is set.
 		if it.hasRejectFlags(rejectInvertedIndexes) && index.IsInverted() {

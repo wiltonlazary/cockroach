@@ -20,11 +20,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/featureflag"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/syntheticprivilege"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/errors"
@@ -41,13 +43,10 @@ type exportNode struct {
 	// fileNamePattern represents the file naming pattern for the
 	// export, typically to be appended to the destination URI
 	fileNamePattern string
-	csvOpts         *roachpb.CSVOptions
-	parquetOpts     *roachpb.ParquetOptions
+	format          roachpb.IOFileFormat
 	chunkRows       int
 	chunkSize       int64
-	fileCompression execinfrapb.FileCompression
 	colNames        []string
-	colNullability  []bool
 }
 
 func (e *exportNode) startExec(params runParams) error {
@@ -73,6 +72,15 @@ const (
 	exportOptionChunkSize   = "chunk_size"
 	exportOptionFileName    = "filename"
 	exportOptionCompression = "compression"
+
+	exportChunkSizeDefault = int64(32 << 20) // 32 MB
+	exportChunkRowsDefault = 100000
+
+	exportFilePatternPart = "%part%"
+	exportGzipCodec       = "gzip"
+	exportSnappyCodec     = "snappy"
+	csvSuffix             = "csv"
+	parquetSuffix         = "parquet"
 )
 
 var exportOptionExpectValues = map[string]KVStringOptValidate{
@@ -83,13 +91,6 @@ var exportOptionExpectValues = map[string]KVStringOptValidate{
 	exportOptionCompression: KVStringOptRequireValue,
 	exportOptionChunkSize:   KVStringOptRequireValue,
 }
-
-const exportChunkSizeDefault = int64(32 << 20) // 32 MB
-const exportChunkRowsDefault = 100000
-const exportFilePatternPart = "%part%"
-const exportCompressionCodec = "gzip"
-const csvSuffix = "csv"
-const parquetSuffix = "parquet"
 
 // featureExportEnabled is used to enable and disable the EXPORT feature.
 var featureExportEnabled = settings.RegisterBoolSetting(
@@ -103,11 +104,11 @@ var featureExportEnabled = settings.RegisterBoolSetting(
 func (ef *execFactory) ConstructExport(
 	input exec.Node,
 	fileName tree.TypedExpr,
-	fileFormat string,
+	fileSuffix string,
 	options []exec.KVOption,
 	notNullCols exec.NodeColumnOrdinalSet,
 ) (exec.Node, error) {
-	fileFormat = strings.ToLower(fileFormat)
+	fileSuffix = strings.ToLower(fileSuffix)
 
 	if !featureExportEnabled.Get(&ef.planner.ExecCfg().Settings.SV) {
 		return nil, pgerror.Newf(
@@ -117,7 +118,7 @@ func (ef *execFactory) ConstructExport(
 	}
 
 	if err := featureflag.CheckEnabled(
-		ef.planner.EvalContext().Context,
+		ef.ctx,
 		ef.planner.execCfg,
 		featureExportEnabled,
 		"EXPORT",
@@ -125,15 +126,15 @@ func (ef *execFactory) ConstructExport(
 		return nil, err
 	}
 
-	if !ef.planner.ExtendedEvalContext().TxnImplicit {
-		return nil, errors.Errorf("EXPORT cannot be used inside a transaction")
+	if !ef.planner.ExtendedEvalContext().TxnIsSingleStmt {
+		return nil, errors.Errorf("EXPORT cannot be used inside a multi-statement transaction")
 	}
 
-	if fileFormat != csvSuffix && fileFormat != parquetSuffix {
-		return nil, errors.Errorf("unsupported export format: %q", fileFormat)
+	if fileSuffix != csvSuffix && fileSuffix != parquetSuffix {
+		return nil, errors.Errorf("unsupported export format: %q", fileSuffix)
 	}
 
-	destinationDatum, err := fileName.Eval(ef.planner.EvalContext())
+	destinationDatum, err := eval.Expr(ef.ctx, ef.planner.EvalContext(), fileName)
 	if err != nil {
 		return nil, err
 	}
@@ -142,11 +143,20 @@ func (ef *execFactory) ConstructExport(
 	if !ok {
 		return nil, errors.Errorf("expected string value for the file location")
 	}
-	admin, err := ef.planner.HasAdminRole(ef.planner.EvalContext().Context)
+	admin, err := ef.planner.HasAdminRole(ef.ctx)
 	if err != nil {
 		panic(err)
 	}
-	if !admin && !ef.planner.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound {
+	// TODO(adityamaru): Ideally we'd use
+	// `cloudprivilege.CheckDestinationPrivileges privileges here, but because of
+	// a ciruclar dependancy with `pkg/sql` this is not possible. Consider moving
+	// this file into `pkg/sql/importer` to get around this.
+	hasExternalIOImplicitAccess := ef.planner.CheckPrivilege(
+		ef.ctx, syntheticprivilege.GlobalPrivilegeObject, privilege.EXTERNALIOIMPLICITACCESS,
+	) == nil
+	if !admin &&
+		!ef.planner.ExecCfg().ExternalIODirConfig.EnableNonAdminImplicitAndArbitraryOutbound &&
+		!hasExternalIOImplicitAccess {
 		conf, err := cloud.ExternalStorageConfFromURI(string(*destination), ef.planner.User())
 		if err != nil {
 			return nil, err
@@ -154,19 +164,14 @@ func (ef *execFactory) ConstructExport(
 		if !conf.AccessIsWithExplicitAuth() {
 			panic(pgerror.Newf(
 				pgcode.InsufficientPrivilege,
-				"only users with the admin role are allowed to EXPORT to the specified URI"))
+				"only users with the admin role or the EXTERNALIOIMPLICITACCESS system privilege "+
+					"are allowed to access the specified %s URI", conf.Provider.String()))
 		}
 	}
-	optVals, err := evalStringOptions(ef.planner.EvalContext(), options, exportOptionExpectValues)
+	optVals, err := evalStringOptions(ef.ctx, ef.planner.EvalContext(), options, exportOptionExpectValues)
 	if err != nil {
 		return nil, err
 	}
-
-	var (
-		exportFilePattern string
-		csvOpts           *roachpb.CSVOptions
-		parquetOpts       *roachpb.ParquetOptions
-	)
 
 	cols := planColumns(input.(planNode))
 	colNames := make([]string, len(cols))
@@ -176,9 +181,10 @@ func (ef *execFactory) ConstructExport(
 		colNullability[i] = !notNullCols.Contains(i)
 	}
 
-	switch fileFormat {
+	format := roachpb.IOFileFormat{}
+	switch fileSuffix {
 	case csvSuffix:
-		csvOpts = &roachpb.CSVOptions{}
+		csvOpts := roachpb.CSVOptions{}
 		if override, ok := optVals[exportOptionDelimiter]; ok {
 			csvOpts.Comma, err = util.GetSingleRune(override)
 			if err != nil {
@@ -188,11 +194,14 @@ func (ef *execFactory) ConstructExport(
 		if override, ok := optVals[exportOptionNullAs]; ok {
 			csvOpts.NullEncoding = &override
 		}
-		exportFilePattern = exportFilePatternPart + "." + csvSuffix
-
+		format.Format = roachpb.IOFileFormat_CSV
+		format.Csv = csvOpts
 	case parquetSuffix:
-		parquetOpts = &roachpb.ParquetOptions{}
-		exportFilePattern = exportFilePatternPart + "." + parquetSuffix
+		parquetOpts := roachpb.ParquetOptions{
+			ColNullability: colNullability,
+		}
+		format.Format = roachpb.IOFileFormat_Parquet
+		format.Parquet = parquetOpts
 	}
 
 	chunkRows := exportChunkRowsDefault
@@ -219,28 +228,30 @@ func (ef *execFactory) ConstructExport(
 
 	// Check whenever compression is expected and extract compression codec name in case
 	// of positive result
-	var codec execinfrapb.FileCompression
+	var codec roachpb.IOFileFormat_Compression
 	if name, ok := optVals[exportOptionCompression]; ok && len(name) != 0 {
-		if strings.EqualFold(name, exportCompressionCodec) {
-			codec = execinfrapb.FileCompression_Gzip
-		} else {
+		switch {
+		case strings.EqualFold(name, exportGzipCodec):
+			codec = roachpb.IOFileFormat_Gzip
+		case strings.EqualFold(name, exportSnappyCodec) && fileSuffix == parquetSuffix:
+			codec = roachpb.IOFileFormat_Snappy
+		default:
 			return nil, pgerror.Newf(pgcode.InvalidParameterValue,
-				"unsupported compression codec %s", name)
+				"unsupported compression codec %s for %s file format", name, fileSuffix)
 		}
+		format.Compression = codec
 	}
 
 	exportID := ef.planner.stmt.QueryID.String()
+	exportFilePattern := exportFilePatternPart + "." + fileSuffix
 	namePattern := fmt.Sprintf("export%s-%s", exportID, exportFilePattern)
 	return &exportNode{
 		source:          input.(planNode),
 		destination:     string(*destination),
 		fileNamePattern: namePattern,
-		csvOpts:         csvOpts,
-		parquetOpts:     parquetOpts,
+		format:          format,
 		chunkRows:       chunkRows,
 		chunkSize:       chunkSize,
-		fileCompression: codec,
 		colNames:        colNames,
-		colNullability:  colNullability,
 	}, nil
 }

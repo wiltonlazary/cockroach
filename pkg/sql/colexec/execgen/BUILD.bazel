@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -5,7 +6,6 @@ go_library(
     srcs = [
         "execgen.go",
         "inline.go",
-        "overloads_bin_util.go",
         "placeholders.go",
         "supported_bin_cmp_ops.go",
         "template.go",
@@ -15,7 +15,8 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/sql/colexecerror",
-        "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treebin",
+        "//pkg/sql/sem/tree/treecmp",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_dave_dst//:dst",
         "@com_github_dave_dst//decorator",
@@ -32,6 +33,7 @@ go_test(
         "template_test.go",
         "util_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":execgen"],
     deps = [
@@ -42,3 +44,5 @@ go_test(
         "@com_github_stretchr_testify//assert",
     ],
 )
+
+get_x_data(name = "get_x_data")

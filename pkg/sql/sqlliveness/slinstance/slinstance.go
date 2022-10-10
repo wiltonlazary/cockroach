@@ -21,6 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
@@ -28,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -60,7 +63,9 @@ type Writer interface {
 }
 
 type session struct {
-	id sqlliveness.SessionID
+	id    sqlliveness.SessionID
+	start hlc.Timestamp
+
 	mu struct {
 		syncutil.RWMutex
 		exp hlc.Timestamp
@@ -70,14 +75,19 @@ type session struct {
 	}
 }
 
-// ID implements the Session interface method ID.
+// ID implements the sqlliveness.Session interface.
 func (s *session) ID() sqlliveness.SessionID { return s.id }
 
-// Expiration implements the Session interface method Expiration.
+// Expiration implements the sqlliveness.Session interface.
 func (s *session) Expiration() hlc.Timestamp {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.mu.exp
+}
+
+// Start implements the sqlliveness.Session interface.
+func (s *session) Start() hlc.Timestamp {
+	return s.start
 }
 
 // RegisterCallbackForSessionExpiry adds the given function to the list
@@ -116,6 +126,7 @@ type Instance struct {
 	ttl       func() time.Duration
 	hb        func() time.Duration
 	testKnobs sqlliveness.TestingKnobs
+	startErr  error
 	mu        struct {
 		started bool
 		syncutil.Mutex
@@ -142,6 +153,14 @@ func (l *Instance) setSession(s *session) {
 }
 
 func (l *Instance) clearSession(ctx context.Context) {
+	l.checkExpiry(ctx)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.mu.s = nil
+	l.mu.blockCh = make(chan struct{})
+}
+
+func (l *Instance) checkExpiry(ctx context.Context) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if expiration := l.mu.s.Expiration(); expiration.Less(l.clock.Now()) {
@@ -149,16 +168,18 @@ func (l *Instance) clearSession(ctx context.Context) {
 		// associated with the session.
 		l.mu.s.invokeSessionExpiryCallbacks(ctx)
 	}
-	l.mu.s = nil
-	l.mu.blockCh = make(chan struct{})
 }
 
 // createSession tries until it can create a new session and returns an error
 // only if the heart beat loop should exit.
 func (l *Instance) createSession(ctx context.Context) (*session, error) {
 	id := sqlliveness.SessionID(uuid.MakeV4().GetBytes())
-	exp := l.clock.Now().Add(l.ttl().Nanoseconds(), 0)
-	s := &session{id: id}
+	start := l.clock.Now()
+	exp := start.Add(l.ttl().Nanoseconds(), 0)
+	s := &session{
+		id:    id,
+		start: start,
+	}
 	s.mu.exp = exp
 
 	opts := retry.Options{
@@ -176,6 +197,11 @@ func (l *Instance) createSession(ctx context.Context) (*session, error) {
 			}
 			if everySecond.ShouldLog() {
 				log.Errorf(ctx, "failed to create a session at %d-th attempt: %v", i, err)
+			}
+			// Unauthenticated errors are unrecoverable, we should break instead
+			// of retrying.
+			if grpcutil.IsAuthError(err) {
+				break
 			}
 			continue
 		}
@@ -234,30 +260,63 @@ func (l *Instance) heartbeatLoop(ctx context.Context) {
 		case <-t.C:
 			t.Read = true
 			s, _ := l.getSessionOrBlockCh()
+			// TODO(aaditya): consider combining `DefaultTTL` and `DefaultHeartBeat` into a single knob to make these
+			//  timeouts less fragile
+			timeout := l.ttl()/2 + l.hb()
 			if s == nil {
-				newSession, err := l.createSession(ctx)
-				if err != nil {
+				var newSession *session
+				if err := contextutil.RunWithTimeout(ctx, "sqlliveness create session", timeout, func(ctx context.Context) error {
+					var err error
+					newSession, err = l.createSession(ctx)
+					return err
+				}); err != nil {
+					log.Errorf(ctx, "sqlliveness failed to create new session: %v", err)
+					func() {
+						l.mu.Lock()
+						defer l.mu.Unlock()
+						l.startErr = err
+						// There was an unrecoverable error when trying to
+						// create the session. Notify all calls to Session that
+						// the session failed.
+						close(l.mu.blockCh)
+					}()
 					return
 				}
 				l.setSession(newSession)
 				t.Reset(l.hb())
 				continue
 			}
-			found, err := l.extendSession(ctx, s)
-			if err != nil {
+			var found bool
+			err := contextutil.RunWithTimeout(ctx, "sqlliveness extend session", timeout, func(ctx context.Context) error {
+				var err error
+				found, err = l.extendSession(ctx, s)
+				return err
+			})
+			switch {
+			case errors.HasType(err, (*contextutil.TimeoutError)(nil)):
+				// Retry without clearing the session because we don't know the current status.
+				l.checkExpiry(ctx)
+				t.Reset(0)
+				continue
+			case err != nil && ctx.Err() == nil:
+				log.Errorf(ctx, "sqlliveness failed to extend session: %v", err)
+				fallthrough
+			case err != nil:
+				// TODO(ajwerner): Decide whether we actually should exit the heartbeat loop here if the context is not
+				// canceled. Consider the case of an ambiguous result error: shouldn't we try again?
 				l.clearSession(ctx)
 				return
-			}
-			if !found {
+			case !found:
+				// No existing session found, immediately create one.
 				l.clearSession(ctx)
 				// Start next loop iteration immediately to insert a new session.
 				t.Reset(0)
-				continue
+			default:
+				if log.V(2) {
+					log.Infof(ctx, "extended SQL liveness session %s", s.ID())
+				}
+				t.Reset(l.hb())
 			}
-			if log.V(2) {
-				log.Infof(ctx, "extended SQL liveness session %s", s.ID())
-			}
-			t.Reset(l.hb())
 		}
 	}
 }
@@ -330,6 +389,15 @@ func (l *Instance) Session(ctx context.Context) (sqlliveness.Session, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-ch:
+			var err error
+			func() {
+				l.mu.Lock()
+				defer l.mu.Unlock()
+				err = l.startErr
+			}()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 }

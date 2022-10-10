@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -29,12 +30,16 @@ go_test(
     name = "pprofui_test",
     size = "small",
     srcs = ["server_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":pprofui"],
     deps = [
         "//pkg/build/bazel",
         "//pkg/server/serverpb",
         "//pkg/testutils",
+        "//pkg/testutils/skip",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

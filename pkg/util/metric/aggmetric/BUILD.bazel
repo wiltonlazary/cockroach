@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,9 +15,9 @@ go_library(
         "//pkg/util/metric",
         "//pkg/util/syncutil",
         "@com_github_cockroachdb_errors//:errors",
-        "@com_github_codahale_hdrhistogram//:hdrhistogram",
         "@com_github_gogo_protobuf//proto",
         "@com_github_google_btree//:btree",
+        "@com_github_prometheus_client_golang//prometheus",
         "@com_github_prometheus_client_model//go",
     ],
 )
@@ -25,13 +26,19 @@ go_test(
     name = "aggmetric_test",
     size = "small",
     srcs = ["agg_metric_test.go"],
+    args = ["-test.timeout=55s"],
+    data = glob(["testdata/**"]),
     deps = [
         ":aggmetric",
         "//pkg/base",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
+        "//pkg/testutils",
+        "//pkg/testutils/echotest",
         "//pkg/util/leaktest",
         "//pkg/util/metric",
         "@com_github_prometheus_client_model//go",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

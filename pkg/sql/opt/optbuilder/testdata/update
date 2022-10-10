@@ -81,9 +81,11 @@ CREATE TABLE assn_cast (
 exec-ddl
 CREATE TABLE assn_cast_on_update (
     i INT,
+    i2 INT ON UPDATE 1.0::FLOAT,
     d DECIMAL(10, 1) ON UPDATE 1.23,
     d2 DECIMAL(10, 1) ON UPDATE 1.23::DECIMAL(10, 2),
-    d_comp DECIMAL(10, 0) AS (d) STORED
+    d_comp DECIMAL(10, 0) AS (d) STORED,
+    b BOOL ON UPDATE 1.0::FLOAT
 )
 ----
 
@@ -565,6 +567,10 @@ with &1
  │    ├── fetch columns: xyz.x:6 xyz.y:7 xyz.z:8
  │    ├── update-mapping:
  │    │    └── y_new:11 => xyz.y:2
+ │    ├── return-mapping:
+ │    │    ├── xyz.x:6 => xyz.x:1
+ │    │    ├── y_new:11 => xyz.y:2
+ │    │    └── xyz.z:8 => xyz.z:3
  │    └── project
  │         ├── columns: y_new:11 xyz.x:6!null xyz.y:7 xyz.z:8 xyz.crdb_internal_mvcc_timestamp:9 xyz.tableoid:10
  │         ├── scan xyz
@@ -627,6 +633,13 @@ project
       ├── update-mapping:
       │    ├── a_new:17 => a:1
       │    └── a_new:17 => e:5
+      ├── return-mapping:
+      │    ├── a_new:17 => a:1
+      │    ├── b:10 => b:2
+      │    ├── c:11 => c:3
+      │    ├── d:12 => d:4
+      │    ├── a_new:17 => e:5
+      │    └── rowid:14 => rowid:6
       └── project
            ├── columns: d_comp:18 a:9!null b:10 c:11 d:12 e:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16 a_new:17!null
            ├── project
@@ -659,6 +672,13 @@ project
  │    ├── update-mapping:
  │    │    ├── a_new:17 => a:1
  │    │    └── a_new:17 => e:5
+ │    ├── return-mapping:
+ │    │    ├── a_new:17 => a:1
+ │    │    ├── b:10 => b:2
+ │    │    ├── c:11 => c:3
+ │    │    ├── d:12 => d:4
+ │    │    ├── a_new:17 => e:5
+ │    │    └── rowid:14 => rowid:6
  │    └── project
  │         ├── columns: d_comp:18 a:9!null b:10 c:11 d:12 e:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16 a_new:17!null
  │         ├── project
@@ -696,6 +716,13 @@ with &1
  │         ├── update-mapping:
  │         │    ├── a_new:17 => abcde.a:1
  │         │    └── a_new:17 => abcde.e:5
+ │         ├── return-mapping:
+ │         │    ├── a_new:17 => abcde.a:1
+ │         │    ├── abcde.b:10 => abcde.b:2
+ │         │    ├── abcde.c:11 => abcde.c:3
+ │         │    ├── abcde.d:12 => abcde.d:4
+ │         │    ├── a_new:17 => abcde.e:5
+ │         │    └── rowid:14 => rowid:6
  │         └── project
  │              ├── columns: d_comp:18 abcde.a:9!null abcde.b:10 abcde.c:11 abcde.d:12 abcde.e:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16 a_new:17!null
  │              ├── project
@@ -744,6 +771,13 @@ project
       ├── columns: a:1!null b:2 c:3 d:4 e:5 rowid:6!null
       ├── fetch columns: a:9 b:10 c:11 d:12 e:13 rowid:14
       ├── update-mapping:
+      │    └── rowid_new:17 => rowid:6
+      ├── return-mapping:
+      │    ├── a:9 => a:1
+      │    ├── b:10 => b:2
+      │    ├── c:11 => c:3
+      │    ├── d:12 => d:4
+      │    ├── e:13 => e:5
       │    └── rowid_new:17 => rowid:6
       └── project
            ├── columns: d_comp:18 a:9!null b:10 c:11 d:12 e:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16 rowid_new:17!null
@@ -1228,6 +1262,13 @@ project
       ├── update-mapping:
       │    ├── b_new:25 => abcde1.b:2
       │    └── d_comp:26 => abcde1.d:4
+      ├── return-mapping:
+      │    ├── abcde1.a:9 => abcde1.a:1
+      │    ├── b_new:25 => abcde1.b:2
+      │    ├── abcde1.c:11 => abcde1.c:3
+      │    ├── d_comp:26 => abcde1.d:4
+      │    ├── abcde1.e:13 => abcde1.e:5
+      │    └── abcde1.rowid:14 => abcde1.rowid:6
       └── project
            ├── columns: d_comp:26 abcde1.a:9!null abcde1.b:10 abcde1.c:11 abcde1.d:12 abcde1.e:13 abcde1.rowid:14!null abcde1.crdb_internal_mvcc_timestamp:15 abcde1.tableoid:16 b_new:25
            ├── project
@@ -1686,7 +1727,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 crdb_internal_mvcc_timestamp:11 tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    └── projections
       │    │    │    │         ├── 1.1 [as=a_new:13]
       │    │    │    │         └── ARRAY[0.95, NULL, 15::DECIMAL(10,2)] [as=b_new:14]
@@ -1696,7 +1737,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:16]
       │    │    │              └── b_new:14
       │    │    └── projections
-      │    │         └── a_cast:15::DECIMAL + c:9::DECIMAL [as=d_comp:17]
+      │    │         └── a_cast:15 + c:9 [as=d_comp:17]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:18]
       │              └── d_comp:17
@@ -1731,7 +1772,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 crdb_internal_mvcc_timestamp:11 tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    └── projections
       │    │    │    │         ├── 1.1 [as=a_new:13]
       │    │    │    │         └── ARRAY[0.95,NULL,15.00] [as=b_new:14]
@@ -1741,7 +1782,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:16]
       │    │    │              └── b_new:14
       │    │    └── projections
-      │    │         └── a_cast:15::DECIMAL + c:9::DECIMAL [as=d_comp:17]
+      │    │         └── a_cast:15 + c:9 [as=d_comp:17]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:18]
       │              └── d_comp:17
@@ -1771,7 +1812,7 @@ update assn_cast
       │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    └── computed column expressions
       │    │    │         └── d_comp:15
-      │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │              └── d:14 + 10.0
       │    │    └── projections
       │    │         ├── ' ' [as=c_new:19]
       │    │         ├── 'foo' [as=qc_new:20]
@@ -1785,7 +1826,7 @@ update assn_cast
       │         └── assignment-cast: STRING [as=s_cast:25]
       │              └── s_new:22
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:26]
+           └── d:14 + 10.0 [as=d_comp_comp:26]
 
 # Test standard prepared update with some types that require assignment casts.
 assign-placeholders-build query-args=(' ', 'foo', '1')
@@ -1808,7 +1849,7 @@ update assn_cast
       │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    └── computed column expressions
       │    │    │         └── d_comp:15
-      │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │              └── d:14 + 10.0
       │    │    └── projections
       │    │         ├── ' ' [as=c_new:19]
       │    │         ├── 'foo' [as=qc_new:20]
@@ -1819,7 +1860,7 @@ update assn_cast
       │         └── assignment-cast: "char" [as=qc_cast:23]
       │              └── qc_new:20
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:24]
+           └── d:14 + 10.0 [as=d_comp_comp:24]
 
 # Test update to DEFAULT that requires an assignment cast.
 build
@@ -1840,14 +1881,14 @@ update assn_cast
       │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    └── computed column expressions
       │    │    │         └── d_comp:15
-      │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │              └── d:14 + 10.0
       │    │    └── projections
       │    │         └── 10::INT2 [as=i_new:19]
       │    └── projections
       │         └── assignment-cast: INT8 [as=i_cast:20]
       │              └── i_new:19
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:21]
+           └── d:14 + 10.0 [as=d_comp_comp:21]
 
 # Test update to a column that requires an assignment cast and a computed column
 # that depends on the new value.
@@ -1872,14 +1913,14 @@ update assn_cast
       │    │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    │    └── computed column expressions
       │    │    │    │         └── d_comp:15
-      │    │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │    │              └── d:14 + 10.0
       │    │    │    └── projections
       │    │    │         └── 1.45::DECIMAL(10,2) [as=d_new:19]
       │    │    └── projections
       │    │         └── assignment-cast: DECIMAL(10) [as=d_cast:20]
       │    │              └── d_new:19
       │    └── projections
-      │         └── d_cast:20::DECIMAL + 10.0 [as=d_comp_comp:21]
+      │         └── d_cast:20 + 10.0 [as=d_comp_comp:21]
       └── projections
            └── assignment-cast: DECIMAL(10) [as=d_comp_cast:22]
                 └── d_comp_comp:21
@@ -1907,14 +1948,14 @@ update assn_cast
       │    │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    │    └── computed column expressions
       │    │    │    │         └── d_comp:15
-      │    │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │    │              └── d:14 + 10.0
       │    │    │    └── projections
       │    │    │         └── 1.45 [as=d_new:19]
       │    │    └── projections
       │    │         └── assignment-cast: DECIMAL(10) [as=d_cast:20]
       │    │              └── d_new:19
       │    └── projections
-      │         └── d_cast:20::DECIMAL + 10.0 [as=d_comp_comp:21]
+      │         └── d_cast:20 + 10.0 [as=d_comp_comp:21]
       └── projections
            └── assignment-cast: DECIMAL(10) [as=d_comp_cast:22]
                 └── d_comp_comp:21
@@ -1945,7 +1986,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 crdb_internal_mvcc_timestamp:11 tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    └── projections
       │    │    │    │         ├── 1.1 [as=a_new:13]
       │    │    │    │         └── ARRAY[0.95, NULL, 15::DECIMAL(10,2)] [as=b_new:14]
@@ -1955,7 +1996,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:16]
       │    │    │              └── b_new:14
       │    │    └── projections
-      │    │         └── a_cast:15::DECIMAL + c:9::DECIMAL [as=d_comp:17]
+      │    │         └── a_cast:15 + c:9 [as=d_comp:17]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:18]
       │              └── d_comp:17
@@ -1989,7 +2030,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 crdb_internal_mvcc_timestamp:11 tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    └── projections
       │    │    │    │         ├── 1.1 [as=a_new:13]
       │    │    │    │         └── ARRAY[0.95,NULL,15.00] [as=b_new:14]
@@ -1999,7 +2040,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:16]
       │    │    │              └── b_new:14
       │    │    └── projections
-      │    │         └── a_cast:15::DECIMAL + c:9::DECIMAL [as=d_comp:17]
+      │    │         └── a_cast:15 + c:9 [as=d_comp:17]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:18]
       │              └── d_comp:17
@@ -2027,7 +2068,7 @@ update assn_cast
       │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    └── computed column expressions
       │    │    │         └── d_comp:15
-      │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │              └── d:14 + 10.0
       │    │    └── projections
       │    │         ├── ' ' [as=c_new:19]
       │    │         └── 10::INT2 [as=i_new:20]
@@ -2037,7 +2078,7 @@ update assn_cast
       │         └── assignment-cast: INT8 [as=i_cast:22]
       │              └── i_new:20
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:23]
+           └── d:14 + 10.0 [as=d_comp_comp:23]
 
 # Test tuple-syntax prepared update with DEFAULT that requires assignment casts.
 assign-placeholders-build query-args=(' ')
@@ -2059,7 +2100,7 @@ update assn_cast
       │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    └── computed column expressions
       │    │    │         └── d_comp:15
-      │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │              └── d:14 + 10.0
       │    │    └── projections
       │    │         ├── ' ' [as=c_new:19]
       │    │         └── 10::INT2 [as=i_new:20]
@@ -2069,7 +2110,7 @@ update assn_cast
       │         └── assignment-cast: INT8 [as=i_cast:22]
       │              └── i_new:20
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:23]
+           └── d:14 + 10.0 [as=d_comp_comp:23]
 
 # Test update with a subquery that requires an assignment cast.
 build
@@ -2096,7 +2137,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 crdb_internal_mvcc_timestamp:11 tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    ├── max1-row
       │    │    │    │    │    ├── columns: n:13!null
       │    │    │    │    │    └── project
@@ -2110,7 +2151,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(10) [as=a_cast:14]
       │    │    │              └── n:13
       │    │    └── projections
-      │    │         └── a_cast:14::DECIMAL + c:9::DECIMAL [as=d_comp:15]
+      │    │         └── a_cast:14 + c:9 [as=d_comp:15]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:16]
       │              └── d_comp:15
@@ -2144,7 +2185,7 @@ update decimals
       │    │    │    │    │    ├── columns: a:7!null b:8 c:9 d:10 decimals.crdb_internal_mvcc_timestamp:11 decimals.tableoid:12
       │    │    │    │    │    └── computed column expressions
       │    │    │    │    │         └── d:10
-      │    │    │    │    │              └── a:7::DECIMAL + c:9::DECIMAL
+      │    │    │    │    │              └── a:7 + c:9
       │    │    │    │    ├── max1-row
       │    │    │    │    │    ├── columns: u:13!null "?column?":18!null
       │    │    │    │    │    └── project
@@ -2164,7 +2205,7 @@ update decimals
       │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:20]
       │    │    │              └── "?column?":18
       │    │    └── projections
-      │    │         └── a_cast:19::DECIMAL + c_cast:20::DECIMAL [as=d_comp:21]
+      │    │         └── a_cast:19 + c_cast:20 [as=d_comp:21]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:22]
       │              └── d_comp:21
@@ -2195,7 +2236,7 @@ update assn_cast
       │    │    │    │    ├── columns: c:10 qc:11 i:12 s:13 d:14 d_comp:15 assn_cast.rowid:16!null assn_cast.crdb_internal_mvcc_timestamp:17 assn_cast.tableoid:18
       │    │    │    │    └── computed column expressions
       │    │    │    │         └── d_comp:15
-      │    │    │    │              └── d:14::DECIMAL + 10.0
+      │    │    │    │              └── d:14 + 10.0
       │    │    │    ├── max1-row
       │    │    │    │    ├── columns: "?column?":24!null "?column?":25!null
       │    │    │    │    └── project
@@ -2214,46 +2255,58 @@ update assn_cast
       │         └── assignment-cast: "char" [as=qc_cast:28]
       │              └── "?column?":24
       └── projections
-           └── d:14::DECIMAL + 10.0 [as=d_comp_comp:29]
+           └── d:14 + 10.0 [as=d_comp_comp:29]
 
 # Test ON UPDATE columns that require assignment casts.
 build
-UPDATE assn_cast_on_update SET i=1
+UPDATE assn_cast_on_update SET i=1, b=true
 ----
 update assn_cast_on_update
  ├── columns: <none>
- ├── fetch columns: i:8 d:9 d2:10 d_comp:11 rowid:12
+ ├── fetch columns: i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16
  ├── update-mapping:
- │    ├── i_new:15 => i:1
- │    ├── d_cast:18 => d:2
- │    ├── d2_cast:19 => d2:3
- │    └── d_comp_cast:20 => d_comp:4
+ │    ├── i_new:19 => i:1
+ │    ├── i2_cast:24 => i2:2
+ │    ├── d_cast:25 => d:3
+ │    ├── d2_cast:26 => d2:4
+ │    ├── d_comp_cast:27 => d_comp:5
+ │    └── b_new:20 => b:6
  └── project
-      ├── columns: d_comp_cast:20!null i:8 d:9 d2:10 d_comp:11 rowid:12!null crdb_internal_mvcc_timestamp:13 tableoid:14 i_new:15!null d_cast:18!null d2_cast:19!null
+      ├── columns: d_comp_cast:27!null i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18 i_new:19!null b_new:20!null i2_cast:24!null d_cast:25!null d2_cast:26!null
       ├── project
-      │    ├── columns: d_cast:18!null d2_cast:19!null i:8 d:9 d2:10 d_comp:11 rowid:12!null crdb_internal_mvcc_timestamp:13 tableoid:14 i_new:15!null
+      │    ├── columns: i2_cast:24!null d_cast:25!null d2_cast:26!null i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18 i_new:19!null b_new:20!null
       │    ├── project
-      │    │    ├── columns: d_on_update:16!null d2_on_update:17!null i:8 d:9 d2:10 d_comp:11 rowid:12!null crdb_internal_mvcc_timestamp:13 tableoid:14 i_new:15!null
+      │    │    ├── columns: i2_on_update:21!null d_on_update:22!null d2_on_update:23!null i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18 i_new:19!null b_new:20!null
       │    │    ├── project
-      │    │    │    ├── columns: i_new:15!null i:8 d:9 d2:10 d_comp:11 rowid:12!null crdb_internal_mvcc_timestamp:13 tableoid:14
+      │    │    │    ├── columns: i_new:19!null b_new:20!null i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    ├── scan assn_cast_on_update
-      │    │    │    │    ├── columns: i:8 d:9 d2:10 d_comp:11 rowid:12!null crdb_internal_mvcc_timestamp:13 tableoid:14
+      │    │    │    │    ├── columns: i:10 i2:11 d:12 d2:13 d_comp:14 b:15 rowid:16!null crdb_internal_mvcc_timestamp:17 tableoid:18
       │    │    │    │    └── computed column expressions
-      │    │    │    │         └── d_comp:11
-      │    │    │    │              └── d:9
+      │    │    │    │         └── d_comp:14
+      │    │    │    │              └── d:12
       │    │    │    └── projections
-      │    │    │         └── 1 [as=i_new:15]
+      │    │    │         ├── 1 [as=i_new:19]
+      │    │    │         └── true [as=b_new:20]
       │    │    └── projections
-      │    │         ├── 1.23 [as=d_on_update:16]
-      │    │         └── 1.23::DECIMAL(10,2) [as=d2_on_update:17]
+      │    │         ├── 1.0 [as=i2_on_update:21]
+      │    │         ├── 1.23 [as=d_on_update:22]
+      │    │         └── 1.23::DECIMAL(10,2) [as=d2_on_update:23]
       │    └── projections
-      │         ├── assignment-cast: DECIMAL(10,1) [as=d_cast:18]
-      │         │    └── d_on_update:16
-      │         └── assignment-cast: DECIMAL(10,1) [as=d2_cast:19]
-      │              └── d2_on_update:17
+      │         ├── assignment-cast: INT8 [as=i2_cast:24]
+      │         │    └── i2_on_update:21
+      │         ├── assignment-cast: DECIMAL(10,1) [as=d_cast:25]
+      │         │    └── d_on_update:22
+      │         └── assignment-cast: DECIMAL(10,1) [as=d2_cast:26]
+      │              └── d2_on_update:23
       └── projections
-           └── assignment-cast: DECIMAL(10) [as=d_comp_cast:20]
-                └── d_cast:18
+           └── assignment-cast: DECIMAL(10) [as=d_comp_cast:27]
+                └── d_cast:25
+
+# This fails because the cast from FLOAT to BOOL is not a valid assignment cast.
+build
+UPDATE assn_cast_on_update SET i=1
+----
+error (42804): value type float doesn't match type bool of column "b"
 
 # ------------------------------------------------------------------------------
 # ON UPDATE tests.

@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
@@ -14,6 +15,9 @@ go_library(
         "//pkg/cmd/roachtest/spec",
         "//pkg/roachprod/install",
         "//pkg/roachprod/logger",
+        "//pkg/roachprod/prometheus",
         "@com_github_cockroachdb_errors//:errors",
     ],
 )
+
+get_x_data(name = "get_x_data")

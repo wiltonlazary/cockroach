@@ -126,7 +126,7 @@ func (p *printWriter) ClearEngineKey(key EngineKey) error {
 	return p.Writer.ClearEngineKey(key)
 }
 
-func (p *printWriter) ClearRawRange(start, end roachpb.Key) error {
+func (p *printWriter) ClearRawRange(start, end roachpb.Key, pointKeys, rangeKeys bool) error {
 	if bytes.HasPrefix(start, keys.LocalRangeLockTablePrefix) {
 		ltStart, err := keys.DecodeLockTableSingleKey(start)
 		if err != nil {
@@ -140,7 +140,7 @@ func (p *printWriter) ClearRawRange(start, end roachpb.Key) error {
 	} else {
 		fmt.Fprintf(&p.b, "ClearRawRange(%s, %s)\n", string(start), string(end))
 	}
-	return p.Writer.ClearRawRange(start, end)
+	return p.Writer.ClearRawRange(start, end, pointKeys, rangeKeys)
 }
 
 func (p *printWriter) PutUnversioned(key roachpb.Key, value []byte) error {
@@ -200,7 +200,7 @@ func TestIntentDemuxWriter(t *testing.T) {
 				// This is a low-level test that explicitly wraps the writer, so it
 				// doesn't matter how the original call to createTestPebbleEngine
 				// behaved in terms of separated intents config.
-				w = wrapIntentWriter(context.Background(), &pw)
+				w = wrapIntentWriter(&pw)
 				return ""
 			case "put-intent":
 				pw.reset()
@@ -246,7 +246,7 @@ func TestIntentDemuxWriter(t *testing.T) {
 				pw.reset()
 				start := scanRoachKey(t, d, "start")
 				end := scanRoachKey(t, d, "end")
-				if scratch, err = w.ClearMVCCRangeAndIntents(start, end, scratch); err != nil {
+				if scratch, err = w.ClearMVCCRange(start, end, true, true, scratch); err != nil {
 					return err.Error()
 				}
 				printEngContents(&pw.b, eng)

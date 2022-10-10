@@ -25,6 +25,36 @@ import {
 import { UIConfigState, reducer as uiConfig } from "./uiConfig";
 import { DOMAIN_NAME } from "./utils";
 import { SQLStatsState, reducer as sqlStats } from "./sqlStats";
+import {
+  SQLDetailsStatsReducerState,
+  reducer as sqlDetailsStats,
+} from "./statementDetails";
+import {
+  IndexStatsReducerState,
+  reducer as indexStats,
+} from "./indexStats/indexStats.reducer";
+import { JobsState, reducer as jobs } from "./jobs";
+import { JobState, reducer as job } from "./jobDetails";
+import {
+  ClusterLocksReqState,
+  reducer as clusterLocks,
+} from "./clusterLocks/clusterLocks.reducer";
+import {
+  TransactionInsightsState,
+  reducer as transactionInsights,
+} from "./insights/transactionInsights";
+import {
+  StatementInsightsState,
+  reducer as statementInsights,
+} from "./insights/statementInsights";
+import {
+  SchemaInsightsState,
+  reducer as schemaInsights,
+} from "./schemaInsights";
+import {
+  TransactionInsightDetailsState,
+  reducer as transactionInsightDetails,
+} from "./insightDetails/transactionInsightDetails";
 
 export type AdminUiState = {
   statementDiagnostics: StatementDiagnosticsState;
@@ -35,6 +65,15 @@ export type AdminUiState = {
   terminateQuery: TerminateQueryState;
   uiConfig: UIConfigState;
   sqlStats: SQLStatsState;
+  sqlDetailsStats: SQLDetailsStatsReducerState;
+  indexStats: IndexStatsReducerState;
+  jobs: JobsState;
+  job: JobState;
+  clusterLocks: ClusterLocksReqState;
+  transactionInsights: TransactionInsightsState;
+  transactionInsightDetails: TransactionInsightDetailsState;
+  statementInsights: StatementInsightsState;
+  schemaInsights: SchemaInsightsState;
 };
 
 export type AppState = {
@@ -47,9 +86,18 @@ export const reducers = combineReducers<AdminUiState>({
   nodes,
   liveness,
   sessions,
+  transactionInsights,
+  transactionInsightDetails,
+  statementInsights,
   terminateQuery,
   uiConfig,
   sqlStats,
+  sqlDetailsStats,
+  indexStats,
+  jobs,
+  job,
+  clusterLocks,
+  schemaInsights,
 });
 
 export const rootActions = {

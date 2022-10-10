@@ -9,9 +9,10 @@
 // licenses/APL.txt.
 
 import moment from "moment";
-
 import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { fromNumber } from "long";
+
+type Timestamp = protos.google.protobuf.ITimestamp;
 
 /**
  * NanoToMilli converts a nanoseconds value into milliseconds.
@@ -115,6 +116,23 @@ export function DurationToNumber(
 }
 
 /**
+ * DurationToMomentDuration converts a Duration object, as seen in wire.proto,
+ * to a duration object from momentjs. If timestamp is null it returns the `defaultIfNull`
+ * value which is by default 0, as momentjs duration.
+ */
+export function DurationToMomentDuration(
+  duration?: protos.google.protobuf.IDuration,
+  defaultIfNullSeconds = 0,
+): moment.Duration {
+  if (!duration) {
+    return moment.duration(defaultIfNullSeconds, "seconds");
+  }
+
+  const seconds = duration.seconds.toNumber() + duration.nanos * 1e-9;
+  return moment.duration(seconds, "seconds");
+}
+
+/**
  * NumberToDuration converts a number representing a duration in seconds
  * to a Duration object.
  */
@@ -138,3 +156,9 @@ export const durationFromISO8601String = (value: string): moment.Duration => {
   }
   return moment.duration(value);
 };
+
+export function makeTimestamp(unixTs: number): Timestamp {
+  return new protos.google.protobuf.Timestamp({
+    seconds: fromNumber(unixTs),
+  });
+}

@@ -78,42 +78,22 @@ CREATE DATABASE IF NOT EXISTS test;
 CREATE TABLE test.t (x INT AS (3) STORED);
 DROP TABLE test.t;
 	`),
+	stmtFeatureTest("Split and Merge Ranges", v202, `
+create database if not EXISTS splitmerge;
+create table splitmerge.t (k int primary key);
+alter table splitmerge.t split at values (1), (2), (3);
+alter table splitmerge.t unsplit at values (1), (2), (3);
+drop table splitmerge.t;
+	`),
 }
 
 func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+	}
 	predecessorVersion, err := PredecessorVersion(*t.BuildVersion())
 	if err != nil {
 		t.Fatal(err)
-	}
-	// This test uses fixtures and we do not have encrypted fixtures right now.
-	c.EncryptDefault(false)
-
-	// Set the bool within to true to create a new fixture for this test. This
-	// is necessary after every release. For example, the day `master` becomes
-	// the 20.2 release, this test will fail because it is missing a fixture for
-	// 20.1; run the test (on 20.1) with the bool flipped to create the fixture.
-	// Check it in (instructions will be logged below) and off we go.
-	if false {
-		// The version to create/update the fixture for. Must be released (i.e.
-		// can download it from the homepage); if that is not the case use the
-		// empty string which uses the local cockroach binary. Make sure that
-		// this binary then has the correct version. For example, to make a
-		// "v20.2" fixture, you will need a binary that has "v20.2" in the
-		// output of `./cockroach version`, and this process will end up
-		// creating fixtures that have "v20.2" in them. This would be part
-		// of tagging the master branch as v21.1 in the process of going
-		// through the major release for v20.2.
-		//
-		// In the common case, one should populate this with the version (instead of
-		// using the empty string) as this is the most straightforward and least
-		// error-prone way to generate the fixtures.
-		//
-		// Please note that you do *NOT* need to update the fixtures in a patch
-		// release. This only happens as part of preparing the master branch for the
-		// next release. The release team runbooks, at time of writing, reflect
-		// this.
-		makeFixtureVersion := "21.2.0" // for 21.2 release in late 2021
-		makeVersionFixtureAndFatal(ctx, t, c, makeFixtureVersion)
 	}
 
 	testFeaturesStep := versionUpgradeTestFeatures.step(c.All())
@@ -143,6 +123,16 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 		//
 		// See the comment on createCheckpoints for details on fixtures.
 		uploadAndStartFromCheckpointFixture(c.All(), predecessorVersion),
+
+		// lower descriptor lease duration to 1 minute, working around a
+		// lease leak that can occasionally make this test time out (flake
+		// rate ~3%).
+		//
+		// TODO(renato): remove this call and function definition when
+		// https://github.com/cockroachdb/cockroach/issues/84382 is
+		// closed.
+		lowerLeaseDuration(1),
+
 		uploadAndInitSchemaChangeWorkload(),
 		waitForUpgradeStep(c.All()),
 		testFeaturesStep,
@@ -158,8 +148,9 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 		// and finalizing on the auto-upgrade path.
 		preventAutoUpgradeStep(1),
 		// Roll nodes forward.
-		binaryUpgradeStep(c.All(), ""),
+		binaryUpgradeStep(c.Node(1), ""),
 		testFeaturesStep,
+		binaryUpgradeStep(c.Range(2, c.Spec().NodeCount), ""),
 		// Run a quick schemachange workload in between each upgrade.
 		// The maxOps is 10 to keep the test runtime under 1-2 minutes.
 		// schemaChangeStep,
@@ -203,8 +194,9 @@ func (u *versionUpgradeTest) run(ctx context.Context, t test.Test) {
 		}
 	}()
 
-	for _, step := range u.steps {
+	for i, step := range u.steps {
 		if step != nil {
+			t.Status(fmt.Sprintf("versionUpgrateTest: starting step %d", i+1))
 			step(ctx, t, u)
 		}
 	}
@@ -372,7 +364,18 @@ func uploadAndStartFromCheckpointFixture(nodes option.NodeListOption, v string) 
 		startOpts := option.DefaultStartOpts()
 		// NB: can't start sequentially since cluster already bootstrapped.
 		startOpts.RoachprodOpts.Sequential = false
-		startOpts.RoachtestOpts.DontEncrypt = true
+		u.c.Start(ctx, t.L(), startOpts, settings, nodes)
+	}
+}
+
+func uploadAndStart(nodes option.NodeListOption, v string) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		// Put and start the binary.
+		binary := u.uploadVersion(ctx, t, nodes, v)
+		// NB: can't start sequentially since cluster already bootstrapped.
+		startOpts := option.DefaultStartOpts()
+		startOpts.RoachprodOpts.Sequential = false
+		settings := install.MakeClusterSettings(install.BinaryOption(binary))
 		u.c.Start(ctx, t.L(), startOpts, settings, nodes)
 	}
 }
@@ -382,7 +385,7 @@ func uploadAndStartFromCheckpointFixture(nodes option.NodeListOption, v string) 
 // Use a waitForUpgradeStep() for that.
 func binaryUpgradeStep(nodes option.NodeListOption, newVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		upgradeNodes(ctx, nodes, newVersion, t, u.c)
+		upgradeNodes(ctx, nodes, option.DefaultStartOpts(), newVersion, t, u.c)
 		// TODO(nvanbenschoten): add upgrade qualification step. What should we
 		// test? We could run logictests. We could add custom logic here. Maybe
 		// this should all be pushed to nightly migration tests instead.
@@ -392,6 +395,7 @@ func binaryUpgradeStep(nodes option.NodeListOption, newVersion string) versionSt
 func upgradeNodes(
 	ctx context.Context,
 	nodes option.NodeListOption,
+	startOpts option.StartOpts,
 	newVersion string,
 	t test.Test,
 	c cluster.Cluster,
@@ -416,13 +420,30 @@ func upgradeNodes(
 			newVersionMsg = "<current>"
 		}
 		t.L().Printf("restarting node %d into version %s", node, newVersionMsg)
-		c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(node))
+		// Stop the cockroach process gracefully in order to drain it properly.
+		// This makes the upgrade closer to how users do it in production, but
+		// it's also needed to eliminate flakiness. In particular, this will
+		// make sure that DistSQL draining information is dissipated through
+		// gossip so that other nodes running an older version don't consider
+		// this upgraded node for DistSQL plans (see #87154 for more details).
+		// TODO(yuzefovich): ideally, we would also check that the drain was
+		// successful since if it wasn't, then we might see flakes too.
+		if err := c.StopCockroachGracefullyOnNode(ctx, t.L(), node); err != nil {
+			t.Fatal(err)
+		}
 
 		binary := uploadVersion(ctx, t, c, c.Node(node), newVersion)
 		settings := install.MakeClusterSettings(install.BinaryOption(binary))
-		startOpts := option.DefaultStartOpts()
-		startOpts.RoachtestOpts.DontEncrypt = true
 		c.Start(ctx, t.L(), startOpts, settings, c.Node(node))
+
+		// We have seen cases where a transient error could occur when this
+		// newly upgraded node serves as a gateway for a distributed query due
+		// to remote nodes not being able to dial back to the gateway for some
+		// reason (investigation of it is tracked in #87634). For now, we're
+		// papering over these flakes by this sleep. For more context, see
+		// #87104.
+		// TODO(yuzefovich): remove this sleep once #87634 is fixed.
+		time.Sleep(4 * time.Second)
 	}
 }
 
@@ -432,6 +453,18 @@ func enableTracingGloballyStep(ctx context.Context, t test.Test, u *versionUpgra
 	_, err := db.ExecContext(ctx, `SET CLUSTER SETTING trace.debug.enable = $1`, true)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// lowerLeaseDuration sets the `sql.catalog.descriptor_lease_duration`
+// setting to 1 minute.
+func lowerLeaseDuration(node int) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		db := u.conn(ctx, t, node)
+		_, err := db.ExecContext(ctx, `SET CLUSTER SETTING sql.catalog.descriptor_lease_duration = '1m'`)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -585,7 +618,6 @@ func makeVersionFixtureAndFatal(
 		makeFixtureVersion = ""
 	}
 
-	c.EncryptDefault(false)
 	newVersionUpgradeTest(c,
 		// Start the cluster from a fixture. That fixture's cluster version may
 		// be at the predecessor version (though in practice it's fully up to
@@ -639,7 +671,7 @@ result:
 
 for i in 1 2 3 4; do
   mkdir -p pkg/cmd/roachtest/fixtures/${i} && \
-  mv artifacts/acceptance/version-upgrade/run_1/logs/${i}.unredacted/checkpoint-*.tgz \
+  mv artifacts/generate-fixtures/run_1/logs/${i}.unredacted/checkpoint-*.tgz \
      pkg/cmd/roachtest/fixtures/${i}/
 done
 `)
@@ -693,5 +725,11 @@ func importLargeBankStep(oldV string, rows int, crdbNodes option.NodeListOption)
 				"--payload-bytes=10240", "--rows="+fmt.Sprint(rows), "--seed=4", "--db=bigbank")
 		})
 		m.Wait()
+	}
+}
+
+func sleepStep(d time.Duration) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		time.Sleep(d)
 	}
 }

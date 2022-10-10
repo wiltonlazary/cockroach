@@ -122,8 +122,8 @@ ON CONFLICT (a) DO
 UPDATE SET a=5
 ----
 upsert abc
- ├── columns: <none>
  ├── arbiter indexes: abc_a_key
+ ├── columns: <none>
  ├── canary column: a:14
  ├── fetch columns: a:14 b:15 c:16 rowid:17
  ├── insert-mapping:
@@ -165,9 +165,10 @@ upsert abc
       │    │    │    │              └── c_comp:13
       │    │    │    ├── scan abc
       │    │    │    │    ├── columns: a:14!null b:15 c:16 rowid:17!null abc.crdb_internal_mvcc_timestamp:18 abc.tableoid:19
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── c:16
-      │    │    │    │              └── b:15 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── c:16
+      │    │    │    │    │         └── b:15 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── x:7 = a:14
       │    │    └── projections
@@ -236,9 +237,10 @@ project
            │    │    │    │              └── z:9
            │    │    │    ├── scan abc
            │    │    │    │    ├── columns: a:13!null b:14 c:15 rowid:16!null abc.crdb_internal_mvcc_timestamp:17 abc.tableoid:18
-           │    │    │    │    └── computed column expressions
-           │    │    │    │         └── c:15
-           │    │    │    │              └── b:14 + 1
+           │    │    │    │    ├── computed column expressions
+           │    │    │    │    │    └── c:15
+           │    │    │    │    │         └── b:14 + 1
+           │    │    │    │    └── flags: disabled not visible index feature
            │    │    │    └── filters
            │    │    │         ├── y:8 = b:14
            │    │    │         └── c_comp:12 = c:15
@@ -263,8 +265,8 @@ UPDATE SET b=10
 WHERE abc.a>0
 ----
 upsert abc
- ├── columns: <none>
  ├── arbiter indexes: abc_a_key
+ ├── columns: <none>
  ├── canary column: a:14
  ├── fetch columns: a:14 b:15 c:16 rowid:17
  ├── insert-mapping:
@@ -309,9 +311,10 @@ upsert abc
       │    │    │    │    │              └── c_comp:13
       │    │    │    │    ├── scan abc
       │    │    │    │    │    ├── columns: a:14!null b:15 c:16 rowid:17!null abc.crdb_internal_mvcc_timestamp:18 abc.tableoid:19
-      │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │         └── c:16
-      │    │    │    │    │              └── b:15 + 1
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    └── c:16
+      │    │    │    │    │    │         └── b:15 + 1
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── x:7 = a:14
       │    │    │    └── filters
@@ -389,9 +392,10 @@ sort
       │              │    │    │    │              └── c_comp:10
       │              │    │    │    ├── scan abc
       │              │    │    │    │    ├── columns: abc.a:11!null abc.b:12 abc.c:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
-      │              │    │    │    │    └── computed column expressions
-      │              │    │    │    │         └── abc.c:13
-      │              │    │    │    │              └── abc.b:12 + 1
+      │              │    │    │    │    ├── computed column expressions
+      │              │    │    │    │    │    └── abc.c:13
+      │              │    │    │    │    │         └── abc.b:12 + 1
+      │              │    │    │    │    └── flags: disabled not visible index feature
       │              │    │    │    └── filters
       │              │    │    │         └── column1:7 = abc.a:11
       │              │    │    └── projections
@@ -418,8 +422,8 @@ ON CONFLICT (a) DO
 UPDATE SET a=tab.a*excluded.a
 ----
 upsert abc [as=tab]
- ├── columns: <none>
  ├── arbiter indexes: abc_a_key
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -460,9 +464,10 @@ upsert abc [as=tab]
       │    │    │    │              └── c_comp:10
       │    │    │    ├── scan abc [as=tab]
       │    │    │    │    ├── columns: a:11!null b:12 c:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── c:13
-      │    │    │    │              └── b:12 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── c:13
+      │    │    │    │    │         └── b:12 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column1:7 = a:11
       │    │    └── projections
@@ -483,8 +488,8 @@ ON CONFLICT (c, b) DO
 UPDATE SET a=5
 ----
 upsert abc
- ├── columns: <none>
  ├── arbiter indexes: abc_b_c_key
+ ├── columns: <none>
  ├── canary column: rowid:14
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -523,9 +528,10 @@ upsert abc
       │    │    │    │              └── rowid_default:9
       │    │    │    ├── scan abc
       │    │    │    │    ├── columns: a:11!null b:12 c:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── c:13
-      │    │    │    │              └── b:12 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── c:13
+      │    │    │    │    │         └── b:12 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         ├── column2:8 = b:12
       │    │    │         └── c_comp:10 = c:13
@@ -577,8 +583,8 @@ VALUES (1, 2, 3), (4, 5, 6)
 ON CONFLICT DO NOTHING
 ----
 insert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_pkey xyz_y_z_key xyz_z_y_key
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── column1:6 => x:1
  │    ├── column2:7 => y:2
@@ -603,16 +609,19 @@ insert xyz
       │    │    │    │    │    │    ├── (1, 2, 3)
       │    │    │    │    │    │    └── (4, 5, 6)
       │    │    │    │    │    ├── scan xyz
-      │    │    │    │    │    │    └── columns: x:9!null y:10 z:11
+      │    │    │    │    │    │    ├── columns: x:9!null y:10 z:11
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── column1:6 = x:9
       │    │    │    │    ├── scan xyz
-      │    │    │    │    │    └── columns: x:14!null y:15 z:16
+      │    │    │    │    │    ├── columns: x:14!null y:15 z:16
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         ├── column2:7 = y:15
       │    │    │    │         └── column3:8 = z:16
       │    │    │    ├── scan xyz
-      │    │    │    │    └── columns: x:19!null y:20 z:21
+      │    │    │    │    ├── columns: x:19!null y:20 z:21
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         ├── column2:7 = y:20
       │    │    │         └── column3:8 = z:21
@@ -635,8 +644,8 @@ VALUES (1, 2, 3), (4, 5, 6)
 ON CONFLICT (y, z) DO NOTHING
 ----
 insert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_y_z_key
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── column1:6 => x:1
  │    ├── column2:7 => y:2
@@ -651,7 +660,8 @@ insert xyz
       │    │    ├── (1, 2, 3)
       │    │    └── (4, 5, 6)
       │    ├── scan xyz
-      │    │    └── columns: x:9!null y:10 z:11
+      │    │    ├── columns: x:9!null y:10 z:11
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         ├── column2:7 = y:10
       │         └── column3:8 = z:11
@@ -664,8 +674,8 @@ INSERT INTO uniq VALUES ('x2', 'y1', 'z2'), ('x2', 'y2', 'z2'), ('x2', 'y2', 'z2
 ON CONFLICT DO NOTHING
 ----
 insert uniq
- ├── columns: <none>
  ├── arbiter indexes: uniq_pkey uniq_y_key uniq_z_key
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── column1:6 => x:1
  │    ├── column2:7 => y:2
@@ -691,15 +701,18 @@ insert uniq
       │    │    │    │    │    │    ├── ('x2', 'y2', 'z2')
       │    │    │    │    │    │    └── ('x2', 'y2', 'z2')
       │    │    │    │    │    ├── scan uniq
-      │    │    │    │    │    │    └── columns: x:9!null y:10 z:11
+      │    │    │    │    │    │    ├── columns: x:9!null y:10 z:11
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── column1:6 = x:9
       │    │    │    │    ├── scan uniq
-      │    │    │    │    │    └── columns: x:14!null y:15 z:16
+      │    │    │    │    │    ├── columns: x:14!null y:15 z:16
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── column2:7 = y:15
       │    │    │    ├── scan uniq
-      │    │    │    │    └── columns: x:19!null y:20 z:21
+      │    │    │    │    ├── columns: x:19!null y:20 z:21
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column3:8 = z:21
       │    │    └── aggregations
@@ -768,7 +781,8 @@ project
  │         │    │    │    │         └── first-agg [as=column1:6]
  │         │    │    │    │              └── column1:6
  │         │    │    │    ├── scan xyz
- │         │    │    │    │    └── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+ │         │    │    │    │    ├── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+ │         │    │    │    │    └── flags: disabled not visible index feature
  │         │    │    │    └── filters
  │         │    │    │         ├── column2:7 = y:10
  │         │    │    │         └── column3:8 = z:11
@@ -817,8 +831,8 @@ ON CONFLICT (a) DO
 UPDATE SET (b, a)=(SELECT x, y+excluded.b FROM xyz WHERE x=excluded.a)
 ----
 upsert abc
- ├── columns: <none>
  ├── arbiter indexes: abc_a_key
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -861,9 +875,10 @@ upsert abc
       │    │    │    │              └── c_comp:10
       │    │    │    ├── scan abc
       │    │    │    │    ├── columns: a:11!null b:12 c:13 rowid:14!null abc.crdb_internal_mvcc_timestamp:15 abc.tableoid:16
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── c:13
-      │    │    │    │              └── b:12 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── c:13
+      │    │    │    │    │         └── b:12 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column1:7 = a:11
       │    │    ├── max1-row
@@ -895,8 +910,8 @@ ON CONFLICT (a) DO
 UPDATE SET a=DEFAULT, b=DEFAULT
 ----
 upsert abc
- ├── columns: <none>
  ├── arbiter indexes: abc_a_key
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -939,9 +954,10 @@ upsert abc
       │    │    │    │              └── c_comp:10
       │    │    │    ├── scan abc
       │    │    │    │    ├── columns: a:11!null b:12 c:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── c:13
-      │    │    │    │              └── b:12 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── c:13
+      │    │    │    │    │         └── b:12 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column1:7 = a:11
       │    │    └── projections
@@ -966,8 +982,8 @@ ON CONFLICT (m) DO
 UPDATE SET m=mutation.m+1
 ----
 upsert mutation
- ├── columns: <none>
  ├── arbiter indexes: mutation_pkey
+ ├── columns: <none>
  ├── canary column: m:12
  ├── fetch columns: m:12 n:13 o:14 p:15 q:16
  ├── insert-mapping:
@@ -1013,8 +1029,9 @@ upsert mutation
       │    │    │    │    │              └── p_comp:11
       │    │    │    │    ├── scan mutation
       │    │    │    │    │    ├── columns: m:12!null n:13 o:14 p:15 q:16 crdb_internal_mvcc_timestamp:17 tableoid:18
-      │    │    │    │    │    └── check constraint expressions
-      │    │    │    │    │         └── m:12 > 0
+      │    │    │    │    │    ├── check constraint expressions
+      │    │    │    │    │    │    └── m:12 > 0
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── column1:8 = m:12
       │    │    │    └── projections
@@ -1037,8 +1054,8 @@ build
 UPSERT INTO xyz VALUES (1)
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_pkey
+ ├── columns: <none>
  ├── canary column: x:8
  ├── fetch columns: x:8 y:9 z:10
  ├── insert-mapping:
@@ -1066,7 +1083,8 @@ upsert xyz
       │    │         └── first-agg [as=y_default:7]
       │    │              └── y_default:7
       │    ├── scan xyz
-      │    │    └── columns: x:8!null y:9 z:10 crdb_internal_mvcc_timestamp:11 tableoid:12
+      │    │    ├── columns: x:8!null y:9 z:10 crdb_internal_mvcc_timestamp:11 tableoid:12
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── column1:6 = x:8
       └── projections
@@ -1139,9 +1157,10 @@ with &1
  │              │    │              └── c_comp:10
  │              │    ├── scan abc
  │              │    │    ├── columns: abc.a:11!null abc.b:12 abc.c:13 rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
- │              │    │    └── computed column expressions
- │              │    │         └── abc.c:13
- │              │    │              └── abc.b:12 + 1
+ │              │    │    ├── computed column expressions
+ │              │    │    │    └── abc.c:13
+ │              │    │    │         └── abc.b:12 + 1
+ │              │    │    └── flags: disabled not visible index feature
  │              │    └── filters
  │              │         └── rowid_default:9 = rowid:14
  │              └── projections
@@ -1159,8 +1178,8 @@ build
 UPSERT INTO xyz (z, x, y) VALUES (1, 2, 3)
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_pkey
+ ├── columns: <none>
  ├── canary column: x:9
  ├── fetch columns: x:9 y:10 z:11
  ├── insert-mapping:
@@ -1186,7 +1205,8 @@ upsert xyz
       │    │         └── first-agg [as=column3:8]
       │    │              └── column3:8
       │    ├── scan xyz
-      │    │    └── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    ├── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── column2:7 = x:9
       └── projections
@@ -1214,8 +1234,8 @@ build
 UPSERT INTO checks (a, b, c) VALUES (1, 2, 3)
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -1255,9 +1275,10 @@ upsert checks
       │    │    │    ├── columns: a:11!null b:12 c:13 d:14 crdb_internal_mvcc_timestamp:15 tableoid:16
       │    │    │    ├── check constraint expressions
       │    │    │    │    └── a:11 > 0
-      │    │    │    └── computed column expressions
-      │    │    │         └── d:14
-      │    │    │              └── c:13 + 1
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d:14
+      │    │    │    │         └── c:13 + 1
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:7 = a:11
       │    └── projections
@@ -1272,8 +1293,8 @@ build
 UPSERT INTO mutation (m, n) VALUES (1, 2)
 ----
 upsert mutation
- ├── columns: <none>
  ├── arbiter indexes: mutation_pkey
+ ├── columns: <none>
  ├── canary column: m:12
  ├── fetch columns: m:12 n:13 o:14 p:15 q:16
  ├── insert-mapping:
@@ -1315,8 +1336,9 @@ upsert mutation
       │    │    │              └── p_comp:11
       │    │    ├── scan mutation
       │    │    │    ├── columns: m:12!null n:13 o:14 p:15 q:16 crdb_internal_mvcc_timestamp:17 tableoid:18
-      │    │    │    └── check constraint expressions
-      │    │    │         └── m:12 > 0
+      │    │    │    ├── check constraint expressions
+      │    │    │    │    └── m:12 > 0
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:8 = m:12
       │    └── projections
@@ -1330,8 +1352,8 @@ build
 UPSERT INTO mutation VALUES (1, 2)
 ----
 upsert mutation
- ├── columns: <none>
  ├── arbiter indexes: mutation_pkey
+ ├── columns: <none>
  ├── canary column: m:12
  ├── fetch columns: m:12 n:13 o:14 p:15 q:16
  ├── insert-mapping:
@@ -1373,8 +1395,9 @@ upsert mutation
       │    │    │              └── p_comp:11
       │    │    ├── scan mutation
       │    │    │    ├── columns: m:12!null n:13 o:14 p:15 q:16 crdb_internal_mvcc_timestamp:17 tableoid:18
-      │    │    │    └── check constraint expressions
-      │    │    │         └── m:12 > 0
+      │    │    │    ├── check constraint expressions
+      │    │    │    │    └── m:12 > 0
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:8 = m:12
       │    └── projections
@@ -1397,8 +1420,8 @@ build
 INSERT INTO checks (a, b) VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b=3, c=4
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -1446,9 +1469,10 @@ upsert checks
       │    │    │    │    │    ├── columns: a:11!null b:12 c:13 d:14 crdb_internal_mvcc_timestamp:15 tableoid:16
       │    │    │    │    │    ├── check constraint expressions
       │    │    │    │    │    │    └── a:11 > 0
-      │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │         └── d:14
-      │    │    │    │    │              └── c:13 + 1
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    └── d:14
+      │    │    │    │    │    │         └── c:13 + 1
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── column1:7 = a:11
       │    │    │    └── projections
@@ -1470,8 +1494,8 @@ build
 INSERT INTO checks (a, b) VALUES (1, 2) ON CONFLICT (a) DO NOTHING
 ----
 insert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── column1:7 => a:1
  │    ├── column2:8 => b:2
@@ -1500,9 +1524,10 @@ insert checks
       │    │    │    ├── columns: a:11!null b:12 c:13 d:14
       │    │    │    ├── check constraint expressions
       │    │    │    │    └── a:11 > 0
-      │    │    │    └── computed column expressions
-      │    │    │         └── d:14
-      │    │    │              └── c:13 + 1
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d:14
+      │    │    │    │         └── c:13 + 1
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:7 = a:11
       │    └── aggregations
@@ -1521,8 +1546,8 @@ build
 UPSERT INTO checks (a, b) VALUES (1, 2)
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: a:11
  ├── fetch columns: a:11 b:12 c:13 d:14
  ├── insert-mapping:
@@ -1566,9 +1591,10 @@ upsert checks
       │    │    │    │    ├── columns: a:11!null b:12 c:13 d:14 crdb_internal_mvcc_timestamp:15 tableoid:16
       │    │    │    │    ├── check constraint expressions
       │    │    │    │    │    └── a:11 > 0
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── d:14
-      │    │    │    │              └── c:13 + 1
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── d:14
+      │    │    │    │    │         └── c:13 + 1
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column1:7 = a:11
       │    │    └── projections
@@ -1588,8 +1614,8 @@ SELECT a, b FROM abc
 ON CONFLICT (a) DO UPDATE SET a=excluded.a, b=(SELECT x FROM xyz WHERE x=checks.a)
 ----
 upsert checks
- ├── columns: <none>
  ├── arbiter indexes: checks_pkey
+ ├── columns: <none>
  ├── canary column: checks.a:15
  ├── fetch columns: checks.a:15 checks.b:16 checks.c:17 d:18
  ├── insert-mapping:
@@ -1640,9 +1666,10 @@ upsert checks
       │    │    │    │    │    ├── columns: checks.a:15!null checks.b:16 checks.c:17 d:18 checks.crdb_internal_mvcc_timestamp:19 checks.tableoid:20
       │    │    │    │    │    ├── check constraint expressions
       │    │    │    │    │    │    └── checks.a:15 > 0
-      │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │         └── d:18
-      │    │    │    │    │              └── checks.c:17 + 1
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    └── d:18
+      │    │    │    │    │    │         └── checks.c:17 + 1
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── abc.a:7 = checks.a:15
       │    │    │    └── projections
@@ -1674,8 +1701,8 @@ SELECT a, b, c FROM abc ORDER BY a
 ON CONFLICT (z, y) DO UPDATE SET y=5
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_y_z_key
+ ├── columns: <none>
  ├── canary column: x:12
  ├── fetch columns: x:12 y:13 z:14
  ├── insert-mapping:
@@ -1704,7 +1731,8 @@ upsert xyz
       │    │    │         └── first-agg [as=a:6]
       │    │    │              └── a:6
       │    │    ├── scan xyz
-      │    │    │    └── columns: x:12!null y:13 z:14 xyz.crdb_internal_mvcc_timestamp:15 xyz.tableoid:16
+      │    │    │    ├── columns: x:12!null y:13 z:14 xyz.crdb_internal_mvcc_timestamp:15 xyz.tableoid:16
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         ├── b:7 = y:13
       │    │         └── c:8 = z:14
@@ -1724,8 +1752,8 @@ build
 UPSERT INTO decimals (a, b) VALUES (1.1, ARRAY[0.95])
 ----
 upsert decimals
- ├── columns: <none>
  ├── arbiter indexes: decimals_pkey
+ ├── columns: <none>
  ├── canary column: a:15
  ├── fetch columns: a:15 b:16 c:17 d:18
  ├── insert-mapping:
@@ -1771,7 +1799,7 @@ upsert decimals
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:12]
       │    │    │    │    │    │    │              └── c_default:11
       │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │         └── a_cast:9::DECIMAL + c_cast:12::DECIMAL [as=d_comp:13]
+      │    │    │    │    │    │         └── a_cast:9 + c_cast:12 [as=d_comp:13]
       │    │    │    │    │    └── projections
       │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:14]
       │    │    │    │    │              └── d_comp:13
@@ -1784,13 +1812,14 @@ upsert decimals
       │    │    │    │              └── d_cast:14
       │    │    │    ├── scan decimals
       │    │    │    │    ├── columns: a:15!null b:16 c:17 d:18 crdb_internal_mvcc_timestamp:19 tableoid:20
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── d:18
-      │    │    │    │              └── a:15::DECIMAL + c:17::DECIMAL
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── d:18
+      │    │    │    │    │         └── a:15 + c:17
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── a_cast:9 = a:15
       │    │    └── projections
-      │    │         └── a:15::DECIMAL + c:17::DECIMAL [as=d_comp:21]
+      │    │         └── a:15 + c:17 [as=d_comp:21]
       │    └── projections
       │         ├── CASE WHEN a:15 IS NULL THEN a_cast:9 ELSE a:15 END [as=upsert_a:22]
       │         ├── CASE WHEN a:15 IS NULL THEN c_cast:12 ELSE c:17 END [as=upsert_c:23]
@@ -1804,8 +1833,8 @@ build
 UPSERT INTO decimals (a) VALUES (1.1)
 ----
 upsert decimals
- ├── columns: <none>
  ├── arbiter indexes: decimals_pkey
+ ├── columns: <none>
  ├── canary column: a:14
  ├── fetch columns: a:14 b:15 c:16 d:17
  ├── insert-mapping:
@@ -1848,7 +1877,7 @@ upsert decimals
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:11]
       │    │    │    │    │    │    │              └── c_default:10
       │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │         └── a_cast:8::DECIMAL + c_cast:11::DECIMAL [as=d_comp:12]
+      │    │    │    │    │    │         └── a_cast:8 + c_cast:11 [as=d_comp:12]
       │    │    │    │    │    └── projections
       │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:13]
       │    │    │    │    │              └── d_comp:12
@@ -1861,13 +1890,14 @@ upsert decimals
       │    │    │    │              └── d_cast:13
       │    │    │    ├── scan decimals
       │    │    │    │    ├── columns: a:14!null b:15 c:16 d:17 crdb_internal_mvcc_timestamp:18 tableoid:19
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── d:17
-      │    │    │    │              └── a:14::DECIMAL + c:16::DECIMAL
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── d:17
+      │    │    │    │    │         └── a:14 + c:16
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── a_cast:8 = a:14
       │    │    └── projections
-      │    │         └── a:14::DECIMAL + c:16::DECIMAL [as=d_comp:20]
+      │    │         └── a:14 + c:16 [as=d_comp:20]
       │    └── projections
       │         ├── CASE WHEN a:14 IS NULL THEN a_cast:8 ELSE a:14 END [as=upsert_a:21]
       │         ├── CASE WHEN a:14 IS NULL THEN b_default:9 ELSE b:15 END [as=upsert_b:22]
@@ -1882,8 +1912,8 @@ assign-placeholders-build query-args=(1.1)
 UPSERT INTO decimals (a) VALUES ($1)
 ----
 upsert decimals
- ├── columns: <none>
  ├── arbiter indexes: decimals_pkey
+ ├── columns: <none>
  ├── canary column: a:14
  ├── fetch columns: a:14 b:15 c:16 d:17
  ├── insert-mapping:
@@ -1926,7 +1956,7 @@ upsert decimals
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:11]
       │    │    │    │    │    │    │              └── c_default:10
       │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │         └── a_cast:8::DECIMAL + c_cast:11::DECIMAL [as=d_comp:12]
+      │    │    │    │    │    │         └── a_cast:8 + c_cast:11 [as=d_comp:12]
       │    │    │    │    │    └── projections
       │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:13]
       │    │    │    │    │              └── d_comp:12
@@ -1939,13 +1969,14 @@ upsert decimals
       │    │    │    │              └── d_cast:13
       │    │    │    ├── scan decimals
       │    │    │    │    ├── columns: a:14!null b:15 c:16 d:17 crdb_internal_mvcc_timestamp:18 tableoid:19
-      │    │    │    │    └── computed column expressions
-      │    │    │    │         └── d:17
-      │    │    │    │              └── a:14::DECIMAL + c:16::DECIMAL
+      │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    └── d:17
+      │    │    │    │    │         └── a:14 + c:16
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── a_cast:8 = a:14
       │    │    └── projections
-      │    │         └── a:14::DECIMAL + c:16::DECIMAL [as=d_comp:20]
+      │    │         └── a:14 + c:16 [as=d_comp:20]
       │    └── projections
       │         ├── CASE WHEN a:14 IS NULL THEN a_cast:8 ELSE a:14 END [as=upsert_a:21]
       │         ├── CASE WHEN a:14 IS NULL THEN b_default:9 ELSE b:15 END [as=upsert_b:22]
@@ -1962,8 +1993,8 @@ ON CONFLICT (a)
 DO UPDATE SET b=ARRAY[0.99]
 ----
 upsert decimals
- ├── columns: <none>
  ├── arbiter indexes: decimals_pkey
+ ├── columns: <none>
  ├── canary column: a:15
  ├── fetch columns: a:15 b:16 c:17 d:18
  ├── insert-mapping:
@@ -2013,7 +2044,7 @@ upsert decimals
       │    │    │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:12]
       │    │    │    │    │    │    │    │    │              └── c_default:11
       │    │    │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │    │    │         └── a_cast:9::DECIMAL + c_cast:12::DECIMAL [as=d_comp:13]
+      │    │    │    │    │    │    │    │         └── a_cast:9 + c_cast:12 [as=d_comp:13]
       │    │    │    │    │    │    │    └── projections
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:14]
       │    │    │    │    │    │    │              └── d_comp:13
@@ -2026,9 +2057,10 @@ upsert decimals
       │    │    │    │    │    │              └── d_cast:14
       │    │    │    │    │    ├── scan decimals
       │    │    │    │    │    │    ├── columns: a:15!null b:16 c:17 d:18 crdb_internal_mvcc_timestamp:19 tableoid:20
-      │    │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │    │         └── d:18
-      │    │    │    │    │    │              └── a:15::DECIMAL + c:17::DECIMAL
+      │    │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    │    └── d:18
+      │    │    │    │    │    │    │         └── a:15 + c:17
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── a_cast:9 = a:15
       │    │    │    │    └── projections
@@ -2037,7 +2069,7 @@ upsert decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:22]
       │    │    │              └── b_new:21
       │    │    └── projections
-      │    │         └── a:15::DECIMAL + c:17::DECIMAL [as=d_comp:23]
+      │    │         └── a:15 + c:17 [as=d_comp:23]
       │    └── projections
       │         ├── CASE WHEN a:15 IS NULL THEN a_cast:9 ELSE a:15 END [as=upsert_a:24]
       │         ├── CASE WHEN a:15 IS NULL THEN b_cast:10 ELSE b_cast:22 END [as=upsert_b:25]
@@ -2054,8 +2086,8 @@ ON CONFLICT (a)
 DO UPDATE SET b=$3
 ----
 upsert decimals
- ├── columns: <none>
  ├── arbiter indexes: decimals_pkey
+ ├── columns: <none>
  ├── canary column: a:15
  ├── fetch columns: a:15 b:16 c:17 d:18
  ├── insert-mapping:
@@ -2105,7 +2137,7 @@ upsert decimals
       │    │    │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:12]
       │    │    │    │    │    │    │    │    │              └── c_default:11
       │    │    │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │    │    │         └── a_cast:9::DECIMAL + c_cast:12::DECIMAL [as=d_comp:13]
+      │    │    │    │    │    │    │    │         └── a_cast:9 + c_cast:12 [as=d_comp:13]
       │    │    │    │    │    │    │    └── projections
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:14]
       │    │    │    │    │    │    │              └── d_comp:13
@@ -2118,9 +2150,10 @@ upsert decimals
       │    │    │    │    │    │              └── d_cast:14
       │    │    │    │    │    ├── scan decimals
       │    │    │    │    │    │    ├── columns: a:15!null b:16 c:17 d:18 crdb_internal_mvcc_timestamp:19 tableoid:20
-      │    │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │    │         └── d:18
-      │    │    │    │    │    │              └── a:15::DECIMAL + c:17::DECIMAL
+      │    │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    │    └── d:18
+      │    │    │    │    │    │    │         └── a:15 + c:17
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── a_cast:9 = a:15
       │    │    │    │    └── projections
@@ -2129,7 +2162,7 @@ upsert decimals
       │    │    │         └── assignment-cast: DECIMAL(5,1)[] [as=b_cast:22]
       │    │    │              └── b_new:21
       │    │    └── projections
-      │    │         └── a:15::DECIMAL + c:17::DECIMAL [as=d_comp:23]
+      │    │         └── a:15 + c:17 [as=d_comp:23]
       │    └── projections
       │         ├── CASE WHEN a:15 IS NULL THEN a_cast:9 ELSE a:15 END [as=upsert_a:24]
       │         ├── CASE WHEN a:15 IS NULL THEN b_cast:10 ELSE b_cast:22 END [as=upsert_b:25]
@@ -2144,8 +2177,8 @@ build
 UPSERT INTO assn_cast (k, c, qc, i, s) VALUES (1.0::DECIMAL, ' ', 'foo', '1', 2)
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:22
  ├── fetch columns: k:22 c:23 qc:24 i:25 s:26 d:27 d_comp:28
  ├── insert-mapping:
@@ -2193,7 +2226,7 @@ upsert assn_cast
       │    │    │    │    │    │    └── projections
       │    │    │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:19]
       │    │    │    │    │    └── projections
-      │    │    │    │    │         └── d_default:19::DECIMAL + 10.0 [as=d_comp_comp:20]
+      │    │    │    │    │         └── d_default:19 + 10.0 [as=d_comp_comp:20]
       │    │    │    │    └── projections
       │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:21]
       │    │    │    │              └── d_comp_comp:20
@@ -2212,13 +2245,14 @@ upsert assn_cast
       │    │    │              └── d_comp_cast:21
       │    │    ├── scan assn_cast
       │    │    │    ├── columns: k:22!null c:23 qc:24 i:25 s:26 d:27 d_comp:28 crdb_internal_mvcc_timestamp:29 tableoid:30
-      │    │    │    └── computed column expressions
-      │    │    │         └── d_comp:28
-      │    │    │              └── d:27::DECIMAL + 10.0
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d_comp:28
+      │    │    │    │         └── d:27 + 10.0
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── k_cast:15 = k:22
       │    └── projections
-      │         └── d:27::DECIMAL + 10.0 [as=d_comp_comp:31]
+      │         └── d:27 + 10.0 [as=d_comp_comp:31]
       └── projections
            ├── CASE WHEN k:22 IS NULL THEN k_cast:15 ELSE k:22 END [as=upsert_k:32]
            ├── CASE WHEN k:22 IS NULL THEN d_default:19 ELSE d:27 END [as=upsert_d:33]
@@ -2229,8 +2263,8 @@ assign-placeholders-build query-args=(1.0, ' ', 'foo', '1')
 UPSERT INTO assn_cast (k, c, qc, i) VALUES ($1::DECIMAL, $2, $3, $4)
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:21
  ├── fetch columns: k:21 c:22 qc:23 i:24 s:25 d:26 d_comp:27
  ├── insert-mapping:
@@ -2276,7 +2310,7 @@ upsert assn_cast
       │    │    │    │    │    │         ├── NULL::STRING [as=s_default:17]
       │    │    │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:18]
       │    │    │    │    │    └── projections
-      │    │    │    │    │         └── d_default:18::DECIMAL + 10.0 [as=d_comp_comp:19]
+      │    │    │    │    │         └── d_default:18 + 10.0 [as=d_comp_comp:19]
       │    │    │    │    └── projections
       │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:20]
       │    │    │    │              └── d_comp_comp:19
@@ -2295,13 +2329,14 @@ upsert assn_cast
       │    │    │              └── d_comp_cast:20
       │    │    ├── scan assn_cast
       │    │    │    ├── columns: k:21!null c:22 qc:23 i:24 s:25 d:26 d_comp:27 crdb_internal_mvcc_timestamp:28 tableoid:29
-      │    │    │    └── computed column expressions
-      │    │    │         └── d_comp:27
-      │    │    │              └── d:26::DECIMAL + 10.0
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d_comp:27
+      │    │    │    │         └── d:26 + 10.0
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── k_cast:14 = k:21
       │    └── projections
-      │         └── d:26::DECIMAL + 10.0 [as=d_comp_comp:30]
+      │         └── d:26 + 10.0 [as=d_comp_comp:30]
       └── projections
            ├── CASE WHEN k:21 IS NULL THEN k_cast:14 ELSE k:21 END [as=upsert_k:31]
            ├── CASE WHEN k:21 IS NULL THEN s_default:17 ELSE s:25 END [as=upsert_s:32]
@@ -2313,8 +2348,8 @@ build
 INSERT INTO assn_cast (k, c, qc, i, s) VALUES (1.0::DECIMAL, ' ', 'foo', '1', 2) ON CONFLICT DO NOTHING
 ----
 insert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── k_cast:15 => k:1
  │    ├── c_cast:16 => c:2
@@ -2351,15 +2386,16 @@ insert assn_cast
       │    │    │    │    └── projections
       │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:19]
       │    │    │    └── projections
-      │    │    │         └── d_default:19::DECIMAL + 10.0 [as=d_comp_comp:20]
+      │    │    │         └── d_default:19 + 10.0 [as=d_comp_comp:20]
       │    │    └── projections
       │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:21]
       │    │              └── d_comp_comp:20
       │    ├── scan assn_cast
       │    │    ├── columns: k:22!null c:23 qc:24 i:25 s:26 d:27 d_comp:28
-      │    │    └── computed column expressions
-      │    │         └── d_comp:28
-      │    │              └── d:27::DECIMAL + 10.0
+      │    │    ├── computed column expressions
+      │    │    │    └── d_comp:28
+      │    │    │         └── d:27 + 10.0
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── k_cast:15 = k:22
       └── aggregations
@@ -2382,8 +2418,8 @@ INSERT INTO assn_cast (k, c, qc, i, s) VALUES (1.0::DECIMAL, 'a', 'b', 1, 'c')
 ON CONFLICT (k) DO UPDATE SET c = ' ', qc = 'foo', i = '1', s = 2
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:21
  ├── fetch columns: k:21 c:22 qc:23 i:24 s:25 d:26 d_comp:27
  ├── insert-mapping:
@@ -2433,7 +2469,7 @@ upsert assn_cast
       │    │    │    │    │    │    │    │    └── projections
       │    │    │    │    │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:18]
       │    │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │    │         └── d_default:18::DECIMAL + 10.0 [as=d_comp_comp:19]
+      │    │    │    │    │    │    │         └── d_default:18 + 10.0 [as=d_comp_comp:19]
       │    │    │    │    │    │    └── projections
       │    │    │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:20]
       │    │    │    │    │    │              └── d_comp_comp:19
@@ -2452,9 +2488,10 @@ upsert assn_cast
       │    │    │    │    │              └── d_comp_cast:20
       │    │    │    │    ├── scan assn_cast
       │    │    │    │    │    ├── columns: k:21!null c:22 qc:23 i:24 s:25 d:26 d_comp:27 crdb_internal_mvcc_timestamp:28 tableoid:29
-      │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │         └── d_comp:27
-      │    │    │    │    │              └── d:26::DECIMAL + 10.0
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    └── d_comp:27
+      │    │    │    │    │    │         └── d:26 + 10.0
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── k_cast:15 = k:21
       │    │    │    └── projections
@@ -2470,7 +2507,7 @@ upsert assn_cast
       │    │         └── assignment-cast: STRING [as=s_cast:36]
       │    │              └── s_new:33
       │    └── projections
-      │         └── d:26::DECIMAL + 10.0 [as=d_comp_comp:37]
+      │         └── d:26 + 10.0 [as=d_comp_comp:37]
       └── projections
            ├── CASE WHEN k:21 IS NULL THEN k_cast:15 ELSE k:21 END [as=upsert_k:38]
            ├── CASE WHEN k:21 IS NULL THEN c_cast:16 ELSE c_cast:34 END [as=upsert_c:39]
@@ -2485,8 +2522,8 @@ build
 UPSERT INTO assn_cast (k, i) VALUES (1, DEFAULT)
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:19
  ├── fetch columns: k:19 c:20 qc:21 i:22 s:23 d:24 d_comp:25
  ├── insert-mapping:
@@ -2528,7 +2565,7 @@ upsert assn_cast
       │    │    │    │    │    │         ├── NULL::STRING [as=s_default:15]
       │    │    │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:16]
       │    │    │    │    │    └── projections
-      │    │    │    │    │         └── d_default:16::DECIMAL + 10.0 [as=d_comp_comp:17]
+      │    │    │    │    │         └── d_default:16 + 10.0 [as=d_comp_comp:17]
       │    │    │    │    └── projections
       │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:18]
       │    │    │    │              └── d_comp_comp:17
@@ -2547,13 +2584,14 @@ upsert assn_cast
       │    │    │              └── d_comp_cast:18
       │    │    ├── scan assn_cast
       │    │    │    ├── columns: k:19!null c:20 qc:21 i:22 s:23 d:24 d_comp:25 crdb_internal_mvcc_timestamp:26 tableoid:27
-      │    │    │    └── computed column expressions
-      │    │    │         └── d_comp:25
-      │    │    │              └── d:24::DECIMAL + 10.0
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d_comp:25
+      │    │    │    │         └── d:24 + 10.0
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:10 = k:19
       │    └── projections
-      │         └── d:24::DECIMAL + 10.0 [as=d_comp_comp:28]
+      │         └── d:24 + 10.0 [as=d_comp_comp:28]
       └── projections
            ├── CASE WHEN k:19 IS NULL THEN column1:10 ELSE k:19 END [as=upsert_k:29]
            ├── CASE WHEN k:19 IS NULL THEN c_default:13 ELSE c:20 END [as=upsert_c:30]
@@ -2567,8 +2605,8 @@ build
 INSERT INTO assn_cast (k, i) VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET i = DEFAULT
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:18
  ├── fetch columns: k:18 c:19 qc:20 i:21 s:22 d:23 d_comp:24
  ├── insert-mapping:
@@ -2609,7 +2647,7 @@ upsert assn_cast
       │    │    │    │    │    │    │    │         ├── NULL::STRING [as=s_default:14]
       │    │    │    │    │    │    │    │         └── NULL::DECIMAL(10) [as=d_default:15]
       │    │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │    │         └── d_default:15::DECIMAL + 10.0 [as=d_comp_comp:16]
+      │    │    │    │    │    │    │         └── d_default:15 + 10.0 [as=d_comp_comp:16]
       │    │    │    │    │    │    └── projections
       │    │    │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:17]
       │    │    │    │    │    │              └── d_comp_comp:16
@@ -2628,9 +2666,10 @@ upsert assn_cast
       │    │    │    │    │              └── d_comp_cast:17
       │    │    │    │    ├── scan assn_cast
       │    │    │    │    │    ├── columns: k:18!null c:19 qc:20 i:21 s:22 d:23 d_comp:24 crdb_internal_mvcc_timestamp:25 tableoid:26
-      │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │         └── d_comp:24
-      │    │    │    │    │              └── d:23::DECIMAL + 10.0
+      │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    └── d_comp:24
+      │    │    │    │    │    │         └── d:23 + 10.0
+      │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    └── filters
       │    │    │    │         └── column1:10 = k:18
       │    │    │    └── projections
@@ -2639,7 +2678,7 @@ upsert assn_cast
       │    │         └── assignment-cast: INT8 [as=i_cast:28]
       │    │              └── i_new:27
       │    └── projections
-      │         └── d:23::DECIMAL + 10.0 [as=d_comp_comp:29]
+      │         └── d:23 + 10.0 [as=d_comp_comp:29]
       └── projections
            ├── CASE WHEN k:18 IS NULL THEN column1:10 ELSE k:18 END [as=upsert_k:30]
            ├── CASE WHEN k:18 IS NULL THEN c_default:12 ELSE c:19 END [as=upsert_c:31]
@@ -2655,8 +2694,8 @@ build
 UPSERT INTO assn_cast (k, d) VALUES (1, 1.45::DECIMAL(10, 2))
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:20
  ├── fetch columns: k:20 c:21 qc:22 i:23 s:24 d:25 d_comp:26
  ├── insert-mapping:
@@ -2702,7 +2741,7 @@ upsert assn_cast
       │    │    │    │    │         └── assignment-cast: INT8 [as=i_cast:17]
       │    │    │    │    │              └── i_default:15
       │    │    │    │    └── projections
-      │    │    │    │         └── d_cast:12::DECIMAL + 10.0 [as=d_comp_comp:18]
+      │    │    │    │         └── d_cast:12 + 10.0 [as=d_comp_comp:18]
       │    │    │    └── projections
       │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:19]
       │    │    │              └── d_comp_comp:18
@@ -2721,9 +2760,10 @@ upsert assn_cast
       │    │              └── d_comp_cast:19
       │    ├── scan assn_cast
       │    │    ├── columns: k:20!null c:21 qc:22 i:23 s:24 d:25 d_comp:26 crdb_internal_mvcc_timestamp:27 tableoid:28
-      │    │    └── computed column expressions
-      │    │         └── d_comp:26
-      │    │              └── d:25::DECIMAL + 10.0
+      │    │    ├── computed column expressions
+      │    │    │    └── d_comp:26
+      │    │    │         └── d:25 + 10.0
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── column1:10 = k:20
       └── projections
@@ -2739,8 +2779,8 @@ assign-placeholders-build query-args=(1.45::DECIMAL(10, 2))
 UPSERT INTO assn_cast (k, d) VALUES (1, $1)
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:20
  ├── fetch columns: k:20 c:21 qc:22 i:23 s:24 d:25 d_comp:26
  ├── insert-mapping:
@@ -2786,7 +2826,7 @@ upsert assn_cast
       │    │    │    │    │         └── assignment-cast: INT8 [as=i_cast:17]
       │    │    │    │    │              └── i_default:15
       │    │    │    │    └── projections
-      │    │    │    │         └── d_cast:12::DECIMAL + 10.0 [as=d_comp_comp:18]
+      │    │    │    │         └── d_cast:12 + 10.0 [as=d_comp_comp:18]
       │    │    │    └── projections
       │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:19]
       │    │    │              └── d_comp_comp:18
@@ -2805,9 +2845,10 @@ upsert assn_cast
       │    │              └── d_comp_cast:19
       │    ├── scan assn_cast
       │    │    ├── columns: k:20!null c:21 qc:22 i:23 s:24 d:25 d_comp:26 crdb_internal_mvcc_timestamp:27 tableoid:28
-      │    │    └── computed column expressions
-      │    │         └── d_comp:26
-      │    │              └── d:25::DECIMAL + 10.0
+      │    │    ├── computed column expressions
+      │    │    │    └── d_comp:26
+      │    │    │         └── d:25 + 10.0
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── column1:10 = k:20
       └── projections
@@ -2823,8 +2864,8 @@ build
 INSERT INTO assn_cast (k, d) VALUES (1, 1.45::DECIMAL(10, 2)) ON CONFLICT DO NOTHING
 ----
 insert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── insert-mapping:
  │    ├── column1:10 => k:1
  │    ├── c_default:13 => c:2
@@ -2863,15 +2904,16 @@ insert assn_cast
       │    │    │    │         └── assignment-cast: INT8 [as=i_cast:17]
       │    │    │    │              └── i_default:15
       │    │    │    └── projections
-      │    │    │         └── d_cast:12::DECIMAL + 10.0 [as=d_comp_comp:18]
+      │    │    │         └── d_cast:12 + 10.0 [as=d_comp_comp:18]
       │    │    └── projections
       │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:19]
       │    │              └── d_comp_comp:18
       │    ├── scan assn_cast
       │    │    ├── columns: k:20!null c:21 qc:22 i:23 s:24 d:25 d_comp:26
-      │    │    └── computed column expressions
-      │    │         └── d_comp:26
-      │    │              └── d:25::DECIMAL + 10.0
+      │    │    ├── computed column expressions
+      │    │    │    └── d_comp:26
+      │    │    │         └── d:25 + 10.0
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── column1:10 = k:20
       └── aggregations
@@ -2894,8 +2936,8 @@ build
 INSERT INTO assn_cast (k, d) VALUES (1, 1.45) ON CONFLICT (k) DO UPDATE SET d = 2.67::DECIMAL(10, 2)
 ----
 upsert assn_cast
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_pkey
+ ├── columns: <none>
  ├── canary column: k:20
  ├── fetch columns: k:20 c:21 qc:22 i:23 s:24 d:25 d_comp:26
  ├── insert-mapping:
@@ -2949,7 +2991,7 @@ upsert assn_cast
       │    │    │    │    │    │    │    │    │         └── assignment-cast: INT8 [as=i_cast:17]
       │    │    │    │    │    │    │    │    │              └── i_default:15
       │    │    │    │    │    │    │    │    └── projections
-      │    │    │    │    │    │    │    │         └── d_cast:12::DECIMAL + 10.0 [as=d_comp_comp:18]
+      │    │    │    │    │    │    │    │         └── d_cast:12 + 10.0 [as=d_comp_comp:18]
       │    │    │    │    │    │    │    └── projections
       │    │    │    │    │    │    │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:19]
       │    │    │    │    │    │    │              └── d_comp_comp:18
@@ -2968,9 +3010,10 @@ upsert assn_cast
       │    │    │    │    │    │              └── d_comp_cast:19
       │    │    │    │    │    ├── scan assn_cast
       │    │    │    │    │    │    ├── columns: k:20!null c:21 qc:22 i:23 s:24 d:25 d_comp:26 crdb_internal_mvcc_timestamp:27 tableoid:28
-      │    │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │    │         └── d_comp:26
-      │    │    │    │    │    │              └── d:25::DECIMAL + 10.0
+      │    │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    │    └── d_comp:26
+      │    │    │    │    │    │    │         └── d:25 + 10.0
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── column1:10 = k:20
       │    │    │    │    └── projections
@@ -2979,7 +3022,7 @@ upsert assn_cast
       │    │    │         └── assignment-cast: DECIMAL(10) [as=d_cast:30]
       │    │    │              └── d_new:29
       │    │    └── projections
-      │    │         └── d_cast:30::DECIMAL + 10.0 [as=d_comp_comp:31]
+      │    │         └── d_cast:30 + 10.0 [as=d_comp_comp:31]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10) [as=d_comp_cast:32]
       │              └── d_comp_comp:31
@@ -2997,8 +3040,8 @@ build
 INSERT INTO assn_cast_on_update (k, i) VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET i = 3
 ----
 upsert assn_cast_on_update
- ├── columns: <none>
  ├── arbiter indexes: assn_cast_on_update_pkey
+ ├── columns: <none>
  ├── canary column: k:12
  ├── fetch columns: k:12 i:13 d:14 d2:15 d_comp:16
  ├── insert-mapping:
@@ -3048,9 +3091,10 @@ upsert assn_cast_on_update
       │    │    │    │    │    │              └── d_comp_cast:11
       │    │    │    │    │    ├── scan assn_cast_on_update
       │    │    │    │    │    │    ├── columns: k:12!null i:13 d:14 d2:15 d_comp:16 crdb_internal_mvcc_timestamp:17 tableoid:18
-      │    │    │    │    │    │    └── computed column expressions
-      │    │    │    │    │    │         └── d_comp:16
-      │    │    │    │    │    │              └── d:14
+      │    │    │    │    │    │    ├── computed column expressions
+      │    │    │    │    │    │    │    └── d_comp:16
+      │    │    │    │    │    │    │         └── d:14
+      │    │    │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    │    │    └── filters
       │    │    │    │    │         └── column1:8 = k:12
       │    │    │    │    └── projections
@@ -3143,8 +3187,8 @@ build
 UPSERT INTO on_update_bare (a) VALUES (1)
 ----
 upsert on_update_bare
- ├── columns: <none>
  ├── arbiter indexes: on_update_bare_pkey
+ ├── columns: <none>
  ├── canary column: a:7
  ├── fetch columns: a:7 v:8
  ├── insert-mapping:
@@ -3172,7 +3216,8 @@ upsert on_update_bare
       │    │    │         └── first-agg [as=v_default:6]
       │    │    │              └── v_default:6
       │    │    ├── scan on_update_bare
-      │    │    │    └── columns: a:7!null v:8 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    │    ├── columns: a:7!null v:8 crdb_internal_mvcc_timestamp:9 tableoid:10
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:5 = a:7
       │    └── projections
@@ -3198,8 +3243,8 @@ build
 UPSERT INTO on_update_with_default (a, b) VALUES (1, 2)
 ----
 upsert on_update_with_default
- ├── columns: <none>
  ├── arbiter indexes: on_update_with_default_pkey
+ ├── columns: <none>
  ├── canary column: a:9
  ├── fetch columns: a:9 b:10 v:11
  ├── insert-mapping:
@@ -3231,7 +3276,8 @@ upsert on_update_with_default
       │    │    │         └── first-agg [as=v_default:8]
       │    │    │              └── v_default:8
       │    │    ├── scan on_update_with_default
-      │    │    │    └── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:6 = a:9
       │    └── projections
@@ -3247,8 +3293,8 @@ ON CONFLICT (a) DO
 UPDATE SET (a, v) = (5, 4)
 ----
 upsert on_update_with_default
- ├── columns: <none>
  ├── arbiter indexes: on_update_with_default_pkey
+ ├── columns: <none>
  ├── canary column: a:9
  ├── fetch columns: a:9 b:10 v:11
  ├── insert-mapping:
@@ -3280,7 +3326,8 @@ upsert on_update_with_default
       │    │    │         └── first-agg [as=b_default:8]
       │    │    │              └── b_default:8
       │    │    ├── scan on_update_with_default
-      │    │    │    └── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:6 = a:9
       │    └── projections
@@ -3298,8 +3345,8 @@ ON CONFLICT (a) DO
 UPDATE SET a=5
 ----
 upsert on_update_with_default
- ├── columns: <none>
  ├── arbiter indexes: on_update_with_default_pkey
+ ├── columns: <none>
  ├── canary column: a:9
  ├── fetch columns: a:9 b:10 v:11
  ├── insert-mapping:
@@ -3334,7 +3381,8 @@ upsert on_update_with_default
       │    │    │    │         └── first-agg [as=v_default:8]
       │    │    │    │              └── v_default:8
       │    │    │    ├── scan on_update_with_default
-      │    │    │    │    └── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    │    ├── columns: a:9!null b:10 v:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    │    └── flags: disabled not visible index feature
       │    │    │    └── filters
       │    │    │         └── column1:6 = a:9
       │    │    └── projections
@@ -3374,8 +3422,8 @@ build
 UPSERT INTO generated_as_identity (a) VALUES (2)
 ----
 upsert generated_as_identity
- ├── columns: <none>
  ├── arbiter indexes: generated_as_identity_pkey
+ ├── columns: <none>
  ├── canary column: rowid:14
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -3409,7 +3457,8 @@ upsert generated_as_identity
       │    │         └── first-agg [as=c_default:9]
       │    │              └── c_default:9
       │    ├── scan generated_as_identity
-      │    │    └── columns: a:11 b:12!null c:13!null rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
+      │    │    ├── columns: a:11 b:12!null c:13!null rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── rowid_default:10 = rowid:14
       └── projections
@@ -3426,8 +3475,8 @@ build
 UPSERT INTO generated_as_identity (a, c) VALUES (3, 30)
 ----
 upsert generated_as_identity
- ├── columns: <none>
  ├── arbiter indexes: generated_as_identity_pkey
+ ├── columns: <none>
  ├── canary column: rowid:14
  ├── fetch columns: a:11 b:12 c:13 rowid:14
  ├── insert-mapping:
@@ -3461,7 +3510,8 @@ upsert generated_as_identity
       │    │         └── first-agg [as=b_default:9]
       │    │              └── b_default:9
       │    ├── scan generated_as_identity
-      │    │    └── columns: a:11 b:12!null c:13!null rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
+      │    │    ├── columns: a:11 b:12!null c:13!null rowid:14!null crdb_internal_mvcc_timestamp:15 tableoid:16
+      │    │    └── flags: disabled not visible index feature
       │    └── filters
       │         └── rowid_default:10 = rowid:14
       └── projections
@@ -3478,8 +3528,8 @@ ON CONFLICT ON CONSTRAINT xyz_pkey DO
 UPDATE SET x=5
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_pkey
+ ├── columns: <none>
  ├── canary column: x:9
  ├── fetch columns: x:9 y:10 z:11
  ├── insert-mapping:
@@ -3510,7 +3560,8 @@ upsert xyz
       │    │    │         └── first-agg [as=z_default:8]
       │    │    │              └── z_default:8
       │    │    ├── scan xyz
-      │    │    │    └── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         └── column1:6 = x:9
       │    └── projections
@@ -3527,8 +3578,8 @@ ON CONFLICT ON CONSTRAINT xyz_y_z_key DO
 UPDATE SET x=5
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_y_z_key
+ ├── columns: <none>
  ├── canary column: x:9
  ├── fetch columns: x:9 y:10 z:11
  ├── insert-mapping:
@@ -3557,7 +3608,8 @@ upsert xyz
       │    │    │         └── first-agg [as=column1:6]
       │    │    │              └── column1:6
       │    │    ├── scan xyz
-      │    │    │    └── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         ├── column2:7 = y:10
       │    │         └── z_default:8 = z:11
@@ -3575,8 +3627,8 @@ ON CONFLICT ON CONSTRAINT xyz_z_y_key DO
 UPDATE SET x=5
 ----
 upsert xyz
- ├── columns: <none>
  ├── arbiter indexes: xyz_z_y_key
+ ├── columns: <none>
  ├── canary column: x:9
  ├── fetch columns: x:9 y:10 z:11
  ├── insert-mapping:
@@ -3605,7 +3657,8 @@ upsert xyz
       │    │    │         └── first-agg [as=column1:6]
       │    │    │              └── column1:6
       │    │    ├── scan xyz
-      │    │    │    └── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    ├── columns: x:9!null y:10 z:11 crdb_internal_mvcc_timestamp:12 tableoid:13
+      │    │    │    └── flags: disabled not visible index feature
       │    │    └── filters
       │    │         ├── column2:7 = y:10
       │    │         └── z_default:8 = z:11
@@ -3623,3 +3676,521 @@ ON CONFLICT ON CONSTRAINT no_such_constraint DO
 UPDATE SET x=5
 ----
 error (42704): constraint "no_such_constraint" for table "xyz" does not exist
+
+exec-ddl
+CREATE TABLE min_arbiters (
+  a INT,
+  b INT,
+  c INT,
+  UNIQUE WITHOUT INDEX (b),
+  UNIQUE WITHOUT INDEX (c) WHERE a > 0
+)
+----
+
+exec-ddl
+CREATE UNIQUE INDEX redundant ON min_arbiters (a, b)
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      └── upsert-distinct-on
+           ├── project
+           │    ├── upsert-distinct-on
+           │    │    ├── upsert-distinct-on
+           │    │    │    ├── anti-join (hash)
+           │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    │    ├── project
+           │    │    │    │    │    │    │    ├── values
+           │    │    │    │    │    │    │    │    └── (1,)
+           │    │    │    │    │    │    │    └── projections
+           │    │    │    │    │    │    │         ├── NULL::INT8
+           │    │    │    │    │    │    │         └── unique_rowid()
+           │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │         └── rowid_default = rowid
+           │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    └── filters
+           │    │    │    │    │         └── b_default = b
+           │    │    │    │    ├── select
+           │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    └── filters
+           │    │    │    │    │         └── a > 0
+           │    │    │    │    └── filters
+           │    │    │    │         ├── b_default = c
+           │    │    │    │         └── column1 > 0
+           │    │    │    └── aggregations
+           │    │    │         ├── first-agg
+           │    │    │         │    └── column1
+           │    │    │         └── first-agg
+           │    │    │              └── b_default
+           │    │    └── aggregations
+           │    │         ├── first-agg
+           │    │         │    └── column1
+           │    │         └── first-agg
+           │    │              └── rowid_default
+           │    └── projections
+           │         └── (column1 > 0) OR NULL::BOOL
+           └── aggregations
+                ├── first-agg
+                │    └── column1
+                └── first-agg
+                     └── rowid_default
+
+exec-ddl
+DROP INDEX redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX redundant ON min_arbiters (a, b, c)
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      └── upsert-distinct-on
+           ├── project
+           │    ├── upsert-distinct-on
+           │    │    ├── upsert-distinct-on
+           │    │    │    ├── anti-join (hash)
+           │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    │    ├── project
+           │    │    │    │    │    │    │    ├── values
+           │    │    │    │    │    │    │    │    └── (1,)
+           │    │    │    │    │    │    │    └── projections
+           │    │    │    │    │    │    │         ├── NULL::INT8
+           │    │    │    │    │    │    │         └── unique_rowid()
+           │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │         └── rowid_default = rowid
+           │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    └── filters
+           │    │    │    │    │         └── b_default = b
+           │    │    │    │    ├── select
+           │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    └── filters
+           │    │    │    │    │         └── a > 0
+           │    │    │    │    └── filters
+           │    │    │    │         ├── b_default = c
+           │    │    │    │         └── column1 > 0
+           │    │    │    └── aggregations
+           │    │    │         ├── first-agg
+           │    │    │         │    └── column1
+           │    │    │         └── first-agg
+           │    │    │              └── b_default
+           │    │    └── aggregations
+           │    │         ├── first-agg
+           │    │         │    └── column1
+           │    │         └── first-agg
+           │    │              └── rowid_default
+           │    └── projections
+           │         └── (column1 > 0) OR NULL::BOOL
+           └── aggregations
+                ├── first-agg
+                │    └── column1
+                └── first-agg
+                     └── rowid_default
+
+exec-ddl
+DROP INDEX redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX redundant ON min_arbiters (b, c) WHERE a > 0
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      ├── project
+      │    └── upsert-distinct-on
+      │         ├── project
+      │         │    ├── upsert-distinct-on
+      │         │    │    ├── upsert-distinct-on
+      │         │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    │    │    ├── project
+      │         │    │    │    │    │    │    │    ├── values
+      │         │    │    │    │    │    │    │    │    └── (1,)
+      │         │    │    │    │    │    │    │    └── projections
+      │         │    │    │    │    │    │    │         ├── NULL::INT8
+      │         │    │    │    │    │    │    │         └── unique_rowid()
+      │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    │    └── filters
+      │         │    │    │    │    │    │         └── rowid_default = rowid
+      │         │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    └── filters
+      │         │    │    │    │    │         └── b_default = b
+      │         │    │    │    │    ├── select
+      │         │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    └── filters
+      │         │    │    │    │    │         └── a > 0
+      │         │    │    │    │    └── filters
+      │         │    │    │    │         ├── b_default = c
+      │         │    │    │    │         └── column1 > 0
+      │         │    │    │    └── aggregations
+      │         │    │    │         ├── first-agg
+      │         │    │    │         │    └── column1
+      │         │    │    │         └── first-agg
+      │         │    │    │              └── b_default
+      │         │    │    └── aggregations
+      │         │    │         ├── first-agg
+      │         │    │         │    └── column1
+      │         │    │         └── first-agg
+      │         │    │              └── rowid_default
+      │         │    └── projections
+      │         │         └── (column1 > 0) OR NULL::BOOL
+      │         └── aggregations
+      │              ├── first-agg
+      │              │    └── column1
+      │              └── first-agg
+      │                   └── rowid_default
+      └── projections
+           └── column1 > 0
+
+exec-ddl
+DROP INDEX redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX redundant ON min_arbiters (b, c) WHERE a > 0
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      ├── project
+      │    └── upsert-distinct-on
+      │         ├── project
+      │         │    ├── upsert-distinct-on
+      │         │    │    ├── upsert-distinct-on
+      │         │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    │    ├── anti-join (hash)
+      │         │    │    │    │    │    │    ├── project
+      │         │    │    │    │    │    │    │    ├── values
+      │         │    │    │    │    │    │    │    │    └── (1,)
+      │         │    │    │    │    │    │    │    └── projections
+      │         │    │    │    │    │    │    │         ├── NULL::INT8
+      │         │    │    │    │    │    │    │         └── unique_rowid()
+      │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    │    └── filters
+      │         │    │    │    │    │    │         └── rowid_default = rowid
+      │         │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    └── filters
+      │         │    │    │    │    │         └── b_default = b
+      │         │    │    │    │    ├── select
+      │         │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │    │    │    │         └── redundant: filters
+      │         │    │    │    │    │    │              └── a > 0
+      │         │    │    │    │    │    └── filters
+      │         │    │    │    │    │         └── a > 0
+      │         │    │    │    │    └── filters
+      │         │    │    │    │         ├── b_default = c
+      │         │    │    │    │         └── column1 > 0
+      │         │    │    │    └── aggregations
+      │         │    │    │         ├── first-agg
+      │         │    │    │         │    └── column1
+      │         │    │    │         └── first-agg
+      │         │    │    │              └── b_default
+      │         │    │    └── aggregations
+      │         │    │         ├── first-agg
+      │         │    │         │    └── column1
+      │         │    │         └── first-agg
+      │         │    │              └── rowid_default
+      │         │    └── projections
+      │         │         └── (column1 > 0) OR NULL::BOOL
+      │         └── aggregations
+      │              ├── first-agg
+      │              │    └── column1
+      │              └── first-agg
+      │                   └── rowid_default
+      └── projections
+           └── column1 > 0
+
+exec-ddl
+DROP INDEX redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX not_redundant ON min_arbiters (b, c) WHERE a > 10
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey not_redundant
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      ├── project
+      │    └── upsert-distinct-on
+      │         ├── project
+      │         │    ├── upsert-distinct-on
+      │         │    │    ├── project
+      │         │    │    │    └── upsert-distinct-on
+      │         │    │    │         ├── project
+      │         │    │    │         │    ├── upsert-distinct-on
+      │         │    │    │         │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    │    │    ├── project
+      │         │    │    │         │    │    │    │    │    │    │    ├── values
+      │         │    │    │         │    │    │    │    │    │    │    │    └── (1,)
+      │         │    │    │         │    │    │    │    │    │    │    └── projections
+      │         │    │    │         │    │    │    │    │    │    │         ├── NULL::INT8
+      │         │    │    │         │    │    │    │    │    │    │         └── unique_rowid()
+      │         │    │    │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │    │    │              └── a > 10
+      │         │    │    │         │    │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │    │         └── rowid_default = rowid
+      │         │    │    │         │    │    │    │    │    ├── select
+      │         │    │    │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │    │    │              └── a > 10
+      │         │    │    │         │    │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │    │         └── a > 10
+      │         │    │    │         │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │         ├── b_default = b
+      │         │    │    │         │    │    │    │    │         ├── b_default = c
+      │         │    │    │         │    │    │    │    │         └── column1 > 10
+      │         │    │    │         │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │              └── a > 10
+      │         │    │    │         │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │         └── b_default = b
+      │         │    │    │         │    │    │    ├── select
+      │         │    │    │         │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │              └── a > 10
+      │         │    │    │         │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │         └── a > 0
+      │         │    │    │         │    │    │    └── filters
+      │         │    │    │         │    │    │         ├── b_default = c
+      │         │    │    │         │    │    │         └── column1 > 0
+      │         │    │    │         │    │    └── aggregations
+      │         │    │    │         │    │         ├── first-agg
+      │         │    │    │         │    │         │    └── column1
+      │         │    │    │         │    │         └── first-agg
+      │         │    │    │         │    │              └── b_default
+      │         │    │    │         │    └── projections
+      │         │    │    │         │         └── (column1 > 10) OR NULL::BOOL
+      │         │    │    │         └── aggregations
+      │         │    │    │              ├── first-agg
+      │         │    │    │              │    └── column1
+      │         │    │    │              └── first-agg
+      │         │    │    │                   └── rowid_default
+      │         │    │    └── aggregations
+      │         │    │         ├── first-agg
+      │         │    │         │    └── column1
+      │         │    │         └── first-agg
+      │         │    │              └── rowid_default
+      │         │    └── projections
+      │         │         └── (column1 > 0) OR NULL::BOOL
+      │         └── aggregations
+      │              ├── first-agg
+      │              │    └── column1
+      │              └── first-agg
+      │                   └── rowid_default
+      └── projections
+           └── column1 > 10
+
+exec-ddl
+DROP INDEX not_redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX not_redundant ON min_arbiters (a, b) WHERE c > 0
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey not_redundant
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      ├── project
+      │    └── upsert-distinct-on
+      │         ├── project
+      │         │    ├── upsert-distinct-on
+      │         │    │    ├── project
+      │         │    │    │    └── upsert-distinct-on
+      │         │    │    │         ├── project
+      │         │    │    │         │    ├── upsert-distinct-on
+      │         │    │    │         │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    │    ├── anti-join (hash)
+      │         │    │    │         │    │    │    │    │    │    ├── project
+      │         │    │    │         │    │    │    │    │    │    │    ├── values
+      │         │    │    │         │    │    │    │    │    │    │    │    └── (1,)
+      │         │    │    │         │    │    │    │    │    │    │    └── projections
+      │         │    │    │         │    │    │    │    │    │    │         ├── NULL::INT8
+      │         │    │    │         │    │    │    │    │    │    │         └── unique_rowid()
+      │         │    │    │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │    │    │              └── c > 0
+      │         │    │    │         │    │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │    │         └── rowid_default = rowid
+      │         │    │    │         │    │    │    │    │    ├── select
+      │         │    │    │         │    │    │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │    │    │              └── c > 0
+      │         │    │    │         │    │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │    │         └── c > 0
+      │         │    │    │         │    │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │    │         ├── column1 = a
+      │         │    │    │         │    │    │    │    │         ├── b_default = b
+      │         │    │    │         │    │    │    │    │         └── b_default > 0
+      │         │    │    │         │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │              └── c > 0
+      │         │    │    │         │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │         └── b_default = b
+      │         │    │    │         │    │    │    ├── select
+      │         │    │    │         │    │    │    │    ├── scan min_arbiters
+      │         │    │    │         │    │    │    │    │    └── partial index predicates
+      │         │    │    │         │    │    │    │    │         └── not_redundant: filters
+      │         │    │    │         │    │    │    │    │              └── c > 0
+      │         │    │    │         │    │    │    │    └── filters
+      │         │    │    │         │    │    │    │         └── a > 0
+      │         │    │    │         │    │    │    └── filters
+      │         │    │    │         │    │    │         ├── b_default = c
+      │         │    │    │         │    │    │         └── column1 > 0
+      │         │    │    │         │    │    └── aggregations
+      │         │    │    │         │    │         ├── first-agg
+      │         │    │    │         │    │         │    └── column1
+      │         │    │    │         │    │         └── first-agg
+      │         │    │    │         │    │              └── b_default
+      │         │    │    │         │    └── projections
+      │         │    │    │         │         └── (b_default > 0) OR NULL::BOOL
+      │         │    │    │         └── aggregations
+      │         │    │    │              └── first-agg
+      │         │    │    │                   └── rowid_default
+      │         │    │    └── aggregations
+      │         │    │         ├── first-agg
+      │         │    │         │    └── column1
+      │         │    │         └── first-agg
+      │         │    │              └── rowid_default
+      │         │    └── projections
+      │         │         └── (column1 > 0) OR NULL::BOOL
+      │         └── aggregations
+      │              ├── first-agg
+      │              │    └── column1
+      │              └── first-agg
+      │                   └── rowid_default
+      └── projections
+           └── b_default > 0
+
+exec-ddl
+DROP INDEX not_redundant
+----
+
+exec-ddl
+CREATE UNIQUE INDEX not_redundant ON min_arbiters (a, c)
+----
+
+build format=hide-all
+INSERT INTO min_arbiters (a) VALUES (1) ON CONFLICT DO NOTHING
+----
+insert min_arbiters
+ ├── arbiter indexes: min_arbiters_pkey not_redundant
+ ├── arbiter constraints: unique_b unique_c
+ └── project
+      └── upsert-distinct-on
+           ├── project
+           │    ├── upsert-distinct-on
+           │    │    ├── upsert-distinct-on
+           │    │    │    ├── upsert-distinct-on
+           │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    │    │    ├── anti-join (hash)
+           │    │    │    │    │    │    │    │    ├── project
+           │    │    │    │    │    │    │    │    │    ├── values
+           │    │    │    │    │    │    │    │    │    │    └── (1,)
+           │    │    │    │    │    │    │    │    │    └── projections
+           │    │    │    │    │    │    │    │    │         ├── NULL::INT8
+           │    │    │    │    │    │    │    │    │         └── unique_rowid()
+           │    │    │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │    │    │         └── rowid_default = rowid
+           │    │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │    │         ├── column1 = a
+           │    │    │    │    │    │    │         └── b_default = c
+           │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │         └── b_default = b
+           │    │    │    │    │    ├── select
+           │    │    │    │    │    │    ├── scan min_arbiters
+           │    │    │    │    │    │    └── filters
+           │    │    │    │    │    │         └── a > 0
+           │    │    │    │    │    └── filters
+           │    │    │    │    │         ├── b_default = c
+           │    │    │    │    │         └── column1 > 0
+           │    │    │    │    └── aggregations
+           │    │    │    │         ├── first-agg
+           │    │    │    │         │    └── column1
+           │    │    │    │         └── first-agg
+           │    │    │    │              └── b_default
+           │    │    │    └── aggregations
+           │    │    │         └── first-agg
+           │    │    │              └── rowid_default
+           │    │    └── aggregations
+           │    │         ├── first-agg
+           │    │         │    └── column1
+           │    │         └── first-agg
+           │    │              └── rowid_default
+           │    └── projections
+           │         └── (column1 > 0) OR NULL::BOOL
+           └── aggregations
+                ├── first-agg
+                │    └── column1
+                └── first-agg
+                     └── rowid_default

@@ -11,6 +11,7 @@
 package invertedidx_test
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
@@ -34,7 +36,7 @@ import (
 func TestTryJoinGeoIndex(t *testing.T) {
 	semaCtx := tree.MakeSemaContext()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
 
@@ -55,7 +57,7 @@ func TestTryJoinGeoIndex(t *testing.T) {
 	}
 
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn1 := tree.NewUnqualifiedTableName("t1")
 	tn2 := tree.NewUnqualifiedTableName("t2")
@@ -291,7 +293,7 @@ func TestTryJoinGeoIndex(t *testing.T) {
 		}
 
 		actInvertedExpr := invertedidx.TryJoinInvertedIndex(
-			evalCtx.Context, &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
+			context.Background(), &f, filters, tab2, md.Table(tab2).Index(tc.indexOrd), inputCols,
 		)
 
 		if actInvertedExpr == nil {
@@ -315,7 +317,7 @@ func TestTryJoinGeoIndex(t *testing.T) {
 func TestTryFilterGeoIndex(t *testing.T) {
 	semaCtx := tree.MakeSemaContext()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 
 	tc := testcat.New()
 	if _, err := tc.ExecuteDDL(
@@ -324,7 +326,7 @@ func TestTryFilterGeoIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 	md := f.Metadata()
 	tn := tree.NewUnqualifiedTableName("t")
 	tab := md.AddTable(tc.Table(tn), tn)
@@ -494,6 +496,7 @@ func TestTryFilterGeoIndex(t *testing.T) {
 		// that is tested elsewhere. This is just testing that we are constraining
 		// the index when we expect to.
 		spanExpr, _, remainingFilters, pfState, ok := invertedidx.TryFilterInvertedIndex(
+			context.Background(),
 			evalCtx,
 			&f,
 			filters,

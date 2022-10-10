@@ -11,6 +11,7 @@
 package xform
 
 import (
+	"context"
 	"math"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
@@ -18,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/errors"
 )
@@ -33,12 +35,12 @@ import (
 // method and then pass through that property in the buildChildPhysicalProps
 // method.
 func CanProvidePhysicalProps(
-	evalCtx *tree.EvalContext, e memo.RelExpr, required *physical.Required,
+	ctx context.Context, evalCtx *eval.Context, e memo.RelExpr, required *physical.Required,
 ) bool {
 	// All operators can provide the Presentation and LimitHint properties, so no
 	// need to check for that.
 	canProvideOrdering := e.Op() == opt.SortOp || ordering.CanProvide(e, &required.Ordering)
-	canProvideDistribution := e.Op() == opt.DistributeOp || distribution.CanProvide(evalCtx, e, &required.Distribution)
+	canProvideDistribution := e.Op() == opt.DistributeOp || distribution.CanProvide(ctx, evalCtx, e, &required.Distribution)
 	return canProvideOrdering && canProvideDistribution
 }
 
@@ -117,7 +119,7 @@ func BuildChildPhysicalProps(
 		childProps.LimitHint = parentProps.LimitHint
 
 	case opt.DistinctOnOp:
-		distinctCount := parent.Relational().Stats.RowCount
+		distinctCount := parent.Relational().Statistics().RowCount
 		if parentProps.LimitHint > 0 {
 			// TODO(mgartner): If the expression is a streaming DistinctOn, this
 			// estimated limit hint is much lower than it should be.
@@ -135,7 +137,7 @@ func BuildChildPhysicalProps(
 			break
 		}
 
-		outputRows := parent.Relational().Stats.RowCount
+		outputRows := parent.Relational().Statistics().RowCount
 		if outputRows == 0 || outputRows < parentProps.LimitHint {
 			break
 		}
@@ -145,7 +147,7 @@ func BuildChildPhysicalProps(
 		streamingType := private.GroupingOrderType(&parentProps.Ordering)
 		if streamingType != memo.NoStreaming {
 			if input, ok := parent.Child(nth).(memo.RelExpr); ok {
-				inputRows := input.Relational().Stats.RowCount
+				inputRows := input.Relational().Statistics().RowCount
 				childProps.LimitHint = streamingGroupByInputLimitHint(inputRows, outputRows, parentProps.LimitHint)
 			}
 		}
@@ -153,12 +155,12 @@ func BuildChildPhysicalProps(
 	case opt.SelectOp, opt.LookupJoinOp:
 		// These operations are assumed to produce a constant number of output rows
 		// for each input row, independent of already-processed rows.
-		outputRows := parent.Relational().Stats.RowCount
+		outputRows := parent.Relational().Statistics().RowCount
 		if outputRows == 0 || outputRows < parentProps.LimitHint {
 			break
 		}
 		if input, ok := parent.Child(nth).(memo.RelExpr); ok {
-			inputRows := input.Relational().Stats.RowCount
+			inputRows := input.Relational().Statistics().RowCount
 			switch parent.Op() {
 			case opt.SelectOp:
 				// outputRows / inputRows is roughly the number of output rows produced
@@ -177,14 +179,14 @@ func BuildChildPhysicalProps(
 		if parentProps.Ordering.Any() {
 			break
 		}
-		outputRows := parent.Relational().Stats.RowCount
+		outputRows := parent.Relational().Statistics().RowCount
 		topk := parent.(*memo.TopKExpr)
 		k := float64(topk.K)
 		if outputRows == 0 || outputRows < k {
 			break
 		}
 		if input, ok := parent.Child(nth).(memo.RelExpr); ok {
-			inputRows := input.Relational().Stats.RowCount
+			inputRows := input.Relational().Statistics().RowCount
 
 			if limitHint := topKInputLimitHint(mem, topk, inputRows, outputRows, k); limitHint < inputRows {
 				childProps.LimitHint = limitHint

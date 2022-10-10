@@ -25,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,10 +41,11 @@ func TestExternalDistinct(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -67,9 +68,9 @@ func TestExternalDistinct(t *testing.T) {
 			var semsToCheck []semaphore.Semaphore
 			var outputOrdering execinfrapb.Ordering
 			verifier := colexectestutils.UnorderedVerifier
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort were added as Closers.
+			numExpectedClosers := 3
 			if tc.isOrderedOnDistinctCols {
 				outputOrdering = convertDistinctColsToOrdering(tc.distinctCols)
 				verifier = colexectestutils.OrderedVerifier
@@ -91,14 +92,8 @@ func TestExternalDistinct(t *testing.T) {
 				require.Equal(t, numExpectedClosers, len(closers))
 				return distinct, err
 			})
-			if tc.errorOnDup == "" || tc.noError {
-				// We don't check that all FDs were released if an error is
-				// expected to be returned because our utility closeIfCloser()
-				// doesn't handle multiple closers (which is always the case for
-				// the external distinct).
-				for i, sem := range semsToCheck {
-					require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
-				}
+			for i, sem := range semsToCheck {
+				require.Equal(t, 0, sem.GetCount(), "sem still reports open FDs at index %d", i)
 			}
 		}
 	}
@@ -112,10 +107,11 @@ func TestExternalDistinctSpilling(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -196,9 +192,9 @@ func TestExternalDistinctSpilling(t *testing.T) {
 				&monitorRegistry,
 			)
 			require.NoError(t, err)
-			// Check that the external distinct and the disk-backed sort
-			// were added as Closers.
-			numExpectedClosers := 2
+			// Check that the disk spiller, the external distinct, and the
+			// disk-backed sort were added as Closers.
+			numExpectedClosers := 3
 			require.Equal(t, numExpectedClosers, len(closers))
 			numRuns++
 			return distinct, nil
@@ -266,10 +262,11 @@ func BenchmarkExternalDistinct(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -281,48 +278,41 @@ func BenchmarkExternalDistinct(b *testing.B) {
 	var monitorRegistry colexecargs.MonitorRegistry
 	defer monitorRegistry.Close(ctx)
 
-	// TODO(yuzefovich): remove shuffleInput == false case in 22.2 without
-	// changing the name of the benchmark (#75106).
-	for _, shuffleInput := range []bool{false, true} {
-		for _, spillForced := range []bool{false, true} {
-			for _, maintainOrdering := range []bool{false, true} {
-				if !spillForced && maintainOrdering {
-					// The in-memory unordered distinct maintains the input ordering
-					// by design, so it's not an interesting case to test it with
-					// both options for 'maintainOrdering' parameter, and we skip
-					// one.
-					continue
-				}
-				flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
-				name := fmt.Sprintf("spilled=%t/ordering=%t", spillForced, maintainOrdering)
-				if shuffleInput {
-					name = name + "/shuffled"
-				}
-				runDistinctBenchmarks(
-					ctx,
-					b,
-					func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
-						var outputOrdering execinfrapb.Ordering
-						if maintainOrdering {
-							outputOrdering = convertDistinctColsToOrdering(distinctCols)
-						}
-						op, _, err := createExternalDistinct(
-							ctx, flowCtx, []colexecop.Operator{input}, typs,
-							distinctCols, false /* nullsAreDistinct */, "", /* errorOnDup */
-							outputOrdering, queueCfg, &colexecop.TestingSemaphore{},
-							nil /* spillingCallbackFn */, 0, /* numForcedRepartitions */
-							&monitorRegistry,
-						)
-						return op, err
-					},
-					func(nCols int) int {
-						return 0
-					},
-					name,
-					true, /* isExternal */
-					shuffleInput,
-				)
+	for _, spillForced := range []bool{false, true} {
+		for _, maintainOrdering := range []bool{false, true} {
+			if !spillForced && maintainOrdering {
+				// The in-memory unordered distinct maintains the input ordering
+				// by design, so it's not an interesting case to test it with
+				// both options for 'maintainOrdering' parameter, and we skip
+				// one.
+				continue
 			}
+			flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
+			name := fmt.Sprintf("spilled=%t/ordering=%t/shuffled", spillForced, maintainOrdering)
+			runDistinctBenchmarks(
+				ctx,
+				b,
+				func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
+					var outputOrdering execinfrapb.Ordering
+					if maintainOrdering {
+						outputOrdering = convertDistinctColsToOrdering(distinctCols)
+					}
+					op, _, err := createExternalDistinct(
+						ctx, flowCtx, []colexecop.Operator{input}, typs,
+						distinctCols, false /* nullsAreDistinct */, "", /* errorOnDup */
+						outputOrdering, queueCfg, &colexecop.TestingSemaphore{},
+						nil /* spillingCallbackFn */, 0, /* numForcedRepartitions */
+						&monitorRegistry,
+					)
+					return op, err
+				},
+				func(nCols int) int {
+					return 0
+				},
+				name,
+				true, /* isExternal */
+				true, /* shuffleInput */
+			)
 		}
 	}
 }

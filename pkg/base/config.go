@@ -13,20 +13,22 @@ package base
 import (
 	"context"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/redact"
 )
 
 // Base config defaults.
 const (
 	defaultInsecure = false
-	defaultUser     = security.RootUser
+	defaultUser     = username.RootUser
 	httpScheme      = "http"
 	httpsScheme     = "https"
 
@@ -47,9 +49,6 @@ const (
 
 	// NetworkTimeout is the timeout used for network operations.
 	NetworkTimeout = 3 * time.Second
-
-	// DefaultCertsDirectory is the default value for the cert directory flag.
-	DefaultCertsDirectory = "${HOME}/.cockroach-certs"
 
 	// defaultRaftTickInterval is the default resolution of the Raft timer.
 	defaultRaftTickInterval = 200 * time.Millisecond
@@ -99,6 +98,9 @@ const (
 	// before a lease expires when acquisition to renew the lease begins.
 	DefaultDescriptorLeaseRenewalTimeout = time.Minute
 )
+
+// DefaultCertsDirectory is the default value for the cert directory flag.
+var DefaultCertsDirectory = os.ExpandEnv("${HOME}/.cockroach-certs")
 
 // DefaultHistogramWindowInterval returns the default rotation window for
 // histograms.
@@ -169,7 +171,7 @@ type Config struct {
 
 	// User running this process. It could be the user under which
 	// the server is running or the user passed in client calls.
-	User security.SQLUsername
+	User username.SQLUsername
 
 	// Addr is the address the server is listening on.
 	Addr string
@@ -203,6 +205,11 @@ type Config struct {
 	// SQLAdvertiseAddr is the advertised SQL address.
 	// This is computed from SQLAddr if specified otherwise Addr.
 	SQLAdvertiseAddr string
+
+	// SocketFile, if non-empty, sets up a TLS-free local listener using
+	// a unix datagram socket at the specified path for SQL clients.
+	// This is auto-populated from SQLAddr if it initially ends with '.0'.
+	SocketFile string
 
 	// HTTPAddr is the configured HTTP listen address.
 	HTTPAddr string
@@ -255,7 +262,7 @@ func (*Config) HistogramWindowInterval() time.Duration {
 // This is also used in tests to reset global objects.
 func (cfg *Config) InitDefaults() {
 	cfg.Insecure = defaultInsecure
-	cfg.User = security.MakeSQLUsernameFromPreNormalizedString(defaultUser)
+	cfg.User = username.MakeSQLUsernameFromPreNormalizedString(defaultUser)
 	cfg.Addr = defaultAddr
 	cfg.AdvertiseAddr = cfg.Addr
 	cfg.HTTPAddr = defaultHTTPAddr
@@ -264,6 +271,7 @@ func (cfg *Config) InitDefaults() {
 	cfg.SplitListenSQL = false
 	cfg.SQLAddr = defaultSQLAddr
 	cfg.SQLAdvertiseAddr = cfg.SQLAddr
+	cfg.SocketFile = ""
 	cfg.SSLCertsDir = DefaultCertsDirectory
 	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
 	cfg.ClusterName = ""
@@ -353,6 +361,10 @@ type RaftConfig struct {
 	// without acknowledgement. With an average entry size of 1 KB that
 	// translates to ~4096 commands that might be executed in the handling of a
 	// single raft.Ready operation.
+	//
+	// This setting is used both by sending and receiving end of Raft messages. To
+	// minimize dropped messages on the receiver, its size should at least match
+	// the sender's (being it the default size, or taken from the env variables).
 	RaftMaxInflightMsgs int
 
 	// Splitting a range which has a replica needing a snapshot results in two
@@ -599,7 +611,7 @@ func TempStorageConfigFromEnv(
 	maxSizeBytes int64,
 ) TempStorageConfig {
 	inMem := parentDir == "" && useStore.InMemory
-	var monitorName string
+	var monitorName redact.RedactableString
 	if inMem {
 		monitorName = "in-mem temp storage"
 	} else {
@@ -614,7 +626,7 @@ func TempStorageConfigFromEnv(
 		maxSizeBytes/10, /* noteworthy */
 		st,
 	)
-	monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+	monitor.Start(ctx, nil /* pool */, mon.NewStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: inMem,
 		Mon:      monitor,

@@ -15,9 +15,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // Operator describes the type of operation that a memo expression performs.
@@ -55,13 +57,12 @@ func (op Operator) SyntaxTag() string {
 // or more children, and an optional private value. The entire tree can be
 // easily visited using a pattern like this:
 //
-//   var visit func(e Expr)
-//   visit := func(e Expr) {
-//     for i, n := 0, e.ChildCount(); i < n; i++ {
-//       visit(e.Child(i))
-//     }
-//   }
-//
+//	var visit func(e Expr)
+//	visit := func(e Expr) {
+//	  for i, n := 0, e.ChildCount(); i < n; i++ {
+//	    visit(e.Child(i))
+//	  }
+//	}
 type Expr interface {
 	// Op returns the operator type of the expression.
 	Op() Operator
@@ -111,61 +112,61 @@ type MutableExpr interface {
 
 // ComparisonOpMap maps from a semantic tree comparison operator type to an
 // optimizer operator type.
-var ComparisonOpMap [tree.NumComparisonOperatorSymbols]Operator
+var ComparisonOpMap [treecmp.NumComparisonOperatorSymbols]Operator
 
 // ComparisonOpReverseMap maps from an optimizer operator type to a semantic
 // tree comparison operator type.
-var ComparisonOpReverseMap = map[Operator]tree.ComparisonOperatorSymbol{
-	EqOp:             tree.EQ,
-	LtOp:             tree.LT,
-	GtOp:             tree.GT,
-	LeOp:             tree.LE,
-	GeOp:             tree.GE,
-	NeOp:             tree.NE,
-	InOp:             tree.In,
-	NotInOp:          tree.NotIn,
-	LikeOp:           tree.Like,
-	NotLikeOp:        tree.NotLike,
-	ILikeOp:          tree.ILike,
-	NotILikeOp:       tree.NotILike,
-	SimilarToOp:      tree.SimilarTo,
-	NotSimilarToOp:   tree.NotSimilarTo,
-	RegMatchOp:       tree.RegMatch,
-	NotRegMatchOp:    tree.NotRegMatch,
-	RegIMatchOp:      tree.RegIMatch,
-	NotRegIMatchOp:   tree.NotRegIMatch,
-	IsOp:             tree.IsNotDistinctFrom,
-	IsNotOp:          tree.IsDistinctFrom,
-	ContainsOp:       tree.Contains,
-	ContainedByOp:    tree.ContainedBy,
-	JsonExistsOp:     tree.JSONExists,
-	JsonSomeExistsOp: tree.JSONSomeExists,
-	JsonAllExistsOp:  tree.JSONAllExists,
-	OverlapsOp:       tree.Overlaps,
-	BBoxCoversOp:     tree.RegMatch,
-	BBoxIntersectsOp: tree.Overlaps,
+var ComparisonOpReverseMap = map[Operator]treecmp.ComparisonOperatorSymbol{
+	EqOp:             treecmp.EQ,
+	LtOp:             treecmp.LT,
+	GtOp:             treecmp.GT,
+	LeOp:             treecmp.LE,
+	GeOp:             treecmp.GE,
+	NeOp:             treecmp.NE,
+	InOp:             treecmp.In,
+	NotInOp:          treecmp.NotIn,
+	LikeOp:           treecmp.Like,
+	NotLikeOp:        treecmp.NotLike,
+	ILikeOp:          treecmp.ILike,
+	NotILikeOp:       treecmp.NotILike,
+	SimilarToOp:      treecmp.SimilarTo,
+	NotSimilarToOp:   treecmp.NotSimilarTo,
+	RegMatchOp:       treecmp.RegMatch,
+	NotRegMatchOp:    treecmp.NotRegMatch,
+	RegIMatchOp:      treecmp.RegIMatch,
+	NotRegIMatchOp:   treecmp.NotRegIMatch,
+	IsOp:             treecmp.IsNotDistinctFrom,
+	IsNotOp:          treecmp.IsDistinctFrom,
+	ContainsOp:       treecmp.Contains,
+	ContainedByOp:    treecmp.ContainedBy,
+	JsonExistsOp:     treecmp.JSONExists,
+	JsonSomeExistsOp: treecmp.JSONSomeExists,
+	JsonAllExistsOp:  treecmp.JSONAllExists,
+	OverlapsOp:       treecmp.Overlaps,
+	BBoxCoversOp:     treecmp.RegMatch,
+	BBoxIntersectsOp: treecmp.Overlaps,
 }
 
 // BinaryOpReverseMap maps from an optimizer operator type to a semantic tree
 // binary operator type.
-var BinaryOpReverseMap = map[Operator]tree.BinaryOperatorSymbol{
-	BitandOp:        tree.Bitand,
-	BitorOp:         tree.Bitor,
-	BitxorOp:        tree.Bitxor,
-	PlusOp:          tree.Plus,
-	MinusOp:         tree.Minus,
-	MultOp:          tree.Mult,
-	DivOp:           tree.Div,
-	FloorDivOp:      tree.FloorDiv,
-	ModOp:           tree.Mod,
-	PowOp:           tree.Pow,
-	ConcatOp:        tree.Concat,
-	LShiftOp:        tree.LShift,
-	RShiftOp:        tree.RShift,
-	FetchValOp:      tree.JSONFetchVal,
-	FetchTextOp:     tree.JSONFetchText,
-	FetchValPathOp:  tree.JSONFetchValPath,
-	FetchTextPathOp: tree.JSONFetchTextPath,
+var BinaryOpReverseMap = map[Operator]treebin.BinaryOperatorSymbol{
+	BitandOp:        treebin.Bitand,
+	BitorOp:         treebin.Bitor,
+	BitxorOp:        treebin.Bitxor,
+	PlusOp:          treebin.Plus,
+	MinusOp:         treebin.Minus,
+	MultOp:          treebin.Mult,
+	DivOp:           treebin.Div,
+	FloorDivOp:      treebin.FloorDiv,
+	ModOp:           treebin.Mod,
+	PowOp:           treebin.Pow,
+	ConcatOp:        treebin.Concat,
+	LShiftOp:        treebin.LShift,
+	RShiftOp:        treebin.RShift,
+	FetchValOp:      treebin.JSONFetchVal,
+	FetchTextOp:     treebin.JSONFetchText,
+	FetchValPathOp:  treebin.JSONFetchValPath,
+	FetchTextPathOp: treebin.JSONFetchTextPath,
 }
 
 // UnaryOpReverseMap maps from an optimizer operator type to a semantic tree
@@ -303,15 +304,15 @@ func BoolOperatorRequiresNotNullArgs(op Operator) bool {
 // rows where its first argument evaluates to NULL. In other words, it always
 // evaluates to the same result even if those rows are filtered. For example:
 //
-//   SELECT string_agg(x, y)
-//   FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
+//	SELECT string_agg(x, y)
+//	FROM (VALUES ('foo', ','), ('bar', ','), (NULL, ',')) t(x, y)
 //
 // In this example, the NULL row can be removed from the input, and the
 // string_agg function still returns the same result. Contrast this to the
 // array_agg function:
 //
-//   SELECT array_agg(x)
-//   FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
+//	SELECT array_agg(x)
+//	FROM (VALUES ('foo'), (NULL), ('bar')) t(x)
 //
 // If the NULL row is removed here, array_agg returns {foo,bar} instead of
 // {foo,NULL,bar}.
@@ -332,7 +333,7 @@ func AggregateIgnoresNulls(op Operator) bool {
 		return false
 
 	default:
-		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("unhandled op %s", redact.Safe(op)))
 	}
 }
 
@@ -357,7 +358,7 @@ func AggregateIsNullOnEmpty(op Operator) bool {
 		return false
 
 	default:
-		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("unhandled op %s", redact.Safe(op)))
 	}
 }
 
@@ -374,20 +375,20 @@ func AggregateIsNeverNullOnNonNullInput(op Operator) bool {
 	case AnyNotNullAggOp, ArrayAggOp, AvgOp, BitAndAggOp,
 		BitOrAggOp, BoolAndOp, BoolOrOp, ConcatAggOp, ConstAggOp,
 		ConstNotNullAggOp, CountOp, CountRowsOp, FirstAggOp,
-		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp, STMakeLineOp,
+		JsonAggOp, JsonbAggOp, MaxOp, MinOp, SqrDiffOp,
 		StringAggOp, SumOp, SumIntOp, XorAggOp, PercentileDiscOp, PercentileContOp,
-		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STExtentOp, STUnionOp,
+		JsonObjectAggOp, JsonbObjectAggOp, StdDevPopOp, STCollectOp, STUnionOp,
 		VarPopOp, CovarPopOp, RegressionAvgXOp, RegressionAvgYOp, RegressionSXXOp,
 		RegressionSXYOp, RegressionSYYOp, RegressionCountOp:
 		return true
 
 	case VarianceOp, StdDevOp, CorrOp, CovarSampOp, RegressionInterceptOp,
-		RegressionR2Op, RegressionSlopeOp:
-		// These aggregations return NULL if they are given a single not-NULL input.
+		RegressionR2Op, RegressionSlopeOp, STExtentOp, STMakeLineOp:
+		// These aggregations can return NULL even with non-null input values.
 		return false
 
 	default:
-		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("unhandled op %s", redact.Safe(op)))
 	}
 }
 
@@ -407,11 +408,11 @@ func AggregateIsNeverNull(op Operator) bool {
 // words, the inner-outer aggregate pair forms a valid "decomposition" of a
 // single aggregate. For example, the following pairs of queries are equivalent:
 //
-//   SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
-//   SELECT sum(y) FROM xy;
+//	SELECT sum(s) FROM (SELECT sum(y) FROM xy GROUP BY x) AS f(s);
+//	SELECT sum(y) FROM xy;
 //
-//   SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
-//   SELECT count(y) FROM xy;
+//	SELECT sum_int(c) FROM (SELECT count(y) FROM xy GROUP BY x) AS f(c);
+//	SELECT count(y) FROM xy;
 //
 // Note: some aggregates like StringAggOp are decomposable in theory, but in
 // practice can not be easily merged as in the examples above.
@@ -437,7 +438,7 @@ func AggregatesCanMerge(inner, outer Operator) bool {
 		return false
 
 	default:
-		panic(errors.AssertionFailedf("unhandled ops: %s, %s", log.Safe(inner), log.Safe(outer)))
+		panic(errors.AssertionFailedf("unhandled ops: %s, %s", redact.Safe(inner), redact.Safe(outer)))
 	}
 }
 
@@ -459,8 +460,28 @@ func AggregateIgnoresDuplicates(op Operator) bool {
 		return false
 
 	default:
-		panic(errors.AssertionFailedf("unhandled op %s", log.Safe(op)))
+		panic(errors.AssertionFailedf("unhandled op %s", redact.Safe(op)))
 	}
+}
+
+// CommuteEqualityOrInequalityOp returns the commuted version of the given
+// operator, e.g. '<' -> '>' and '=' -> '='. It only handles equality and
+// inequality operators. Note that commuting an operator is not the same as
+// negating it.
+func CommuteEqualityOrInequalityOp(op Operator) Operator {
+	switch op {
+	case EqOp:
+		return EqOp
+	case GeOp:
+		return LeOp
+	case GtOp:
+		return LtOp
+	case LeOp:
+		return GeOp
+	case LtOp:
+		return GtOp
+	}
+	panic(errors.AssertionFailedf("attempted to commute operator: %s", redact.Safe(op)))
 }
 
 // OpaqueMetadata is an object stored in OpaqueRelExpr and passed

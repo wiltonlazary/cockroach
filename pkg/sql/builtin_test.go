@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -41,12 +42,12 @@ func TestFuncNull(t *testing.T) {
 		}
 	}
 
-	for _, name := range builtins.AllBuiltinNames {
+	for _, name := range builtins.AllBuiltinNames() {
 		switch strings.ToLower(name) {
 		case "crdb_internal.force_panic", "crdb_internal.force_log_fatal", "pg_sleep":
 			continue
 		}
-		_, variations := builtins.GetBuiltinProperties(name)
+		_, variations := builtinsregistry.GetBuiltinProperties(name)
 		for _, builtin := range variations {
 			// Untyped NULL.
 			{

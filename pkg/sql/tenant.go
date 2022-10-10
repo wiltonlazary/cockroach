@@ -16,13 +16,15 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -32,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -65,7 +68,11 @@ func rejectIfSystemTenant(tenID uint64, op string) error {
 // span config (in system.span_configurations) for it. It also initializes the
 // usage data in system.tenant_usage if info.Usage is set.
 func CreateTenantRecord(
-	ctx context.Context, execCfg *ExecutorConfig, txn *kv.Txn, info *descpb.TenantInfoWithUsage,
+	ctx context.Context,
+	execCfg *ExecutorConfig,
+	txn *kv.Txn,
+	info *descpb.TenantInfoWithUsage,
+	initialTenantZoneConfig *zonepb.ZoneConfig,
 ) error {
 	const op = "create"
 	if err := rejectIfCantCoordinateMultiTenancy(execCfg.Codec, op); err != nil {
@@ -124,10 +131,6 @@ func CreateTenantRecord(
 		}
 	}
 
-	if !execCfg.Settings.Version.IsActive(ctx, clusterversion.PreSeedTenantSpanConfigs) {
-		return nil
-	}
-
 	// Install a single key[1] span config at the start of tenant's keyspace;
 	// elsewhere this ensures that we split on the tenant boundary. The subset
 	// of entries with spans in the tenant keyspace are, henceforth, governed
@@ -143,24 +146,30 @@ func CreateTenantRecord(
 	//      boundaries. Whatever is inserted will get cleared out by the
 	//      tenant's reconciliation process.
 
-	// TODO(irfansharif): What should this initial default be? Could be this
-	// static one, could use host's RANGE TENANT or host's RANGE DEFAULT?
-	// Does it even matter given it'll disappear as soon as tenant starts
-	// reconciling?
-	tenantSpanConfig := execCfg.DefaultZoneConfig.AsSpanConfig()
+	tenantSpanConfig := initialTenantZoneConfig.AsSpanConfig()
+	// Make sure to enable rangefeeds; the tenant will need them on its system
+	// tables as soon as it starts up. It's not unsafe/buggy if we didn't do this,
+	// -- the tenant's span config reconciliation process would eventually install
+	// appropriate (rangefeed.enabled = true) configs for its system tables, at
+	// which point subsystems that rely on rangefeeds are able to proceed. All of
+	// this can noticeably slow down pod startup, so we just enable things to
+	// start with.
+	tenantSpanConfig.RangefeedEnabled = true
+	// Make it behave like usual system database ranges, for good measure.
+	tenantSpanConfig.GCPolicy.IgnoreStrictEnforcement = true
+
 	tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(tenID))
-	toUpsert := []roachpb.SpanConfigEntry{
-		{
-			Span: roachpb.Span{
-				Key:    tenantPrefix,
-				EndKey: tenantPrefix.Next(),
-			},
-			Config: tenantSpanConfig,
-		},
+	record, err := spanconfig.MakeRecord(spanconfig.MakeTargetFromSpan(roachpb.Span{
+		Key:    tenantPrefix,
+		EndKey: tenantPrefix.Next(),
+	}), tenantSpanConfig)
+	if err != nil {
+		return err
 	}
+	toUpsert := []spanconfig.Record{record}
 	scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-	return scKVAccessor.UpdateSpanConfigEntries(
-		ctx, nil /* toDelete */, toUpsert,
+	return scKVAccessor.UpdateSpanConfigRecords(
+		ctx, nil, toUpsert, hlc.MinTimestamp, hlc.MaxTimestamp,
 	)
 }
 
@@ -211,6 +220,10 @@ func updateTenantRecord(
 
 // CreateTenant implements the tree.TenantOperator interface.
 func (p *planner) CreateTenant(ctx context.Context, tenID uint64) error {
+	if err := p.RequireAdminRole(ctx, "create tenant"); err != nil {
+		return err
+	}
+
 	info := &descpb.TenantInfoWithUsage{
 		TenantInfo: descpb.TenantInfo{
 			ID: tenID,
@@ -219,16 +232,22 @@ func (p *planner) CreateTenant(ctx context.Context, tenID uint64) error {
 			State: descpb.TenantInfo_ACTIVE,
 		},
 	}
-	if err := CreateTenantRecord(ctx, p.ExecCfg(), p.Txn(), info); err != nil {
+
+	initialTenantZoneConfig, err := GetHydratedZoneConfigForTenantsRange(ctx, p.Txn())
+	if err != nil {
 		return err
 	}
 
-	codec := keys.MakeSQLCodec(roachpb.MakeTenantID(tenID))
+	if err := CreateTenantRecord(ctx, p.ExecCfg(), p.Txn(), info, initialTenantZoneConfig); err != nil {
+		return err
+	}
+
 	// Initialize the tenant's keyspace.
+	codec := keys.MakeSQLCodec(roachpb.MakeTenantID(tenID))
 	schema := bootstrap.MakeMetadataSchema(
 		codec,
-		p.ExtendedEvalContext().ExecCfg.DefaultZoneConfig, /* defaultZoneConfig */
-		nil, /* defaultSystemZoneConfig */
+		initialTenantZoneConfig, /* defaultZoneConfig */
+		initialTenantZoneConfig, /* defaultSystemZoneConfig */
 	)
 	kvs, splits := schema.GetInitialValues()
 
@@ -294,15 +313,20 @@ func generateTenantClusterSettingKV(
 		return roachpb.KeyValue{}, errors.NewAssertionErrorWithWrappedErrf(err,
 			"failed to encode current cluster version %v", &v)
 	}
+	ts, err := tree.MakeDTimestamp(timeutil.Now(), time.Microsecond)
+	if err != nil {
+		return roachpb.KeyValue{}, errors.NewAssertionErrorWithWrappedErrf(err,
+			"failed to represent the current time")
+	}
 	kvs, err := rowenc.EncodePrimaryIndex(
 		codec,
 		systemschema.SettingsTable,
 		systemschema.SettingsTable.GetPrimaryIndex(),
 		catalog.ColumnIDToOrdinalMap(systemschema.SettingsTable.PublicColumns()),
 		[]tree.Datum{
-			tree.NewDString(clusterversion.KeyVersionSetting),      // name
-			tree.NewDString(string(encoded)),                       // value
-			tree.NewDTimeTZFromTime(timeutil.Now()),                // lastUpdated
+			tree.NewDString(clusterversion.KeyVersionSetting), // name
+			tree.NewDString(string(encoded)),                  // value
+			ts,                                                // lastUpdated
 			tree.NewDString((*settings.VersionSetting)(nil).Typ()), // type
 		},
 		false, /* includeEmpty */
@@ -322,6 +346,9 @@ func generateTenantClusterSettingKV(
 }
 
 // ActivateTenant marks a tenant active.
+//
+// The caller is responsible for checking that the user is authorized
+// to take this action.
 func ActivateTenant(ctx context.Context, execCfg *ExecutorConfig, txn *kv.Txn, tenID uint64) error {
 	const op = "activate"
 	if err := rejectIfCantCoordinateMultiTenancy(execCfg.Codec, op); err != nil {
@@ -372,6 +399,9 @@ func clearTenant(ctx context.Context, execCfg *ExecutorConfig, info *descpb.Tena
 // DestroyTenant implements the tree.TenantOperator interface.
 func (p *planner) DestroyTenant(ctx context.Context, tenID uint64, synchronous bool) error {
 	const op = "destroy"
+	if err := p.RequireAdminRole(ctx, "destroy tenant"); err != nil {
+		return err
+	}
 	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, op); err != nil {
 		return err
 	}
@@ -406,6 +436,9 @@ func (p *planner) DestroyTenant(ctx context.Context, tenID uint64, synchronous b
 }
 
 // GCTenantSync clears the tenant's data and removes its record.
+//
+// The caller is responsible for checking that the user is authorized
+// to take this action.
 func GCTenantSync(ctx context.Context, execCfg *ExecutorConfig, info *descpb.TenantInfo) error {
 	const op = "gc"
 	if err := rejectIfCantCoordinateMultiTenancy(execCfg.Codec, op); err != nil {
@@ -436,28 +469,43 @@ func GCTenantSync(ctx context.Context, execCfg *ExecutorConfig, info *descpb.Ten
 			return errors.Wrapf(err, "deleting tenant %d usage", info.ID)
 		}
 
-		if !execCfg.Settings.Version.IsActive(ctx, clusterversion.PreSeedTenantSpanConfigs) {
-			return nil
+		if _, err := execCfg.InternalExecutor.ExecEx(
+			ctx, "delete-tenant-settings", txn, sessiondata.NodeUserSessionDataOverride,
+			`DELETE FROM system.tenant_settings WHERE tenant_id = $1`, info.ID,
+		); err != nil {
+			return errors.Wrapf(err, "deleting tenant %d settings", info.ID)
 		}
 
-		// Clear out all span config entries left over by the tenant.
-		tenantPrefix := keys.MakeTenantPrefix(roachpb.MakeTenantID(info.ID))
+		// Clear out all span config records left over by the tenant.
+		tenID := roachpb.MakeTenantID(info.ID)
+		tenantPrefix := keys.MakeTenantPrefix(tenID)
 		tenantSpan := roachpb.Span{
 			Key:    tenantPrefix,
 			EndKey: tenantPrefix.PrefixEnd(),
 		}
 
+		systemTarget, err := spanconfig.MakeTenantKeyspaceTarget(tenID, tenID)
+		if err != nil {
+			return err
+		}
 		scKVAccessor := execCfg.SpanConfigKVAccessor.WithTxn(ctx, txn)
-		entries, err := scKVAccessor.GetSpanConfigEntriesFor(ctx, []roachpb.Span{tenantSpan})
+		records, err := scKVAccessor.GetSpanConfigRecords(
+			ctx, []spanconfig.Target{
+				spanconfig.MakeTargetFromSpan(tenantSpan),
+				spanconfig.MakeTargetFromSystemTarget(systemTarget),
+			},
+		)
 		if err != nil {
 			return err
 		}
 
-		toDelete := make([]roachpb.Span, len(entries))
-		for i, entry := range entries {
-			toDelete[i] = entry.Span
+		toDelete := make([]spanconfig.Target, len(records))
+		for i, record := range records {
+			toDelete[i] = record.GetTarget()
 		}
-		return scKVAccessor.UpdateSpanConfigEntries(ctx, toDelete, nil /* toUpsert */)
+		return scKVAccessor.UpdateSpanConfigRecords(
+			ctx, toDelete, nil, hlc.MinTimestamp, hlc.MaxTimestamp,
+		)
 	})
 	return errors.Wrapf(err, "deleting tenant %d record", info.ID)
 }
@@ -467,7 +515,7 @@ func gcTenantJob(
 	ctx context.Context,
 	execCfg *ExecutorConfig,
 	txn *kv.Txn,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	tenID uint64,
 	synchronous bool,
 ) (jobspb.JobID, error) {
@@ -481,7 +529,7 @@ func gcTenantJob(
 	progress := jobspb.SchemaChangeGCProgress{}
 	if synchronous {
 		progress.Tenant = &jobspb.SchemaChangeGCProgress_TenantProgress{
-			Status: jobspb.SchemaChangeGCProgress_DELETING,
+			Status: jobspb.SchemaChangeGCProgress_CLEARING,
 		}
 	}
 	gcJobRecord := jobs.Record{
@@ -501,11 +549,15 @@ func gcTenantJob(
 }
 
 // GCTenant implements the tree.TenantOperator interface.
+//
+// TODO(jeffswenson): Delete internal_crdb.gc_tenant after the DestroyTenant
+// changes are deployed to all Cockroach Cloud serverless hosts.
 func (p *planner) GCTenant(ctx context.Context, tenID uint64) error {
-	// TODO(jeffswenson): Delete internal_crdb.gc_tenant after the DestroyTenant
-	// changes are deployed to all Cockroach Cloud serverless hosts.
-	if !p.ExtendedEvalContext().TxnImplicit {
-		return errors.Errorf("gc_tenant cannot be used inside a transaction")
+	if !p.extendedEvalCtx.TxnIsSingleStmt {
+		return errors.Errorf("gc_tenant cannot be used inside a multi-statement transaction")
+	}
+	if err := p.RequireAdminRole(ctx, "gc tenant"); err != nil {
+		return err
 	}
 	var info *descpb.TenantInfo
 	if txnErr := p.ExecCfg().DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
@@ -538,6 +590,10 @@ func (p *planner) UpdateTenantResourceLimits(
 	asOfConsumedRequestUnits float64,
 ) error {
 	const op = "update-resource-limits"
+	if err := p.RequireAdminRole(ctx, "update tenant resource limits"); err != nil {
+		return err
+	}
+
 	if err := rejectIfCantCoordinateMultiTenancy(p.execCfg.Codec, op); err != nil {
 		return err
 	}
@@ -548,4 +604,12 @@ func (p *planner) UpdateTenantResourceLimits(
 		ctx, p.Txn(), roachpb.MakeTenantID(tenantID),
 		availableRU, refillRate, maxBurstRU, asOf, asOfConsumedRequestUnits,
 	)
+}
+
+// TestingUpdateTenantRecord is a public wrapper around updateTenantRecord
+// intended for testing purposes.
+func TestingUpdateTenantRecord(
+	ctx context.Context, execCfg *ExecutorConfig, txn *kv.Txn, info *descpb.TenantInfo,
+) error {
+	return updateTenantRecord(ctx, execCfg, txn, info)
 }

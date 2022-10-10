@@ -20,7 +20,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.UserPrivileges) scop.Op {
+				emit(func(this *scpb.UserPrivileges) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
 			),
@@ -28,8 +28,13 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.UserPrivileges) scop.Op {
-					return notImplemented(this)
+				// TODO(postamar): remove revertibility constraint when possible
+				revertible(false),
+				emit(func(this *scpb.UserPrivileges) *scop.RemoveUserPrivileges {
+					return &scop.RemoveUserPrivileges{
+						DescriptorID: this.DescriptorID,
+						User:         this.UserName,
+					}
 				}),
 			),
 		),

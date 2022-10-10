@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -38,11 +39,13 @@ go_test(
         "main_test.go",
         "printer_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":encoding"],
     deps = [
         "//pkg/geo",
+        "//pkg/geo/geographiclib",
         "//pkg/geo/geopb",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/util/bitarray",
         "//pkg/util/duration",
         "//pkg/util/ipaddr",
@@ -92,4 +95,10 @@ genrule(
         "@go_sdk//:bin/go",
         "@com_github_cockroachdb_tools//cmd/stringer",
     ],
+    visibility = [
+        ":__pkg__",
+        "//pkg/gen:__pkg__",
+    ],
 )
+
+get_x_data(name = "get_x_data")

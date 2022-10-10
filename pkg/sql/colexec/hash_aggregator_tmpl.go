@@ -84,6 +84,8 @@ func populateEqChains(
 	return eqChainsCount
 }
 
+var zeroIntColumn = make([]int, coldata.MaxBatchSize)
+
 // populateEqChains populates op.scratch.eqChains with indices of tuples from b
 // that belong to the same groups. It returns the number of equality chains as
 // well as a selection vector that contains "heads" of each of the chains. The
@@ -126,23 +128,18 @@ func (op *hashAggregator) populateEqChains(
 func findSplit(
 	op *hashAggregator, start int, end int, sel []int, useSel bool, ascending bool,
 ) (bool, int) {
-	if useSel {
-		_ = sel[start]
-		_ = sel[end]
-	} else {
+	if !useSel {
 		_ = op.distinctOutput[start]
 		_ = op.distinctOutput[end]
 	}
 	if ascending {
 		for i := start; i <= end; i++ {
 			if useSel {
-				//gcassert:bce
 				idx := sel[i]
 				if op.distinctOutput[idx] {
 					return true, i
 				}
 			} else {
-				//gcassert:bce
 				if op.distinctOutput[i] {
 					return true, i
 				}
@@ -340,25 +337,21 @@ func getNext(op *hashAggregator, partialOrder bool) coldata.Batch {
 		case hashAggregatorOutputting:
 			// Note that ResetMaybeReallocate truncates the requested capacity
 			// at coldata.BatchSize(), so we can just try asking for
-			// len(op.buckets) capacity.
+			// len(op.buckets)-op.curOutputBucketIdx (the number of remaining
+			// output tuples) capacity.
 			op.output, _ = op.accountingHelper.ResetMaybeReallocate(
-				op.outputTypes, op.output, len(op.buckets), op.maxOutputBatchMemSize,
+				op.outputTypes, op.output, len(op.buckets)-op.curOutputBucketIdx,
 			)
 			curOutputIdx := 0
-			for curOutputIdx < op.output.Capacity() &&
-				op.curOutputBucketIdx < len(op.buckets) &&
-				(op.maxCapacity == 0 || curOutputIdx < op.maxCapacity) {
+			for batchDone := false; op.curOutputBucketIdx < len(op.buckets) && !batchDone; {
 				bucket := op.buckets[op.curOutputBucketIdx]
 				for fnIdx, fn := range bucket.fns {
 					fn.SetOutput(op.output.ColVec(fnIdx))
 					fn.Flush(curOutputIdx)
 				}
-				op.accountingHelper.AccountForSet(curOutputIdx)
+				batchDone = op.accountingHelper.AccountForSet(curOutputIdx)
 				curOutputIdx++
 				op.curOutputBucketIdx++
-				if op.maxCapacity == 0 && op.accountingHelper.Allocator.Used() >= op.maxOutputBatchMemSize {
-					op.maxCapacity = curOutputIdx
-				}
 			}
 			if op.curOutputBucketIdx >= len(op.buckets) {
 				if partialOrder {

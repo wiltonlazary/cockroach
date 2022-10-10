@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -29,11 +28,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/blobs"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/sysutil"
 	"github.com/cockroachdb/errors"
@@ -106,8 +106,9 @@ func storeFromURI(
 	t *testing.T,
 	uri string,
 	clientFactory blobs.BlobClientFactory,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	ie sqlutil.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
 	kvDB *kv.DB,
 	testSettings *cluster.Settings,
 ) cloud.ExternalStorage {
@@ -117,7 +118,7 @@ func storeFromURI(
 	}
 	// Setup a sink for the given args.
 	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
-		clientFactory, ie, kvDB)
+		clientFactory, ie, ief, kvDB, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,8 +130,9 @@ func CheckExportStore(
 	t *testing.T,
 	storeURI string,
 	skipSingleFile bool,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	ie sqlutil.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
 	kvDB *kv.DB,
 	testSettings *cluster.Settings,
 ) {
@@ -144,7 +146,8 @@ func CheckExportStore(
 
 	// Setup a sink for the given args.
 	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
-	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, ie, kvDB)
+	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory,
+		ie, ief, kvDB, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,9 +180,9 @@ func CheckExportStore(
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer r.Close()
+			defer r.Close(ctx)
 
-			res, err := ioutil.ReadAll(r)
+			res, err := ioctx.ReadAll(ctx, r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -208,8 +211,8 @@ func CheckExportStore(
 		if err != nil {
 			t.Fatalf("Could not get reader for %s: %+v", testingFilename, err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -226,14 +229,14 @@ func CheckExportStore(
 					t.Logf("read %d of file at %d", length, offset)
 					reader, size, err := s.ReadFileAt(ctx, testingFilename, offset)
 					require.NoError(t, err)
-					defer reader.Close()
+					defer reader.Close(ctx)
 					require.Equal(t, int64(len(testingContent)), size)
 					expected, got := make([]byte, length), make([]byte, length)
 					_, err = byteReader.Seek(offset, io.SeekStart)
 					require.NoError(t, err)
 
 					expectedN, expectedErr := io.ReadFull(byteReader, expected)
-					gotN, gotErr := io.ReadFull(reader, got)
+					gotN, gotErr := io.ReadFull(ioctx.ReaderCtxAdapter(ctx, reader), got)
 					require.Equal(t, expectedErr != nil, gotErr != nil, "%+v vs %+v", expectedErr, gotErr)
 					require.Equal(t, expectedN, gotN)
 					require.Equal(t, expected, got)
@@ -252,15 +255,15 @@ func CheckExportStore(
 			t.Fatal(err)
 		}
 		singleFile := storeFromURI(ctx, t, appendPath(t, storeURI, testingFilename), clientFactory,
-			user, ie, kvDB, testSettings)
+			user, ie, ief, kvDB, testSettings)
 		defer singleFile.Close()
 
 		res, err := singleFile.ReadFile(ctx, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -273,7 +276,7 @@ func CheckExportStore(
 	t.Run("write-single-file-by-uri", func(t *testing.T) {
 		const testingFilename = "B"
 		singleFile := storeFromURI(ctx, t, appendPath(t, storeURI, testingFilename), clientFactory,
-			user, ie, kvDB, testSettings)
+			user, ie, ief, kvDB, testSettings)
 		defer singleFile.Close()
 
 		if err := cloud.WriteFile(ctx, singleFile, "", bytes.NewReader([]byte("bbb"))); err != nil {
@@ -284,8 +287,8 @@ func CheckExportStore(
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -304,7 +307,7 @@ func CheckExportStore(
 		if err := cloud.WriteFile(ctx, s, testingFilename, bytes.NewReader([]byte("aaa"))); err != nil {
 			t.Fatal(err)
 		}
-		singleFile := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		singleFile := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, ief, kvDB, testSettings)
 		defer singleFile.Close()
 
 		// Read a valid file.
@@ -312,8 +315,8 @@ func CheckExportStore(
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer res.Close()
-		content, err := ioutil.ReadAll(res)
+		defer res.Close(ctx)
+		content, err := ioctx.ReadAll(ctx, res)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -344,12 +347,13 @@ func CheckExportStore(
 func CheckListFiles(
 	t *testing.T,
 	storeURI string,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	ie sqlutil.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
 	kvDB *kv.DB,
 	testSettings *cluster.Settings,
 ) {
-	CheckListFilesCanonical(t, storeURI, "", user, ie, kvDB, testSettings)
+	CheckListFilesCanonical(t, storeURI, "", user, ie, ief, kvDB, testSettings)
 }
 
 // CheckListFilesCanonical is like CheckListFiles but takes a canonical prefix
@@ -359,8 +363,9 @@ func CheckListFilesCanonical(
 	t *testing.T,
 	storeURI string,
 	canonical string,
-	user security.SQLUsername,
+	user username.SQLUsername,
 	ie sqlutil.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
 	kvDB *kv.DB,
 	testSettings *cluster.Settings,
 ) {
@@ -374,7 +379,7 @@ func CheckListFilesCanonical(
 
 	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
 	for _, fileName := range fileNames {
-		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, ief, kvDB, testSettings)
 		if err := cloud.WriteFile(ctx, file, fileName, bytes.NewReader([]byte("bbb"))); err != nil {
 			t.Fatal(err)
 		}
@@ -462,7 +467,7 @@ func CheckListFilesCanonical(
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				s := storeFromURI(ctx, t, tc.uri, clientFactory, user, ie, kvDB, testSettings)
+				s := storeFromURI(ctx, t, tc.uri, clientFactory, user, ie, ief, kvDB, testSettings)
 				var actual []string
 				require.NoError(t, s.List(ctx, tc.prefix, tc.delimiter, func(f string) error {
 					actual = append(actual, f)
@@ -475,7 +480,7 @@ func CheckListFilesCanonical(
 	})
 
 	for _, fileName := range fileNames {
-		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, kvDB, testSettings)
+		file := storeFromURI(ctx, t, storeURI, clientFactory, user, ie, ief, kvDB, testSettings)
 		if err := file.Delete(ctx, fileName); err != nil {
 			t.Fatal(err)
 		}
@@ -487,15 +492,19 @@ func uploadData(
 	t *testing.T,
 	testSettings *cluster.Settings,
 	rnd *rand.Rand,
-	dest roachpb.ExternalStorage,
+	dest cloudpb.ExternalStorage,
 	basename string,
 ) ([]byte, func()) {
 	data := randutil.RandBytes(rnd, 16<<20)
 	ctx := context.Background()
 
-	s, err := cloud.MakeExternalStorage(
-		ctx, dest, base.ExternalIODirConfig{}, testSettings,
-		nil, nil, nil)
+	s, err := cloud.MakeExternalStorage(ctx, dest, base.ExternalIODirConfig{}, testSettings,
+		nil, /* blobClientFactory */
+		nil, /* ie */
+		nil, /* ief */
+		nil, /* kvDB */
+		nil, /* limiters */
+	)
 	require.NoError(t, err)
 	require.NoError(t, cloud.WriteFile(ctx, s, basename, bytes.NewReader(data)))
 	return data, func() {
@@ -507,7 +516,7 @@ func uploadData(
 // CheckAntagonisticRead checks an external storage is able to perform reads if
 // the HTTP client's dialer artificially degrades its connections.
 func CheckAntagonisticRead(
-	t *testing.T, conf roachpb.ExternalStorage, testSettings *cluster.Settings,
+	t *testing.T, conf cloudpb.ExternalStorage, testSettings *cluster.Settings,
 ) {
 	rnd, _ := randutil.NewTestRand()
 
@@ -534,16 +543,62 @@ func CheckAntagonisticRead(
 	}()
 
 	ctx := context.Background()
-	s, err := cloud.MakeExternalStorage(
-		ctx, conf, base.ExternalIODirConfig{}, testSettings,
-		nil, nil, nil)
+	s, err := cloud.MakeExternalStorage(ctx, conf, base.ExternalIODirConfig{}, testSettings,
+		nil, /* blobClientFactory */
+		nil, /* ie */
+		nil, /* ief */
+		nil, /* kvDB */
+		nil, /* limiters */
+	)
 	require.NoError(t, err)
 	defer s.Close()
 
 	stream, err := s.ReadFile(ctx, basename)
 	require.NoError(t, err)
-	defer stream.Close()
-	read, err := ioutil.ReadAll(stream)
+	defer stream.Close(ctx)
+	read, err := ioctx.ReadAll(ctx, stream)
 	require.NoError(t, err)
 	require.Equal(t, data, read)
+}
+
+// CheckNoPermission checks that we do not have permission to list the external
+// storage at storeURI.
+func CheckNoPermission(
+	t *testing.T,
+	storeURI string,
+	user username.SQLUsername,
+	ie sqlutil.InternalExecutor,
+	ief sqlutil.InternalExecutorFactory,
+	kvDB *kv.DB,
+	testSettings *cluster.Settings,
+) {
+	ioConf := base.ExternalIODirConfig{}
+	ctx := context.Background()
+
+	conf, err := cloud.ExternalStorageConfFromURI(storeURI, user)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientFactory := blobs.TestBlobServiceClient(testSettings.ExternalIODir)
+	s, err := cloud.MakeExternalStorage(ctx, conf, ioConf, testSettings, clientFactory, ie, ief, kvDB, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	err = s.List(ctx, "", "", nil)
+	if err == nil {
+		t.Fatalf("expected error when listing %s with no permissions", storeURI)
+	}
+
+	require.Regexp(t, "(failed|unable) to list", err)
+}
+
+// IsImplicitAuthConfigured returns true if the `GOOGLE_APPLICATION_CREDENTIALS`
+// environment variable is set. This env variable points to the `keys.json` file
+// that is used for implicit authentication.
+func IsImplicitAuthConfigured() bool {
+	credentials := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	return credentials != ""
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 )
 
 // Cluster is the interface through which a given roachtest interacts with the
@@ -39,7 +40,7 @@ type Cluster interface {
 	Get(ctx context.Context, l *logger.Logger, src, dest string, opts ...option.Option) error
 	Put(ctx context.Context, src, dest string, opts ...option.Option)
 	PutE(ctx context.Context, l *logger.Logger, src, dest string, opts ...option.Option) error
-	PutLibraries(ctx context.Context, libraryDir string) error
+	PutLibraries(ctx context.Context, libraryDir string, libraries []string) error
 	Stage(
 		ctx context.Context, l *logger.Logger, application, versionOrSHA, dir string, opts ...option.Option,
 	) error
@@ -72,6 +73,7 @@ type Cluster interface {
 
 	Conn(ctx context.Context, l *logger.Logger, node int) *gosql.DB
 	ConnE(ctx context.Context, l *logger.Logger, node int) (*gosql.DB, error)
+	ConnEAsUser(ctx context.Context, l *logger.Logger, node int, user string) (*gosql.DB, error)
 
 	// URLs for the Admin UI.
 
@@ -105,20 +107,15 @@ type Cluster interface {
 	Spec() spec.ClusterSpec
 	Name() string
 	IsLocal() bool
+	IsSecure() bool
 
 	// Deleting CockroachDB data and logs on nodes.
 
 	WipeE(ctx context.Context, l *logger.Logger, opts ...option.Option) error
 	Wipe(ctx context.Context, opts ...option.Option)
 
-	// Toggling encryption-at-rest settings for starting CockroachDB.
-
-	EncryptAtRandom(on bool)
-	EncryptDefault(on bool)
-
 	// Internal niche tools.
 
-	Reset(ctx context.Context, l *logger.Logger) error
 	Reformat(ctx context.Context, l *logger.Logger, node option.NodeListOption, filesystem string) error
 	Install(
 		ctx context.Context, l *logger.Logger, nodes option.NodeListOption, software ...string,
@@ -128,8 +125,13 @@ type Cluster interface {
 	// These should be removed over time.
 
 	MakeNodes(opts ...option.Option) string
-	CheckReplicaDivergenceOnDB(context.Context, *logger.Logger, *gosql.DB) error
 	GitClone(
 		ctx context.Context, l *logger.Logger, src, dest, branch string, node option.NodeListOption,
 	) error
+
+	FetchTimeseriesData(ctx context.Context, l *logger.Logger) error
+	RefetchCertsFromNode(ctx context.Context, node int) error
+
+	StartGrafana(ctx context.Context, l *logger.Logger, promCfg *prometheus.Config) error
+	StopGrafana(ctx context.Context, l *logger.Logger, dumpDir string) error
 }

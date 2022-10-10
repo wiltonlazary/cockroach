@@ -18,10 +18,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/row"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -34,7 +36,7 @@ type inputStatCollector struct {
 }
 
 var _ execinfra.RowSource = &inputStatCollector{}
-var _ execinfra.OpNode = &inputStatCollector{}
+var _ execopnode.OpNode = &inputStatCollector{}
 
 // newInputStatCollector creates a new inputStatCollector that wraps the given
 // input.
@@ -46,16 +48,16 @@ func newInputStatCollector(input execinfra.RowSource) *inputStatCollector {
 
 // ChildCount is part of the OpNode interface.
 func (isc *inputStatCollector) ChildCount(verbose bool) int {
-	if _, ok := isc.RowSource.(execinfra.OpNode); ok {
+	if _, ok := isc.RowSource.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
 // Child is part of the OpNode interface.
-func (isc *inputStatCollector) Child(nth int, verbose bool) execinfra.OpNode {
+func (isc *inputStatCollector) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		return isc.RowSource.(execinfra.OpNode)
+		return isc.RowSource.(execopnode.OpNode)
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }
@@ -92,25 +94,21 @@ func newRowFetcherStatCollector(f *row.Fetcher) *rowFetcherStatCollector {
 // StartScan is part of the rowFetcher interface.
 func (c *rowFetcherStatCollector) StartScan(
 	ctx context.Context,
-	txn *kv.Txn,
 	spans roachpb.Spans,
+	spanIDs []int,
 	batchBytesLimit rowinfra.BytesLimit,
 	limitHint rowinfra.RowLimit,
-	traceKV bool,
-	forceProductionKVBatchSize bool,
 ) error {
 	start := timeutil.Now()
-	err := c.fetcher.StartScan(ctx, txn, spans, batchBytesLimit, limitHint, traceKV, forceProductionKVBatchSize)
+	err := c.fetcher.StartScan(ctx, spans, spanIDs, batchBytesLimit, limitHint)
 	c.startScanStallTime += timeutil.Since(start)
 	return err
 }
 
 // StartScanFrom is part of the rowFetcher interface.
-func (c *rowFetcherStatCollector) StartScanFrom(
-	ctx context.Context, f row.KVBatchFetcher, traceKV bool,
-) error {
+func (c *rowFetcherStatCollector) StartScanFrom(ctx context.Context, f row.KVBatchFetcher) error {
 	start := timeutil.Now()
-	err := c.fetcher.StartScanFrom(ctx, f, traceKV)
+	err := c.fetcher.StartScanFrom(ctx, f)
 	c.startScanStallTime += timeutil.Since(start)
 	return err
 }
@@ -124,26 +122,25 @@ func (c *rowFetcherStatCollector) StartInconsistentScan(
 	spans roachpb.Spans,
 	batchBytesLimit rowinfra.BytesLimit,
 	limitHint rowinfra.RowLimit,
-	traceKV bool,
-	forceProductionKVBatchSize bool,
+	qualityOfService sessiondatapb.QoSLevel,
 ) error {
 	start := timeutil.Now()
 	err := c.fetcher.StartInconsistentScan(
-		ctx, db, initialTimestamp, maxTimestampAge, spans, batchBytesLimit, limitHint, traceKV, forceProductionKVBatchSize,
+		ctx, db, initialTimestamp, maxTimestampAge, spans, batchBytesLimit, limitHint, qualityOfService,
 	)
 	c.startScanStallTime += timeutil.Since(start)
 	return err
 }
 
 // NextRow is part of the rowFetcher interface.
-func (c *rowFetcherStatCollector) NextRow(ctx context.Context) (rowenc.EncDatumRow, error) {
+func (c *rowFetcherStatCollector) NextRow(ctx context.Context) (rowenc.EncDatumRow, int, error) {
 	start := timeutil.Now()
-	row, err := c.fetcher.NextRow(ctx)
+	row, spanID, err := c.fetcher.NextRow(ctx)
 	if row != nil {
 		c.stats.NumTuples.Add(1)
 	}
 	c.stats.WaitTime.Add(timeutil.Since(start))
-	return row, err
+	return row, spanID, err
 }
 
 // NextRowInto is part of the rowFetcher interface.
@@ -159,11 +156,6 @@ func (c *rowFetcherStatCollector) NextRowInto(
 	return ok, err
 }
 
-// PartialKey is part of the rowFetcher interface.
-func (c *rowFetcherStatCollector) PartialKey(nCols int) (roachpb.Key, error) {
-	return c.fetcher.PartialKey(nCols)
-}
-
 func (c *rowFetcherStatCollector) Reset() {
 	c.fetcher.Reset()
 }
@@ -171,6 +163,11 @@ func (c *rowFetcherStatCollector) Reset() {
 // GetBytesRead is part of the rowFetcher interface.
 func (c *rowFetcherStatCollector) GetBytesRead() int64 {
 	return c.fetcher.GetBytesRead()
+}
+
+// GetBatchRequestsIssued is part of the rowFetcher interface.
+func (c *rowFetcherStatCollector) GetBatchRequestsIssued() int64 {
+	return c.fetcher.GetBatchRequestsIssued()
 }
 
 // Close is part of the rowFetcher interface.

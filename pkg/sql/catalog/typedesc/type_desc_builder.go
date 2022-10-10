@@ -11,13 +11,13 @@
 package typedesc
 
 import (
-	"context"
-
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
+	"github.com/cockroachdb/errors"
 )
 
 // TypeDescriptorBuilder is an extension of catalog.DescriptorBuilder
@@ -30,20 +30,52 @@ type TypeDescriptorBuilder interface {
 }
 
 type typeDescriptorBuilder struct {
-	original      *descpb.TypeDescriptor
-	maybeModified *descpb.TypeDescriptor
-
-	changed bool
+	original             *descpb.TypeDescriptor
+	maybeModified        *descpb.TypeDescriptor
+	mvccTimestamp        hlc.Timestamp
+	isUncommittedVersion bool
+	changes              catalog.PostDeserializationChanges
+	// This is the raw bytes (tag + data) of the type descriptor in storage.
+	rawBytesInStorage []byte
 }
 
 var _ TypeDescriptorBuilder = &typeDescriptorBuilder{}
 
-// NewBuilder creates a new catalog.DescriptorBuilder object for building
-// type descriptors.
+// NewBuilder returns a new TypeDescriptorBuilder instance by delegating to
+// NewBuilderWithMVCCTimestamp with an empty MVCC timestamp.
+//
+// Callers must assume that the given protobuf has already been treated with the
+// MVCC timestamp beforehand.
 func NewBuilder(desc *descpb.TypeDescriptor) TypeDescriptorBuilder {
-	return &typeDescriptorBuilder{
-		original: protoutil.Clone(desc).(*descpb.TypeDescriptor),
+	return NewBuilderWithMVCCTimestamp(desc, hlc.Timestamp{})
+}
+
+// NewBuilderWithMVCCTimestamp creates a new TypeDescriptorBuilder instance
+// for building table descriptors.
+func NewBuilderWithMVCCTimestamp(
+	desc *descpb.TypeDescriptor, mvccTimestamp hlc.Timestamp,
+) TypeDescriptorBuilder {
+	return newBuilder(
+		desc,
+		mvccTimestamp,
+		false, /* isUncommittedVersion */
+		catalog.PostDeserializationChanges{},
+	)
+}
+
+func newBuilder(
+	desc *descpb.TypeDescriptor,
+	mvccTimestamp hlc.Timestamp,
+	isUncommittedVersion bool,
+	changes catalog.PostDeserializationChanges,
+) TypeDescriptorBuilder {
+	b := &typeDescriptorBuilder{
+		original:             protoutil.Clone(desc).(*descpb.TypeDescriptor),
+		mvccTimestamp:        mvccTimestamp,
+		isUncommittedVersion: isUncommittedVersion,
+		changes:              changes,
 	}
+	return b
 }
 
 // DescriptorType implements the catalog.DescriptorBuilder interface.
@@ -53,18 +85,44 @@ func (tdb *typeDescriptorBuilder) DescriptorType() catalog.DescriptorType {
 
 // RunPostDeserializationChanges implements the catalog.DescriptorBuilder
 // interface.
-func (tdb *typeDescriptorBuilder) RunPostDeserializationChanges(
-	_ context.Context, _ catalog.DescGetter,
-) error {
+func (tdb *typeDescriptorBuilder) RunPostDeserializationChanges() (err error) {
+	defer func() {
+		err = errors.Wrapf(err, "type %q (%d)", tdb.original.Name, tdb.original.ID)
+	}()
+	// Set the ModificationTime field before doing anything else.
+	// Other changes may depend on it.
+	mustSetModTime, err := descpb.MustSetModificationTime(
+		tdb.original.ModificationTime, tdb.mvccTimestamp, tdb.original.Version,
+	)
+	if err != nil {
+		return err
+	}
 	tdb.maybeModified = protoutil.Clone(tdb.original).(*descpb.TypeDescriptor)
-	tdb.changed = catprivilege.MaybeFixPrivileges(
+	if mustSetModTime {
+		tdb.maybeModified.ModificationTime = tdb.mvccTimestamp
+		tdb.changes.Add(catalog.SetModTimeToMVCCTimestamp)
+	}
+	fixedPrivileges := catprivilege.MaybeFixPrivileges(
 		&tdb.maybeModified.Privileges,
 		tdb.maybeModified.GetParentID(),
 		tdb.maybeModified.GetParentSchemaID(),
 		privilege.Type,
 		tdb.maybeModified.GetName(),
 	)
+	if fixedPrivileges {
+		tdb.changes.Add(catalog.UpgradedPrivileges)
+	}
 	return nil
+}
+
+// RunRestoreChanges implements the catalog.DescriptorBuilder interface.
+func (tdb *typeDescriptorBuilder) RunRestoreChanges(_ func(id descpb.ID) catalog.Descriptor) error {
+	return nil
+}
+
+// SetRawBytesInStorage implements the catalog.DescriptorBuilder interface.
+func (tdb *typeDescriptorBuilder) SetRawBytesInStorage(rawBytes []byte) {
+	tdb.rawBytesInStorage = append([]byte(nil), rawBytes...) // deep-copy
 }
 
 // BuildImmutable implements the catalog.DescriptorBuilder interface.
@@ -78,7 +136,8 @@ func (tdb *typeDescriptorBuilder) BuildImmutableType() catalog.TypeDescriptor {
 	if desc == nil {
 		desc = tdb.original
 	}
-	imm := makeImmutable(desc)
+	imm := makeImmutable(desc, tdb.isUncommittedVersion, tdb.changes)
+	imm.rawBytesInStorage = append([]byte(nil), tdb.rawBytesInStorage...) // deep-copy
 	return &imm
 }
 
@@ -93,11 +152,14 @@ func (tdb *typeDescriptorBuilder) BuildExistingMutableType() *Mutable {
 	if tdb.maybeModified == nil {
 		tdb.maybeModified = protoutil.Clone(tdb.original).(*descpb.TypeDescriptor)
 	}
-	clusterVersion := makeImmutable(tdb.original)
+	mutableType := makeImmutable(tdb.maybeModified,
+		false /* isUncommitedVersion */, tdb.changes)
+	mutableType.rawBytesInStorage = append([]byte(nil), tdb.rawBytesInStorage...) // deep-copy
+	clusterVersion := makeImmutable(tdb.original,
+		false /* isUncommitedVersion */, catalog.PostDeserializationChanges{})
 	return &Mutable{
-		immutable:      makeImmutable(tdb.maybeModified),
+		immutable:      mutableType,
 		ClusterVersion: &clusterVersion,
-		changed:        tdb.changed,
 	}
 }
 
@@ -109,14 +171,27 @@ func (tdb *typeDescriptorBuilder) BuildCreatedMutable() catalog.MutableDescripto
 // BuildCreatedMutableType returns a mutable descriptor for a type
 // which is in the process of being created.
 func (tdb *typeDescriptorBuilder) BuildCreatedMutableType() *Mutable {
+	desc := tdb.maybeModified
+	if desc == nil {
+		desc = tdb.original
+	}
+	createdType := makeImmutable(desc, tdb.isUncommittedVersion, tdb.changes)
+	createdType.rawBytesInStorage = append([]byte(nil), tdb.rawBytesInStorage...) // deep-copy
 	return &Mutable{
-		immutable: makeImmutable(tdb.original),
-		changed:   tdb.changed,
+		immutable: createdType,
 	}
 }
 
-func makeImmutable(desc *descpb.TypeDescriptor) immutable {
-	immutDesc := immutable{TypeDescriptor: *desc}
+func makeImmutable(
+	desc *descpb.TypeDescriptor,
+	isUncommittedVersion bool,
+	changes catalog.PostDeserializationChanges,
+) immutable {
+	immutDesc := immutable{
+		TypeDescriptor:       *desc,
+		isUncommittedVersion: isUncommittedVersion,
+		changes:              changes,
+	}
 
 	// Initialize metadata specific to the TypeDescriptor kind.
 	switch immutDesc.Kind {

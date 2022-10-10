@@ -11,19 +11,31 @@ package streamclient
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl"
+	"github.com/cockroachdb/cockroach/pkg/ccl/streamingccl/streampb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/streaming"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 type testStreamClient struct{}
 
 var _ Client = testStreamClient{}
+
+// Dial implements Client interface.
+func (sc testStreamClient) Dial(ctx context.Context) error {
+	return nil
+}
 
 // Create implements the Client interface.
 func (sc testStreamClient) Create(
@@ -34,21 +46,21 @@ func (sc testStreamClient) Create(
 
 // Plan implements the Client interface.
 func (sc testStreamClient) Plan(ctx context.Context, ID streaming.StreamID) (Topology, error) {
-	return Topology([]PartitionInfo{
-		{SrcAddr: streamingccl.PartitionAddress("test://host1")},
-		{SrcAddr: streamingccl.PartitionAddress("test://host2")},
-	}), nil
+	return Topology{
+		{SrcAddr: "test://host1"},
+		{SrcAddr: "test://host2"},
+	}, nil
 }
 
 // Heartbeat implements the Client interface.
 func (sc testStreamClient) Heartbeat(
 	ctx context.Context, ID streaming.StreamID, _ hlc.Timestamp,
-) error {
-	return nil
+) (streampb.StreamReplicationStatus, error) {
+	return streampb.StreamReplicationStatus{}, nil
 }
 
 // Close implements the Client interface.
-func (sc testStreamClient) Close() error {
+func (sc testStreamClient) Close(ctx context.Context) error {
 	return nil
 }
 
@@ -64,14 +76,26 @@ func (sc testStreamClient) Subscribe(
 		},
 	}
 
+	sampleResolvedSpan := jobspb.ResolvedSpan{
+		Span:      roachpb.Span{Key: sampleKV.Key, EndKey: sampleKV.Key.Next()},
+		Timestamp: hlc.Timestamp{WallTime: 100},
+	}
+
 	events := make(chan streamingccl.Event, 2)
 	events <- streamingccl.MakeKVEvent(sampleKV)
-	events <- streamingccl.MakeCheckpointEvent(hlc.Timestamp{WallTime: 100})
+	events <- streamingccl.MakeCheckpointEvent([]jobspb.ResolvedSpan{sampleResolvedSpan})
 	close(events)
 
 	return &testStreamSubscription{
 		eventCh: events,
 	}, nil
+}
+
+// Complete implements the streamclient.Client interface.
+func (sc testStreamClient) Complete(
+	ctx context.Context, streamID streaming.StreamID, successfulIngestion bool,
+) error {
+	return nil
 }
 
 type testStreamSubscription struct {
@@ -93,15 +117,65 @@ func (t testStreamSubscription) Err() error {
 	return nil
 }
 
+func TestGetFirstActiveClient(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	client := GetRandomStreamClientSingletonForTesting()
+	defer func() {
+		require.NoError(t, client.Close(context.Background()))
+	}()
+
+	streamAddresses := []string{
+		"randomgen://test0/",
+		"<invalid-url-test1>",
+		"randomgen://test2/",
+		"invalidScheme://test3",
+		"randomgen://test4/",
+		"randomgen://test5/",
+		"randomgen://test6/",
+	}
+	addressDialCount := map[string]int{}
+	for _, addr := range streamAddresses {
+		addressDialCount[addr] = 0
+	}
+
+	// Track dials and error for all but test3 and test4
+	client.RegisterDialInterception(func(streamURL *url.URL) error {
+		addr := streamURL.String()
+		addressDialCount[addr]++
+		if addr != streamAddresses[3] && addr != streamAddresses[4] {
+			return errors.Errorf("injected dial error")
+		}
+		return nil
+	})
+
+	activeClient, err := GetFirstActiveClient(context.Background(), streamAddresses)
+	require.NoError(t, err)
+
+	// Should've dialed the valid schemes up to the 5th one where it should've
+	// succeeded
+	require.Equal(t, 1, addressDialCount[streamAddresses[0]])
+	require.Equal(t, 0, addressDialCount[streamAddresses[1]])
+	require.Equal(t, 1, addressDialCount[streamAddresses[2]])
+	require.Equal(t, 0, addressDialCount[streamAddresses[3]])
+	require.Equal(t, 1, addressDialCount[streamAddresses[4]])
+	require.Equal(t, 0, addressDialCount[streamAddresses[5]])
+	require.Equal(t, 0, addressDialCount[streamAddresses[6]])
+
+	// The 5th should've succeded as it was a valid scheme and succeeded Dial
+	require.Equal(t, activeClient.(*RandomStreamClient).streamURL.String(), streamAddresses[4])
+}
+
 // ExampleClientUsage serves as documentation to indicate how a stream
 // client could be used.
 func ExampleClient() {
 	client := testStreamClient{}
+	ctx := context.Background()
 	defer func() {
-		_ = client.Close()
+		_ = client.Close(ctx)
 	}()
 
-	id, err := client.Create(context.Background(), roachpb.MakeTenantID(1))
+	id, err := client.Create(ctx, roachpb.MakeTenantID(1))
 	if err != nil {
 		panic(err)
 	}
@@ -113,7 +187,7 @@ func ExampleClient() {
 
 	done := make(chan struct{})
 
-	grp := ctxgroup.WithContext(context.Background())
+	grp := ctxgroup.WithContext(ctx)
 	grp.GoCtx(func(ctx context.Context) error {
 		ticker := time.NewTicker(time.Second * 30)
 		for {
@@ -125,7 +199,7 @@ func ExampleClient() {
 				ts := ingested.ts
 				ingested.Unlock()
 
-				if err := client.Heartbeat(ctx, id, ts); err != nil {
+				if _, err := client.Heartbeat(ctx, id, ts); err != nil {
 					return err
 				}
 			}
@@ -138,14 +212,14 @@ func ExampleClient() {
 		ts := ingested.ts
 		ingested.Unlock()
 
-		topology, err := client.Plan(context.Background(), id)
+		topology, err := client.Plan(ctx, id)
 		if err != nil {
 			panic(err)
 		}
 
 		for _, partition := range topology {
 			// TODO(dt): use Subscribe helper and partition.SrcAddr
-			sub, err := client.Subscribe(context.Background(), id, partition.SubscriptionToken, ts)
+			sub, err := client.Subscribe(ctx, id, partition.SubscriptionToken, ts)
 			if err != nil {
 				panic(err)
 			}
@@ -157,14 +231,24 @@ func ExampleClient() {
 				switch event.Type() {
 				case streamingccl.KVEvent:
 					kv := event.GetKV()
-					fmt.Printf("%s->%s@%d\n", kv.Key.String(), string(kv.Value.RawBytes), kv.Value.Timestamp.WallTime)
+					fmt.Printf("kv: %s->%s@%d\n", kv.Key.String(), string(kv.Value.RawBytes), kv.Value.Timestamp.WallTime)
+				case streamingccl.SSTableEvent:
+					sst := event.GetSSTable()
+					fmt.Printf("sst: %s->%s@%d\n", sst.Span.String(), string(sst.Data), sst.WriteTS.WallTime)
+				case streamingccl.DeleteRangeEvent:
+					delRange := event.GetDeleteRange()
+					fmt.Printf("delRange: %s@%d\n", delRange.Span.String(), delRange.Timestamp.WallTime)
 				case streamingccl.CheckpointEvent:
 					ingested.Lock()
-					ingested.ts.Forward(*event.GetResolved())
+					minTS := hlc.MaxTimestamp
+					for _, rs := range event.GetResolvedSpans() {
+						if rs.Timestamp.Less(minTS) {
+							minTS = rs.Timestamp
+						}
+					}
+					ingested.ts.Forward(minTS)
 					ingested.Unlock()
-					fmt.Printf("resolved %d\n", event.GetResolved().WallTime)
-				case streamingccl.GenerationEvent:
-					fmt.Printf("received generation event")
+					fmt.Printf("resolved %d\n", minTS.WallTime)
 				default:
 					panic(fmt.Sprintf("unexpected event type %v", event.Type()))
 				}
@@ -178,8 +262,8 @@ func ExampleClient() {
 	}
 
 	// Output:
-	// "key_1"->value_1@1
+	// kv: "key_1"->value_1@1
 	// resolved 100
-	// "key_1"->value_1@1
+	// kv: "key_1"->value_1@1
 	// resolved 100
 }

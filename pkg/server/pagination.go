@@ -15,7 +15,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"reflect"
 	"sort"
@@ -174,13 +174,13 @@ func (p *paginationState) paginate(
 // <nodesQueried>|<inProgressNode>|<inProgressNodeIndex>|<nodesToQuery>
 //
 // Where:
-//  - nodesQueried is a comma-separated list of node IDs that have already been
-//    queried (matching p.nodesQueried).
-//  - inProgressNode is the ID of the node where the cursor is currently at.
-//  - inProgressNodeIndex is the index of the response from inProgressNode's
-//    node-local function where the cursor is currently at.
-//  - nodesToQuery is a comma-separated list of node IDs of nodes that are yet
-//    to be queried.
+//   - nodesQueried is a comma-separated list of node IDs that have already been
+//     queried (matching p.nodesQueried).
+//   - inProgressNode is the ID of the node where the cursor is currently at.
+//   - inProgressNodeIndex is the index of the response from inProgressNode's
+//     node-local function where the cursor is currently at.
+//   - nodesToQuery is a comma-separated list of node IDs of nodes that are yet
+//     to be queried.
 //
 // All node IDs and indices are represented as unsigned 32-bit ints, and
 // comma-separated lists are allowed to have trailing commas. The character
@@ -189,7 +189,7 @@ func (p *paginationState) UnmarshalText(text []byte) error {
 	decoder := base64.NewDecoder(base64.URLEncoding, bytes.NewReader(text))
 	var decodedText []byte
 	var err error
-	if decodedText, err = ioutil.ReadAll(decoder); err != nil {
+	if decodedText, err = io.ReadAll(decoder); err != nil {
 		return err
 	}
 	parts := strings.Split(string(decodedText), "|")

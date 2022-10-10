@@ -8,7 +8,9 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-/* Package client_test tests clients against a fully-instantiated
+/*
+	Package client_test tests clients against a fully-instantiated
+
 cockroach cluster (a single node, but bootstrapped, gossiped, etc.).
 */
 package kv_test
@@ -28,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -43,12 +45,13 @@ import (
 )
 
 // testUser has valid client certs.
-var testUser = security.TestUser
+var testUser = username.TestUser
 
 // checkKVs verifies that a KeyValue slice contains the expected keys and
 // values. The values can be either integers or strings; the expected results
 // are passed as alternating keys and values, e.g:
-//   checkScanResult(t, result, key1, val1, key2, val2)
+//
+//	checkScanResult(t, result, key1, val1, key2, val2)
 func checkKVs(t *testing.T, kvs []kv.KeyValue, expected ...interface{}) {
 	t.Helper()
 	expLen := len(expected) / 2
@@ -166,9 +169,9 @@ func TestClientRetryNonTxn(t *testing.T) {
 				// We must try the non-txn put or get in a goroutine because
 				// it might have to retry and will only succeed immediately in
 				// the event we can push.
-				go func() {
+				go func(i int, args roachpb.Request) {
 					var err error
-					if _, ok := test.args.(*roachpb.GetRequest); ok {
+					if _, ok := args.(*roachpb.GetRequest); ok {
 						_, err = db.Get(nonTxnCtx, key)
 					} else {
 						err = db.Put(nonTxnCtx, key, "value")
@@ -179,8 +182,8 @@ func TestClientRetryNonTxn(t *testing.T) {
 					}
 					doneCall <- errors.Wrapf(
 						err, "%d: expected success on non-txn call to %s",
-						i, test.args.Method())
-				}()
+						i, args.Method())
+				}(i, test.args)
 				// Block until the non-transactional client has pushed us at
 				// least once.
 				testutils.SucceedsSoon(t, func() error {
@@ -767,7 +770,7 @@ func TestReadConsistencyTypes(t *testing.T) {
 					return ba.CreateReply(), nil
 				})
 
-			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 			db := kv.NewDB(log.MakeTestingAmbientCtxWithNewTracer(), factory, clock, stopper)
 
 			prepWithRC := func() *kv.Batch {
@@ -910,7 +913,7 @@ func TestNodeIDAndObservedTimestamps(t *testing.T) {
 		})
 
 	setup := func(nodeID roachpb.NodeID) *kv.DB {
-		clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+		clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 		dbCtx := kv.DefaultDBContext(stopper)
 		var c base.NodeIDContainer
 		if nodeID != 0 {

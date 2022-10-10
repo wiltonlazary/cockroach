@@ -45,6 +45,7 @@ func registerSchemaChangeRandomLoad(r registry.Registry) {
 			spec.Geo(),
 			spec.Zones(geoZonesStr),
 		),
+		NativeLibs: registry.LibGEOS,
 		// This is set while development is still happening on the workload and we
 		// fix (or bypass) minor schema change bugs that are discovered.
 		NonReleaseBlocker: true,
@@ -84,9 +85,11 @@ func registerRandomLoadBenchSpec(r registry.Registry, b randomLoadBenchSpec) {
 	name := strings.Join(nameParts, "/")
 
 	r.Add(registry.TestSpec{
-		Name:    name,
-		Owner:   registry.OwnerSQLSchema,
-		Cluster: r.MakeClusterSpec(b.Nodes),
+		Name:       name,
+		Owner:      registry.OwnerSQLSchema,
+		Cluster:    r.MakeClusterSpec(b.Nodes),
+		NativeLibs: registry.LibGEOS,
+		Skip:       "https://github.com/cockroachdb/cockroach/issues/56230",
 		// This is set while development is still happening on the workload and we
 		// fix (or bypass) minor schema change bugs that are discovered.
 		NonReleaseBlocker: true,

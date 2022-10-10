@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	pbtypes "github.com/gogo/protobuf/types"
@@ -29,8 +29,8 @@ func timestampProto(t *testing.T, ts time.Time) *pbtypes.Timestamp {
 }
 
 func TestValidatePayloadContents(t *testing.T) {
-	now := timeutil.Now().Add(-1 * time.Second)
-	username := security.MakeSQLUsernameFromPreNormalizedString("testuser")
+	now := timeutil.NowNoMono().Add(-1 * time.Second)
+	username := username.MakeSQLUsernameFromPreNormalizedString("testuser")
 	testCases := []struct {
 		description string
 		payload     *sessiondatapb.SessionRevivalToken_Payload
@@ -90,9 +90,10 @@ func TestValidatePayloadContents(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
-			valid, err := validatePayloadContents(tc.payload, username)
-			require.Equal(t, tc.valid, valid)
-			if !valid {
+			err := validatePayloadContents(tc.payload, username)
+			if tc.valid {
+				require.NoError(t, err)
+			} else {
 				require.EqualError(t, err, tc.errorText)
 			}
 		})

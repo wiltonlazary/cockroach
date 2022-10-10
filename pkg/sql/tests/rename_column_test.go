@@ -40,7 +40,7 @@ func TestRenameColumnDuringConcurrentMutation(t *testing.T) {
 
 	const (
 		_ eventType = iota
-		publishDeleteAndWriteOnly
+		publishWriteOnly
 		backfill
 		resume
 	)
@@ -67,7 +67,7 @@ func TestRenameColumnDuringConcurrentMutation(t *testing.T) {
 			Knobs: base.TestingKnobs{
 				SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
 					RunBeforePublishWriteAndDelete: func() {
-						maybeBlockOnEvent(publishDeleteAndWriteOnly)
+						maybeBlockOnEvent(publishWriteOnly)
 					},
 					RunBeforeBackfill: func() error {
 						maybeBlockOnEvent(backfill)
@@ -96,7 +96,7 @@ func TestRenameColumnDuringConcurrentMutation(t *testing.T) {
 		name   string
 		evType eventType
 	}{
-		{"publishDeleteAndWriteOnly", publishDeleteAndWriteOnly},
+		{"publishWriteOnly", publishWriteOnly},
 		{"backfill", backfill},
 		{"resume", resume},
 	} {
@@ -104,6 +104,8 @@ func TestRenameColumnDuringConcurrentMutation(t *testing.T) {
 			eventToBlockOn = testCase.evType
 			dbName := path.Base(t.Name())
 			tdb := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+			tdb.Exec(t, "SET CLUSTER SETTING sql.defaults.use_declarative_schema_changer = 'off';")
+			tdb.Exec(t, "SET use_declarative_schema_changer = 'off';")
 			tdb.Exec(t, "CREATE DATABASE "+dbName)
 			tdb.Exec(t, "CREATE TABLE "+dbName+".foo (i INT PRIMARY KEY)")
 			scDone := make(chan error)

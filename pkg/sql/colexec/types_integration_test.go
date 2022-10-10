@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -44,12 +45,13 @@ func TestSQLTypesIntegration(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings: st,
 		},
@@ -77,7 +79,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 			typs := []*types.T{typ}
 			source := execinfra.NewRepeatableRowSource(typs, rows)
 
-			columnarizer := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, source)
+			columnarizer := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, source)
 
 			c, err := colserde.NewArrowBatchConverter(typs)
 			require.NoError(t, err)
@@ -86,6 +88,7 @@ func TestSQLTypesIntegration(t *testing.T) {
 			arrowOp := newArrowTestOperator(columnarizer, c, r, typs)
 
 			materializer := NewMaterializer(
+				nil, /* allocator */
 				flowCtx,
 				1, /* processorID */
 				colexecargs.OpWithMetaInfo{Root: arrowOp},

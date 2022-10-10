@@ -29,30 +29,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
+	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/errors"
 )
-
-const (
-	// TODO(azhng): currently we do not have the ability to compute a hash for
-	//  query plan. This is currently being worked on by the SQL Queries team.
-	//  Once we are able get consistent hash value from a query plan, we should
-	//  update this.
-	dummyPlanHash = int64(0)
-)
-
-// ErrConcurrentSQLStatsCompaction is reported when two sql stats compaction
-// jobs are issued concurrently. This is a sentinel error.
-var ErrConcurrentSQLStatsCompaction = errors.New("another sql stats compaction job is already running")
 
 // Config is a configuration struct for the persisted SQL stats subsystem.
 type Config struct {
-	Settings         *cluster.Settings
-	InternalExecutor sqlutil.InternalExecutor
-	KvDB             *kv.DB
-	SQLIDContainer   *base.SQLIDContainer
-	JobRegistry      *jobs.Registry
+	Settings                *cluster.Settings
+	InternalExecutor        sqlutil.InternalExecutor
+	InternalExecutorMonitor *mon.BytesMonitor
+	KvDB                    *kv.DB
+	SQLIDContainer          *base.SQLIDContainer
+	JobRegistry             *jobs.Registry
 
 	// Metrics.
 	FlushCounter   *metric.Counter
@@ -104,6 +93,9 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 		scanInterval: defaultScanInterval,
 		jitterFn:     p.jitterInterval,
 	}
+	if cfg.Knobs != nil {
+		p.jobMonitor.testingKnobs.updateCheckInterval = cfg.Knobs.JobMonitorUpdateCheckInterval
+	}
 
 	return p
 }
@@ -112,6 +104,9 @@ func New(cfg *Config, memSQLStats *sslocal.SQLStats) *PersistedSQLStats {
 func (s *PersistedSQLStats) Start(ctx context.Context, stopper *stop.Stopper) {
 	s.startSQLStatsFlushLoop(ctx, stopper)
 	s.jobMonitor.start(ctx, stopper)
+	stopper.AddCloser(stop.CloserFn(func() {
+		s.cfg.InternalExecutorMonitor.Stop(ctx)
+	}))
 }
 
 // GetController returns the controller of the PersistedSQLStats.
@@ -154,10 +149,7 @@ func (s *PersistedSQLStats) startSQLStatsFlushLoop(ctx context.Context, stopper 
 				return
 			}
 
-			enabled := SQLStatsFlushEnabled.Get(&s.cfg.Settings.SV)
-			if enabled {
-				s.Flush(ctx)
-			}
+			s.Flush(ctx)
 		}
 	})
 }
@@ -173,9 +165,24 @@ func (s *PersistedSQLStats) GetNextFlushAt() time.Time {
 	return s.atomic.nextFlushAt.Load().(time.Time)
 }
 
+// GetSQLInstanceID returns the SQLInstanceID.
+func (s *PersistedSQLStats) GetSQLInstanceID() base.SQLInstanceID {
+	return s.cfg.SQLIDContainer.SQLInstanceID()
+}
+
+// GetEnabledSQLInstanceID returns the SQLInstanceID when gateway node is enabled,
+// and zero otherwise.
+func (s *PersistedSQLStats) GetEnabledSQLInstanceID() base.SQLInstanceID {
+	if sqlstats.GatewayNodeEnabled.Get(&s.cfg.Settings.SV) {
+		return s.cfg.SQLIDContainer.SQLInstanceID()
+	}
+	return 0
+}
+
 // nextFlushInterval calculates the wait interval that is between:
 // [(1 - SQLStatsFlushJitter) * SQLStatsFlushInterval),
-//  (1 + SQLStatsFlushJitter) * SQLStatsFlushInterval)]
+//
+//	(1 + SQLStatsFlushJitter) * SQLStatsFlushInterval)]
 func (s *PersistedSQLStats) nextFlushInterval() time.Duration {
 	baseInterval := SQLStatsFlushInterval.Get(&s.cfg.Settings.SV)
 	waitInterval := s.jitterInterval(baseInterval)

@@ -8,7 +8,9 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-/* Package storage_test provides a means of testing store
+/*
+	Package storage_test provides a means of testing store
+
 functionality which depends on a fully-functional KV client. This
 cannot be done within the storage package because of circular
 dependencies.
@@ -31,8 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
-	"github.com/cockroachdb/errors"
-	"github.com/kr/pretty"
+	"github.com/stretchr/testify/require"
 )
 
 // getArgs returns a GetRequest and GetResponse pair addressed to
@@ -45,14 +46,11 @@ func getArgs(key roachpb.Key) *roachpb.GetRequest {
 	}
 }
 
-// putArgs returns a PutRequest and PutResponse pair addressed to
-// the default replica for the specified key / value.
+// putArgs returns a PutRequest for the specified key / value.
 func putArgs(key roachpb.Key, value []byte) *roachpb.PutRequest {
 	return &roachpb.PutRequest{
-		RequestHeader: roachpb.RequestHeader{
-			Key: key,
-		},
-		Value: roachpb.MakeValueFromBytes(value),
+		RequestHeader: roachpb.RequestHeader{Key: key},
+		Value:         roachpb.MakeValueFromBytes(value),
 	}
 }
 
@@ -102,6 +100,15 @@ func heartbeatArgs(
 	}, roachpb.Header{Txn: txn}
 }
 
+func endTxnArgs(txn *roachpb.Transaction, commit bool) (*roachpb.EndTxnRequest, roachpb.Header) {
+	return &roachpb.EndTxnRequest{
+		RequestHeader: roachpb.RequestHeader{
+			Key: txn.Key, // not allowed when going through TxnCoordSender, but we're not
+		},
+		Commit: commit,
+	}, roachpb.Header{Txn: txn}
+}
+
 func pushTxnArgs(
 	pusher, pushee *roachpb.Transaction, pushType roachpb.PushTxnType,
 ) *roachpb.PushTxnRequest {
@@ -135,38 +142,38 @@ func adminTransferLeaseArgs(key roachpb.Key, target roachpb.StoreID) roachpb.Req
 	}
 }
 
-func verifyRangeStats(
-	reader storage.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats,
-) error {
-	ms, err := stateloader.Make(rangeID).LoadMVCCStats(context.Background(), reader)
-	if err != nil {
-		return err
-	}
+func assertRangeStats(
+	t *testing.T, name string, r storage.Reader, rangeID roachpb.RangeID, expMS enginepb.MVCCStats,
+) {
+	t.Helper()
+
+	ms, err := stateloader.Make(rangeID).LoadMVCCStats(context.Background(), r)
+	require.NoError(t, err)
 	// When used with a real wall clock these will not be the same, since it
 	// takes time to load stats.
 	expMS.AgeTo(ms.LastUpdateNanos)
 	// Clear system counts as these are expected to vary.
 	ms.SysBytes, ms.SysCount, ms.AbortSpanBytes = 0, 0, 0
-	if ms != expMS {
-		return errors.Errorf("expected and actual stats differ:\n%s", pretty.Diff(expMS, ms))
-	}
-	return nil
+	require.Equal(t, expMS, ms, "%s: stats differ", name)
 }
 
-func verifyRecomputedStats(
-	reader storage.Reader, d *roachpb.RangeDescriptor, expMS enginepb.MVCCStats, nowNanos int64,
-) error {
-	ms, err := rditer.ComputeStatsForRange(d, reader, nowNanos)
-	if err != nil {
-		return err
-	}
+func assertRecomputedStats(
+	t *testing.T,
+	name string,
+	r storage.Reader,
+	desc *roachpb.RangeDescriptor,
+	expMS enginepb.MVCCStats,
+	nowNanos int64,
+) {
+	t.Helper()
+
+	ms, err := rditer.ComputeStatsForRange(desc, r, nowNanos)
+	require.NoError(t, err)
+
 	// When used with a real wall clock these will not be the same, since it
 	// takes time to load stats.
 	expMS.AgeTo(ms.LastUpdateNanos)
-	if expMS != ms {
-		return fmt.Errorf("expected range's stats to agree with recomputation: got\n%+v\nrecomputed\n%+v", expMS, ms)
-	}
-	return nil
+	require.Equal(t, expMS, ms, "%s: recomputed stats diverge", name)
 }
 
 func waitForTombstone(

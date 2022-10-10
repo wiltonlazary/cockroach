@@ -27,14 +27,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/stmtdiagnostics"
+	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/memzipper"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 )
 
 // setExplainBundleResult sets the result of an EXPLAIN ANALYZE (DEBUG)
-// statement.
+// statement. warnings will be printed out as is in the CLI.
 //
 // Note: bundle.insert() must have been called.
 //
@@ -44,6 +46,7 @@ func setExplainBundleResult(
 	res RestrictedCommandResult,
 	bundle diagnosticsBundle,
 	execCfg *ExecutorConfig,
+	warnings []string,
 ) error {
 	res.ResetStmtType(&tree.ExplainAnalyze{})
 	res.SetColumns(ctx, colinfo.ExplainPlanColumns)
@@ -59,8 +62,8 @@ func setExplainBundleResult(
 			"Statement diagnostics bundle generated. Download from the Admin UI (Advanced",
 			"Debug -> Statement Diagnostics History), via the direct link below, or using",
 			"the SQL shell or command line.",
-			fmt.Sprintf("Admin UI: %s", execCfg.AdminURL()),
-			fmt.Sprintf("Direct link: %s/_admin/v1/stmtbundle/%d", execCfg.AdminURL(), bundle.diagID),
+			fmt.Sprintf("Admin UI: %s", execCfg.NodeInfo.AdminURL()),
+			fmt.Sprintf("Direct link: %s/_admin/v1/stmtbundle/%d", execCfg.NodeInfo.AdminURL(), bundle.diagID),
 			fmt.Sprintf("SQL shell: \\statement-diag download %d", bundle.diagID),
 			fmt.Sprintf("Command line: cockroach statement-diag download %d", bundle.diagID),
 		}
@@ -75,6 +78,10 @@ func setExplainBundleResult(
 			fmt.Sprintf("SQL shell: \\statement-diag download %d", bundle.diagID),
 			fmt.Sprintf("Command line: cockroach statement-diag download %d", bundle.diagID),
 		}
+	}
+	if len(warnings) > 0 {
+		text = append(text, "")
+		text = append(text, warnings...)
 	}
 
 	if err := res.Err(); err != nil {
@@ -118,7 +125,7 @@ func buildStatementBundle(
 	ie *InternalExecutor,
 	plan *planTop,
 	planString string,
-	trace tracing.Recording,
+	trace tracingpb.Recording,
 	placeholders *tree.PlaceholderInfo,
 ) diagnosticsBundle {
 	if plan == nil {
@@ -127,7 +134,7 @@ func buildStatementBundle(
 	b := makeStmtBundleBuilder(db, ie, plan, trace, placeholders)
 
 	b.addStatement()
-	b.addOptPlans()
+	b.addOptPlans(ctx)
 	b.addExecPlan(planString)
 	b.addDistSQLDiagrams()
 	b.addExplainVec()
@@ -152,11 +159,13 @@ func (bundle *diagnosticsBundle) insert(
 	ast tree.Statement,
 	stmtDiagRecorder *stmtdiagnostics.Registry,
 	diagRequestID stmtdiagnostics.RequestID,
+	req stmtdiagnostics.Request,
 ) {
 	var err error
 	bundle.diagID, err = stmtDiagRecorder.InsertStatementDiagnostics(
 		ctx,
 		diagRequestID,
+		req,
 		fingerprint,
 		tree.AsString(ast),
 		bundle.zip,
@@ -176,7 +185,7 @@ type stmtBundleBuilder struct {
 	ie *InternalExecutor
 
 	plan         *planTop
-	trace        tracing.Recording
+	trace        tracingpb.Recording
 	placeholders *tree.PlaceholderInfo
 
 	z memzipper.Zipper
@@ -186,7 +195,7 @@ func makeStmtBundleBuilder(
 	db *kv.DB,
 	ie *InternalExecutor,
 	plan *planTop,
-	trace tracing.Recording,
+	trace tracingpb.Recording,
 	placeholders *tree.PlaceholderInfo,
 ) stmtBundleBuilder {
 	b := stmtBundleBuilder{db: db, ie: ie, plan: plan, trace: trace, placeholders: placeholders}
@@ -229,30 +238,34 @@ func (b *stmtBundleBuilder) addStatement() {
 
 // addOptPlans adds the EXPLAIN (OPT) variants as files opt.txt, opt-v.txt,
 // opt-vv.txt.
-func (b *stmtBundleBuilder) addOptPlans() {
+func (b *stmtBundleBuilder) addOptPlans(ctx context.Context) {
 	if b.plan.mem == nil || b.plan.mem.RootExpr() == nil {
 		// No optimizer plans; an error must have occurred during planning.
+		b.z.AddFile("opt.txt", "no plan")
+		b.z.AddFile("opt-v.txt", "no plan")
+		b.z.AddFile("opt-vv.txt", "no plan")
 		return
 	}
 
 	formatOptPlan := func(flags memo.ExprFmtFlags) string {
-		f := memo.MakeExprFmtCtx(flags, b.plan.mem, b.plan.catalog)
+		f := memo.MakeExprFmtCtx(ctx, flags, b.plan.mem, b.plan.catalog)
 		f.FormatExpr(b.plan.mem.RootExpr())
 		return f.Buffer.String()
 	}
 
 	b.z.AddFile("opt.txt", formatOptPlan(memo.ExprFmtHideAll))
 	b.z.AddFile("opt-v.txt", formatOptPlan(
-		memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes,
+		memo.ExprFmtHideQualifications|memo.ExprFmtHideScalars|memo.ExprFmtHideTypes|memo.ExprFmtHideNotVisibleIndexInfo,
 	))
-	b.z.AddFile("opt-vv.txt", formatOptPlan(memo.ExprFmtHideQualifications))
+	b.z.AddFile("opt-vv.txt", formatOptPlan(memo.ExprFmtHideQualifications|memo.ExprFmtHideNotVisibleIndexInfo))
 }
 
 // addExecPlan adds the EXPLAIN (VERBOSE) plan as file plan.txt.
 func (b *stmtBundleBuilder) addExecPlan(plan string) {
-	if plan != "" {
-		b.z.AddFile("plan.txt", plan)
+	if plan == "" {
+		plan = "no plan"
 	}
+	b.z.AddFile("plan.txt", plan)
 }
 
 func (b *stmtBundleBuilder) addDistSQLDiagrams() {
@@ -274,6 +287,9 @@ func (b *stmtBundleBuilder) addDistSQLDiagrams() {
 			filename = fmt.Sprintf("distsql-%d-%s.html", i+1, d.typ)
 		}
 		b.z.AddFile(filename, contents)
+	}
+	if len(b.plan.distSQLFlowInfos) == 0 {
+		b.z.AddFile("distsql.html", "<body>no execution</body>")
 	}
 }
 
@@ -356,6 +372,7 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 	mem := b.plan.mem
 	if mem == nil {
 		// No optimizer plans; an error must have occurred during planning.
+		b.z.AddFile("schema.sql", "-- no schema collected\n")
 		return
 	}
 	buf.Reset()
@@ -375,9 +392,8 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		return
 	}
 
-	if len(tables) == 0 && len(sequences) == 0 && len(views) == 0 {
-		return
-	}
+	// Note: we do not shortcut out of this function if there is no table/sequence/view to report:
+	// the bundle analysis tool require schema.sql to always be present, even if it's empty.
 
 	first := true
 	blankLine := func() {
@@ -403,6 +419,9 @@ func (b *stmtBundleBuilder) addEnv(ctx context.Context) {
 		if err := c.PrintCreateView(&buf, &views[i]); err != nil {
 			fmt.Fprintf(&buf, "-- error getting schema for view %s: %v\n", views[i].String(), err)
 		}
+	}
+	if buf.Len() == 0 {
+		buf.WriteString("-- there were no objects used in this query\n")
 	}
 	b.z.AddFile("schema.sql", buf.String())
 	for i := range tables {
@@ -474,7 +493,8 @@ func TestingOverrideExplainEnvVersion(ver string) func() {
 }
 
 // PrintVersion appends a row of the form:
-//  -- Version: CockroachDB CCL v20.1.0 ...
+//
+//	-- Version: CockroachDB CCL v20.1.0 ...
 func (c *stmtEnvCollector) PrintVersion(w io.Writer) error {
 	version, err := c.query("SELECT version()")
 	if err != nil {
@@ -502,6 +522,22 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		return boolStr
 	}
 
+	datestyleConv := func(enumVal string) string {
+		n, err := strconv.ParseInt(enumVal, 10, 32)
+		if err != nil || n < 0 || n >= int64(len(dateStyleEnumMap)) {
+			return enumVal
+		}
+		return dateStyleEnumMap[n]
+	}
+
+	intervalstyleConv := func(enumVal string) string {
+		n, err := strconv.ParseInt(enumVal, 10, 32)
+		if err != nil || n < 0 || n >= int64(len(duration.IntervalStyle_name)) {
+			return enumVal
+		}
+		return strings.ToLower(duration.IntervalStyle(n).String())
+	}
+
 	distsqlConv := func(enumVal string) string {
 		n, err := strconv.ParseInt(enumVal, 10, 32)
 		if err != nil {
@@ -525,18 +561,42 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 		clusterSetting settings.NonMaskedSetting
 		convFunc       func(string) string
 	}{
-		{sessionSetting: "reorder_joins_limit", clusterSetting: ReorderJoinsLimitClusterValue},
+		{sessionSetting: "allow_prepare_as_opt_plan"},
+		{sessionSetting: "cost_scans_with_default_col_size", clusterSetting: costScansWithDefaultColSize, convFunc: boolToOnOff},
+		{sessionSetting: "datestyle", clusterSetting: dateStyle, convFunc: datestyleConv},
+		{sessionSetting: "default_int_size", clusterSetting: defaultIntSize},
+		{sessionSetting: "default_transaction_priority"},
+		{sessionSetting: "default_transaction_quality_of_service"},
+		{sessionSetting: "default_transaction_read_only"},
+		{sessionSetting: "default_transaction_use_follower_reads"},
+		{sessionSetting: "disallow_full_table_scans", clusterSetting: disallowFullTableScans, convFunc: boolToOnOff},
+		{sessionSetting: "distsql", clusterSetting: DistSQLClusterExecMode, convFunc: distsqlConv},
+		{sessionSetting: "enable_implicit_select_for_update", clusterSetting: implicitSelectForUpdateClusterMode, convFunc: boolToOnOff},
+		{sessionSetting: "enable_implicit_transaction_for_batch_statements"},
+		{sessionSetting: "enable_insert_fast_path", clusterSetting: insertFastPathClusterMode, convFunc: boolToOnOff},
+		{sessionSetting: "enable_multiple_modifications_of_table"},
 		{sessionSetting: "enable_zigzag_join", clusterSetting: zigzagJoinClusterMode, convFunc: boolToOnOff},
+		{sessionSetting: "expect_and_ignore_not_visible_columns_in_copy"},
+		{sessionSetting: "intervalstyle", clusterSetting: intervalStyle, convFunc: intervalstyleConv},
+		{sessionSetting: "large_full_scan_rows", clusterSetting: largeFullScanRows},
+		{sessionSetting: "locality_optimized_partitioned_index_scan", clusterSetting: localityOptimizedSearchMode, convFunc: boolToOnOff},
+		{sessionSetting: "null_ordered_last"},
+		{sessionSetting: "on_update_rehome_row_enabled", clusterSetting: onUpdateRehomeRowEnabledClusterMode, convFunc: boolToOnOff},
+		{sessionSetting: "opt_split_scan_limit"},
+		{sessionSetting: "optimizer_use_forecasts", convFunc: boolToOnOff},
 		{sessionSetting: "optimizer_use_histograms", clusterSetting: optUseHistogramsClusterMode, convFunc: boolToOnOff},
 		{sessionSetting: "optimizer_use_multicol_stats", clusterSetting: optUseMultiColStatsClusterMode, convFunc: boolToOnOff},
-		{sessionSetting: "locality_optimized_partitioned_index_scan", clusterSetting: localityOptimizedSearchMode, convFunc: boolToOnOff},
-		{sessionSetting: "propagate_input_ordering", clusterSetting: propagateInputOrdering, convFunc: boolToOnOff},
+		{sessionSetting: "optimizer_use_not_visible_indexes"},
+		{sessionSetting: "pg_trgm.similarity_threshold"},
 		{sessionSetting: "prefer_lookup_joins_for_fks", clusterSetting: preferLookupJoinsForFKs, convFunc: boolToOnOff},
-		{sessionSetting: "intervalstyle_enabled", clusterSetting: intervalStyleEnabled, convFunc: boolToOnOff},
-		{sessionSetting: "datestyle_enabled", clusterSetting: dateStyleEnabled, convFunc: boolToOnOff},
-		{sessionSetting: "disallow_full_table_scans", clusterSetting: disallowFullTableScans, convFunc: boolToOnOff},
-		{sessionSetting: "large_full_scan_rows", clusterSetting: largeFullScanRows},
-		{sessionSetting: "distsql", clusterSetting: DistSQLClusterExecMode, convFunc: distsqlConv},
+		{sessionSetting: "propagate_input_ordering", clusterSetting: propagateInputOrdering, convFunc: boolToOnOff},
+		{sessionSetting: "reorder_joins_limit", clusterSetting: ReorderJoinsLimitClusterValue},
+		{sessionSetting: "sql_safe_updates"},
+		{sessionSetting: "testing_optimizer_cost_perturbation"},
+		{sessionSetting: "testing_optimizer_disable_rule_probability"},
+		{sessionSetting: "testing_optimizer_random_seed"},
+		{sessionSetting: "timezone"},
+		{sessionSetting: "unconstrained_non_covering_index_scan_enabled"},
 		{sessionSetting: "vectorize", clusterSetting: VectorizeClusterMode, convFunc: vectorizeConv},
 	}
 
@@ -546,7 +606,16 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 			return err
 		}
 		// Get the default value for the cluster setting.
-		def := s.clusterSetting.EncodedDefault()
+		var def string
+		if s.clusterSetting == nil {
+			if ok, v, _ := getSessionVar(s.sessionSetting, true); ok {
+				if v.GlobalDefault != nil {
+					def = v.GlobalDefault(nil /* *settings.Values */)
+				}
+			}
+		} else {
+			def = s.clusterSetting.EncodedDefault()
+		}
 		if s.convFunc != nil {
 			// If necessary, convert the encoded cluster setting to a session setting
 			// value (e.g.  "true"->"on"), depending on the setting.
@@ -563,6 +632,8 @@ func (c *stmtEnvCollector) PrintSessionSettings(w io.Writer) error {
 }
 
 func (c *stmtEnvCollector) PrintClusterSettings(w io.Writer) error {
+	// TODO(michae2): We should also query system.database_role_settings.
+
 	rows, err := c.ie.QueryBufferedEx(
 		c.ctx,
 		"stmtEnvCollector",

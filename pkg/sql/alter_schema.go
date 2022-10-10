@@ -14,12 +14,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemadesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
@@ -57,10 +57,10 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 	if err != nil {
 		return nil, err
 	}
-	schema, err := p.Descriptors().GetSchemaByName(ctx, p.txn, db,
+	schema, err := p.Descriptors().GetImmutableSchemaByName(ctx, p.txn, db,
 		string(n.Schema.SchemaName), tree.SchemaLookupFlags{
-			Required:       true,
-			RequireMutable: true,
+			Required:    true,
+			AvoidLeased: true,
 		})
 	if err != nil {
 		return nil, err
@@ -73,7 +73,11 @@ func (p *planner) AlterSchema(ctx context.Context, n *tree.AlterSchema) (planNod
 	case catalog.SchemaPublic, catalog.SchemaVirtual, catalog.SchemaTemporary:
 		return nil, pgerror.Newf(pgcode.InvalidSchemaName, "cannot modify schema %q", n.Schema.String())
 	case catalog.SchemaUserDefined:
-		desc := schema.(*schemadesc.Mutable)
+		flags := p.CommonLookupFlagsRequired()
+		desc, err := p.Descriptors().GetMutableSchemaByID(ctx, p.txn, schema.GetID(), flags)
+		if err != nil {
+			return nil, err
+		}
 		// The user must be a superuser or the owner of the schema to modify it.
 		hasAdmin, err := p.HasAdminRole(ctx)
 		if err != nil {
@@ -105,6 +109,27 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 			return err
 		}
 
+		// Ensure that the new name is a valid schema name.
+		if err := schemadesc.IsSchemaNameValid(newName); err != nil {
+			return err
+		}
+
+		// Check that there isn't a name collision with the new name.
+		found, _, err := schemaExists(params.ctx, params.p.txn, params.p.Descriptors(), n.db.ID, newName)
+		if err != nil {
+			return err
+		}
+		if found {
+			return sqlerrors.NewSchemaAlreadyExistsError(newName)
+		}
+
+		lookupFlags := tree.CommonLookupFlags{Required: true, AvoidLeased: true}
+		if err := maybeFailOnDependentDescInRename(
+			params.ctx, params.p, n.db, n.desc.GetName(), lookupFlags, catalog.Schema,
+		); err != nil {
+			return err
+		}
+
 		if err := params.p.renameSchema(
 			params.ctx, n.db, n.desc, newName, tree.AsStringWithFQNames(n.n, params.Ann()),
 		); err != nil {
@@ -121,7 +146,9 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 			NewSchemaName: newQualifiedSchemaName.String(),
 		})
 	case *tree.AlterSchemaOwner:
-		newOwner, err := t.Owner.ToSQLUsername(params.p.SessionData(), security.UsernameValidation)
+		newOwner, err := decodeusername.FromRoleSpec(
+			params.p.SessionData(), username.PurposeValidation, t.Owner,
+		)
 		if err != nil {
 			return err
 		}
@@ -136,7 +163,7 @@ func (n *alterSchemaNode) startExec(params runParams) error {
 func (p *planner) alterSchemaOwner(
 	ctx context.Context,
 	scDesc *schemadesc.Mutable,
-	newOwner security.SQLUsername,
+	newOwner username.SQLUsername,
 	jobDescription string,
 ) error {
 	oldOwner := scDesc.GetPrivileges().Owner()
@@ -146,7 +173,7 @@ func (p *planner) alterSchemaOwner(
 	}
 
 	// The user must also have CREATE privilege on the schema's database.
-	parentDBDesc, err := p.Descriptors().GetMutableDescriptorByID(ctx, scDesc.GetParentID(), p.txn)
+	parentDBDesc, err := p.Descriptors().GetMutableDescriptorByID(ctx, p.txn, scDesc.GetParentID())
 	if err != nil {
 		return err
 	}
@@ -172,7 +199,7 @@ func (p *planner) setNewSchemaOwner(
 	ctx context.Context,
 	dbDesc *dbdesc.Mutable,
 	scDesc *schemadesc.Mutable,
-	newOwner security.SQLUsername,
+	newOwner username.SQLUsername,
 ) error {
 	// Update the owner of the schema.
 	privs := scDesc.GetPrivileges()
@@ -200,20 +227,6 @@ func (p *planner) renameSchema(
 		ParentID:       desc.GetParentID(),
 		ParentSchemaID: desc.GetParentSchemaID(),
 		Name:           desc.GetName(),
-	}
-
-	// Check that there isn't a name collision with the new name.
-	found, _, err := schemaExists(ctx, p.txn, p.ExecCfg().Codec, db.ID, newName)
-	if err != nil {
-		return err
-	}
-	if found {
-		return sqlerrors.NewSchemaAlreadyExistsError(newName)
-	}
-
-	// Ensure that the new name is a valid schema name.
-	if err := schemadesc.IsSchemaNameValid(newName); err != nil {
-		return err
 	}
 
 	// Set the new name for the descriptor.
@@ -246,15 +259,8 @@ func (p *planner) renameSchema(
 		)
 	}
 
-	// Remove the old schema name or mark it as dropped, depending on version.
-	if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.AvoidDrainingNames) {
-		delete(db.Schemas, oldName)
-	} else {
-		db.Schemas[oldName] = descpb.DatabaseDescriptor_SchemaInfo{
-			ID:      desc.ID,
-			Dropped: true,
-		}
-	}
+	// Remove the old schema name.
+	delete(db.Schemas, oldName)
 
 	// Create an entry for the new schema name.
 	db.Schemas[newName] = descpb.DatabaseDescriptor_SchemaInfo{ID: desc.ID}

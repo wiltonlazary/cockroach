@@ -39,7 +39,7 @@ var MaxTxnRefreshSpansBytes = settings.RegisterIntSetting(
 	settings.TenantWritable,
 	"kv.transaction.max_refresh_spans_bytes",
 	"maximum number of bytes used to track refresh spans in serializable transactions",
-	256*1000,
+	1<<22, /* 4 MB */
 ).WithPublic()
 
 // txnSpanRefresher is a txnInterceptor that collects the read spans of a
@@ -120,11 +120,10 @@ type txnSpanRefresher struct {
 	// set when we've failed to condense the refresh spans below the target memory
 	// limit.
 	refreshInvalid bool
-
-	// refreshedTimestamp keeps track of the largest timestamp that refreshed
-	// don't fail on (i.e. if we'll refresh, we'll refreshFrom timestamp onwards).
-	// After every epoch bump, it is initialized to the timestamp of the first
-	// batch. It is then bumped after every successful refresh.
+	// refreshedTimestamp keeps track of the largest timestamp that a transaction
+	// was able to refresh all of its refreshable spans to. It is updated under
+	// lock and used to ensure that concurrent requests don't cause the refresh
+	// spans to get out of sync. See assertRefreshSpansAtInvalidTimestamp.
 	refreshedTimestamp hlc.Timestamp
 
 	// canAutoRetry is set if the txnSpanRefresher is allowed to auto-retry.
@@ -141,29 +140,6 @@ type txnSpanRefresher struct {
 func (sr *txnSpanRefresher) SendLocked(
 	ctx context.Context, ba roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, *roachpb.Error) {
-	batchReadTimestamp := ba.Txn.ReadTimestamp
-	if sr.refreshedTimestamp.IsEmpty() {
-		// This must be the first batch we're sending for this epoch. Future
-		// refreshes shouldn't check values below batchReadTimestamp, so initialize
-		// sr.refreshedTimestamp.
-		sr.refreshedTimestamp = batchReadTimestamp
-	} else if batchReadTimestamp.Less(sr.refreshedTimestamp) {
-		// sr.refreshedTimestamp might be ahead of batchReadTimestamp. We want to
-		// read at the latest refreshed timestamp, so bump the batch.
-		// batchReadTimestamp can be behind after a successful refresh, if the
-		// TxnCoordSender hasn't actually heard about the updated read timestamp.
-		// This can happen if a refresh succeeds, but then the retry of the batch
-		// that produced the timestamp fails without returning the update txn (for
-		// example, through a canceled ctx). The client should only be sending
-		// rollbacks in such cases.
-		ba.Txn.ReadTimestamp.Forward(sr.refreshedTimestamp)
-		ba.Txn.WriteTimestamp.Forward(sr.refreshedTimestamp)
-	} else if sr.refreshedTimestamp != batchReadTimestamp {
-		return nil, roachpb.NewError(errors.AssertionFailedf(
-			"unexpected batch read timestamp: %s. Expected refreshed timestamp: %s. ba: %s. txn: %s",
-			batchReadTimestamp, sr.refreshedTimestamp, ba, ba.Txn))
-	}
-
 	// Set the batch's CanForwardReadTimestamp flag.
 	ba.CanForwardReadTimestamp = sr.canForwardReadTimestampWithoutRefresh(ba.Txn)
 
@@ -187,44 +163,51 @@ func (sr *txnSpanRefresher) SendLocked(
 
 	// Iterate over and aggregate refresh spans in the requests, qualified by
 	// possible resume spans in the responses.
+	if err := sr.assertRefreshSpansAtInvalidTimestamp(br.Txn.ReadTimestamp); err != nil {
+		return nil, roachpb.NewError(err)
+	}
 	if !sr.refreshInvalid {
 		if err := sr.appendRefreshSpans(ctx, ba, br); err != nil {
 			return nil, roachpb.NewError(err)
 		}
 		// Check whether we should condense the refresh spans.
-		maxBytes := MaxTxnRefreshSpansBytes.Get(&sr.st.SV)
-		if sr.refreshFootprint.bytes >= maxBytes {
-			condensedBefore := sr.refreshFootprint.condensed
-			condensedSufficient := sr.tryCondenseRefreshSpans(ctx, maxBytes)
-			if condensedSufficient {
-				log.VEventf(ctx, 2, "condensed refresh spans for txn %s to %d bytes",
-					br.Txn, sr.refreshFootprint.bytes)
-			} else {
-				// Condensing was not enough. Giving up on tracking reads. Refreshed
-				// will not be possible.
-				log.VEventf(ctx, 2, "condensed refresh spans didn't save enough memory. txn %s. "+
-					"refresh spans after condense: %d bytes",
-					br.Txn, sr.refreshFootprint.bytes)
-				sr.refreshInvalid = true
-				sr.refreshFootprint.clear()
-			}
-
-			if sr.refreshFootprint.condensed && !condensedBefore {
-				sr.refreshMemoryLimitExceeded.Inc(1)
-			}
-		}
+		sr.maybeCondenseRefreshSpans(ctx, br.Txn)
 	}
 	return br, nil
 }
 
-// tryCondenseRefreshSpans attempts to condense the refresh spans in order to
-// save memory. Returns true if we managed to condense them below maxBytes.
-func (sr *txnSpanRefresher) tryCondenseRefreshSpans(ctx context.Context, maxBytes int64) bool {
-	if sr.knobs.CondenseRefreshSpansFilter != nil && !sr.knobs.CondenseRefreshSpansFilter() {
-		return false
+// maybeCondenseRefreshSpans checks whether the refresh footprint exceeds the
+// maximum size (as determined by the MaxTxnRefreshSpansBytes cluster setting)
+// and attempts to condense it if so. If condensing is insufficient, then the
+// refresh is invalidated. It is assumed that the refresh is valid when this
+// method is called.
+func (sr *txnSpanRefresher) maybeCondenseRefreshSpans(
+	ctx context.Context, txn *roachpb.Transaction,
+) {
+	maxBytes := MaxTxnRefreshSpansBytes.Get(&sr.st.SV)
+	if sr.refreshFootprint.bytes >= maxBytes {
+		condensedBefore := sr.refreshFootprint.condensed
+		var condensedSufficient bool
+		if sr.knobs.CondenseRefreshSpansFilter == nil || sr.knobs.CondenseRefreshSpansFilter() {
+			sr.refreshFootprint.maybeCondense(ctx, sr.riGen, maxBytes)
+			condensedSufficient = sr.refreshFootprint.bytes < maxBytes
+		}
+		if condensedSufficient {
+			log.VEventf(ctx, 2, "condensed refresh spans for txn %s to %d bytes",
+				txn, sr.refreshFootprint.bytes)
+		} else {
+			// Condensing was not enough. Giving up on tracking reads. Refreshes
+			// will not be possible.
+			log.VEventf(ctx, 2, "condensed refresh spans didn't save enough memory. txn %s. "+
+				"refresh spans after condense: %d bytes",
+				txn, sr.refreshFootprint.bytes)
+			sr.refreshInvalid = true
+			sr.refreshFootprint.clear()
+		}
+		if sr.refreshFootprint.condensed && !condensedBefore {
+			sr.refreshMemoryLimitExceeded.Inc(1)
+		}
 	}
-	sr.refreshFootprint.maybeCondense(ctx, sr.riGen, maxBytes)
-	return sr.refreshFootprint.bytes < maxBytes
 }
 
 // sendLockedWithRefreshAttempts sends the batch through the wrapped sender. It
@@ -241,9 +224,9 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 	}
 	br, pErr := sr.wrapped.SendLocked(ctx, ba)
 
-	// 19.2 servers might give us an error with the WriteTooOld flag set. This
-	// interceptor wants to always terminate that flag. In the case of an error,
-	// we can just ignore it.
+	// We might receive errors with the WriteTooOld flag set. This interceptor
+	// wants to always terminate that flag. In the case of an error, we can just
+	// ignore it.
 	if pErr != nil && pErr.GetTxn() != nil {
 		pErr.GetTxn().WriteTooOld = false
 	}
@@ -286,7 +269,9 @@ func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
 			log.VEventf(ctx, 2, "not checking error for refresh; refresh attempts exhausted")
 		}
 	}
-	sr.forwardRefreshTimestampOnResponse(br, pErr)
+	if err := sr.forwardRefreshTimestampOnResponse(&ba, br, pErr); err != nil {
+		return nil, roachpb.NewError(err)
+	}
 	return br, pErr
 }
 
@@ -307,12 +292,14 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 	if !ok {
 		return nil, pErr
 	}
-	refreshTxn := txn.Clone()
-	refreshTxn.Refresh(refreshTS)
-	log.VEventf(ctx, 2, "trying to refresh to %s because of %s", refreshTxn.ReadTimestamp, pErr)
+	refreshFrom := txn.ReadTimestamp
+	refreshToTxn := txn.Clone()
+	refreshToTxn.Refresh(refreshTS)
+	log.VEventf(ctx, 2, "trying to refresh to %s because of %s",
+		refreshToTxn.ReadTimestamp, pErr)
 
 	// Try refreshing the txn spans so we can retry.
-	if refreshErr := sr.tryRefreshTxnSpans(ctx, refreshTxn); refreshErr != nil {
+	if refreshErr := sr.tryRefreshTxnSpans(ctx, refreshFrom, refreshToTxn); refreshErr != nil {
 		log.Eventf(ctx, "refresh failed; propagating original retry error")
 		// TODO(lidor): we should add refreshErr info to the returned error. See issue #41057.
 		return nil, pErr
@@ -321,7 +308,7 @@ func (sr *txnSpanRefresher) maybeRefreshAndRetrySend(
 	// We've refreshed all of the read spans successfully and bumped
 	// ba.Txn's timestamps. Attempt the request again.
 	log.Eventf(ctx, "refresh succeeded; retrying original request")
-	ba.UpdateTxn(refreshTxn)
+	ba.UpdateTxn(refreshToTxn)
 	sr.refreshAutoRetries.Inc(1)
 
 	// To prevent starvation of batches that are trying to commit, split off the
@@ -461,19 +448,20 @@ func (sr *txnSpanRefresher) maybeRefreshPreemptivelyLocked(
 		return ba, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, nil)
 	}
 
-	refreshTxn := ba.Txn.Clone()
-	refreshTxn.Refresh(ba.Txn.WriteTimestamp)
+	refreshFrom := ba.Txn.ReadTimestamp
+	refreshToTxn := ba.Txn.Clone()
+	refreshToTxn.Refresh(ba.Txn.WriteTimestamp)
 	log.VEventf(ctx, 2, "preemptively refreshing to timestamp %s before issuing %s",
-		refreshTxn.ReadTimestamp, ba)
+		refreshToTxn.ReadTimestamp, ba)
 
 	// Try refreshing the txn spans at a timestamp that will allow us to commit.
-	if refreshErr := sr.tryRefreshTxnSpans(ctx, refreshTxn); refreshErr != nil {
+	if refreshErr := sr.tryRefreshTxnSpans(ctx, refreshFrom, refreshToTxn); refreshErr != nil {
 		log.Eventf(ctx, "preemptive refresh failed; propagating retry error")
 		return roachpb.BatchRequest{}, newRetryErrorOnFailedPreemptiveRefresh(ba.Txn, refreshErr)
 	}
 
 	log.Eventf(ctx, "preemptive refresh succeeded")
-	ba.UpdateTxn(refreshTxn)
+	ba.UpdateTxn(refreshToTxn)
 	return ba, nil
 }
 
@@ -498,14 +486,13 @@ func newRetryErrorOnFailedPreemptiveRefresh(
 
 // tryRefreshTxnSpans sends Refresh and RefreshRange commands to all spans read
 // during the transaction to ensure that no writes were written more recently
-// than sr.refreshedTimestamp. All implicated timestamp caches are updated with
-// the final transaction timestamp. Returns whether the refresh was successful
-// or not.
+// than refreshFrom. All implicated timestamp caches are updated with the final
+// transaction timestamp. Returns whether the refresh was successful or not.
 //
 // The provided transaction should be a Clone() of the original transaction with
 // its ReadTimestamp adjusted by the Refresh() method.
 func (sr *txnSpanRefresher) tryRefreshTxnSpans(
-	ctx context.Context, refreshTxn *roachpb.Transaction,
+	ctx context.Context, refreshFrom hlc.Timestamp, refreshToTxn *roachpb.Transaction,
 ) (err *roachpb.Error) {
 	// Track the result of the refresh in metrics.
 	defer func() {
@@ -524,14 +511,14 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 		return roachpb.NewError(errors.AssertionFailedf("can't refresh txn spans; not valid"))
 	} else if sr.refreshFootprint.empty() {
 		log.VEvent(ctx, 2, "there are no txn spans to refresh")
-		sr.refreshedTimestamp.Forward(refreshTxn.ReadTimestamp)
+		sr.forwardRefreshTimestampOnRefresh(refreshToTxn)
 		return nil
 	}
 
 	// Refresh all spans (merge first).
 	// TODO(nvanbenschoten): actually merge spans.
 	refreshSpanBa := roachpb.BatchRequest{}
-	refreshSpanBa.Txn = refreshTxn
+	refreshSpanBa.Txn = refreshToTxn
 	addRefreshes := func(refreshes *condensableSpanSet) {
 		// We're going to check writes between the previous refreshed timestamp, if
 		// any, and the timestamp we want to bump the transaction to. Note that if
@@ -549,17 +536,17 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 			if len(u.EndKey) == 0 {
 				req = &roachpb.RefreshRequest{
 					RequestHeader: roachpb.RequestHeaderFromSpan(u),
-					RefreshFrom:   sr.refreshedTimestamp,
+					RefreshFrom:   refreshFrom,
 				}
 			} else {
 				req = &roachpb.RefreshRangeRequest{
 					RequestHeader: roachpb.RequestHeaderFromSpan(u),
-					RefreshFrom:   sr.refreshedTimestamp,
+					RefreshFrom:   refreshFrom,
 				}
 			}
 			refreshSpanBa.Add(req)
 			log.VEventf(ctx, 2, "updating span %s @%s - @%s to avoid serializable restart",
-				req.Header().Span(), sr.refreshedTimestamp, refreshTxn.WriteTimestamp)
+				req.Header().Span(), refreshFrom, refreshToTxn.WriteTimestamp)
 		}
 	}
 	addRefreshes(&sr.refreshFootprint)
@@ -570,7 +557,7 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 		return batchErr
 	}
 
-	sr.refreshedTimestamp.Forward(refreshTxn.ReadTimestamp)
+	sr.forwardRefreshTimestampOnRefresh(refreshToTxn)
 	return nil
 }
 
@@ -579,22 +566,13 @@ func (sr *txnSpanRefresher) tryRefreshTxnSpans(
 func (sr *txnSpanRefresher) appendRefreshSpans(
 	ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
 ) error {
-	readTimestamp := br.Txn.ReadTimestamp
-	if readTimestamp.Less(sr.refreshedTimestamp) {
-		// This can happen with (illegal) concurrent txn use, but that's supposed to
-		// be detected by the gatekeeper interceptor.
-		return errors.AssertionFailedf("attempting to append refresh spans after the tracked"+
-			" timestamp has moved forward. batchTimestamp: %s refreshedTimestamp: %s ba: %s",
-			errors.Safe(readTimestamp), errors.Safe(sr.refreshedTimestamp), ba)
-	}
-
-	ba.RefreshSpanIterate(br, func(span roachpb.Span) {
-		if log.ExpensiveLogEnabled(ctx, 3) {
+	expLogEnabled := log.ExpensiveLogEnabled(ctx, 3)
+	return ba.RefreshSpanIterate(br, func(span roachpb.Span) {
+		if expLogEnabled {
 			log.VEventf(ctx, 3, "recording span to refresh: %s", span.String())
 		}
 		sr.refreshFootprint.insert(span)
 	})
-	return nil
 }
 
 // canForwardReadTimestampWithoutRefresh returns whether the transaction can
@@ -622,21 +600,54 @@ func (sr *txnSpanRefresher) canForwardReadTimestampWithoutRefresh(txn *roachpb.T
 	return sr.canForwardReadTimestamp(txn) && !sr.refreshInvalid && sr.refreshFootprint.empty()
 }
 
+// forwardRefreshTimestampOnRefresh updates the refresher's tracked
+// refreshedTimestamp under lock after a successful refresh. This in conjunction
+// with a check in assertRefreshSpansAtInvalidTimestamp prevents a race where a
+// concurrent request may add new refresh spans only "verified" up to its batch
+// timestamp after we've refreshed past that timestamp.
+func (sr *txnSpanRefresher) forwardRefreshTimestampOnRefresh(refreshToTxn *roachpb.Transaction) {
+	sr.refreshedTimestamp.Forward(refreshToTxn.ReadTimestamp)
+}
+
 // forwardRefreshTimestampOnResponse updates the refresher's tracked
 // refreshedTimestamp to stay in sync with "server-side refreshes", where the
 // transaction's read timestamp is updated during the evaluation of a batch.
 func (sr *txnSpanRefresher) forwardRefreshTimestampOnResponse(
-	br *roachpb.BatchResponse, pErr *roachpb.Error,
-) {
-	var txn *roachpb.Transaction
+	ba *roachpb.BatchRequest, br *roachpb.BatchResponse, pErr *roachpb.Error,
+) error {
+	baTxn := ba.Txn
+	var brTxn *roachpb.Transaction
 	if pErr != nil {
-		txn = pErr.GetTxn()
+		brTxn = pErr.GetTxn()
 	} else {
-		txn = br.Txn
+		brTxn = br.Txn
 	}
-	if txn != nil {
-		sr.refreshedTimestamp.Forward(txn.ReadTimestamp)
+	if baTxn == nil || brTxn == nil {
+		return nil
 	}
+	if baTxn.ReadTimestamp.Less(brTxn.ReadTimestamp) {
+		sr.refreshedTimestamp.Forward(brTxn.ReadTimestamp)
+	} else if brTxn.ReadTimestamp.Less(baTxn.ReadTimestamp) {
+		return errors.AssertionFailedf("received transaction in response with "+
+			"earlier read timestamp than in the request. ba.Txn: %s, br.Txn: %s", baTxn, brTxn)
+	}
+	return nil
+}
+
+// assertRefreshSpansAtInvalidTimestamp returns an error if the timestamp at
+// which a set of reads was performed is below the largest timestamp that this
+// transaction has already refreshed to.
+func (sr *txnSpanRefresher) assertRefreshSpansAtInvalidTimestamp(
+	readTimestamp hlc.Timestamp,
+) error {
+	if readTimestamp.Less(sr.refreshedTimestamp) {
+		// This can happen with (illegal) concurrent txn use, but that's supposed to
+		// be detected by the gatekeeper interceptor.
+		return errors.AssertionFailedf("attempting to append refresh spans after the tracked"+
+			" timestamp has moved forward. batchTimestamp: %s refreshedTimestamp: %s",
+			errors.Safe(readTimestamp), errors.Safe(sr.refreshedTimestamp))
+	}
+	return nil
 }
 
 // maxRefreshAttempts returns the configured number of times that a transaction
@@ -672,12 +683,16 @@ func (sr *txnSpanRefresher) populateLeafFinalState(tfs *roachpb.LeafTxnFinalStat
 func (sr *txnSpanRefresher) importLeafFinalState(
 	ctx context.Context, tfs *roachpb.LeafTxnFinalState,
 ) {
+	if err := sr.assertRefreshSpansAtInvalidTimestamp(tfs.Txn.ReadTimestamp); err != nil {
+		log.Fatalf(ctx, "%s", err)
+	}
 	if tfs.RefreshInvalid {
 		sr.refreshInvalid = true
 		sr.refreshFootprint.clear()
 	} else if !sr.refreshInvalid {
 		sr.refreshFootprint.insert(tfs.RefreshSpans...)
-		sr.refreshFootprint.maybeCondense(ctx, sr.riGen, MaxTxnRefreshSpansBytes.Get(&sr.st.SV))
+		// Check whether we should condense the refresh spans.
+		sr.maybeCondenseRefreshSpans(ctx, &tfs.Txn)
 	}
 }
 

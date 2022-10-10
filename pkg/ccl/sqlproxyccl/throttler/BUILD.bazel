@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -23,9 +24,12 @@ go_test(
         "local_test.go",
         "throttle_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":throttler"],
     deps = [
         "//pkg/util/timeutil",
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

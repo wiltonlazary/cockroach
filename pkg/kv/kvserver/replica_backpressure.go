@@ -53,7 +53,7 @@ var backpressureRangeSizeMultiplier = settings.RegisterFloatSetting(
 //
 // We additionally mitigate this situation further by doing the following:
 //
-//  1) We store in-memory on each replica the largest zone configuration range
+//  1. We store in-memory on each replica the largest zone configuration range
 //     size (largestPreviousMaxRangeBytes) we've seen and we do not backpressure
 //     if the current range size is less than that. That value is cleared when
 //     a range splits or runs GC such that the range size becomes smaller than
@@ -61,10 +61,9 @@ var backpressureRangeSizeMultiplier = settings.RegisterFloatSetting(
 //     a node may restart before the splitting has concluded, leaving the
 //     cluster in a state of backpressure.
 //
-//  2) We assign a higher priority in the snapshot queue to ranges which are
+//  2. We assign a higher priority in the snapshot queue to ranges which are
 //     currently backpressuring than ranges which are larger but are not
 //     applying backpressure.
-//
 var backpressureByteTolerance = settings.RegisterByteSizeSetting(
 	settings.TenantWritable,
 	"kv.range.backpressure_byte_tolerance",
@@ -106,6 +105,21 @@ func canBackpressureBatch(ba *roachpb.BatchRequest) bool {
 		}
 	}
 	return false
+}
+
+// signallerForBatch returns the signaller to use for this batch. This is the
+// Replica's breaker's signaller except if any request in the batch uses
+// poison.Policy_Wait, in which case it's a neverTripSignaller. In particular,
+// `(signaller).C() == nil` signals that the request bypasses the circuit
+// breakers.
+func (r *Replica) signallerForBatch(ba *roachpb.BatchRequest) signaller {
+	for _, ru := range ba.Requests {
+		req := ru.GetInner()
+		if roachpb.BypassesReplicaCircuitBreaker(req) {
+			return neverTripSignaller{}
+		}
+	}
+	return r.breaker.Signal()
 }
 
 // shouldBackpressureWrites returns whether writes to the range should be

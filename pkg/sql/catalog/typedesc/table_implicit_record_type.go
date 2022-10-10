@@ -17,6 +17,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -39,7 +42,7 @@ type TableImplicitRecordType struct {
 	// by examining the privileges for the table that the record type corresponds
 	// to, and providing the USAGE privilege if the table had the SELECT
 	// privilege.
-	privs *descpb.PrivilegeDescriptor
+	privs *catpb.PrivilegeDescriptor
 }
 
 var _ catalog.TypeDescriptor = (*TableImplicitRecordType)(nil)
@@ -67,7 +70,7 @@ func CreateImplicitRecordTypeFromTableDesc(
 	// names.
 	typ := types.MakeLabeledTuple(typs, names)
 	tableID := descriptor.GetID()
-	typeOID := TypeIDToOID(tableID)
+	typeOID := catid.TypeIDToOID(tableID)
 	// Setting the type's OID allows us to properly report and display this type
 	// as having ID <tableID> + 100000 in the pg_type table and ::REGTYPE casts.
 	// It will also be used to serialize expressions casted to this type for
@@ -82,7 +85,7 @@ func CreateImplicitRecordTypeFromTableDesc(
 	}
 
 	tablePrivs := descriptor.GetPrivileges()
-	newPrivs := make([]descpb.UserPrivileges, len(tablePrivs.Users))
+	newPrivs := make([]catpb.UserPrivileges, len(tablePrivs.Users))
 	for i := range tablePrivs.Users {
 		newPrivs[i].UserProto = tablePrivs.Users[i].UserProto
 		// A table's record type has USAGE privs if a user has SELECT on the table.
@@ -94,7 +97,7 @@ func CreateImplicitRecordTypeFromTableDesc(
 	return &TableImplicitRecordType{
 		desc: descriptor,
 		typ:  typ,
-		privs: &descpb.PrivilegeDescriptor{
+		privs: &catpb.PrivilegeDescriptor{
 			Users:      newPrivs,
 			OwnerProto: tablePrivs.OwnerProto,
 			Version:    tablePrivs.Version,
@@ -102,13 +105,13 @@ func CreateImplicitRecordTypeFromTableDesc(
 	}, nil
 }
 
-// GetName implements the NameKey interface.
+// GetName implements the Namespace interface.
 func (v TableImplicitRecordType) GetName() string { return v.desc.GetName() }
 
-// GetParentID implements the NameKey interface.
+// GetParentID implements the Namespace interface.
 func (v TableImplicitRecordType) GetParentID() descpb.ID { return v.desc.GetParentID() }
 
-// GetParentSchemaID implements the NameKey interface.
+// GetParentSchemaID implements the Namespace interface.
 func (v TableImplicitRecordType) GetParentSchemaID() descpb.ID { return v.desc.GetParentSchemaID() }
 
 // GetID implements the NameEntry interface.
@@ -125,14 +128,8 @@ func (v TableImplicitRecordType) GetModificationTime() hlc.Timestamp {
 	return v.desc.GetModificationTime()
 }
 
-// GetDrainingNames implements the Descriptor interface.
-func (v TableImplicitRecordType) GetDrainingNames() []descpb.NameInfo {
-	// Implicit record types don't have draining names.
-	return nil
-}
-
 // GetPrivileges implements the Descriptor interface.
-func (v TableImplicitRecordType) GetPrivileges() *descpb.PrivilegeDescriptor {
+func (v TableImplicitRecordType) GetPrivileges() *catpb.PrivilegeDescriptor {
 	return v.privs
 }
 
@@ -204,10 +201,17 @@ func (v TableImplicitRecordType) GetReferencedDescIDs() (catalog.DescriptorIDSet
 }
 
 // ValidateSelf implements the Descriptor interface.
-func (v TableImplicitRecordType) ValidateSelf(_ catalog.ValidationErrorAccumulator) {}
+func (v TableImplicitRecordType) ValidateSelf(_ catalog.ValidationErrorAccumulator) {
+}
 
-// ValidateCrossReferences implements the Descriptor interface.
-func (v TableImplicitRecordType) ValidateCrossReferences(
+// ValidateForwardReferences implements the Descriptor interface.
+func (v TableImplicitRecordType) ValidateForwardReferences(
+	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
+) {
+}
+
+// ValidateBackReferences implements the Descriptor interface.
+func (v TableImplicitRecordType) ValidateBackReferences(
 	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
 ) {
 }
@@ -216,6 +220,11 @@ func (v TableImplicitRecordType) ValidateCrossReferences(
 func (v TableImplicitRecordType) ValidateTxnCommit(
 	_ catalog.ValidationErrorAccumulator, _ catalog.ValidationDescGetter,
 ) {
+}
+
+// GetRawBytesInStorage implements the catalog.Descriptor interface.
+func (v TableImplicitRecordType) GetRawBytesInStorage() []byte {
+	return nil
 }
 
 // TypeDesc implements the TypeDescriptor interface.
@@ -228,14 +237,14 @@ func (v TableImplicitRecordType) TypeDesc() *descpb.TypeDescriptor {
 func (v TableImplicitRecordType) HydrateTypeInfoWithName(
 	ctx context.Context, typ *types.T, name *tree.TypeName, res catalog.TypeDescriptorResolver,
 ) error {
-	if typ.IsHydrated() {
+	if typ.IsHydrated() && typ.TypeMeta.Version == uint32(v.desc.GetVersion()) {
 		return nil
 	}
 	if typ.Family() != types.TupleFamily {
 		return errors.AssertionFailedf("unexpected hydration of non-tuple type %s with table implicit record type %d",
 			typ, v.GetID())
 	}
-	if typ.Oid() != TypeIDToOID(v.GetID()) {
+	if typ.Oid() != catid.TypeIDToOID(v.GetID()) {
 		return errors.AssertionFailedf("unexpected mismatch during table implicit record type hydration: "+
 			"type %s has id %d, descriptor has id %d", typ, typ.Oid(), v.GetID())
 	}
@@ -299,6 +308,19 @@ func (v TableImplicitRecordType) TransitioningRegionNames() (catpb.RegionNames, 
 		"can not get region names of a implicit table record type")
 }
 
+// SuperRegions implements the TypeDescriptor interface.
+func (v TableImplicitRecordType) SuperRegions() ([]descpb.SuperRegion, error) {
+	return nil, errors.AssertionFailedf(
+		"can not get super regions of a implicit table record type",
+	)
+}
+
+// ZoneConfigExtensions implements the TypeDescriptorInterface.
+func (v TableImplicitRecordType) ZoneConfigExtensions() (descpb.ZoneConfigExtensions, error) {
+	return descpb.ZoneConfigExtensions{}, errors.AssertionFailedf(
+		"can not get the zone config extensions of a implicit table record type")
+}
+
 // GetArrayTypeID implements the TypeDescriptorInterface.
 func (v TableImplicitRecordType) GetArrayTypeID() descpb.ID {
 	return 0
@@ -327,6 +349,45 @@ func (v TableImplicitRecordType) NumReferencingDescriptors() int { return 0 }
 // GetReferencingDescriptorID implements the TypeDescriptorInterface.
 func (v TableImplicitRecordType) GetReferencingDescriptorID(_ int) descpb.ID { return 0 }
 
+// GetReferencingDescriptorIDs implements the TypeDescriptorInterface.
+func (v TableImplicitRecordType) GetReferencingDescriptorIDs() []descpb.ID { return nil }
+
+// GetPostDeserializationChanges implements the Descriptor interface.
+func (v TableImplicitRecordType) GetPostDeserializationChanges() catalog.PostDeserializationChanges {
+	return catalog.PostDeserializationChanges{}
+}
+
+// HasConcurrentSchemaChanges implements catalog.Descriptor.
+func (v TableImplicitRecordType) HasConcurrentSchemaChanges() bool {
+	return false
+}
+
+// SkipNamespace implements catalog.Descriptor. We never store table implicit
+// record type which is always constructed in memory.
+func (v TableImplicitRecordType) SkipNamespace() bool {
+	return true
+}
+
 func (v TableImplicitRecordType) panicNotSupported(message string) {
 	panic(errors.AssertionFailedf("implicit table record type for table %q: not supported: %s", v.GetName(), message))
+}
+
+// GetDeclarativeSchemaChangerState implements the Descriptor interface.
+func (v TableImplicitRecordType) GetDeclarativeSchemaChangerState() *scpb.DescriptorState {
+	v.panicNotSupported("GetDeclarativeSchemaChangeState")
+	return nil
+}
+
+// GetObjectType implements the PrivilegeObject interface.
+func (v TableImplicitRecordType) GetObjectType() privilege.ObjectType {
+	v.panicNotSupported("GetObjectType")
+	return ""
+}
+
+// GetPrivilegeDescriptor implements the PrivilegeObject interface.
+func (v TableImplicitRecordType) GetPrivilegeDescriptor(
+	ctx context.Context, planner eval.Planner,
+) (*catpb.PrivilegeDescriptor, error) {
+	v.panicNotSupported("GetPrivilegeDescriptor")
+	return nil, nil
 }

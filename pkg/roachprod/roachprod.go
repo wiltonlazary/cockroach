@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/aws"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/azure"
@@ -219,26 +219,38 @@ func CachedClusters(l *logger.Logger, fn func(clusterName string, numVMs int)) {
 	}
 }
 
+// acquireFilesystemLock acquires a filesystem lock so that two concurrent
+// synchronizations of roachprod state don't clobber each other.
+func acquireFilesystemLock() (unlockFn func(), _ error) {
+	lockFile := os.ExpandEnv("$HOME/.roachprod/LOCK")
+	f, err := os.Create(lockFile)
+	if err != nil {
+		return nil, errors.Wrapf(err, "creating lock file %q", lockFile)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		f.Close()
+		return nil, errors.Wrap(err, "acquiring lock on %q")
+	}
+	return func() {
+		f.Close()
+	}, nil
+}
+
 // Sync grabs an exclusive lock on the roachprod state and then proceeds to
 // read the current state from the cloud and write it out to disk. The locking
 // protects both the reading and the writing in order to prevent the hazard
 // caused by concurrent goroutines reading cloud state in a different order
 // than writing it to disk.
 func Sync(l *logger.Logger) (*cloud.Cloud, error) {
-	lockFile := os.ExpandEnv("$HOME/.roachprod/LOCK")
 	if !config.Quiet {
 		l.Printf("Syncing...")
 	}
-	// Acquire a filesystem lock so that two concurrent synchronizations of
-	// roachprod state don't clobber each other.
-	f, err := os.Create(lockFile)
+	unlock, err := acquireFilesystemLock()
 	if err != nil {
-		return nil, errors.Wrapf(err, "creating lock file %q", lockFile)
+		return nil, err
 	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		return nil, errors.Wrap(err, "acquiring lock on %q")
-	}
-	defer f.Close()
+	defer unlock()
+
 	cld, err := cloud.ListCloud(l)
 	if err != nil {
 		return nil, err
@@ -448,13 +460,15 @@ func IP(
 }
 
 // Status retrieves the status of nodes in a cluster.
-func Status(ctx context.Context, l *logger.Logger, clusterName, processTag string) error {
+func Status(
+	ctx context.Context, l *logger.Logger, clusterName, processTag string,
+) ([]install.NodeStatus, error) {
 	if err := LoadClusters(); err != nil {
-		return err
+		return nil, err
 	}
 	c, err := newCluster(l, clusterName, install.TagOption(processTag))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	return c.Status(ctx, l)
 }
@@ -623,6 +637,7 @@ func DefaultStartOpts() install.StartOpts {
 	return install.StartOpts{
 		Sequential:      true,
 		EncryptedStores: false,
+		NumFilesLimit:   config.DefaultNumFilesLimit,
 		SkipInit:        false,
 		StoreCount:      1,
 		TenantID:        2,
@@ -662,7 +677,12 @@ func Monitor(
 type StopOpts struct {
 	ProcessTag string
 	Sig        int
-	Wait       bool
+	// If Wait is set, roachprod waits until the PID disappears (i.e. the
+	// process has terminated).
+	Wait bool // forced to true when Sig == 9
+	// If MaxWait is set, roachprod waits that approximate number of seconds
+	// until the PID disappears.
+	MaxWait int
 }
 
 // DefaultStopOpts returns StopOpts populated with the default values used by Stop.
@@ -671,6 +691,7 @@ func DefaultStopOpts() StopOpts {
 		ProcessTag: "",
 		Sig:        9,
 		Wait:       false,
+		MaxWait:    0,
 	}
 }
 
@@ -683,7 +704,7 @@ func Stop(ctx context.Context, l *logger.Logger, clusterName string, opts StopOp
 	if err != nil {
 		return err
 	}
-	return c.Stop(ctx, l, opts.Sig, opts.Wait)
+	return c.Stop(ctx, l, opts.Sig, opts.Wait, opts.MaxWait)
 }
 
 // Init initializes the cluster.
@@ -800,7 +821,7 @@ func Put(
 	if err != nil {
 		return err
 	}
-	return c.Put(ctx, l, src, dest)
+	return c.Put(ctx, l, c.Nodes, src, dest)
 }
 
 // Get copies a remote file from the nodes in a cluster.
@@ -814,7 +835,7 @@ func Get(l *logger.Logger, clusterName, src, dest string) error {
 	if err != nil {
 		return err
 	}
-	return c.Get(l, src, dest)
+	return c.Get(l, c.Nodes, src, dest)
 }
 
 // PgURL generates pgurls for the nodes in a cluster.
@@ -858,43 +879,44 @@ func PgURL(
 	return urls, nil
 }
 
-// AdminURL generates admin UI URLs for the nodes in a cluster.
-func AdminURL(
-	l *logger.Logger, clusterName, path string, usePublicIPs, openInBrowser, secure bool,
-) ([]string, error) {
-	if err := LoadClusters(); err != nil {
-		return nil, err
-	}
-	c, err := newCluster(l, clusterName, install.SecureOption(secure))
-	if err != nil {
-		return nil, err
-	}
+type urlConfig struct {
+	path          string
+	usePublicIP   bool
+	openInBrowser bool
+	secure        bool
+	port          int
+}
 
+func urlGenerator(
+	c *install.SyncedCluster, l *logger.Logger, nodes install.Nodes, config urlConfig,
+) ([]string, error) {
 	var urls []string
-	for i, node := range c.TargetNodes() {
+	for i, node := range nodes {
 		host := vm.Name(c.Name, int(node)) + "." + gce.Subdomain
 
 		// verify DNS is working / fallback to IPs if not.
-		if i == 0 && !usePublicIPs {
+		if i == 0 && !config.usePublicIP {
 			if _, err := net.LookupHost(host); err != nil {
 				fmt.Fprintf(l.Stderr, "no valid DNS (yet?). might need to re-run `sync`?\n")
-				usePublicIPs = true
+				config.usePublicIP = true
 			}
 		}
 
-		if usePublicIPs {
+		if config.usePublicIP {
 			host = c.VMs[node-1].PublicIP
 		}
-		port := c.NodeUIPort(node)
+		if config.port == 0 {
+			config.port = c.NodeUIPort(node)
+		}
 		scheme := "http"
 		if c.Secure {
 			scheme = "https"
 		}
-		if !strings.HasPrefix(path, "/") {
-			path = "/" + path
+		if !strings.HasPrefix(config.path, "/") {
+			config.path = "/" + config.path
 		}
-		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
-		if openInBrowser {
+		url := fmt.Sprintf("%s://%s:%d%s", scheme, host, config.port, config.path)
+		if config.openInBrowser {
 			if err := exec.Command("python", "-m", "webbrowser", url).Run(); err != nil {
 				return nil, err
 			}
@@ -903,6 +925,26 @@ func AdminURL(
 		}
 	}
 	return urls, nil
+}
+
+// AdminURL generates admin UI URLs for the nodes in a cluster.
+func AdminURL(
+	l *logger.Logger, clusterName, path string, usePublicIP, openInBrowser, secure bool,
+) ([]string, error) {
+	if err := LoadClusters(); err != nil {
+		return nil, err
+	}
+	c, err := newCluster(l, clusterName, install.SecureOption(secure))
+	if err != nil {
+		return nil, err
+	}
+	uConfig := urlConfig{
+		path:          path,
+		usePublicIP:   usePublicIP,
+		openInBrowser: openInBrowser,
+		secure:        secure,
+	}
+	return urlGenerator(c, l, c.TargetNodes(), uConfig)
 }
 
 // PprofOpts specifies the options needed by Pprof().
@@ -956,7 +998,7 @@ func Pprof(l *logger.Logger, clusterName string, opts PprofOpts) error {
 		}
 		outputFile := fmt.Sprintf("pprof-%s-%d-%s-%04d.out", profType, startTime, c.Name, node)
 		outputDir := filepath.Dir(outputFile)
-		file, err := ioutil.TempFile(outputDir, ".pprof")
+		file, err := os.CreateTemp(outputDir, ".pprof")
 		if err != nil {
 			return nil, errors.Wrap(err, "create tmpfile for pprof download")
 		}
@@ -1159,9 +1201,6 @@ func Create(
 	createVMOpts vm.CreateOpts,
 	providerOptsContainer vm.ProviderOptionsContainer,
 ) (retErr error) {
-	if err := LoadClusters(); err != nil {
-		return errors.Wrap(err, "problem loading clusters")
-	}
 	if numNodes <= 0 || numNodes >= 1000 {
 		// Upper limit is just for safety.
 		return fmt.Errorf("number of nodes must be in [1..999]")
@@ -1171,22 +1210,22 @@ func Create(
 		return err
 	}
 
-	defer func() {
-		if retErr == nil || config.IsLocalClusterName(clusterName) {
-			return
+	isLocal := config.IsLocalClusterName(clusterName)
+	if isLocal {
+		// To ensure that multiple processes don't create local clusters at
+		// the same time (causing port collisions), acquire the lock file.
+		unlockFn, err := acquireFilesystemLock()
+		if err != nil {
+			return err
 		}
-		if errors.HasType(retErr, (*ClusterAlreadyExistsError)(nil)) {
-			return
-		}
-		fmt.Fprintf(l.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
-		if err := cleanupFailedCreate(l, clusterName); err != nil {
-			fmt.Fprintf(l.Stderr, "Error while cleaning up partially-created cluster: %s\n", err)
-		} else {
-			fmt.Fprintf(l.Stderr, "Cleaning up OK\n")
-		}
-	}()
+		defer unlockFn()
+	}
 
-	if !config.IsLocalClusterName(clusterName) {
+	if err := LoadClusters(); err != nil {
+		return errors.Wrap(err, "problem loading clusters")
+	}
+
+	if !isLocal {
 		cld, err := cloud.ListCloud(l)
 		if err != nil {
 			return err
@@ -1194,6 +1233,18 @@ func Create(
 		if _, ok := cld.Clusters[clusterName]; ok {
 			return &ClusterAlreadyExistsError{name: clusterName}
 		}
+
+		defer func() {
+			if retErr == nil {
+				return
+			}
+			fmt.Fprintf(l.Stderr, "Cleaning up partially-created cluster (prev err: %s)\n", retErr)
+			if err := cleanupFailedCreate(l, clusterName); err != nil {
+				fmt.Fprintf(l.Stderr, "Error while cleaning up partially-created cluster: %s\n", err)
+			} else {
+				fmt.Fprintf(l.Stderr, "Cleaning up OK\n")
+			}
+		}()
 	} else {
 		if _, ok := readSyncedClusters(clusterName); ok {
 			return &ClusterAlreadyExistsError{name: clusterName}
@@ -1305,4 +1356,133 @@ func InitProviders() map[string]string {
 	}
 
 	return providersState
+}
+
+// StartGrafana spins up a prometheus and grafana instance on the last node provided and scrapes
+// from all other nodes.
+func StartGrafana(
+	ctx context.Context,
+	l *logger.Logger,
+	clusterName string,
+	grafanaURL string,
+	promCfg *prometheus.Config, // passed iff grafanaURL is empty
+) error {
+	if grafanaURL != "" && promCfg != nil {
+		return errors.New("cannot pass grafanaURL and a non empty promCfg")
+	}
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+	nodes, err := install.ListNodes("all", len(c.VMs))
+	if err != nil {
+		return err
+	}
+
+	if promCfg == nil {
+		promCfg = &prometheus.Config{}
+		// Configure the prometheus/grafana servers to run on the last node in the cluster
+		promCfg.WithPrometheusNode(nodes[len(nodes)-1])
+
+		// Configure scraping on all nodes in the cluster
+		promCfg.WithCluster(nodes)
+		promCfg.WithNodeExporter(nodes)
+
+		// By default, spin up a grafana server
+		promCfg.Grafana.Enabled = true
+		if grafanaURL != "" {
+			promCfg.WithGrafanaDashboard(grafanaURL)
+		}
+	}
+	_, err = prometheus.Init(ctx, l, c, *promCfg)
+	if err != nil {
+		return err
+	}
+	urls, err := GrafanaURL(ctx, l, clusterName, false)
+	if err != nil {
+		return err
+	}
+	for i, url := range urls {
+		fmt.Printf("Grafana dashboard %d: %s\n", i, url)
+	}
+	return nil
+}
+
+// StopGrafana shuts down prometheus and grafana servers on the last node in
+// the cluster, if they exist.
+func StopGrafana(ctx context.Context, l *logger.Logger, clusterName string, dumpDir string) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+	nodes, err := install.ListNodes("all", len(c.VMs))
+	if err != nil {
+		return err
+	}
+	if err := prometheus.Shutdown(ctx, c, l, nodes, dumpDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GrafanaURL returns a url to the grafana dashboard
+func GrafanaURL(
+	ctx context.Context, l *logger.Logger, clusterName string, openInBrowser bool,
+) ([]string, error) {
+	if err := LoadClusters(); err != nil {
+		return nil, err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return nil, err
+	}
+	nodes, err := install.ListNodes("all", len(c.VMs))
+	if err != nil {
+		return nil, err
+	}
+	// grafana is assumed to be running on the last node in the target
+	grafanaNode := install.Nodes{nodes[len(nodes)-1]}
+
+	uConfig := urlConfig{
+		usePublicIP:   true,
+		openInBrowser: openInBrowser,
+		secure:        false,
+		port:          3000,
+	}
+	return urlGenerator(c, l, grafanaNode, uConfig)
+}
+
+// PrometheusSnapshot takes a snapshot of prometheus and stores the snapshot and
+// a script to spin up a docker instance for it to the given directory. We
+// assume the last node contains the prometheus server.
+func PrometheusSnapshot(
+	ctx context.Context, l *logger.Logger, clusterName string, dumpDir string,
+) error {
+	if err := LoadClusters(); err != nil {
+		return err
+	}
+	c, err := newCluster(l, clusterName)
+	if err != nil {
+		return err
+	}
+	nodes, err := install.ListNodes("all", len(c.VMs))
+	if err != nil {
+		return err
+	}
+
+	promNode := install.Nodes{nodes[len(nodes)-1]}
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	if err := prometheus.Snapshot(ctx, c, l, promNode, dumpDir); err != nil {
+		l.Printf("failed to get prometheus snapshot: %v", err)
+		return err
+	}
+	return nil
 }

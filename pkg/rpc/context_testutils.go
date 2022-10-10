@@ -26,17 +26,13 @@ import (
 // knob functions are called at various points in the Context life cycle if they
 // are non-nil.
 type ContextTestingKnobs struct {
-
-	// UnaryClientInterceptor if non-nil will be called at dial time to provide
-	// the base unary interceptor for client connections.
-	// This function may return a nil interceptor to avoid injecting behavior
-	// for a given target and class.
-	UnaryClientInterceptor func(target string, class ConnectionClass) grpc.UnaryClientInterceptor
-
 	// StreamClient if non-nil will be called at dial time to provide
 	// the base stream interceptor for client connections.
 	// This function may return a nil interceptor to avoid injecting behavior
 	// for a given target and class.
+	//
+	// Note that this is not called for streaming RPCs using the
+	// internalClientAdapter - i.e. KV RPCs done against the local server.
 	StreamClientInterceptor func(target string, class ConnectionClass) grpc.StreamClientInterceptor
 
 	// ArtificialLatencyMap if non-nil contains a map from target address
@@ -45,9 +41,9 @@ type ContextTestingKnobs struct {
 	// the given amount of milliseconds on every network write.
 	ArtificialLatencyMap map[string]int
 
-	// ClusterID initializes the Context's ClusterID container to this value if
-	// non-nil at construction time.
-	ClusterID *uuid.UUID
+	// StorageClusterID initializes the Context's StorageClusterID container to
+	// this value if non-nil at construction time.
+	StorageClusterID *uuid.UUID
 }
 
 // NewInsecureTestingContext creates an insecure rpc Context suitable for tests.
@@ -59,13 +55,14 @@ func NewInsecureTestingContext(
 }
 
 // NewInsecureTestingContextWithClusterID creates an insecure rpc Context
-// suitable for tests. The context is given the provided cluster ID.
+// suitable for tests. The context is given the provided storage cluster ID and
+// will derive a logical cluster ID from it automatically.
 func NewInsecureTestingContextWithClusterID(
-	ctx context.Context, clock *hlc.Clock, stopper *stop.Stopper, clusterID uuid.UUID,
+	ctx context.Context, clock *hlc.Clock, stopper *stop.Stopper, storageClusterID uuid.UUID,
 ) *Context {
 	return NewInsecureTestingContextWithKnobs(ctx,
 		clock, stopper, ContextTestingKnobs{
-			ClusterID: &clusterID,
+			StorageClusterID: &storageClusterID,
 		})
 }
 
@@ -76,11 +73,12 @@ func NewInsecureTestingContextWithKnobs(
 ) *Context {
 	return NewContext(ctx,
 		ContextOptions{
-			TenantID: roachpb.SystemTenantID,
-			Config:   &base.Config{Insecure: true},
-			Clock:    clock,
-			Stopper:  stopper,
-			Settings: cluster.MakeTestingClusterSettings(),
-			Knobs:    knobs,
+			TenantID:  roachpb.SystemTenantID,
+			Config:    &base.Config{Insecure: true},
+			Clock:     clock.WallClock(),
+			MaxOffset: clock.MaxOffset(),
+			Stopper:   stopper,
+			Settings:  cluster.MakeTestingClusterSettings(),
+			Knobs:     knobs,
 		})
 }

@@ -14,9 +14,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -35,6 +37,7 @@ var (
 // TestSetups verifies that all setups generate executable SQL.
 func TestSetups(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer utilccl.TestingEnableEnterprise()()
 
 	for name, setup := range Setups {
 		t.Run(name, func(t *testing.T) {
@@ -45,9 +48,11 @@ func TestSetups(t *testing.T) {
 			rnd, _ := randutil.NewTestRand()
 
 			sql := setup(rnd)
-			if _, err := sqlDB.Exec(sql); err != nil {
-				t.Log(sql)
-				t.Fatal(err)
+			for _, stmt := range sql {
+				if _, err := sqlDB.Exec(stmt); err != nil {
+					t.Log(stmt)
+					t.Fatal(err)
+				}
 			}
 		})
 	}
@@ -69,9 +74,9 @@ func TestSetups(t *testing.T) {
 //
 // If this test fails, there is likely a bug in:
 //
-//   1. sqlsmith that makes valid INSERTs impossible or very unlikely
-//   2. Or rand-tables that makes it impossible or very unlikely to ever
-//      generate a successful INSERT
+//  1. sqlsmith that makes valid INSERTs impossible or very unlikely
+//  2. Or rand-tables that makes it impossible or very unlikely to ever
+//     generate a successful INSERT
 //
 // Note that there is a small but non-zero chance that this test produces a
 // false-negative.
@@ -83,11 +88,14 @@ func TestRandTableInserts(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	rnd, _ := randutil.NewTestRand()
+	defer utilccl.TestingEnableEnterprise()()
 
 	setup := randTablesN(rnd, 10)
-	if _, err := sqlDB.Exec(setup); err != nil {
-		t.Log(setup)
-		t.Fatal(err)
+	for _, stmt := range setup {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Log(stmt)
+			t.Fatal(err)
+		}
 	}
 
 	insertOnly := simpleOption("insert only", func(s *Smither) {
@@ -168,8 +176,10 @@ func TestGenerateParse(t *testing.T) {
 	settings := setting(rnd)
 	t.Log("setting:", settingName, settings.Options)
 	setupSQL := setup(rnd)
-	t.Log(setupSQL)
-	db.Exec(t, setupSQL)
+	t.Log(strings.Join(setupSQL, "\n"))
+	for _, stmt := range setupSQL {
+		db.Exec(t, stmt)
+	}
 
 	smither, err := NewSmither(sqlDB, rnd, settings.Options...)
 	if err != nil {

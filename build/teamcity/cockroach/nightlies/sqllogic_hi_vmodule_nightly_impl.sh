@@ -12,11 +12,10 @@ ARTIFACTS_DIR=/artifacts
 GO_TEST_JSON_OUTPUT_FILE=$ARTIFACTS_DIR/test.json.txt
 
 exit_status=0
-$BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci --config=ci \
-    test //pkg/sql/logictest:logictest_test -- \
+$BAZEL_BIN/pkg/cmd/bazci/bazci_/bazci -- test --config=ci \
+    //pkg/sql/logictest/tests/... \
     --test_arg=--vmodule=*=10 \
     --test_arg=-show-sql \
-    --test_filter='^TestLogic$' \
     --test_env=GO_TEST_WRAP_TESTV=1 \
     --test_env=GO_TEST_WRAP=1 \
     --test_env=GO_TEST_JSON_OUTPUT_FILE=$GO_TEST_JSON_OUTPUT_FILE \

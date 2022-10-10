@@ -11,12 +11,10 @@
 package kvcoord
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"runtime/debug"
 
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -43,12 +41,19 @@ var DisableCommitSanityCheck = envutil.EnvOrDefaultBool("COCKROACH_DISABLE_COMMI
 
 // txnState represents states relating to whether an EndTxn request needs
 // to be sent.
+//
 //go:generate stringer -type=txnState
 type txnState int
 
 const (
 	// txnPending is the normal state for ongoing transactions.
 	txnPending txnState = iota
+
+	// txnRetryableError means that the transaction encountered a
+	// TransactionRetryWithProtoRefreshError, and calls to Send() fail in this
+	// state. It is possible to move back to txnPending by calling
+	// ClearTxnRetryableErr().
+	txnRetryableError
 
 	// txnError means that a batch encountered a non-retriable error. Further
 	// batches except EndTxn(commit=false) will be rejected.
@@ -105,6 +110,11 @@ type TxnCoordSender struct {
 		syncutil.Mutex
 
 		txnState txnState
+
+		// storedRetryableErr is set when txnState == txnRetryableError. This
+		// storedRetryableErr is returned to clients on Send().
+		storedRetryableErr *roachpb.TransactionRetryWithProtoRefreshError
+
 		// storedErr is set when txnState == txnError. This storedErr is returned to
 		// clients on Send().
 		storedErr *roachpb.Error
@@ -336,11 +346,6 @@ func newLeafTxnCoordSender(
 	tcf *TxnCoordSenderFactory, tis *roachpb.LeafTxnInputState,
 ) kv.TxnSender {
 	txn := &tis.Txn
-	// 19.2 roots might have this flag set. In 20.1, the flag is only set by the
-	// server and terminated by the client in the span refresher interceptor. If
-	// the root is a 19.2 node, we reset the flag because it only confuses
-	// that interceptor and provides no benefit.
-	txn.WriteTooOld = false
 	txn.AssertInitialized(context.TODO())
 
 	if txn.Status != roachpb.PENDING {
@@ -442,9 +447,9 @@ func (tc *TxnCoordSender) finalizeNonLockingTxnLocked(
 	et := ba.Requests[0].GetEndTxn()
 	if et.Commit {
 		deadline := et.Deadline
-		if deadline != nil && !deadline.IsEmpty() && deadline.LessEq(tc.mu.txn.WriteTimestamp) {
+		if !deadline.IsEmpty() && deadline.LessEq(tc.mu.txn.WriteTimestamp) {
 			txn := tc.mu.txn.Clone()
-			pErr := generateTxnDeadlineExceededErr(txn, *deadline)
+			pErr := generateTxnDeadlineExceededErr(txn, deadline)
 			// We need to bump the epoch and transform this retriable error.
 			ba.Txn = txn
 			return tc.updateStateLocked(ctx, ba, nil /* br */, pErr)
@@ -576,7 +581,8 @@ func (tc *TxnCoordSender) Send(
 // clock to read below that future-time value, violating "monotonic reads".
 //
 // In practice, most transactions do not need to wait at all, because their
-// commit timestamps were pulled from an HLC clock (i.e. are not synthetic)
+// commit timestamps were pulled from an HLC clock (either the local clock
+// or a remote clock on a node whom the local node has communicated with)
 // and so they will be guaranteed to lead the local HLC's clock, assuming
 // proper HLC time propagation. Only transactions whose commit timestamps
 // were pushed into the future will need to wait, like those who wrote to a
@@ -629,17 +635,19 @@ func (tc *TxnCoordSender) maybeCommitWait(ctx context.Context, deferred bool) er
 	commitTS := tc.mu.txn.WriteTimestamp
 	readOnly := tc.mu.txn.Sequence == 0
 	linearizable := tc.linearizable
-	needWait := commitTS.Synthetic || (linearizable && !readOnly)
-	if !needWait {
-		// No need to wait. If !Synthetic then we know the commit timestamp
-		// leads the local HLC clock, and since that's all we'd need to wait
-		// for, we can short-circuit.
-		return nil
-	}
 
 	waitUntil := commitTS
 	if linearizable && !readOnly {
 		waitUntil = waitUntil.Add(tc.clock.MaxOffset().Nanoseconds(), 0)
+	}
+	if waitUntil.LessEq(tc.clock.Now()) {
+		// No wait fast-path. This is the common case for most transactions. Only
+		// transactions who have their commit timestamp bumped into the future will
+		// need to wait.
+		return nil
+	}
+	if fn := tc.testingKnobs.CommitWaitFilter; fn != nil {
+		fn()
 	}
 
 	before := tc.clock.PhysicalTime()
@@ -686,6 +694,8 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 	switch tc.mu.txnState {
 	case txnPending:
 		// All good.
+	case txnRetryableError:
+		return roachpb.NewError(tc.mu.storedRetryableErr)
 	case txnError:
 		return tc.mu.storedErr
 	case txnFinalized:
@@ -712,19 +722,10 @@ func (tc *TxnCoordSender) maybeRejectClientLocked(
 		// The transaction heartbeat observed an aborted transaction record and
 		// this was not due to a synchronous transaction commit and transaction
 		// record garbage collection.
-		// See the comment on txnHeartbeater.mu.finalizedStatus for more details.
+		// See the comment on txnHeartbeater.mu.finalObservedStatus for more details.
 		abortedErr := roachpb.NewErrorWithTxn(
 			roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_CLIENT_REJECT), &tc.mu.txn)
-		if tc.typ == kv.LeafTxn {
-			// Leaf txns return raw retriable errors (which get handled by the
-			// root) rather than TransactionRetryWithProtoRefreshError.
-			return abortedErr
-		}
-		// Root txns handle retriable errors.
-		newTxn := roachpb.PrepareTransactionForRetry(
-			ctx, abortedErr, roachpb.NormalUserPriority, tc.clock)
-		return roachpb.NewError(roachpb.NewTransactionRetryWithProtoRefreshError(
-			abortedErr.String(), tc.mu.txn.ID, newTxn))
+		return roachpb.NewError(tc.handleRetryableErrLocked(ctx, abortedErr))
 	case protoStatus != roachpb.PENDING || hbObservedStatus != roachpb.PENDING:
 		// The transaction proto is in an unexpected state.
 		return roachpb.NewErrorf(
@@ -815,6 +816,11 @@ func (tc *TxnCoordSender) handleRetryableErrLocked(
 		pErr.String(),
 		errTxnID, // the id of the transaction that encountered the error
 		newTxn)
+
+	// Move to a retryable error state, where all Send() calls fail until the
+	// state is cleared.
+	tc.mu.txnState = txnRetryableError
+	tc.mu.storedRetryableErr = retErr
 
 	// If the ID changed, it means we had to start a new transaction and the
 	// old one is toast. This TxnCoordSender cannot be used any more - future
@@ -972,30 +978,6 @@ func sanityCheckErrWithTxn(
 	return err
 }
 
-// setTxnAnchorKey sets the key at which to anchor the transaction record. The
-// transaction anchor key defaults to the first key written in a transaction.
-func (tc *TxnCoordSender) setTxnAnchorKeyLocked(key roachpb.Key) error {
-	if len(tc.mu.txn.Key) != 0 {
-		return errors.Errorf("transaction anchor key already set")
-	}
-	tc.mu.txn.Key = key
-	return nil
-}
-
-// AnchorOnSystemConfigRange is part of the client.TxnSender interface.
-func (tc *TxnCoordSender) AnchorOnSystemConfigRange() error {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	// Allow this to be called more than once.
-	if bytes.Equal(tc.mu.txn.Key, keys.SystemConfigSpan.Key) {
-		return nil
-	}
-	// The system-config trigger must be run on the system-config range which
-	// means any transaction with the trigger set needs to be anchored to the
-	// system-config range.
-	return tc.setTxnAnchorKeyLocked(keys.SystemConfigSpan.Key)
-}
-
 // TxnStatus is part of the client.TxnSender interface.
 func (tc *TxnCoordSender) TxnStatus() roachpb.TransactionStatus {
 	tc.mu.Lock()
@@ -1072,11 +1054,11 @@ func (tc *TxnCoordSender) SetFixedTimestamp(ctx context.Context, ts hlc.Timestam
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	// The transaction must not have already been used in this epoch.
-	if !tc.interceptorAlloc.txnSpanRefresher.refreshFootprint.empty() {
+	if tc.hasPerformedReadsLocked() {
 		return errors.WithContextTags(errors.AssertionFailedf(
 			"cannot set fixed timestamp, txn %s already performed reads", tc.mu.txn), ctx)
 	}
-	if tc.mu.txn.Sequence != 0 {
+	if tc.hasPerformedWritesLocked() {
 		return errors.WithContextTags(errors.AssertionFailedf(
 			"cannot set fixed timestamp, txn %s already performed writes", tc.mu.txn), ctx)
 	}
@@ -1302,6 +1284,18 @@ func (tc *TxnCoordSender) Step(ctx context.Context) error {
 	return tc.interceptorAlloc.txnSeqNumAllocator.stepLocked(ctx)
 }
 
+// SetReadSeqNum is part of the TxnSender interface.
+func (tc *TxnCoordSender) SetReadSeqNum(seq enginepb.TxnSeq) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if seq < 0 || seq > tc.interceptorAlloc.txnSeqNumAllocator.writeSeq {
+		return errors.AssertionFailedf("invalid read seq num < 0 || > writeSeq (%d): %d",
+			tc.interceptorAlloc.txnSeqNumAllocator.writeSeq, seq)
+	}
+	tc.interceptorAlloc.txnSeqNumAllocator.readSeq = seq
+	return nil
+}
+
 // ConfigureStepping is part of the TxnSender interface.
 func (tc *TxnCoordSender) ConfigureStepping(
 	ctx context.Context, mode kv.SteppingMode,
@@ -1359,4 +1353,48 @@ func (tc *TxnCoordSender) DeferCommitWait(ctx context.Context) func(context.Cont
 		}
 		return tc.maybeCommitWait(ctx, true /* deferred */)
 	}
+}
+
+// GetTxnRetryableErr is part of the TxnSender interface.
+func (tc *TxnCoordSender) GetTxnRetryableErr(
+	ctx context.Context,
+) *roachpb.TransactionRetryWithProtoRefreshError {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.txnState == txnRetryableError {
+		return tc.mu.storedRetryableErr
+	}
+	return nil
+}
+
+// ClearTxnRetryableErr is part of the TxnSender interface.
+func (tc *TxnCoordSender) ClearTxnRetryableErr(ctx context.Context) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.mu.txnState == txnRetryableError {
+		tc.mu.storedRetryableErr = nil
+		tc.mu.txnState = txnPending
+	}
+}
+
+// HasPerformedReads is part of the TxnSender interface.
+func (tc *TxnCoordSender) HasPerformedReads() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.hasPerformedReadsLocked()
+}
+
+// HasPerformedWrites is part of the TxnSender interface.
+func (tc *TxnCoordSender) HasPerformedWrites() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.hasPerformedWritesLocked()
+}
+
+func (tc *TxnCoordSender) hasPerformedReadsLocked() bool {
+	return !tc.interceptorAlloc.txnSpanRefresher.refreshFootprint.empty()
+}
+
+func (tc *TxnCoordSender) hasPerformedWritesLocked() bool {
+	return tc.mu.txn.Sequence != 0
 }

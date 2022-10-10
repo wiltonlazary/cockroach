@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
@@ -92,12 +92,13 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 	}
 	defer tempEngine.Close()
 
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -127,12 +128,12 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 		return errors.New("processor is unexpectedly not a RowSource")
 	}
 
-	acc := evalCtx.Mon.MakeBoundAccount()
+	acc := evalCtx.TestingMon.MakeBoundAccount()
 	defer acc.Close(ctx)
 	testAllocator := colmem.NewAllocator(ctx, &acc, coldataext.NewExtendedColumnFactory(&evalCtx))
 	columnarizers := make([]colexecop.Operator, len(args.inputs))
 	for i, input := range inputsColOp {
-		columnarizers[i] = colexec.NewBufferingColumnarizer(testAllocator, flowCtx, int32(i)+1, input)
+		columnarizers[i] = colexec.NewBufferingColumnarizerForTests(testAllocator, flowCtx, int32(i)+1, input)
 	}
 
 	constructorArgs := &colexecargs.NewColOperatorArgs{
@@ -162,6 +163,7 @@ func verifyColOperator(t *testing.T, args verifyColOperatorArgs) error {
 	}
 
 	outColOp := colexec.NewMaterializer(
+		nil, /* allocator */
 		flowCtx,
 		int32(len(args.inputs))+2,
 		result.OpWithMetaInfo,

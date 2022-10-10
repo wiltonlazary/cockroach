@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/apd/v3"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/keyside"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc/valueside"
@@ -24,8 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 )
 
 // DecodeKeyValsToCols decodes the values that are part of the key, writing the
@@ -49,14 +50,12 @@ func DecodeKeyValsToCols(
 	rowIdx int,
 	indexColIdx []int,
 	checkAllColsForNull bool,
-	types []*types.T,
-	directions []descpb.IndexDescriptor_Direction,
+	keyCols []descpb.IndexFetchSpec_KeyColumn,
 	unseen *util.FastIntSet,
 	key []byte,
-	invertedColIdx int,
 	scratch []byte,
 ) (remainingKey []byte, foundNull bool, retScratch []byte, _ error) {
-	for j := range types {
+	for j := range keyCols {
 		var err error
 		vecIdx := indexColIdx[j]
 		if vecIdx == -1 {
@@ -71,8 +70,11 @@ func DecodeKeyValsToCols(
 				unseen.Remove(vecIdx)
 			}
 			var isNull bool
-			isInverted := invertedColIdx == vecIdx
-			key, isNull, scratch, err = decodeTableKeyToCol(da, vecs, vecIdx, rowIdx, types[j], key, directions[j], isInverted, scratch)
+			key, isNull, scratch, err = decodeTableKeyToCol(
+				da, vecs, vecIdx, rowIdx,
+				keyCols[j].Type, key, keyCols[j].Direction,
+				scratch,
+			)
 			foundNull = isNull || foundNull
 		}
 		if err != nil {
@@ -93,12 +95,11 @@ func decodeTableKeyToCol(
 	rowIdx int,
 	valType *types.T,
 	key []byte,
-	dir descpb.IndexDescriptor_Direction,
-	isInverted bool,
+	dir catpb.IndexColumn_Direction,
 	scratch []byte,
 ) (_ []byte, _ bool, retScratch []byte, _ error) {
-	if (dir != descpb.IndexDescriptor_ASC) && (dir != descpb.IndexDescriptor_DESC) {
-		return nil, false, scratch, errors.AssertionFailedf("invalid direction: %d", log.Safe(dir))
+	if (dir != catpb.IndexColumn_ASC) && (dir != catpb.IndexColumn_DESC) {
+		return nil, false, scratch, errors.AssertionFailedf("invalid direction: %d", redact.Safe(dir))
 	}
 	var isNull bool
 	if key, isNull = encoding.DecodeIfNull(key); isNull {
@@ -110,23 +111,12 @@ func decodeTableKeyToCol(
 	// type.
 	colIdx := vecs.ColsMap[vecIdx]
 
-	// Inverted columns should not be decoded, but should instead be
-	// passed on as a DBytes datum.
-	if isInverted {
-		keyLen, err := encoding.PeekLength(key)
-		if err != nil {
-			return nil, false, scratch, err
-		}
-		vecs.BytesCols[colIdx].Set(rowIdx, key[:keyLen])
-		return key[keyLen:], false, scratch, nil
-	}
-
 	var rkey []byte
 	var err error
 	switch valType.Family() {
 	case types.BoolFamily:
 		var i int64
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
@@ -134,7 +124,7 @@ func decodeTableKeyToCol(
 		vecs.BoolCols[colIdx][rowIdx] = i != 0
 	case types.IntFamily, types.DateFamily:
 		var i int64
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, i, err = encoding.DecodeVarintAscending(key)
 		} else {
 			rkey, i, err = encoding.DecodeVarintDescending(key)
@@ -149,7 +139,7 @@ func decodeTableKeyToCol(
 		}
 	case types.FloatFamily:
 		var f float64
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, f, err = encoding.DecodeFloatAscending(key)
 		} else {
 			rkey, f, err = encoding.DecodeFloatDescending(key)
@@ -157,14 +147,14 @@ func decodeTableKeyToCol(
 		vecs.Float64Cols[colIdx][rowIdx] = f
 	case types.DecimalFamily:
 		var d apd.Decimal
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, d, err = encoding.DecodeDecimalAscending(key, scratch[:0])
 		} else {
 			rkey, d, err = encoding.DecodeDecimalDescending(key, scratch[:0])
 		}
 		vecs.DecimalCols[colIdx][rowIdx] = d
 	case types.BytesFamily, types.StringFamily, types.UuidFamily:
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			// We ask for the deep copy to be made so that scratch doesn't
 			// reference the memory of key - this allows us to return scratch
 			// to the caller to be reused. The deep copy additionally ensures
@@ -180,7 +170,7 @@ func decodeTableKeyToCol(
 		vecs.BytesCols[colIdx].Set(rowIdx, scratch)
 	case types.TimestampFamily, types.TimestampTZFamily:
 		var t time.Time
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, t, err = encoding.DecodeTimeAscending(key)
 		} else {
 			rkey, t, err = encoding.DecodeTimeDescending(key)
@@ -188,7 +178,7 @@ func decodeTableKeyToCol(
 		vecs.TimestampCols[colIdx][rowIdx] = t
 	case types.IntervalFamily:
 		var d duration.Duration
-		if dir == descpb.IndexDescriptor_ASC {
+		if dir == catpb.IndexColumn_ASC {
 			rkey, d, err = encoding.DecodeDurationAscending(key)
 		} else {
 			rkey, d, err = encoding.DecodeDurationDescending(key)
@@ -201,10 +191,18 @@ func decodeTableKeyToCol(
 		jsonLen, err = encoding.PeekLength(key)
 		vecs.JSONCols[colIdx].Bytes.Set(rowIdx, key[:jsonLen])
 		rkey = key[jsonLen:]
+	case types.EncodedKeyFamily:
+		// Don't attempt to decode the inverted key.
+		keyLen, err := encoding.PeekLength(key)
+		if err != nil {
+			return nil, false, scratch, err
+		}
+		vecs.BytesCols[colIdx].Set(rowIdx, key[:keyLen])
+		rkey = key[keyLen:]
 	default:
 		var d tree.Datum
 		encDir := encoding.Ascending
-		if dir == descpb.IndexDescriptor_DESC {
+		if dir == catpb.IndexColumn_DESC {
 			encDir = encoding.Descending
 		}
 		d, rkey, err = keyside.Decode(da, valType, key, encDir)

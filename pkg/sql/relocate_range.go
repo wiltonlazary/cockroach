@@ -55,14 +55,14 @@ type relocateRequest struct {
 }
 
 func (n *relocateRange) startExec(params runParams) error {
-	toStoreID, err := paramparse.DatumAsInt(params.EvalContext(), "TO", n.toStoreID)
+	toStoreID, err := paramparse.DatumAsInt(params.ctx, params.EvalContext(), "TO", n.toStoreID)
 	if err != nil {
 		return err
 	}
 	var fromStoreID int64
 	if n.subjectReplicas != tree.RelocateLease {
 		// The from expression is NULL if the target is LEASE.
-		fromStoreID, err = paramparse.DatumAsInt(params.EvalContext(), "FROM", n.fromStoreID)
+		fromStoreID, err = paramparse.DatumAsInt(params.ctx, params.EvalContext(), "FROM", n.fromStoreID)
 		if err != nil {
 			return err
 		}
@@ -163,6 +163,10 @@ func relocate(params runParams, req relocateRequest) (*roachpb.RangeDescriptor, 
 			{ChangeType: roachpb.REMOVE_VOTER, Target: fromTarget},
 		},
 	)
+	// TODO(aayush): If the `AdminChangeReplicas`call failed because it found that
+	// the range was already in the process of being rebalanced, we currently fail
+	// the statement. We should consider instead force-removing these learners
+	// when `AdminChangeReplicas` calls are issued by SQL.
 	return rangeDesc, err
 }
 

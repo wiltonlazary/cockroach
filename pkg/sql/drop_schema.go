@@ -14,11 +14,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/dbdesc"
@@ -27,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -72,10 +72,10 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 			return nil, err
 		}
 
-		sc, err := p.Descriptors().GetSchemaByName(
+		sc, err := p.Descriptors().GetImmutableSchemaByName(
 			ctx, p.txn, db, scName, tree.SchemaLookupFlags{
-				Required:       false,
-				RequireMutable: true,
+				Required:    false,
+				AvoidLeased: true,
 			},
 		)
 		if err != nil {
@@ -102,15 +102,18 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 			}
 			if !(isAdmin || hasOwnership) {
 				return nil, pgerror.Newf(pgcode.InsufficientPrivilege,
-					"must be owner of schema %q", sc.GetName())
+					"must be owner of schema %s", tree.Name(sc.GetName()))
 			}
 			namesBefore := len(d.objectNamesToDelete)
+			fnsBefore := len(d.functionsToDelete)
 			if err := d.collectObjectsInSchema(ctx, p, db, sc); err != nil {
 				return nil, err
 			}
 			// We added some new objects to delete. Ensure that we have the correct
 			// drop behavior to be doing this.
-			if namesBefore != len(d.objectNamesToDelete) && n.DropBehavior != tree.DropCascade {
+			if (namesBefore != len(d.objectNamesToDelete) || fnsBefore != len(d.functionsToDelete)) &&
+				n.DropBehavior != tree.DropCascade {
+
 				return nil, pgerror.Newf(pgcode.DependentObjectsStillExist,
 					"schema %q is not empty and CASCADE was not specified", scName)
 			}
@@ -121,12 +124,7 @@ func (p *planner) DropSchema(ctx context.Context, n *tree.DropSchema) (planNode,
 
 	}
 
-	// The database descriptor is used to generate specific error messages when
-	// a database cannot be collected for dropping. The database descriptor is nil here
-	// because dropping a schema will never result in a database being collected and dropped.
-	// Also, schemas can belong to different databases, so it does not make sense to pass a single
-	// database descriptor.
-	if err := d.resolveCollectedObjects(ctx, p, nil /* db */); err != nil {
+	if err := d.resolveCollectedObjects(ctx, p); err != nil {
 		return nil, err
 	}
 
@@ -150,8 +148,12 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 		sc := n.d.schemasToDelete[i].schema
 		schemaIDs[i] = sc.GetID()
 		db := n.d.schemasToDelete[i].dbDesc
-
-		mutDesc := sc.(*schemadesc.Mutable)
+		mutDesc, err := p.Descriptors().GetMutableSchemaByID(
+			ctx, p.txn, sc.GetID(), p.CommonLookupFlagsRequired(),
+		)
+		if err != nil {
+			return err
+		}
 		if err := p.dropSchemaImpl(ctx, db, mutDesc); err != nil {
 			return err
 		}
@@ -171,6 +173,7 @@ func (n *dropSchemaNode) startExec(params runParams) error {
 
 	// Create the job to drop the schema.
 	if err := p.createDropSchemaJob(
+		params.ctx,
 		schemaIDs,
 		n.d.getDroppedTableDetails(),
 		n.d.typesToDelete,
@@ -206,15 +209,12 @@ func (p *planner) dropSchemaImpl(
 ) error {
 
 	// Update parent database schemas mapping.
-	if p.execCfg.Settings.Version.IsActive(ctx, clusterversion.AvoidDrainingNames) {
-		delete(parentDB.Schemas, sc.GetName())
-	} else {
-		// TODO (rohany): This can be removed once RESTORE installs schemas into
-		//  the parent database.
-		parentDB.AddSchemaToDatabase(sc.GetName(), descpb.DatabaseDescriptor_SchemaInfo{
-			ID:      sc.GetID(),
-			Dropped: true,
-		})
+	delete(parentDB.Schemas, sc.GetName())
+
+	// Exit early with an error if the schema is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(sc) {
+		return scerrors.ConcurrentSchemaChangeError(sc)
 	}
 
 	// Update the schema descriptor as dropped.
@@ -239,6 +239,7 @@ func (p *planner) dropSchemaImpl(
 }
 
 func (p *planner) createDropSchemaJob(
+	ctx context.Context,
 	schemas []descpb.ID,
 	tableDropDetails []jobspb.DroppedTableDetails,
 	typesToDrop []*typedesc.Mutable,
@@ -249,7 +250,7 @@ func (p *planner) createDropSchemaJob(
 		typeIDs = append(typeIDs, t.ID)
 	}
 
-	_, err := p.extendedEvalCtx.QueueJob(p.EvalContext().Ctx(), jobs.Record{
+	_, err := p.extendedEvalCtx.QueueJob(ctx, jobs.Record{
 		Description:   jobDesc,
 		Username:      p.User(),
 		DescriptorIDs: schemas,
@@ -273,7 +274,7 @@ func (p *planner) removeSchemaComment(ctx context.Context, schemaID descpb.ID) e
 		ctx,
 		"delete-schema-comment",
 		p.txn,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		"DELETE FROM system.comments WHERE type=$1 AND object_id=$2 AND sub_id=0",
 		keys.SchemaCommentType,
 		schemaID)

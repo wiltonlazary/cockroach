@@ -33,23 +33,29 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
+type scanConfig struct {
+	Spans     []roachpb.Span
+	Timestamp hlc.Timestamp
+	WithDiff  bool
+	Knobs     TestingKnobs
+}
+
 type kvScanner interface {
 	// Scan will scan all of the KVs in the spans specified by the physical config
 	// at the specified timestamp and write them to the buffer.
-	Scan(ctx context.Context, sink kvevent.Writer, cfg physicalConfig) error
+	Scan(ctx context.Context, sink kvevent.Writer, cfg scanConfig) error
 }
 
 type scanRequestScanner struct {
-	settings *cluster.Settings
-	gossip   gossip.OptionalGossip
-	db       *kv.DB
+	settings                *cluster.Settings
+	gossip                  gossip.OptionalGossip
+	db                      *kv.DB
+	onBackfillRangeCallback func(int64) (func(), func())
 }
 
 var _ kvScanner = (*scanRequestScanner)(nil)
 
-func (p *scanRequestScanner) Scan(
-	ctx context.Context, sink kvevent.Writer, cfg physicalConfig,
-) error {
+func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg scanConfig) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -63,6 +69,12 @@ func (p *scanRequestScanner) Scan(
 	spans, err := getSpansToProcess(ctx, distSender, cfg.Spans)
 	if err != nil {
 		return err
+	}
+
+	var backfillDec, backfillClear func()
+	if p.onBackfillRangeCallback != nil {
+		backfillDec, backfillClear = p.onBackfillRangeCallback(int64(len(spans)))
+		defer backfillClear()
 	}
 
 	maxConcurrentScans := maxConcurrentScanRequests(p.gossip, &p.settings.SV)
@@ -92,6 +104,9 @@ func (p *scanRequestScanner) Scan(
 			defer limAlloc.Release()
 			err := p.exportSpan(ctx, span, cfg.Timestamp, cfg.WithDiff, sink, cfg.Knobs)
 			finished := atomic.AddInt64(&atomicFinished, 1)
+			if backfillDec != nil {
+				backfillDec()
+			}
 			if log.V(2) {
 				log.Infof(ctx, `exported %d of %d: %v`, finished, len(spans), err)
 			}
@@ -118,7 +133,7 @@ func (p *scanRequestScanner) exportSpan(
 	}
 	stopwatchStart := timeutil.Now()
 	var scanDuration, bufferDuration time.Duration
-	const targetBytesPerScan = 16 << 20 // 16 MiB
+	targetBytesPerScan := changefeedbase.ScanRequestSize.Get(&p.settings.SV)
 	for remaining := &span; remaining != nil; {
 		start := timeutil.Now()
 		b := txn.NewBatch()
@@ -130,7 +145,9 @@ func (p *scanRequestScanner) exportSpan(
 		// during result parsing.
 		b.AddRawRequest(r)
 		if knobs.BeforeScanRequest != nil {
-			knobs.BeforeScanRequest(b)
+			if err := knobs.BeforeScanRequest(b); err != nil {
+				return err
+			}
 		}
 
 		if err := txn.Run(ctx, b); err != nil {
@@ -147,7 +164,7 @@ func (p *scanRequestScanner) exportSpan(
 		if res.ResumeSpan != nil {
 			consumed := roachpb.Span{Key: remaining.Key, EndKey: res.ResumeSpan.Key}
 			if err := sink.Add(
-				ctx, kvevent.MakeResolvedEvent(consumed, ts, jobspb.ResolvedSpan_NONE),
+				ctx, kvevent.NewBackfillResolvedEvent(consumed, ts, jobspb.ResolvedSpan_NONE),
 			); err != nil {
 				return err
 			}
@@ -156,7 +173,7 @@ func (p *scanRequestScanner) exportSpan(
 	}
 	// p.metrics.PollRequestNanosHist.RecordValue(scanDuration.Nanoseconds())
 	if err := sink.Add(
-		ctx, kvevent.MakeResolvedEvent(span, ts, jobspb.ResolvedSpan_NONE),
+		ctx, kvevent.NewBackfillResolvedEvent(span, ts, jobspb.ResolvedSpan_NONE),
 	); err != nil {
 		return err
 	}
@@ -170,7 +187,7 @@ func (p *scanRequestScanner) exportSpan(
 func getSpansToProcess(
 	ctx context.Context, ds *kvcoord.DistSender, targetSpans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	ranges, err := allRangeSpans(ctx, ds, targetSpans)
+	ranges, err := AllRangeSpans(ctx, ds, targetSpans)
 	if err != nil {
 		return nil, err
 	}
@@ -216,27 +233,20 @@ func slurpScanResponse(
 	ctx context.Context,
 	sink kvevent.Writer,
 	res *roachpb.ScanResponse,
-	ts hlc.Timestamp,
+	backfillTS hlc.Timestamp,
 	withDiff bool,
 	span roachpb.Span,
 ) error {
+	var keyBytes, valBytes []byte
+	var ts hlc.Timestamp
+	var err error
 	for _, br := range res.BatchResponses {
 		for len(br) > 0 {
-			var kv roachpb.KeyValue
-			var err error
-			kv.Key, kv.Value.Timestamp, kv.Value.RawBytes, br, err = enginepb.ScanDecodeKeyValue(br)
+			keyBytes, ts, valBytes, br, err = enginepb.ScanDecodeKeyValue(br)
 			if err != nil {
 				return errors.Wrapf(err, `decoding changes for %s`, span)
 			}
-			var prevVal roachpb.Value
-			if withDiff {
-				// Include the same value for the "before" and "after" KV, but
-				// interpret them at different timestamp. Specifically, interpret
-				// the "before" KV at the timestamp immediately before the schema
-				// change. This is handled in kvsToRows.
-				prevVal = kv.Value
-			}
-			if err = sink.Add(ctx, kvevent.MakeKVEvent(kv, prevVal, ts)); err != nil {
+			if err = sink.Add(ctx, kvevent.NewBackfillKVEvent(keyBytes, ts, valBytes, withDiff, backfillTS)); err != nil {
 				return errors.Wrapf(err, `buffering changes for %s`, span)
 			}
 		}
@@ -244,7 +254,8 @@ func slurpScanResponse(
 	return nil
 }
 
-func allRangeSpans(
+// AllRangeSpans returns the list of all ranges that for the specified list of spans.
+func AllRangeSpans(
 	ctx context.Context, ds *kvcoord.DistSender, spans []roachpb.Span,
 ) ([]roachpb.Span, error) {
 
@@ -281,7 +292,7 @@ func clusterNodeCount(gw gossip.OptionalGossip) int {
 		return 1
 	}
 	var nodes int
-	_ = g.IterateInfos(gossip.KeyNodeIDPrefix, func(_ string, _ gossip.Info) error {
+	_ = g.IterateInfos(gossip.KeyNodeDescPrefix, func(_ string, _ gossip.Info) error {
 		nodes++
 		return nil
 	})

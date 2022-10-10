@@ -338,9 +338,11 @@ func TestExplainMVCCSteps(t *testing.T) {
 	defer srv.Stopper().Stop(ctx)
 	r := sqlutils.MakeSQLRunner(godb)
 	r.Exec(t, "CREATE TABLE ab (a PRIMARY KEY, b) AS SELECT g, g FROM generate_series(1,1000) g(g)")
+	r.Exec(t, "CREATE TABLE bc (b PRIMARY KEY, c) AS SELECT g, g FROM generate_series(1,1000) g(g)")
 
+	scanQuery := "SELECT count(*) FROM ab"
 	expectedSteps, expectedSeeks := 1000, 2
-	foundSteps, foundSeeks := getMVCCStats(t, r)
+	foundSteps, foundSeeks := getMVCCStats(t, r, scanQuery)
 
 	assert.Equal(t, expectedSteps, foundSteps)
 	assert.Equal(t, expectedSeeks, foundSeeks)
@@ -351,17 +353,30 @@ func TestExplainMVCCSteps(t *testing.T) {
 	r.Exec(t, "UPDATE ab SET b=b+1 WHERE true")
 
 	expectedSteps, expectedSeeks = 2000, 2
-	foundSteps, foundSeeks = getMVCCStats(t, r)
+	foundSteps, foundSeeks = getMVCCStats(t, r, scanQuery)
 
 	assert.Equal(t, expectedSteps, foundSteps)
 	assert.Equal(t, expectedSeeks, foundSeeks)
+
+	// Check that the lookup join (which is executed via a row-by-row processor
+	// wrapped into the vectorized flow) correctly propagates the scan stats.
+	lookupJoinQuery := "SELECT count(*) FROM ab INNER LOOKUP JOIN bc ON ab.b = bc.b"
+	foundSteps, foundSeeks = getMVCCStats(t, r, lookupJoinQuery)
+	// We're mainly interested in the fact whether the propagation takes place,
+	// so one of the values being positive is sufficient.
+	assert.Greater(t, foundSteps+foundSeeks, 0)
 }
 
-func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks int) {
-	rows := r.Query(t, "EXPLAIN ANALYZE(VERBOSE) SELECT count(*) FROM ab")
+// getMVCCStats returns the number of MVCC steps and seeks found in the EXPLAIN
+// ANALYZE of the given query from the top-most operator in the plan (i.e. if
+// there are multiple operators exposing the scan stats, then the first info
+// that appears in the EXPLAIN output is used).
+func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner, query string) (foundSteps, foundSeeks int) {
+	rows := r.Query(t, "EXPLAIN ANALYZE(VERBOSE) "+query)
 	var output strings.Builder
 	var str string
 	var err error
+	var stepsSet, seeksSet bool
 	for rows.Next() {
 		if err := rows.Scan(&str); err != nil {
 			t.Fatal(err)
@@ -373,15 +388,17 @@ func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks i
 		str = strings.ReplaceAll(str, ",", "")
 		stepRe := regexp.MustCompile(`MVCC step count \(ext/int\): (\d+)/(\d+)`)
 		stepMatches := stepRe.FindStringSubmatch(str)
-		if len(stepMatches) == 3 {
+		if len(stepMatches) == 3 && !stepsSet {
 			foundSteps, err = strconv.Atoi(stepMatches[1])
 			assert.NoError(t, err)
+			stepsSet = true
 		}
 		seekRe := regexp.MustCompile(`MVCC seek count \(ext/int\): (\d+)/(\d+)`)
 		seekMatches := seekRe.FindStringSubmatch(str)
-		if len(seekMatches) == 3 {
+		if len(seekMatches) == 3 && !seeksSet {
 			foundSeeks, err = strconv.Atoi(seekMatches[1])
 			assert.NoError(t, err)
+			seeksSet = true
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -392,4 +409,63 @@ func getMVCCStats(t *testing.T, r *sqlutils.SQLRunner) (foundSteps, foundSeeks i
 		fmt.Println(output.String())
 	}
 	return foundSteps, foundSeeks
+}
+
+// TestExplainAnalyzeWarnings verifies that warnings are printed whenever the
+// estimated number of rows to be scanned differs significantly from the actual
+// row count.
+func TestExplainAnalyzeWarnings(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, godb, _ := serverutils.StartServer(t, base.TestServerArgs{Insecure: true})
+	defer srv.Stopper().Stop(ctx)
+	r := sqlutils.MakeSQLRunner(godb)
+
+	// Disable auto stats collection so that it doesn't interfere.
+	r.Exec(t, "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false")
+	r.Exec(t, "CREATE TABLE warnings (k INT PRIMARY KEY)")
+	// Insert 1000 rows into the table - this will be the actual row count. The
+	// "acceptable" range for the estimates when the warning is not added is
+	// [450, 2100].
+	r.Exec(t, "INSERT INTO warnings SELECT generate_series(1, 1000)")
+
+	for i, tc := range []struct {
+		estimatedRowCount int
+		expectWarning     bool
+	}{
+		{estimatedRowCount: 0, expectWarning: true},
+		{estimatedRowCount: 100, expectWarning: true},
+		{estimatedRowCount: 449, expectWarning: true},
+		{estimatedRowCount: 450, expectWarning: false},
+		{estimatedRowCount: 1000, expectWarning: false},
+		{estimatedRowCount: 2000, expectWarning: false},
+		{estimatedRowCount: 2100, expectWarning: false},
+		{estimatedRowCount: 2101, expectWarning: true},
+		{estimatedRowCount: 10000, expectWarning: true},
+	} {
+		// Inject fake stats.
+		r.Exec(t, fmt.Sprintf(
+			`ALTER TABLE warnings INJECT STATISTICS '[{
+                            "columns": ["k"],
+                            "created_at": "2022-08-23 00:00:0%[2]d.000000",
+                            "distinct_count": %[1]d,
+                            "name": "__auto__",
+                            "null_count": 0,
+                            "row_count": %[1]d
+			}]'`, tc.estimatedRowCount, i,
+		))
+		rows := r.QueryStr(t, "EXPLAIN ANALYZE SELECT * FROM warnings")
+		var warningFound bool
+		for _, row := range rows {
+			if len(row) > 1 {
+				t.Fatalf("unexpectedly more than a single string is returned in %v", row)
+			}
+			if strings.HasPrefix(row[0], "WARNING") {
+				warningFound = true
+			}
+		}
+		assert.Equal(t, tc.expectWarning, warningFound, fmt.Sprintf("failed for estimated row count %d", tc.estimatedRowCount))
+	}
 }

@@ -11,11 +11,17 @@
 package sctestdeps
 
 import (
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/nstree"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // Option configures the TestState.
@@ -30,16 +36,37 @@ func (o optionFunc) apply(state *TestState) { o(state) }
 var _ Option = (optionFunc)(nil)
 
 // WithNamespace sets the TestState namespace to the provided value.
-func WithNamespace(ns map[descpb.NameInfo]descpb.ID) Option {
+func WithNamespace(c nstree.Catalog) Option {
 	return optionFunc(func(state *TestState) {
-		state.namespace = ns
+		_ = c.ForEachNamespaceEntry(func(e nstree.NamespaceEntry) error {
+			state.committed.UpsertNamespaceEntry(e, e.GetID(), e.GetMVCCTimestamp())
+			state.uncommitted.UpsertNamespaceEntry(e, e.GetID(), e.GetMVCCTimestamp())
+			return nil
+		})
 	})
 }
 
 // WithDescriptors sets the TestState descriptors to the provided value.
-func WithDescriptors(descs nstree.Map) Option {
+// This function also scrubs any volatile timestamps from the descriptor.
+func WithDescriptors(c nstree.Catalog) Option {
+	modifTime := hlc.Timestamp{WallTime: defaultOverriddenCreatedAt.UnixNano()}
 	return optionFunc(func(state *TestState) {
-		state.descriptors = descs
+		_ = c.ForEachDescriptorEntry(func(desc catalog.Descriptor) error {
+			mut := desc.NewBuilder().BuildCreatedMutable()
+			switch m := mut.(type) {
+			case *tabledesc.Mutable:
+				for _, idx := range m.AllIndexes() {
+					if !idx.CreatedAt().IsZero() {
+						idx.IndexDesc().CreatedAtNanos = modifTime.WallTime
+					}
+				}
+				m.CreateAsOfTime = modifTime
+			}
+			desc = resetModificationTime(mut)
+			state.committed.UpsertDescriptorEntry(desc)
+			state.uncommitted.UpsertDescriptorEntry(desc)
+			return nil
+		})
 	})
 }
 
@@ -50,8 +77,15 @@ func WithSessionData(sessionData sessiondata.SessionData) Option {
 	})
 }
 
+// WithZoneConfigs sets the TestStates zone config map to the provided value.
+func WithZoneConfigs(zoneConfigs map[catid.DescID]*zonepb.ZoneConfig) Option {
+	return optionFunc(func(state *TestState) {
+		state.zoneConfigs = zoneConfigs
+	})
+}
+
 // WithTestingKnobs sets the TestState testing knobs to the provided value.
-func WithTestingKnobs(testingKnobs *scrun.TestingKnobs) Option {
+func WithTestingKnobs(testingKnobs *scexec.TestingKnobs) Option {
 	return optionFunc(func(state *TestState) {
 		state.testingKnobs = testingKnobs
 	})
@@ -71,11 +105,11 @@ func WithCurrentDatabase(db string) Option {
 	})
 }
 
-// WithBackfillTracker injects a BackfillTracker to be provided by the
+// WithBackfillerTracker injects a BackfillerTracker to be provided by the
 // TestState. If this option is not provided, the default tracker will
 // resolve any descriptor referenced and return an empty backfill progress.
 // All writes in the default tracker are ignored.
-func WithBackfillTracker(backfillTracker scexec.BackfillTracker) Option {
+func WithBackfillerTracker(backfillTracker scexec.BackfillerTracker) Option {
 	return optionFunc(func(state *TestState) {
 		state.backfillTracker = backfillTracker
 	})
@@ -89,11 +123,39 @@ func WithBackfiller(backfiller scexec.Backfiller) Option {
 	})
 }
 
+// WithComments injects sets comment cache of TestState to the provided value.
+func WithComments(comments map[descmetadata.CommentKey]string) Option {
+	return optionFunc(func(state *TestState) {
+		state.comments = comments
+	})
+}
+
+// WithMerger injects a Merger to be provided by the TestState.
+// The default merger logs the merge event into the test state.
+func WithMerger(merger scexec.Merger) Option {
+	return optionFunc(func(state *TestState) {
+		state.merger = merger
+	})
+}
+
+var (
+	// defaultOverriddenCreatedAt is used to populate the CreatedAt timestamp for
+	// all descriptors injected into the catalog. We inject this to make the
+	// tests deterministic.
+	defaultOverriddenCreatedAt = time.Date(2022, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	// defaultCreatedAt is used to populated the CreatedAt timestamp for all newly
+	// created indexes.
+	defaultCreatedAt = defaultOverriddenCreatedAt.Add(time.Hour)
+)
+
 var defaultOptions = []Option{
 	optionFunc(func(state *TestState) {
-		state.namespace = make(map[descpb.NameInfo]descpb.ID)
-		state.backfillTracker = &testBackfillTracker{deps: state}
+		state.backfillTracker = &testBackfillerTracker{deps: state}
 		state.backfiller = &testBackfiller{s: state}
+		state.merger = &testBackfiller{s: state}
 		state.indexSpanSplitter = &indexSpanSplitter{}
+		state.approximateTimestamp = defaultCreatedAt
+		state.zoneConfigs = make(map[catid.DescID]*zonepb.ZoneConfig)
 	}),
 }

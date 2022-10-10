@@ -45,27 +45,16 @@ func (tc *Collection) GetImmutableDatabaseByName(
 	return tc.getDatabaseByName(ctx, txn, name, flags)
 }
 
-// GetDatabaseDesc implements the Accessor interface.
-//
-// TODO(ajwerner): This exists to support the SchemaResolver interface and
-// should be removed or adjusted.
-func (tc *Collection) GetDatabaseDesc(
-	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
-) (desc catalog.DatabaseDescriptor, err error) {
-	return tc.getDatabaseByName(ctx, txn, name, flags)
-}
-
 // getDatabaseByName returns a database descriptor with properties according to
 // the provided lookup flags.
 func (tc *Collection) getDatabaseByName(
 	ctx context.Context, txn *kv.Txn, name string, flags tree.DatabaseLookupFlags,
 ) (catalog.DatabaseDescriptor, error) {
-	found, desc, err := tc.getByName(
-		ctx, txn, nil, nil, name, flags.AvoidLeased, flags.RequireMutable, flags.AvoidSynthetic,
-	)
+	desc, err := tc.getDescriptorByName(ctx, txn, nil /* db */, nil /* sc */, name, flags, catalog.Database)
 	if err != nil {
 		return nil, err
-	} else if !found {
+	}
+	if desc == nil {
 		if flags.Required {
 			return nil, sqlerrors.NewUndefinedDatabaseError(name)
 		}
@@ -77,9 +66,6 @@ func (tc *Collection) getDatabaseByName(
 			return nil, sqlerrors.NewUndefinedDatabaseError(name)
 		}
 		return nil, nil
-	}
-	if dropped, err := filterDescriptorState(db, flags.Required, flags); err != nil || dropped {
-		return nil, err
 	}
 	return db, nil
 }
@@ -96,7 +82,7 @@ func (tc *Collection) GetImmutableDatabaseByID(
 func (tc *Collection) getDatabaseByID(
 	ctx context.Context, txn *kv.Txn, dbID descpb.ID, flags tree.DatabaseLookupFlags,
 ) (bool, catalog.DatabaseDescriptor, error) {
-	desc, err := tc.getDescriptorByID(ctx, txn, dbID, flags)
+	descs, err := tc.getDescriptorsByID(ctx, txn, flags, dbID)
 	if err != nil {
 		if errors.Is(err, catalog.ErrDescriptorNotFound) {
 			if flags.Required {
@@ -106,7 +92,7 @@ func (tc *Collection) getDatabaseByID(
 		}
 		return false, nil, err
 	}
-	db, ok := desc.(catalog.DatabaseDescriptor)
+	db, ok := descs[0].(catalog.DatabaseDescriptor)
 	if !ok {
 		return false, nil, sqlerrors.NewUndefinedDatabaseError(fmt.Sprintf("[%d]", dbID))
 	}

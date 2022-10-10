@@ -19,8 +19,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/errors"
 )
 
@@ -193,7 +195,7 @@ func (s *subquery) ResolvedType() *types.T {
 }
 
 // Eval is part of the tree.TypedExpr interface.
-func (s *subquery) Eval(_ *tree.EvalContext) (tree.Datum, error) {
+func (s *subquery) Eval(_ context.Context, _ tree.ExprEvaluator) (tree.Datum, error) {
 	panic(errors.AssertionFailedf("subquery must be replaced before evaluation"))
 }
 
@@ -201,6 +203,9 @@ func (s *subquery) Eval(_ *tree.EvalContext) (tree.Datum, error) {
 // It stores the resulting relational expression in s.node, and also updates
 // s.cols and s.ordering with the output columns and ordering of the subquery.
 func (s *subquery) buildSubquery(desiredTypes []*types.T) {
+	if s.scope.builder.insideFuncDef {
+		panic(unimplemented.New("user-defined functions", "subquery usage inside a function definition"))
+	}
 	if s.scope.replaceSRFs {
 		// We need to save and restore the previous value of the replaceSRFs field in
 		// case we are recursively called within a subquery context.
@@ -330,18 +335,17 @@ func (b *Builder) buildSingleRowSubquery(
 //
 // We use the following transformations:
 //
-//   <var> IN (<subquery>)
-//     ==> ConstructAny(<subquery>, <var>, EqOp)
+//	<var> IN (<subquery>)
+//	  ==> ConstructAny(<subquery>, <var>, EqOp)
 //
-//   <var> NOT IN (<subquery>)
-//    ==> ConstructNot(ConstructAny(<subquery>, <var>, EqOp))
+//	<var> NOT IN (<subquery>)
+//	 ==> ConstructNot(ConstructAny(<subquery>, <var>, EqOp))
 //
-//   <var> <comp> {SOME|ANY}(<subquery>)
-//     ==> ConstructAny(<subquery>, <var>, <comp>)
+//	<var> <comp> {SOME|ANY}(<subquery>)
+//	  ==> ConstructAny(<subquery>, <var>, <comp>)
 //
-//   <var> <comp> ALL(<subquery>)
-//     ==> ConstructNot(ConstructAny(<subquery>, <var>, Negate(<comp>)))
-//
+//	<var> <comp> ALL(<subquery>)
+//	  ==> ConstructNot(ConstructAny(<subquery>, <var>, Negate(<comp>)))
 func (b *Builder) buildMultiRowSubquery(
 	c *tree.ComparisonExpr, inScope *scope, colRefs *opt.ColSet,
 ) (out opt.ScalarExpr, outScope *scope) {
@@ -354,14 +358,14 @@ func (b *Builder) buildMultiRowSubquery(
 
 	var cmp opt.Operator
 	switch c.Operator.Symbol {
-	case tree.In, tree.NotIn:
+	case treecmp.In, treecmp.NotIn:
 		// <var> = x
 		cmp = opt.EqOp
 
-	case tree.Any, tree.Some, tree.All:
+	case treecmp.Any, treecmp.Some, treecmp.All:
 		// <var> <comp> x
 		cmp = opt.ComparisonOpMap[c.SubOperator.Symbol]
-		if c.Operator.Symbol == tree.All {
+		if c.Operator.Symbol == treecmp.All {
 			// NOT(<var> <comp> x)
 			cmp = opt.NegateOpMap[cmp]
 		}
@@ -378,7 +382,7 @@ func (b *Builder) buildMultiRowSubquery(
 		OriginalExpr: s.Subquery,
 	})
 	switch c.Operator.Symbol {
-	case tree.NotIn, tree.All:
+	case treecmp.NotIn, treecmp.All:
 		// NOT Any(...)
 		out = b.factory.ConstructNot(out)
 	}

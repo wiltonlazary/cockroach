@@ -20,19 +20,31 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.ColumnComment) scop.Op {
-					return notImplemented(this)
+				emit(func(this *scpb.ColumnComment) *scop.UpsertColumnComment {
+					return &scop.UpsertColumnComment{
+						TableID:        this.TableID,
+						ColumnID:       this.ColumnID,
+						Comment:        this.Comment,
+						PGAttributeNum: this.PgAttributeNum,
+					}
+				}),
+				emit(func(this *scpb.ColumnComment, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.ColumnComment) scop.Op {
+				emit(func(this *scpb.ColumnComment) *scop.RemoveColumnComment {
 					return &scop.RemoveColumnComment{
-						TableID:  this.TableID,
-						ColumnID: this.ColumnID,
+						TableID:        this.TableID,
+						ColumnID:       this.ColumnID,
+						PgAttributeNum: this.PgAttributeNum,
 					}
+				}),
+				emit(func(this *scpb.ColumnComment, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
 			),
 		),

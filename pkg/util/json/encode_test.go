@@ -13,8 +13,8 @@ package json
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -63,7 +63,7 @@ func TestJSONRandomEncodeRoundTrip(t *testing.T) {
 
 func TestFilesEncode(t *testing.T) {
 	dir := testutils.TestDataPath(t, "raw")
-	dirContents, err := ioutil.ReadDir(dir)
+	dirContents, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestFilesEncode(t *testing.T) {
 		t.Run(tc.Name(), func(t *testing.T) {
 			numFilesRan++
 			path := filepath.Join(dir, tc.Name())
-			contents, err := ioutil.ReadFile(path)
+			contents, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -113,13 +113,13 @@ func TestFilesEncode(t *testing.T) {
 					t, "encoded", tc.Name()+".bytes")
 
 				if *rewriteResultsInTestfiles {
-					err := ioutil.WriteFile(fixtureFilename, []byte(stringifiedEncoding), 0644)
+					err := os.WriteFile(fixtureFilename, []byte(stringifiedEncoding), 0644)
 					if err != nil {
 						t.Fatal(err)
 					}
 				}
 
-				expected, err := ioutil.ReadFile(fixtureFilename)
+				expected, err := os.ReadFile(fixtureFilename)
 				if err != nil {
 					t.Fatal(err)
 				}

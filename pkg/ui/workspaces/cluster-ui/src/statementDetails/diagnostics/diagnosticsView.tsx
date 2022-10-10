@@ -14,6 +14,7 @@ import moment from "moment";
 import classnames from "classnames/bind";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { Button, Icon } from "@cockroachlabs/ui-components";
+import { Button as CancelButton } from "src/button";
 import { Text, TextTypes } from "src/text";
 import { Table, ColumnsConfig } from "src/table";
 import { SummaryCard } from "src/summaryCard";
@@ -30,8 +31,10 @@ import {
 import { EmptyTable } from "src/empty";
 import styles from "./diagnosticsView.module.scss";
 import { getBasePath } from "../../api";
+import { DATE_FORMAT_24_UTC } from "../../util";
 
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+type IStatementDiagnosticsReport =
+  cockroach.server.serverpb.IStatementDiagnosticsReport;
 
 export interface DiagnosticsViewStateProps {
   hasData: boolean;
@@ -43,6 +46,9 @@ export interface DiagnosticsViewStateProps {
 export interface DiagnosticsViewDispatchProps {
   dismissAlertMessage: () => void;
   onDownloadDiagnosticBundleClick?: (statementFingerprint: string) => void;
+  onDiagnosticCancelRequestClick?: (
+    report: IStatementDiagnosticsReport,
+  ) => void;
   onSortingChange?: (
     name: string,
     columnTitle: string,
@@ -76,7 +82,7 @@ export const EmptyDiagnosticsView = ({
   statementFingerprint,
   showDiagnosticsViewLink,
   activateDiagnosticsRef,
-}: DiagnosticsViewProps) => {
+}: DiagnosticsViewProps): React.ReactElement => {
   return (
     <EmptyTable
       icon={emptyListResultsImg}
@@ -122,7 +128,7 @@ export class DiagnosticsView extends React.Component<
       defaultSortOrder: "descend",
       render: (_text, record) => {
         const timestamp = record.requested_at.seconds.toNumber() * 1000;
-        return moment(timestamp).format("LL[ at ]h:mm a");
+        return moment.utc(timestamp).format(DATE_FORMAT_24_UTC);
       },
     },
     {
@@ -145,7 +151,11 @@ export class DiagnosticsView extends React.Component<
       title: "",
       sorter: false,
       width: "160px",
-      render: ((onDownloadDiagnosticBundleClick: (s: string) => void) => {
+      render: (() => {
+        const {
+          onDownloadDiagnosticBundleClick,
+          onDiagnosticCancelRequestClick,
+        } = this.props;
         return (_text: string, record: IStatementDiagnosticsReport) => {
           if (record.completed) {
             return (
@@ -175,23 +185,38 @@ export class DiagnosticsView extends React.Component<
               </div>
             );
           }
-          return null;
+          return (
+            <div
+              className={cx("crl-statements-diagnostics-view__actions-column")}
+            >
+              <CancelButton
+                size="small"
+                type="secondary"
+                onClick={() =>
+                  onDiagnosticCancelRequestClick &&
+                  onDiagnosticCancelRequestClick(record)
+                }
+              >
+                Cancel request
+              </CancelButton>
+            </div>
+          );
         };
-      })(this.props.onDownloadDiagnosticBundleClick),
+      })(),
     },
   ];
 
-  componentWillUnmount() {
+  componentWillUnmount(): void {
     this.props.dismissAlertMessage();
   }
 
-  onSortingChange = (columnName: string, ascending: boolean) => {
+  onSortingChange = (columnName: string, ascending: boolean): void => {
     if (this.props.onSortingChange) {
       this.props.onSortingChange("Diagnostics", columnName, ascending);
     }
   };
 
-  render() {
+  render(): React.ReactElement {
     const {
       hasData,
       diagnosticsReports,
@@ -200,7 +225,7 @@ export class DiagnosticsView extends React.Component<
       activateDiagnosticsRef,
     } = this.props;
 
-    const canRequestDiagnostics = diagnosticsReports.every(
+    const readyToRequestDiagnostics = diagnosticsReports.every(
       diagnostic => diagnostic.completed,
     );
 
@@ -221,14 +246,14 @@ export class DiagnosticsView extends React.Component<
       <SummaryCard>
         <div className={cx("crl-statements-diagnostics-view__title")}>
           <Text textType={TextTypes.Heading3}>Statement diagnostics</Text>
-          {canRequestDiagnostics && (
+          {readyToRequestDiagnostics && (
             <Button
               onClick={() =>
                 activateDiagnosticsRef?.current?.showModalFor(
                   statementFingerprint,
                 )
               }
-              disabled={!canRequestDiagnostics}
+              disabled={!readyToRequestDiagnostics}
               intent="secondary"
             >
               Activate diagnostics

@@ -1,6 +1,8 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@io_bazel_rules_go//proto:def.bzl", "go_proto_library")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("//pkg/testutils/buildutil:buildutil.bzl", "disallowed_imports_test")
 
 go_library(
     name = "execinfrapb",
@@ -19,23 +21,25 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/base",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/rpc",
-        "//pkg/security",
+        "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/catalogkeys",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/catalog/descpb",
-        "//pkg/sql/catalog/tabledesc",
         "//pkg/sql/catalog/typedesc",
         "//pkg/sql/parser",
         "//pkg/sql/pgwire/pgcode",
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/rowenc",
-        "//pkg/sql/sem/builtins",
+        "//pkg/sql/sem/eval",
+        "//pkg/sql/sem/normalize",
         "//pkg/sql/sem/transform",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sem/tree/treewindow",
         "//pkg/sql/sessiondata",
         "//pkg/sql/types",
         "//pkg/util",
@@ -49,7 +53,7 @@ go_library(
         "//pkg/util/protoutil",
         "//pkg/util/stop",
         "//pkg/util/syncutil",
-        "//pkg/util/tracing",
+        "//pkg/util/timeutil",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
@@ -69,17 +73,23 @@ go_test(
         "flow_diagram_external_test.go",
         "flow_diagram_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":execinfrapb"],
     deps = [
-        "//pkg/roachpb:with-mocks",
-        "//pkg/security",
+        "//pkg/base",
+        "//pkg/keys",
+        "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/sql",
+        "//pkg/sql/catalog/catpb",
         "//pkg/sql/catalog/descpb",
+        "//pkg/sql/rowenc",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/leaktest",
         "//pkg/util/optional",
+        "@com_github_stretchr_testify//require",
     ],
 )
 
@@ -95,16 +105,16 @@ proto_library(
         "processors_changefeeds.proto",
         "processors_sql.proto",
         "processors_table_stats.proto",
+        "processors_ttl.proto",
     ],
     strip_import_prefix = "/pkg",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/cloud/cloudpb:cloudpb_proto",
         "//pkg/jobs/jobspb:jobspb_proto",
         "//pkg/roachpb:roachpb_proto",
-        "//pkg/sql/catalog/catpb:catpb_proto",
         "//pkg/sql/catalog/descpb:descpb_proto",
         "//pkg/sql/inverted:inverted_proto",
-        "//pkg/sql/pgwire/pgerror:pgerror_proto",
         "//pkg/sql/sessiondatapb:sessiondatapb_proto",
         "//pkg/sql/types:types_proto",
         "//pkg/util/hlc:hlc_proto",
@@ -124,12 +134,12 @@ go_proto_library(
     proto = ":execinfrapb_proto",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/cloud/cloudpb",
         "//pkg/jobs/jobspb",
-        "//pkg/roachpb:with-mocks",
-        "//pkg/sql/catalog/catpb",
+        "//pkg/roachpb",
+        "//pkg/sql/catalog/catpb",  # keep
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/inverted",
-        "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
         "//pkg/util/hlc",
@@ -139,3 +149,10 @@ go_proto_library(
         "@com_github_gogo_protobuf//gogoproto",
     ],
 )
+
+disallowed_imports_test(
+    "execinfrapb",
+    ["//pkg/sql/sem/builtins"],
+)
+
+get_x_data(name = "get_x_data")

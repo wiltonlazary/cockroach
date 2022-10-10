@@ -10,8 +10,7 @@ package statusccl
 
 import (
 	"context"
-	"io/ioutil"
-	"net/http"
+	"io"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -74,15 +73,15 @@ func TestTenantGRPCServices(t *testing.T) {
 		require.NotEmpty(t, resp.Statements)
 	})
 
-	httpClient, err := tenant.RPCContext().GetHTTPClient()
+	httpClient, err := tenant.GetAdminHTTPClient()
 	require.NoError(t, err)
+	defer httpClient.CloseIdleConnections()
 
 	t.Run("gRPC Gateway is running", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant.HTTPAddr() + "/_status/statements")
-		defer http.DefaultClient.CloseIdleConnections()
+		resp, err := httpClient.Get(tenant.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "transactions")
 	})
@@ -93,17 +92,15 @@ func TestTenantGRPCServices(t *testing.T) {
 
 	tenant2, connTenant2 := serverutils.StartTenant(t, server, base.TestTenantArgs{
 		TenantID:     tenantID,
-		Existing:     true,
 		TestingKnobs: testingKnobs,
 	})
 	defer connTenant2.Close()
 
 	t.Run("statements endpoint fans out request to multiple pods", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant2.HTTPAddr() + "/_status/statements")
-		defer http.DefaultClient.CloseIdleConnections()
+		resp, err := httpClient.Get(tenant2.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.Contains(t, string(body), "CREATE TABLE test")
 		require.Contains(t, string(body), "INSERT INTO test VALUES")
@@ -116,11 +113,14 @@ func TestTenantGRPCServices(t *testing.T) {
 	defer connTenant3.Close()
 
 	t.Run("fanout of statements endpoint is segregated by tenant", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant3.HTTPAddr() + "/_status/statements")
-		defer http.DefaultClient.CloseIdleConnections()
+		httpClient3, err := tenant3.GetAdminHTTPClient()
+		require.NoError(t, err)
+		defer httpClient3.CloseIdleConnections()
+
+		resp, err := httpClient3.Get(tenant3.AdminURL() + "/_status/statements")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		require.NotContains(t, string(body), "CREATE TABLE test")
 		require.NotContains(t, string(body), "INSERT INTO test VALUES")
@@ -155,9 +155,9 @@ func TestTenantGRPCServices(t *testing.T) {
 	})
 
 	t.Run("sessions endpoint is available", func(t *testing.T) {
-		resp, err := httpClient.Get("https://" + tenant.HTTPAddr() + "/_status/sessions")
-		defer http.DefaultClient.CloseIdleConnections()
+		resp, err := httpClient.Get(tenant.AdminURL() + "/_status/sessions")
 		require.NoError(t, err)
+		defer resp.Body.Close()
 		require.Equal(t, 200, resp.StatusCode)
 	})
 }

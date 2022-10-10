@@ -66,38 +66,25 @@ func (dt *DistSQLTypeResolver) ResolveTypeByOID(
 func (dt *DistSQLTypeResolver) GetTypeDescriptor(
 	ctx context.Context, id descpb.ID,
 ) (tree.TypeName, catalog.TypeDescriptor, error) {
-	flags := tree.CommonLookupFlags{
-		Required: true,
-	}
-	desc, err := dt.descriptors.getDescriptorByIDMaybeSetTxnDeadline(
-		ctx, dt.txn, id, flags, false, /* setTxnDeadline */
-	)
+	descs, err := dt.descriptors.getDescriptorsByID(ctx, dt.txn, tree.CommonLookupFlags{}, id)
 	if err != nil {
 		return tree.TypeName{}, nil, err
 	}
 	var typeDesc catalog.TypeDescriptor
-	switch t := desc.(type) {
+	switch t := descs[0].(type) {
 	case catalog.TypeDescriptor:
 		// User-defined type.
 		typeDesc = t
 	case catalog.TableDescriptor:
-		// If we find a table descriptor when we were expecting a type descriptor,
-		// we return the implicitly-created type descriptor that is created for each
-		// table. Make sure that we hydrate the table ahead of time, since we expect
-		// that the table's types are fully hydrated below.
-		t, err = dt.descriptors.hydrateTypesInTableDesc(ctx, dt.txn, t)
-		if err != nil {
-			return tree.TypeName{}, nil, err
-		}
 		typeDesc, err = typedesc.CreateImplicitRecordTypeFromTableDesc(t)
 		if err != nil {
 			return tree.TypeName{}, nil, err
 		}
 	default:
 		return tree.TypeName{}, nil, pgerror.Newf(pgcode.WrongObjectType,
-			"descriptor %d is a %s not a %s", id, desc.DescriptorType(), catalog.Type)
+			"descriptor %d is a %s not a %s", id, t.DescriptorType(), catalog.Type)
 	}
-	name := tree.MakeUnqualifiedTypeName(desc.GetName())
+	name := tree.MakeUnqualifiedTypeName(typeDesc.GetName())
 	return name, typeDesc, nil
 }
 

@@ -119,7 +119,6 @@ func TestTenantTempTableCleanup(t *testing.T) {
 
 	_, tenantSecondDB := serverutils.StartTenant(t, tc.Server(1),
 		base.TestTenantArgs{
-			Existing: true,
 			TenantID: serverutils.TestTenantID(),
 			Settings: settings,
 			Stopper:  tenantStoppers[1],
@@ -143,7 +142,7 @@ func TestTenantTempTableCleanup(t *testing.T) {
 	// two clean up cycles just in case, so that we have
 	// stable timing.
 	waitForCleanup()
-	tenantSQL.CheckQueryResults(t, "SELECT table_name FROM [SHOW TABLES]",
+	tenantSQL.CheckQueryResultsRetry(t, "SELECT table_name FROM [SHOW TABLES]",
 		[][]string{
 			{"temp_table"},
 		})
@@ -161,7 +160,6 @@ func TestTenantTempTableCleanup(t *testing.T) {
 	tenantStoppers[0] = stop.NewStopper()
 	_, tenantPrimaryDB = serverutils.StartTenant(t, tc.Server(0),
 		base.TestTenantArgs{
-			Existing:     true,
 			TenantID:     serverutils.TestTenantID(),
 			Settings:     settings,
 			TestingKnobs: tenantTempKnobSettings,

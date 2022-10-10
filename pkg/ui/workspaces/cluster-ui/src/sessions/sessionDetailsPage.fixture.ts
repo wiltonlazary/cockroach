@@ -12,6 +12,7 @@ import { createMemoryHistory } from "history";
 import { SessionDetailsProps } from "./sessionDetails";
 import {
   activeSession,
+  closedSession,
   idleSession,
   idleTransactionSession,
 } from "./sessionsPage.fixture";
@@ -43,7 +44,7 @@ const sessionDetailsPropsBase: SessionDetailsProps = {
     isExact: true,
     params: { [sessionAttr]: "blah" },
   },
-
+  setTimeScale: () => {},
   refreshSessions: () => {},
   cancelSession: (req: CancelSessionRequestMessage) => {},
   cancelQuery: (req: CancelQueryRequestMessage) => {},
@@ -51,7 +52,6 @@ const sessionDetailsPropsBase: SessionDetailsProps = {
   refreshNodesLiveness: () => {},
   uiConfig: {
     showGatewayNodeLink: true,
-    showTerminateActions: true,
   },
 };
 
@@ -68,6 +68,11 @@ export const sessionDetailsActiveTxnPropsFixture: SessionDetailsProps = {
 export const sessionDetailsActiveStmtPropsFixture: SessionDetailsProps = {
   ...sessionDetailsPropsBase,
   session: activeSession,
+};
+
+export const sessionDetailsClosedPropsFixture: SessionDetailsProps = {
+  ...sessionDetailsPropsBase,
+  session: closedSession,
 };
 
 export const sessionDetailsNotFound: SessionDetailsProps = {

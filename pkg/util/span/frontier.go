@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 )
 
 // frontierEntry represents a timestamped span. It is used as the nodes in both
@@ -91,6 +92,7 @@ func (h *frontierHeap) Pop() interface{} {
 
 // Frontier tracks the minimum timestamp of a set of spans.
 type Frontier struct {
+	syncutil.Mutex
 	// tree contains `*frontierEntry` items for the entire current tracked
 	// span set. Any tracked spans that have never been `Forward`ed will have a
 	// zero timestamp. If any entries needed to be split along a tracking
@@ -116,28 +118,49 @@ func makeSpan(r interval.Range) (res roachpb.Span) {
 }
 
 // MakeFrontier returns a Frontier that tracks the given set of spans.
+// Each span timestamp initialized at 0.
 func MakeFrontier(spans ...roachpb.Span) (*Frontier, error) {
+	return MakeFrontierAt(hlc.Timestamp{}, spans...)
+}
+
+// MakeFrontierAt returns a Frontier that tracks the given set of spans.
+// Each span timestamp initialized at specified start time.
+func MakeFrontierAt(startAt hlc.Timestamp, spans ...roachpb.Span) (*Frontier, error) {
 	f := &Frontier{tree: interval.NewTree(interval.ExclusiveOverlapper)}
+	if err := f.AddSpansAt(startAt, spans...); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// AddSpansAt adds the provided spans to the frontier at the provided timestamp.
+func (f *Frontier) AddSpansAt(startAt hlc.Timestamp, spans ...roachpb.Span) error {
 	for _, s := range spans {
 		span := makeSpan(s.AsRange())
 		e := &frontierEntry{
 			id:   f.idAlloc,
 			keys: span.AsRange(),
 			span: span,
-			ts:   hlc.Timestamp{},
+			ts:   startAt,
 		}
 		f.idAlloc++
 		if err := f.tree.Insert(e, true /* fast */); err != nil {
-			return nil, err
+			return err
 		}
 		heap.Push(&f.minHeap, e)
 	}
 	f.tree.AdjustRanges()
-	return f, nil
+	return nil
 }
 
 // Frontier returns the minimum timestamp being tracked.
 func (f *Frontier) Frontier() hlc.Timestamp {
+	f.Lock()
+	defer f.Unlock()
+	return f.frontierLocked()
+}
+
+func (f *Frontier) frontierLocked() hlc.Timestamp {
 	if f.minHeap.Len() == 0 {
 		return hlc.Timestamp{}
 	}
@@ -146,6 +169,8 @@ func (f *Frontier) Frontier() hlc.Timestamp {
 
 // PeekFrontierSpan returns one of the spans at the Frontier.
 func (f *Frontier) PeekFrontierSpan() roachpb.Span {
+	f.Lock()
+	defer f.Unlock()
 	if f.minHeap.Len() == 0 {
 		return roachpb.Span{}
 	}
@@ -161,11 +186,13 @@ func (f *Frontier) PeekFrontierSpan() roachpb.Span {
 // set boundary). Similarly, an entry created by a previous Forward may be
 // partially overlapped and have to be split into two entries.
 func (f *Frontier) Forward(span roachpb.Span, ts hlc.Timestamp) (bool, error) {
-	prevFrontier := f.Frontier()
+	f.Lock()
+	defer f.Unlock()
+	prevFrontier := f.frontierLocked()
 	if err := f.insert(span, ts); err != nil {
 		return false, err
 	}
-	return prevFrontier.Less(f.Frontier()), nil
+	return prevFrontier.Less(f.frontierLocked()), nil
 }
 
 // extendRangeToTheLeft extends the range to the left of the range, provided those
@@ -375,6 +402,8 @@ type Operation func(roachpb.Span, hlc.Timestamp) (done OpResult)
 // Entries invokes the given callback with the current timestamp for each
 // component span in the tracked span set.
 func (f *Frontier) Entries(fn Operation) {
+	f.Lock()
+	defer f.Unlock()
 	f.tree.Do(func(i interval.Interface) bool {
 		spe := i.(*frontierEntry)
 		return fn(spe.span, spe.ts).asBool()
@@ -389,14 +418,19 @@ func (f *Frontier) Entries(fn Operation) {
 // 4|      .             h__k  .
 // 3|      .      e__f         .
 // 1 ---a----------------------m---q-- Frontier
-//      |___________span___________|
+//
+//	|___________span___________|
 //
 // In the above example, frontier tracks [b, m) and the current frontier
 // timestamp is 1.  SpanEntries for span [a-q) will invoke op with:
-//   ([b-c), 5), ([c-e), 1), ([e-f), 3], ([f, h], 1) ([h, k), 4), ([k, m), 1).
+//
+//	([b-c), 5), ([c-e), 1), ([e-f), 3], ([f, h], 1) ([h, k), 4), ([k, m), 1).
+//
 // Note: neither [a-b) nor [m, q) will be emitted since they fall outside the spans
 // tracked by this frontier.
 func (f *Frontier) SpanEntries(span roachpb.Span, op Operation) {
+	f.Lock()
+	defer f.Unlock()
 	todoRange := span.AsRange()
 
 	f.tree.DoMatching(func(i interval.Interface) bool {
@@ -422,6 +456,8 @@ func (f *Frontier) SpanEntries(span roachpb.Span, op Operation) {
 
 // String implements Stringer.
 func (f *Frontier) String() string {
+	f.Lock()
+	defer f.Unlock()
 	var buf strings.Builder
 	f.tree.Do(func(i interval.Interface) bool {
 		if buf.Len() != 0 {

@@ -14,20 +14,22 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/scheduledjobs"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -63,7 +65,9 @@ WHERE
 	})
 }
 
-func newTestHelper(t *testing.T) (helper *testHelper, cleanup func()) {
+func newTestHelper(
+	t *testing.T, sqlStatsKnobs *sqlstats.TestingKnobs,
+) (helper *testHelper, cleanup func()) {
 	helper = &testHelper{
 		env: jobstest.NewJobSchedulerTestEnv(
 			jobstest.UseSystemTables, timeutil.Now(), tree.ScheduledSQLStatsCompactionExecutor),
@@ -71,13 +75,11 @@ func newTestHelper(t *testing.T) (helper *testHelper, cleanup func()) {
 
 	knobs := jobs.NewTestingKnobsWithShortIntervals()
 	knobs.JobSchedulerEnv = helper.env
-	knobs.TakeOverJobsScheduling = func(fn func(ctx context.Context, maxSchedules int64, txn *kv.Txn) error) {
+	knobs.TakeOverJobsScheduling = func(fn func(ctx context.Context, maxSchedules int64) error) {
 		helper.executeSchedules = func() error {
 			defer helper.server.JobRegistry().(*jobs.Registry).TestingNudgeAdoptionQueue()
-			return helper.cfg.DB.Txn(context.Background(), func(ctx context.Context, txn *kv.Txn) error {
-				// maxSchedules = 0 means there's no limit.
-				return fn(ctx, 0 /* maxSchedules */, txn)
-			})
+			// maxSchedules = 0 means there's no limit.
+			return fn(context.Background(), 0 /* maxSchedules */)
 		}
 	}
 	knobs.CaptureJobExecutionConfig = func(config *scheduledjobs.JobExecutionConfig) {
@@ -86,6 +88,7 @@ func newTestHelper(t *testing.T) (helper *testHelper, cleanup func()) {
 
 	params, _ := tests.CreateTestServerParams()
 	params.Knobs.JobsTestingKnobs = knobs
+	params.Knobs.SQLStatsKnobs = sqlStatsKnobs
 	server, db, _ := serverutils.StartServer(t, params)
 	require.NotNil(t, helper.cfg)
 
@@ -127,7 +130,15 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	helper, helperCleanup := newTestHelper(t)
+	var tm atomic.Value
+	tm.Store(timeutil.Now().Add(-2 * time.Hour))
+	knobs := &sqlstats.TestingKnobs{
+		StubTimeNow: func() time.Time {
+			return tm.Load().(time.Time)
+		},
+	}
+
+	helper, helperCleanup := newTestHelper(t, knobs)
 	defer helperCleanup()
 
 	// We run some queries then flush so that we ensure that are some stats in
@@ -145,6 +156,8 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 	verifySQLStatsCompactionScheduleCreatedOnStartup(t, helper)
 	schedule := getSQLStatsCompactionSchedule(t, helper)
 	require.Equal(t, string(jobs.StatusPending), schedule.ScheduleStatus())
+
+	tm.Store(timeutil.Now())
 
 	// Force the schedule to execute.
 	helper.env.SetTime(schedule.NextRun().Add(time.Minute))
@@ -165,9 +178,10 @@ func TestScheduledSQLStatsCompaction(t *testing.T) {
 func TestSQLStatsScheduleOperations(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	skip.UnderStressRace(t, "test is too slow to run under race")
 
 	ctx := context.Background()
-	helper, helperCleanup := newTestHelper(t)
+	helper, helperCleanup := newTestHelper(t, &sqlstats.TestingKnobs{JobMonitorUpdateCheckInterval: time.Second})
 	defer helperCleanup()
 
 	schedID := getSQLStatsCompactionSchedule(t, helper).ScheduleID()
@@ -213,6 +227,7 @@ func TestSQLStatsScheduleOperations(t *testing.T) {
 				require.Equal(t, expr, sj.ScheduleExpr())
 				return nil
 			})
+
 			require.True(t, errors.Is(
 				errors.Unwrap(err), persistedsqlstats.ErrScheduleIntervalTooLong),
 				"expected ErrScheduleIntervalTooLong, but found %+v", err)

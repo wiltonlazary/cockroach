@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-// TODO(aaron-crl): This uses the CertsLocator from the security package
+// TODO(aaron-crl): This uses the Locator from the security package
 // Getting about half way to integration with the certificate manager
 // While I'd originally hoped to decouple it completely, I realized
 // it would create an even larger headache if we maintained default
@@ -19,12 +19,14 @@ package server
 import (
 	"context"
 	"encoding/pem"
-	"io/ioutil"
 	"os"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/errors"
@@ -94,14 +96,14 @@ func (sb *ServiceCertificateBundle) loadCACertAndKey(certPath string, keyPath st
 
 // loadOrCreateServiceCertificates will attempt to load the service cert/key
 // into the service bundle.
-// * If they do not exist:
-//   It will attempt to load the service CA cert/key pair.
-//   * If they do not exist:
+//   - If they do not exist:
+//     It will attempt to load the service CA cert/key pair.
+//   - If they do not exist:
 //     It will generate the service CA cert/key pair.
 //     It will persist these to disk and store them
-//       in the ServiceCertificateBundle.
-//   It will generate the service cert/key pair.
-//   It will persist these to disk and store them
+//     in the ServiceCertificateBundle.
+//     It will generate the service cert/key pair.
+//     It will persist these to disk and store them
 //     in the ServiceCertificateBundle.
 func (sb *ServiceCertificateBundle) loadOrCreateServiceCertificates(
 	ctx context.Context,
@@ -240,14 +242,14 @@ func (sb *ServiceCertificateBundle) createServiceCA(
 // Simple wrapper to make it easier to store certs somewhere else later.
 // TODO (aaron-crl): Put validation checks here.
 func loadCertificateFile(certPath string) (cert []byte, err error) {
-	cert, err = ioutil.ReadFile(certPath)
+	cert, err = os.ReadFile(certPath)
 	return
 }
 
 // Simple wrapper to make it easier to store certs somewhere else later.
 // TODO (aaron-crl): Put validation checks here.
 func loadKeyFile(keyPath string) (key []byte, err error) {
-	key, err = ioutil.ReadFile(keyPath)
+	key, err = os.ReadFile(keyPath)
 	return
 }
 
@@ -287,11 +289,12 @@ func writeKeyFile(keyFilePath string, keyPEM *pem.Block, overwrite bool) error {
 // N.B.: This function fast fails if an inter-node cert/key pair are present
 // as this should _never_ happen.
 func (b *CertificateBundle) InitializeFromConfig(ctx context.Context, c base.Config) error {
-	cl := security.MakeCertsLocator(c.SSLCertsDir)
+	cl := certnames.MakeLocator(c.SSLCertsDir)
 
 	// First check to see if host cert is already present
 	// if it is, we should fail to initialize.
-	if exists, err := cl.HasNodeCert(); err != nil {
+	loader := securityassets.GetLoader()
+	if exists, err := loader.FileExists(cl.NodeCertPath()); err != nil {
 		return err
 	} else if exists {
 		return errors.New("inter-node certificate already present")
@@ -318,7 +321,7 @@ func (b *CertificateBundle) InitializeFromConfig(ctx context.Context, c base.Con
 		cl.CAKeyPath(),
 		defaultCertLifetime,
 		defaultCALifetime,
-		security.NodeUser,
+		username.NodeUser,
 		serviceNameInterNode,
 		rpcAddrs,
 		true, /* serviceCertIsAlsoValidAsClient */
@@ -336,7 +339,7 @@ func (b *CertificateBundle) InitializeFromConfig(ctx context.Context, c base.Con
 		cl.ClientCAKeyPath(),
 		defaultCertLifetime,
 		defaultCALifetime,
-		security.NodeUser,
+		username.NodeUser,
 		serviceNameUserAuth,
 		nil,
 		true, /* serviceCertIsAlsoValidAsClient */
@@ -354,7 +357,7 @@ func (b *CertificateBundle) InitializeFromConfig(ctx context.Context, c base.Con
 		cl.SQLServiceCAKeyPath(),
 		defaultCertLifetime,
 		defaultCALifetime,
-		security.NodeUser,
+		username.NodeUser,
 		serviceNameSQL,
 		// TODO(aaron-crl): Add RPC variable to config or SplitSQLAddr.
 		sqlAddrs,
@@ -373,7 +376,7 @@ func (b *CertificateBundle) InitializeFromConfig(ctx context.Context, c base.Con
 		cl.RPCServiceCAKeyPath(),
 		defaultCertLifetime,
 		defaultCALifetime,
-		security.NodeUser,
+		username.NodeUser,
 		serviceNameRPC,
 		// TODO(aaron-crl): Add RPC variable to config.
 		rpcAddrs,
@@ -432,11 +435,12 @@ func extractHosts(addrs ...string) []string {
 // It is assumed that a node receiving this has not has TLS initialized. If
 // an inter-node certificate is found, this function will error.
 func (b *CertificateBundle) InitializeNodeFromBundle(ctx context.Context, c base.Config) error {
-	cl := security.MakeCertsLocator(c.SSLCertsDir)
+	cl := certnames.MakeLocator(c.SSLCertsDir)
 
 	// First check to see if host cert is already present
 	// if it is, we should fail to initialize.
-	if exists, err := cl.HasNodeCert(); err != nil {
+	loader := securityassets.GetLoader()
+	if exists, err := loader.FileExists(cl.NodeCertPath()); err != nil {
 		return err
 	} else if exists {
 		return errors.New("inter-node certificate already present")
@@ -524,7 +528,7 @@ func (sb *ServiceCertificateBundle) loadCACertAndKeyIfExists(
 // will skip any CA's where the certificate is not found. Any other read errors
 // including permissions result in an error.
 func collectLocalCABundle(SSLCertsDir string) (CertificateBundle, error) {
-	cl := security.MakeCertsLocator(SSLCertsDir)
+	cl := certnames.MakeLocator(SSLCertsDir)
 	var b CertificateBundle
 	var err error
 
@@ -574,7 +578,7 @@ func collectLocalCABundle(SSLCertsDir string) (CertificateBundle, error) {
 // any interface. All existing interfaces will again receive a new
 // certificate/key pair.
 func rotateGeneratedCerts(ctx context.Context, c base.Config) error {
-	cl := security.MakeCertsLocator(c.SSLCertsDir)
+	cl := certnames.MakeLocator(c.SSLCertsDir)
 
 	// Fail fast if we can't load the CAs.
 	b, err := collectLocalCABundle(c.SSLCertsDir)
@@ -597,7 +601,7 @@ func rotateGeneratedCerts(ctx context.Context, c base.Config) error {
 			cl.NodeCertPath(),
 			cl.NodeKeyPath(),
 			defaultCertLifetime,
-			security.NodeUser,
+			username.NodeUser,
 			serviceNameInterNode,
 			rpcAddrs,
 			true, /* serviceCertIsAlsoValidAsClient */
@@ -614,7 +618,7 @@ func rotateGeneratedCerts(ctx context.Context, c base.Config) error {
 			cl.ClientNodeCertPath(),
 			cl.ClientNodeKeyPath(),
 			defaultCertLifetime,
-			security.NodeUser,
+			username.NodeUser,
 			serviceNameUserAuth,
 			nil,
 			true, /* serviceCertIsAlsoValidAsClient */
@@ -631,7 +635,7 @@ func rotateGeneratedCerts(ctx context.Context, c base.Config) error {
 			cl.SQLServiceCertPath(),
 			cl.SQLServiceKeyPath(),
 			defaultCertLifetime,
-			security.NodeUser,
+			username.NodeUser,
 			serviceNameSQL,
 			sqlAddrs,
 			false, /* serviceCertIsAlsoValidAsClient */
@@ -648,7 +652,7 @@ func rotateGeneratedCerts(ctx context.Context, c base.Config) error {
 			cl.RPCServiceCertPath(),
 			cl.RPCServiceKeyPath(),
 			defaultCertLifetime,
-			security.NodeUser,
+			username.NodeUser,
 			serviceNameRPC,
 			rpcAddrs,
 			false, /* serviceCertIsAlsoValidAsClient */

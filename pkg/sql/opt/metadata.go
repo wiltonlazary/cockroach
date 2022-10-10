@@ -16,6 +16,7 @@ import (
 	"math/bits"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/multiregion"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -48,21 +49,21 @@ type privilegeBitmap uint32
 //
 // For example, consider the query:
 //
-//   SELECT x FROM a WHERE y > 0
+//	SELECT x FROM a WHERE y > 0
 //
 // There are 2 columns in the above query: x and y. During name resolution, the
 // above query becomes:
 //
-//   SELECT [0] FROM a WHERE [1] > 0
-//   -- [0] -> x
-//   -- [1] -> y
+//	SELECT [0] FROM a WHERE [1] > 0
+//	-- [0] -> x
+//	-- [1] -> y
 //
 // An operator is allowed to reuse some or all of the column ids of an input if:
 //
-// 1. For every output row, there exists at least one input row having identical
-//    values for those columns.
-// 2. OR if no such input row exists, there is at least one output row having
-//    NULL values for all those columns (e.g. when outer join NULL-extends).
+//  1. For every output row, there exists at least one input row having identical
+//     values for those columns.
+//  2. OR if no such input row exists, there is at least one output row having
+//     NULL values for all those columns (e.g. when outer join NULL-extends).
 //
 // For example, is it safe for a Select to use its input's column ids because it
 // only filters rows. Likewise, pass-through column ids of a Project can be
@@ -70,7 +71,7 @@ type privilegeBitmap uint32
 //
 // For an example where columns cannot be reused, consider the query:
 //
-//   SELECT * FROM a AS l JOIN a AS r ON (l.x = r.y)
+//	SELECT * FROM a AS l JOIN a AS r ON (l.x = r.y)
 //
 // In this query, `l.x` is not equivalent to `r.x` and `l.y` is not equivalent
 // to `r.y`. Therefore, we need to give these columns different ids.
@@ -196,7 +197,7 @@ func (md *Metadata) Init() {
 // This metadata can then be modified independent of the copied metadata.
 //
 // Table annotations are not transferred over; all annotations are unset on
-// the copy.
+// the copy, except for regionConfig, which is read-only, and can be shared.
 //
 // copyScalarFn must be a function that returns a copy of the given scalar
 // expression.
@@ -226,8 +227,17 @@ func (md *Metadata) CopyFrom(from *Metadata, copyScalarFn func(Expr) Expr) {
 		md.tables = make([]TableMeta, len(from.tables))
 	}
 	for i := range from.tables {
-		// Note: annotations inside TableMeta are not retained.
+		// Note: annotations inside TableMeta are not retained...
 		md.tables[i].copyFrom(&from.tables[i], copyScalarFn)
+
+		// ...except for the regionConfig annotation.
+		tabID := from.tables[i].MetaID
+		regionConfig, ok := md.TableAnnotation(tabID, regionConfigAnnID).(*multiregion.RegionConfig)
+		if ok {
+			// Don't waste time looking up a database descriptor and constructing a
+			// RegionConfig more than once for a given table.
+			md.SetTableAnnotation(tabID, regionConfigAnnID, regionConfig)
+		}
 	}
 
 	md.sequences = append(md.sequences, from.sequences...)
@@ -466,15 +476,43 @@ func (md *Metadata) DuplicateTable(
 		}
 	}
 
-	md.tables = append(md.tables, TableMeta{
-		MetaID:                 newTabID,
-		Table:                  tabMeta.Table,
-		Alias:                  tabMeta.Alias,
-		IgnoreForeignKeys:      tabMeta.IgnoreForeignKeys,
-		Constraints:            constraints,
-		ComputedCols:           computedCols,
-		partialIndexPredicates: partialIndexPredicates,
-	})
+	var checkConstraintsStats map[ColumnID]interface{}
+	if len(tabMeta.checkConstraintsStats) > 0 {
+		checkConstraintsStats =
+			make(map[ColumnID]interface{},
+				len(tabMeta.checkConstraintsStats))
+		for i := range tabMeta.checkConstraintsStats {
+			if dstCol, ok := colMap.Get(int(i)); ok {
+				// We remap the column ID key, but not any column IDs in the
+				// ColumnStatistic as this is still being used in the statistics of the
+				// original table and should be treated as immutable. When the Histogram
+				// is copied in ColumnStatistic.CopyFromOther, it is initialized with
+				// the proper column ID.
+				checkConstraintsStats[ColumnID(dstCol)] = tabMeta.checkConstraintsStats[i]
+			} else {
+				panic(errors.AssertionFailedf("remapping of check constraint stats column failed"))
+			}
+		}
+	}
+
+	newTabMeta := TableMeta{
+		MetaID:                   newTabID,
+		Table:                    tabMeta.Table,
+		Alias:                    tabMeta.Alias,
+		IgnoreForeignKeys:        tabMeta.IgnoreForeignKeys,
+		Constraints:              constraints,
+		ComputedCols:             computedCols,
+		partialIndexPredicates:   partialIndexPredicates,
+		indexPartitionLocalities: tabMeta.indexPartitionLocalities,
+		checkConstraintsStats:    checkConstraintsStats,
+	}
+	md.tables = append(md.tables, newTabMeta)
+	regionConfig, ok := md.TableAnnotation(tabID, regionConfigAnnID).(*multiregion.RegionConfig)
+	if ok {
+		// Don't waste time looking up a database descriptor and constructing a
+		// RegionConfig more than once for a given table.
+		md.SetTableAnnotation(newTabID, regionConfigAnnID, regionConfig)
+	}
 
 	return newTabID
 }
@@ -524,14 +562,16 @@ func (md *Metadata) ColumnMeta(colID ColumnID) *ColumnMeta {
 // QualifiedAlias returns the column alias, possibly qualified with the table,
 // schema, or database name:
 //
-//   1. If fullyQualify is true, then the returned alias is prefixed by the
-//      original, fully qualified name of the table: tab.Name().FQString().
+//  1. If fullyQualify is true, then the returned alias is prefixed by the
+//     original, fully qualified name of the table: tab.Name().FQString().
 //
-//   2. If there's another column in the metadata with the same column alias but
-//      a different table name, then prefix the column alias with the table
-//      name: "tabName.columnAlias".
-//
-func (md *Metadata) QualifiedAlias(colID ColumnID, fullyQualify bool, catalog cat.Catalog) string {
+//  2. If there's another column in the metadata with the same column alias but
+//     a different table name, then prefix the column alias with the table
+//     name: "tabName.columnAlias". If alwaysQualify is true, then the column
+//     alias is always prefixed with the table alias.
+func (md *Metadata) QualifiedAlias(
+	colID ColumnID, fullyQualify, alwaysQualify bool, catalog cat.Catalog,
+) string {
 	cm := md.ColumnMeta(colID)
 	if cm.Table == 0 {
 		// Column doesn't belong to a table, so no need to qualify it further.
@@ -541,8 +581,9 @@ func (md *Metadata) QualifiedAlias(colID ColumnID, fullyQualify bool, catalog ca
 	// If a fully qualified alias has not been requested, then only qualify it if
 	// it would otherwise be ambiguous.
 	var tabAlias tree.TableName
-	qualify := fullyQualify
+	qualify := fullyQualify || alwaysQualify
 	if !fullyQualify {
+		tabAlias = md.TableMeta(cm.Table).Alias
 		for i := range md.cols {
 			if i == int(cm.MetaID-1) {
 				continue
@@ -551,7 +592,6 @@ func (md *Metadata) QualifiedAlias(colID ColumnID, fullyQualify bool, catalog ca
 			// If there are two columns with same alias, then column is ambiguous.
 			cm2 := &md.cols[i]
 			if cm2.Alias == cm.Alias {
-				tabAlias = md.TableMeta(cm.Table).Alias
 				if cm2.Table == 0 {
 					qualify = true
 				} else {
@@ -589,14 +629,20 @@ func (md *Metadata) QualifiedAlias(colID ColumnID, fullyQualify bool, catalog ca
 // TableMeta instance stores.
 func (md *Metadata) UpdateTableMeta(tables map[cat.StableID]cat.Table) {
 	for i := range md.tables {
-		if tab, ok := tables[md.tables[i].Table.ID()]; ok {
+		oldTable := md.tables[i].Table
+		if newTable, ok := tables[oldTable.ID()]; ok {
 			// If there are any inverted hypothetical indexes, the hypothetical table
 			// will have extra inverted columns added. Add any new inverted columns to
 			// the metadata.
-			for j, n := md.tables[i].Table.ColumnCount(), tab.ColumnCount(); j < n; j++ {
-				md.AddColumn(string(tab.Column(i).ColName()), types.Bytes)
+			for j, n := oldTable.ColumnCount(), newTable.ColumnCount(); j < n; j++ {
+				md.AddColumn(string(newTable.Column(j).ColName()), types.Bytes)
 			}
-			md.tables[i].Table = tab
+			if newTable.ColumnCount() > oldTable.ColumnCount() {
+				// If we added any new columns, we need to recalculate the not null
+				// column set.
+				md.SetTableAnnotation(md.tables[i].MetaID, NotNullAnnID, nil)
+			}
+			md.tables[i].Table = newTable
 		}
 	}
 }

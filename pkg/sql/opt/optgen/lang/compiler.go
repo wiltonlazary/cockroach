@@ -55,8 +55,9 @@ func (c *CompiledExpr) LookupMatchingDefines(name string) DefineSetExpr {
 // LookupMatchingRules returns the set of rules that match the given opname at
 // the top-level, or nil if none do. For example, "InnerJoin" would match this
 // rule:
-//   [CommuteJoin]
-//   (InnerJoin $r:* $s:*) => (InnerJoin $s $r)
+//
+//	[CommuteJoin]
+//	(InnerJoin $r:* $s:*) => (InnerJoin $s $r)
 func (c *CompiledExpr) LookupMatchingRules(name string) RuleSetExpr {
 	return c.matchIndex[name]
 }
@@ -556,7 +557,9 @@ func (c *ruleContentCompiler) compileLet(let *LetExpr) Expr {
 		c.addErr(let, fmt.Errorf("let target must be a custom function"))
 	}
 
-	// Ensure that binding labels are unique.
+	// Ensure that binding labels are unique and collect bindings that can be
+	// referenced in Result.
+	bindings := make(map[StringExpr]DataType)
 	for _, label := range let.Labels {
 		_, ok := c.compiler.bindings[label]
 		if ok {
@@ -565,13 +568,21 @@ func (c *ruleContentCompiler) compileLet(let *LetExpr) Expr {
 
 		// Initialize the binding.
 		c.compiler.bindings[label] = AnyDataType
+
+		// Collect bindings that can be referenced in Result.
+		bindings[label] = AnyDataType
 	}
 
-	labels := nested.compile(&let.Labels).(*StringsExpr)
+	// Only the variables bound in the current LetExpr can be referenced in
+	// Result.
+	c.compiler.bindings, bindings = bindings, c.compiler.bindings
 	result := nested.compile(let.Result).(*RefExpr)
 
+	// Restore the bindings.
+	c.compiler.bindings = bindings
+
 	return &LetExpr{
-		Labels: *labels,
+		Labels: let.Labels,
 		Target: target,
 		Result: result,
 		Src:    let.Source(),
@@ -738,10 +749,11 @@ func (c *ruleContentCompiler) compileOpName(fn *FuncExpr) (_ Expr, ok bool) {
 
 // addDisallowedErr creates an error prefixed by one of the following strings,
 // depending on the context:
-//   match pattern
-//   replace pattern
-//   custom match function
-//   custom replace function
+//
+//	match pattern
+//	replace pattern
+//	custom match function
+//	custom replace function
 func (c *ruleContentCompiler) addDisallowedErr(loc Expr, disallowed string) {
 	if c.matchPattern {
 		if c.customFunc {

@@ -12,6 +12,7 @@ package scgraph
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scop"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
@@ -28,11 +29,18 @@ type Edge interface {
 
 // OpEdge represents an edge changing the state of a target with an op.
 type OpEdge struct {
-	from, to   *screl.Node
-	op         []scop.Op
-	typ        scop.Type
+	from, to *screl.Node
+	op       []scop.Op
+	typ      scop.Type
+
+	// canFail indicates that a backfill or validation operation for this
+	// target has yet to be run as of the originating node for this edge.
+	canFail bool
+
+	// revertible indicates that no operation which destroys information
+	// permanently or publishes new information externally has yet been
+	// run for this target.
 	revertible bool
-	minPhase   scop.Phase
 }
 
 // From implements the Edge interface.
@@ -44,17 +52,17 @@ func (oe *OpEdge) To() *screl.Node { return oe.to }
 // Op returns the scop.Op for execution that is associated with the op edge.
 func (oe *OpEdge) Op() []scop.Op { return oe.op }
 
-// Revertible returns if the dependency edge is revertible
+// Revertible returns if the dependency edge is revertible.
 func (oe *OpEdge) Revertible() bool { return oe.revertible }
+
+// CanFail returns if the dependency edge corresponds to a target in a state
+// which has yet to undergo all of its validation and backfill operations
+// before reaching its targeted status.
+func (oe *OpEdge) CanFail() bool { return oe.canFail }
 
 // Type returns the types of operations associated with this edge.
 func (oe *OpEdge) Type() scop.Type {
 	return oe.typ
-}
-
-// IsPhaseSatisfied returns true iff the operations can run in the given phase.
-func (oe *OpEdge) IsPhaseSatisfied(phase scop.Phase) bool {
-	return phase >= oe.minPhase
 }
 
 // String returns a string representation of this edge
@@ -82,6 +90,17 @@ const (
 	// SameStagePrecedence indicates that the source (from) of the edge must
 	// be reached before the destination (to), and _must_ do so in the same stage.
 	SameStagePrecedence
+
+	// PreviousStagePrecedence indicates that the source (from) of the edge must
+	// be reached before the destination (to), and _must_ do so in a previous
+	// stage.
+	PreviousStagePrecedence
+
+	// PreviousTransactionPrecedence is like PreviousStagePrecedence but does
+	// not allow the transition to occur unless the current phase is at least
+	// PostCommitPhase, because StatementPhase and PreCommitPhase are special
+	// in that they take place in the same transaction.
+	PreviousTransactionPrecedence
 )
 
 // DepEdge represents a dependency between two nodes. A dependency
@@ -91,9 +110,34 @@ type DepEdge struct {
 	from, to *screl.Node
 	kind     DepEdgeKind
 
-	// TODO(ajwerner): Deal with the possibility that multiple rules could
-	// generate the same edge.
-	rule string
+	rules []Rule
+}
+
+// Rule describes a reason for a DepEdge to exist.
+type Rule struct {
+	Name RuleName
+	Kind DepEdgeKind
+}
+
+// RuleNames is a slice of RuleName.
+type RuleNames []RuleName
+
+// String makes RuleNames a fmt.Stringer.
+func (rn RuleNames) String() string {
+	var sb strings.Builder
+	if len(rn) == 1 {
+		sb.WriteString(string(rn[0]))
+	} else {
+		sb.WriteString("[")
+		for i, r := range rn {
+			if i > 0 {
+				sb.WriteString("; ")
+			}
+			sb.WriteString(string(r))
+		}
+		sb.WriteString("]")
+	}
+	return sb.String()
 }
 
 // From implements the Edge interface.
@@ -102,10 +146,22 @@ func (de *DepEdge) From() *screl.Node { return de.from }
 // To implements the Edge interface.
 func (de *DepEdge) To() *screl.Node { return de.to }
 
-// Name returns the name of the rule which generated this edge.
-func (de *DepEdge) Name() string { return de.rule }
+// RuleNames returns the names of the rules which generated this edge.
+func (de *DepEdge) RuleNames() RuleNames {
+	ret := make(RuleNames, len(de.rules))
+	for i, r := range de.rules {
+		ret[i] = r.Name
+	}
+	return ret
+}
 
-// Kind returns the kind of the DepEdge.
+// Rules returns the metadata about the rules which generated this edge.
+func (de *DepEdge) Rules() []Rule { return de.rules }
+
+// Kind returns the kind of the DepEdge. Note that it returns the strongest
+// kind implied by a rule; if one rule which created this edge is Precedence,
+// and another is SameStagePrecedence or PreviousStagePrecedence, then it
+// returns the latter.
 func (de *DepEdge) Kind() DepEdgeKind { return de.kind }
 
 // String returns a string representation of this edge

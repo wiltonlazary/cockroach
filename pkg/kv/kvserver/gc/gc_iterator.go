@@ -15,25 +15,50 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 )
 
 // gcIterator wraps an rditer.ReplicaMVCCDataIterator which it reverse iterates for
 // the purpose of discovering gc-able replicated data.
 type gcIterator struct {
-	it   *rditer.ReplicaMVCCDataIterator
-	done bool
-	err  error
-	buf  gcIteratorRingBuf
+	it        *rditer.ReplicaMVCCDataIterator
+	threshold hlc.Timestamp
+	done      bool
+	err       error
+	buf       gcIteratorRingBuf
+
+	// Range tombstone timestamp caching to avoid recomputing timestamp for every
+	// object covered by current range key.
+	cachedRangeTombstoneTS  hlc.Timestamp
+	cachedRangeTombstoneKey roachpb.Key
 }
 
-func makeGCIterator(desc *roachpb.RangeDescriptor, snap storage.Reader) gcIterator {
+// TODO(sumeer): change gcIterator to use MVCCValueLenAndIsTombstone(). It
+// needs to get the value only for intents.
+
+func makeGCIterator(
+	desc *roachpb.RangeDescriptor,
+	snap storage.Reader,
+	threshold hlc.Timestamp,
+	excludeUserKeySpan bool,
+) gcIterator {
 	return gcIterator{
-		it: rditer.NewReplicaMVCCDataIterator(desc, snap, true /* seekEnd */),
+		it: rditer.NewReplicaMVCCDataIterator(desc, snap, rditer.ReplicaDataIteratorOptions{
+			Reverse:            true,
+			IterKind:           storage.MVCCKeyAndIntentsIterKind,
+			KeyTypes:           storage.IterKeyTypePointsAndRanges,
+			ExcludeUserKeySpan: excludeUserKeySpan,
+		}),
+		threshold: threshold,
 	}
 }
 
 type gcIteratorState struct {
+	// Sequential elements in iteration order (oldest to newest).
 	cur, next, afterNext *storage.MVCCKeyValue
+	// Optional timestamp of the first available range tombstone at or below the
+	// GC threshold for the cur key.
+	firstRangeTombstoneTsAtOrBelowGC hlc.Timestamp
 }
 
 // curIsNewest returns true if the current MVCCKeyValue in the gcIteratorState
@@ -58,7 +83,9 @@ func (s *gcIteratorState) curIsIntent() bool {
 }
 
 // state returns the current state of the iterator. The state contains the
-// current and the two following versions of the current key if they exist.
+// current and the two following versions of the current key if they exist
+// as well as an optional timestamp of the first range tombstone covering
+// current key at or below GC threshold.
 //
 // If ok is false, further iteration is unsafe; either the end of iteration has
 // been reached or an error has occurred. Callers should check it.err to
@@ -70,11 +97,11 @@ func (it *gcIterator) state() (s gcIteratorState, ok bool) {
 	// The current key is the newest if the key which comes next is different or
 	// the key which comes after the current key is an intent or this is the first
 	// key in the range.
-	s.cur, ok = it.peekAt(0)
+	s.cur, s.firstRangeTombstoneTsAtOrBelowGC, ok = it.peekAt(0)
 	if !ok {
 		return gcIteratorState{}, false
 	}
-	next, ok := it.peekAt(1)
+	next, _, ok := it.peekAt(1)
 	if !ok && it.err != nil { // cur is the first key in the range
 		return gcIteratorState{}, false
 	}
@@ -82,7 +109,7 @@ func (it *gcIterator) state() (s gcIteratorState, ok bool) {
 		return s, true
 	}
 	s.next = next
-	afterNext, ok := it.peekAt(2)
+	afterNext, _, ok := it.peekAt(2)
 	if !ok && it.err != nil { // cur is the first key in the range
 		return gcIteratorState{}, false
 	}
@@ -97,13 +124,16 @@ func (it *gcIterator) step() {
 	it.buf.removeFront()
 }
 
-func (it *gcIterator) peekAt(i int) (*storage.MVCCKeyValue, bool) {
+// peekAt returns key value and a ts of first range tombstone less or equal
+// to gc threshold.
+func (it *gcIterator) peekAt(i int) (*storage.MVCCKeyValue, hlc.Timestamp, bool) {
 	if it.buf.len <= i {
 		if !it.fillTo(i + 1) {
-			return nil, false
+			return nil, hlc.Timestamp{}, false
 		}
 	}
-	return it.buf.at(i), true
+	kv, rangeTs := it.buf.at(i)
+	return kv, rangeTs, true
 }
 
 func (it *gcIterator) fillTo(targetLen int) (ok bool) {
@@ -112,10 +142,37 @@ func (it *gcIterator) fillTo(targetLen int) (ok bool) {
 			it.err, it.done = err, err == nil
 			return false
 		}
-		it.buf.pushBack(it.it)
+		if hasPoint, hasRange := it.it.HasPointAndRange(); hasPoint {
+			ts := hlc.Timestamp{}
+			if hasRange {
+				ts = it.currentRangeTS()
+			}
+			it.buf.pushBack(it.it.UnsafeKey(), it.it.UnsafeValue(), ts)
+		}
 		it.it.Prev()
 	}
 	return true
+}
+
+// currentRangeTS returns timestamp of the first range tombstone at or below
+// gc threshold for current key. it also updates cached value to avoid
+// recomputation for every key and version by checking current range bounds
+// start key.
+// Note: should only be called if HasPointAndRange() indicated that we have
+// a range key.
+func (it *gcIterator) currentRangeTS() hlc.Timestamp {
+	rangeTombstoneStartKey := it.it.RangeBounds().Key
+	if rangeTombstoneStartKey.Equal(it.cachedRangeTombstoneKey) {
+		return it.cachedRangeTombstoneTS
+	}
+	it.cachedRangeTombstoneKey = append(it.cachedRangeTombstoneKey[:0], rangeTombstoneStartKey...)
+
+	if v, ok := it.it.RangeKeys().FirstAtOrBelow(it.threshold); ok {
+		it.cachedRangeTombstoneTS = v.Timestamp
+	} else {
+		it.cachedRangeTombstoneTS = hlc.Timestamp{}
+	}
+	return it.cachedRangeTombstoneTS
 }
 
 func (it *gcIterator) close() {
@@ -130,15 +187,20 @@ const gcIteratorRingBufSize = 3
 type gcIteratorRingBuf struct {
 	allocs [gcIteratorRingBufSize]bufalloc.ByteAllocator
 	buf    [gcIteratorRingBufSize]storage.MVCCKeyValue
-	len    int
-	head   int
+	// If there are any range tombstones available for the key, this buffer will
+	// contain ts of first range at or below gc threshold. Otherwise, it'll be an
+	// empty timestamp.
+	firstRangeTombstoneAtOrBelowGCTss [gcIteratorRingBufSize]hlc.Timestamp
+	len                               int
+	head                              int
 }
 
-func (b *gcIteratorRingBuf) at(i int) *storage.MVCCKeyValue {
+func (b *gcIteratorRingBuf) at(i int) (*storage.MVCCKeyValue, hlc.Timestamp) {
 	if i >= b.len {
 		panic("index out of range")
 	}
-	return &b.buf[(b.head+i)%gcIteratorRingBufSize]
+	idx := (b.head + i) % gcIteratorRingBufSize
+	return &b.buf[idx], b.firstRangeTombstoneAtOrBelowGCTss[idx]
 }
 
 func (b *gcIteratorRingBuf) removeFront() {
@@ -146,28 +208,23 @@ func (b *gcIteratorRingBuf) removeFront() {
 		panic("cannot remove from empty gcIteratorRingBuf")
 	}
 	b.buf[b.head] = storage.MVCCKeyValue{}
+	b.firstRangeTombstoneAtOrBelowGCTss[b.head] = hlc.Timestamp{}
 	b.head = (b.head + 1) % gcIteratorRingBufSize
 	b.len--
 }
 
-type iterator interface {
-	UnsafeKey() storage.MVCCKey
-	UnsafeValue() []byte
-}
-
-func (b *gcIteratorRingBuf) pushBack(it iterator) {
+func (b *gcIteratorRingBuf) pushBack(k storage.MVCCKey, v []byte, rangeTS hlc.Timestamp) {
 	if b.len == gcIteratorRingBufSize {
 		panic("cannot add to full gcIteratorRingBuf")
 	}
 	i := (b.head + b.len) % gcIteratorRingBufSize
 	b.allocs[i] = b.allocs[i].Truncate()
-	k := it.UnsafeKey()
-	v := it.UnsafeValue()
 	b.allocs[i], k.Key = b.allocs[i].Copy(k.Key, len(v))
 	b.allocs[i], v = b.allocs[i].Copy(v, 0)
 	b.buf[i] = storage.MVCCKeyValue{
 		Key:   k,
 		Value: v,
 	}
+	b.firstRangeTombstoneAtOrBelowGCTss[i] = rangeTS
 	b.len++
 }

@@ -15,6 +15,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/testutils/lint/passes/errwrap"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // requireConstMsg records functions for which the last string
@@ -30,8 +32,14 @@ var requireConstMsg = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/sql.optPlanningCtx).log": true,
 }
 
-// requireConstFmt records functions for which the string arg
-// before the final ellipsis must be a constant string.
+/*
+requireConstFmt records functions for which the string arg
+before the final ellipsis must be a constant string.
+
+Definitions surrounded in parentheses are functions attached to a struct.
+For functions defined in the main package, a *second* entry is required
+in the form (main.yourStruct).yourFuncF
+*/
 var requireConstFmt = map[string]bool{
 	// Logging things.
 	"log.Printf":           true,
@@ -60,9 +68,12 @@ var requireConstFmt = map[string]bool{
 	"github.com/cockroachdb/cockroach/pkg/util/log.formatArgs":             true,
 	"github.com/cockroachdb/cockroach/pkg/util/log.logfDepth":              true,
 	"github.com/cockroachdb/cockroach/pkg/util/log.shoutfDepth":            true,
+	"github.com/cockroachdb/cockroach/pkg/util/log.logfDepthInternal":      true,
 	"github.com/cockroachdb/cockroach/pkg/util/log.makeStartLine":          true,
 
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash.ReportOrPanic": true,
+
+	"github.com/cockroachdb/cockroach/pkg/roachpb.NewAmbiguousResultErrorf": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/util/tracing.Span).Recordf":      true,
 	"(*github.com/cockroachdb/cockroach/pkg/util/tracing.spanInner).Recordf": true,
@@ -79,6 +90,14 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/util/grpcutil.grpcLogger).Warningf": true,
 	"(*github.com/cockroachdb/cockroach/pkg/util/grpcutil.grpcLogger).Errorf":   true,
 	"(*github.com/cockroachdb/cockroach/pkg/util/grpcutil.grpcLogger).Fatalf":   true,
+
+	// Both of these signatures need to be included for the linter to not flag
+	// roachtest testImpl.Errorf since it is in the main package
+	"(*main.testImpl).Errorf": true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.testImpl).Errorf": true,
+
+	"(*main.testImpl).Fatalf": true,
+	"(*github.com/cockroachdb/cockroach/pkg/cmd/roachtest.testImpl).Fatalf": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Debugf":   true,
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvserver.raftLogger).Infof":    true,
@@ -116,8 +135,8 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Errorf": true,
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Fatalf": true,
 
-	"(*github.com/cockroachdb/cockroach/pkg/server.adminServer).serverErrorf": true,
-	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal":         true,
+	"github.com/cockroachdb/cockroach/pkg/server.serverErrorf":        true,
+	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal": true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl.kafkaLogAdapter).Printf": true,
 
@@ -129,12 +148,19 @@ var requireConstFmt = map[string]bool{
 
 	"(*github.com/cockroachdb/cockroach/pkg/sql/pgwire.authPipe).Logf": true,
 
+	"(github.com/cockroachdb/cockroach/pkg/sql/logictest/logictestbase.stdlogger).Fatalf": true,
+	"(github.com/cockroachdb/cockroach/pkg/sql/logictest/logictestbase.stdlogger).Logf":   true,
+
 	// Error things are populated in the init() message.
+}
+
+func title(s string) string {
+	return cases.Title(language.English, cases.NoLower).String(s)
 }
 
 func init() {
 	for _, sev := range logpb.Severity_name {
-		capsev := strings.Title(strings.ToLower(sev))
+		capsev := title(strings.ToLower(sev))
 		// log.Infof, log.Warningf etc.
 		requireConstFmt["github.com/cockroachdb/cockroach/pkg/util/log."+capsev+"f"] = true
 		// log.VInfof, log.VWarningf etc.
@@ -145,7 +171,7 @@ func init() {
 		requireConstMsg["github.com/cockroachdb/cockroach/pkg/util/log."+capsev] = true
 
 		for _, ch := range logpb.Channel_name {
-			capch := strings.ReplaceAll(strings.Title(strings.ReplaceAll(strings.ToLower(ch), "_", " ")), " ", "")
+			capch := strings.ReplaceAll(title(strings.ReplaceAll(strings.ToLower(ch), "_", " ")), " ", "")
 			// log.Ops.Infof, log.Ops.Warningf, etc.
 			requireConstFmt["(github.com/cockroachdb/cockroach/pkg/util/log.logger"+capch+")."+capsev+"f"] = true
 			// log.Ops.VInfof, log.Ops.VWarningf, etc.
@@ -157,7 +183,7 @@ func init() {
 		}
 	}
 	for _, ch := range logpb.Channel_name {
-		capch := strings.ReplaceAll(strings.Title(strings.ReplaceAll(strings.ToLower(ch), "_", " ")), " ", "")
+		capch := strings.ReplaceAll(title(strings.ReplaceAll(strings.ToLower(ch), "_", " ")), " ", "")
 		// log.Ops.Shoutf, log.Dev.Shoutf, etc.
 		requireConstFmt["(github.com/cockroachdb/cockroach/pkg/util/log.logger"+capch+").Shoutf"] = true
 		// log.Ops.Shout, log.Dev.Shout, etc.

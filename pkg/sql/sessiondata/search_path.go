@@ -14,11 +14,11 @@ import (
 	"bytes"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catconstants"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 )
 
 // DefaultSearchPath is the search path used by virgin sessions.
@@ -42,8 +42,8 @@ var EmptySearchPath = SearchPath{}
 
 // DefaultSearchPathForUser returns the default search path with the user
 // specific schema name set so that it can be expanded during resolution.
-func DefaultSearchPathForUser(username security.SQLUsername) SearchPath {
-	return DefaultSearchPath.WithUserSchemaName(username.Normalized())
+func DefaultSearchPathForUser(userName username.SQLUsername) SearchPath {
+	return DefaultSearchPath.WithUserSchemaName(userName.Normalized())
 }
 
 // MakeSearchPath returns a new immutable SearchPath struct. The paths slice
@@ -289,4 +289,33 @@ func (iter *SearchPathIter) Next() (path string, ok bool) {
 		return iter.paths[iter.i-1], true
 	}
 	return "", false
+}
+
+// NumElements returns the number of elements in the search path.
+func (s *SearchPath) NumElements() int {
+	// TODO(ajwerner): Refactor this so that we don't need to do an O(N)
+	// operation to find the number of elements. In practice it doesn't matter
+	// much because search paths tend to be short.
+	iter := s.Iter()
+	var i int
+	for _, ok := iter.Next(); ok; _, ok = iter.Next() {
+		i++
+	}
+	return i
+}
+
+// GetSchema returns the ith schema element if it is in range.
+func (s *SearchPath) GetSchema(ord int) string {
+	// TODO(ajwerner): Refactor this so that we don't need to do an O(n)
+	// operation to find the nth element. In practice it doesn't matter
+	// much because search paths tend to be short.
+	iter := s.Iter()
+	var i int
+	for schema, ok := iter.Next(); ok; schema, ok = iter.Next() {
+		if ord == i {
+			return schema
+		}
+		i++
+	}
+	return ""
 }

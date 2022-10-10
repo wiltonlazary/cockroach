@@ -83,6 +83,8 @@ type replicaGCQueue struct {
 	db      *kv.DB
 }
 
+var _ queueImpl = &replicaGCQueue{}
+
 // newReplicaGCQueue returns a new instance of replicaGCQueue.
 func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 	rgcq := &replicaGCQueue{
@@ -143,7 +145,7 @@ func replicaIsSuspect(repl *Replica) bool {
 	if !ok {
 		return true
 	}
-	if t := replDesc.GetType(); t != roachpb.VOTER_FULL && t != roachpb.NON_VOTER {
+	if t := replDesc.Type; t != roachpb.VOTER_FULL && t != roachpb.NON_VOTER {
 		return true
 	}
 
@@ -269,7 +271,7 @@ func (rgcq *replicaGCQueue) process(
 		// the use of a snapshot when catching up to the new replica ID.
 		// We don't normally expect to have a *higher* local replica ID
 		// than the one in the meta descriptor, but it's possible after
-		// recovering with unsafe-remove-dead-replicas.
+		// recovering with "debug recover".
 		return false, nil
 	} else if sameRange {
 		// We are no longer a member of this range, but the range still exists.
@@ -365,11 +367,20 @@ func (rgcq *replicaGCQueue) process(
 	return true, nil
 }
 
+func (*replicaGCQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 func (*replicaGCQueue) timer(_ time.Duration) time.Duration {
 	return replicaGCQueueTimerDuration
 }
 
 // purgatoryChan returns nil.
 func (*replicaGCQueue) purgatoryChan() <-chan time.Time {
+	return nil
+}
+
+func (*replicaGCQueue) updateChan() <-chan time.Time {
 	return nil
 }

@@ -12,12 +12,11 @@
 package securitytest
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/securityassets"
 	"github.com/cockroachdb/errors"
 )
 
@@ -38,7 +37,7 @@ func RestrictedCopy(path, tempdir, name string) (string, error) {
 		return "", err
 	}
 	tempPath := filepath.Join(tempdir, name)
-	if err := ioutil.WriteFile(tempPath, contents, 0600); err != nil {
+	if err := os.WriteFile(tempPath, contents, 0600); err != nil {
 		return "", err
 	}
 	return tempPath, nil
@@ -100,7 +99,7 @@ func AssetStat(name string) (os.FileInfo, error) {
 }
 
 // EmbeddedAssets is an AssetLoader pointing to embedded asset functions.
-var EmbeddedAssets = security.AssetLoader{
+var EmbeddedAssets = securityassets.Loader{
 	ReadDir:  AssetReadDir,
 	ReadFile: Asset,
 	Stat:     AssetStat,

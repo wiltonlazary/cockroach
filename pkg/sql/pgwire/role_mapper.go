@@ -13,7 +13,7 @@ package pgwire
 import (
 	"context"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/identmap"
 	"github.com/cockroachdb/errors"
@@ -30,15 +30,15 @@ import (
 // maps groups of users onto database roles.
 type RoleMapper = func(
 	ctx context.Context,
-	systemIdentity security.SQLUsername,
-) ([]security.SQLUsername, error)
+	systemIdentity username.SQLUsername,
+) ([]username.SQLUsername, error)
 
 // UseProvidedIdentity is a trivial implementation of RoleMapper which always
 // returns its input.
 func UseProvidedIdentity(
-	_ context.Context, id security.SQLUsername,
-) ([]security.SQLUsername, error) {
-	return []security.SQLUsername{id}, nil
+	_ context.Context, id username.SQLUsername,
+) ([]username.SQLUsername, error) {
+	return []username.SQLUsername{id}, nil
 }
 
 var _ RoleMapper = UseProvidedIdentity
@@ -55,8 +55,8 @@ func HbaMapper(hbaEntry *hba.Entry, identMap *identmap.Conf) RoleMapper {
 	if mapName == "" {
 		return UseProvidedIdentity
 	}
-	return func(_ context.Context, id security.SQLUsername) ([]security.SQLUsername, error) {
-		users, err := identMap.Map(mapName, id.Normalized())
+	return func(_ context.Context, id username.SQLUsername) ([]username.SQLUsername, error) {
+		users, _, err := identMap.Map(mapName, id.Normalized())
 		if err != nil {
 			return nil, err
 		}

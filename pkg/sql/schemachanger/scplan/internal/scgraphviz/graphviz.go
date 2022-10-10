@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
@@ -27,11 +26,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scgraph"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/internal/scstage"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan/scviz"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
-	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/errors"
 	"github.com/emicklei/dot"
-	"github.com/gogo/protobuf/jsonpb"
 )
 
 // StagesURL returns a URL to a rendering of the stages of the Plan.
@@ -68,33 +66,6 @@ func buildURL(gv string) (string, error) {
 		Path:     "scplan/viz.html",
 		Fragment: base64.StdEncoding.EncodeToString(buf.Bytes()),
 	}).String(), nil
-}
-
-// DecorateErrorWithPlanDetails adds plan graphviz URLs as error details.
-func DecorateErrorWithPlanDetails(
-	err error, cs scpb.CurrentState, g *scgraph.Graph, stages []scstage.Stage,
-) error {
-	if err == nil {
-		return nil
-	}
-
-	if len(stages) > 0 {
-		stagesURL, stagesErr := StagesURL(cs, g, stages)
-		if stagesErr != nil {
-			return errors.CombineErrors(err, stagesErr)
-		}
-		err = errors.WithDetailf(err, "stages: %s", stagesURL)
-	}
-
-	if g != nil {
-		dependenciesURL, dependenciesErr := DependenciesURL(cs, g)
-		if dependenciesErr != nil {
-			return errors.CombineErrors(err, dependenciesErr)
-		}
-		err = errors.WithDetailf(err, "dependencies: %s", dependenciesURL)
-	}
-
-	return errors.WithAssertionFailure(err)
 }
 
 // DrawStages returns a graphviz string of the stages of the Plan.
@@ -255,8 +226,11 @@ func drawDeps(cs scpb.CurrentState, g *scgraph.Graph) (*dot.Graph, error) {
 			ge.Attr("fontsize", "9")
 		case *scgraph.DepEdge:
 			ge.Attr("color", "red")
-			ge.Attr("label", e.Name())
-			if e.Kind() == scgraph.SameStagePrecedence {
+			ge.Attr("label", e.RuleNames())
+			switch e.Kind() {
+			case scgraph.PreviousStagePrecedence:
+				ge.Attr("arrowhead", "inv")
+			case scgraph.SameStagePrecedence:
 				ge.Attr("arrowhead", "diamond")
 			}
 		}
@@ -281,51 +255,22 @@ func itoa(i, ub int) string {
 	return fmt.Sprintf(fmt.Sprintf("%%0%dd", len(strconv.Itoa(ub))), i)
 }
 
-// ToMap converts a struct to a map, field by field. If at any point a protobuf
-// message is encountered, it is converted to a map using jsonpb to marshal it
-// to json and then marshaling it back to a map. This approach allows zero
-// values to be effectively omitted.
+// ToMap is a thin wrapper around scviz.ToMap which comes with some default
+// behavior for planned data structures.
 func ToMap(v interface{}) (interface{}, error) {
-	if v == nil {
-		return nil, nil
+	// The SetJobStateOnDescriptor is very large and graphviz fails to render it.
+	// Clear the DescriptorState field so that the relevant information (the
+	// existence of the Op and the descriptor ID) make it into the graph.
+	if sjs, ok := v.(*scop.SetJobStateOnDescriptor); ok {
+		clone := *sjs
+		clone.State = scpb.DescriptorState{}
+		v = &clone
 	}
-	if msg, ok := v.(protoutil.Message); ok {
-		var buf bytes.Buffer
-		jsonEncoder := jsonpb.Marshaler{EmitDefaults: false}
-		if err := jsonEncoder.Marshal(&buf, msg); err != nil {
-			return nil, errors.Wrapf(err, "%T %v", v, v)
-		}
-		var m map[string]interface{}
-		if err := json.NewDecoder(&buf).Decode(&m); err != nil {
-			return nil, err
-		}
-		return m, nil
+	m, err := scviz.ToMap(v, false /* emitDefaults */)
+	if err != nil {
+		return nil, err
 	}
-	vv := reflect.ValueOf(v)
-	vt := vv.Type()
-	switch vt.Kind() {
-	case reflect.Struct:
-	case reflect.Ptr:
-		if vt.Elem().Kind() != reflect.Struct {
-			return v, nil
-		}
-		vv = vv.Elem()
-		vt = vt.Elem()
-	default:
-		return v, nil
-	}
-
-	m := make(map[string]interface{}, vt.NumField())
-	for i := 0; i < vt.NumField(); i++ {
-		vvf := vv.Field(i)
-		if !vvf.CanInterface() || vvf.IsZero() {
-			continue
-		}
-		var err error
-		if m[vt.Field(i).Name], err = ToMap(vvf.Interface()); err != nil {
-			return nil, err
-		}
-	}
+	scviz.WalkMap(m, scviz.RewriteEmbeddedIntoParent)
 	return m, nil
 }
 

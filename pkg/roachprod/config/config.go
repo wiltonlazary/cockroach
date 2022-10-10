@@ -71,7 +71,30 @@ const (
 	// DefaultAdminUIPort is the default port on which the cockroach process is
 	// listening for HTTP connections for the Admin UI.
 	DefaultAdminUIPort = 26258
+
+	// DefaultNumFilesLimit is the default limit on the number of files that can
+	// be opened by the process.
+	DefaultNumFilesLimit = 65 << 13
 )
+
+// DefaultEnvVars returns default environment variables used in conjunction with CLI and MakeClusterSettings.
+// These can be overriden by specifying different values (last one wins).
+// See 'generateStartCmd' which sets 'ENV_VARS' for the systemd startup script (start.sh).
+func DefaultEnvVars() []string {
+	return []string{
+		// RPC compressions costs around 5% on kv95, so we disable it. It might help
+		// when moving snapshots around, though.
+		// (For other perf. related knobs, see https://github.com/cockroachdb/cockroach/issues/17165)
+		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
+		// Get rid of an annoying popup in the UI.
+		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
+		// Allow upgrading a stable release data-dir to a dev version.
+		// N.B. many roachtests which perform upgrade scenarios require this env. var after changes in [1]; otherwise,
+		// the tests will fail even on release branches when attempting to upgrade previous (stable) release to an alpha.
+		// [1] https://github.com/cockroachdb/cockroach/pull/87468
+		"COCKROACH_UPGRADE_TO_DEV_VERSION=true",
+	}
+}
 
 // IsLocalClusterName returns true if the given name is a valid name for a local
 // cluster.

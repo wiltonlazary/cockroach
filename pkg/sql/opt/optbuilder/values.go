@@ -13,6 +13,7 @@ package optbuilder
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -78,7 +79,7 @@ func (b *Builder) buildValuesClause(
 			if typ := texpr.ResolvedType(); typ.Family() != types.UnknownFamily {
 				if colTypes[colIdx].Family() == types.UnknownFamily {
 					colTypes[colIdx] = typ
-				} else if rightHasMoreSpecificTuple(colTypes[colIdx], typ) {
+				} else if moreSpecific, _ := rightHasMoreSpecificTuple(colTypes[colIdx], typ); moreSpecific {
 					// This condition handles the case when an earlier expression in the
 					// VALUES clause is an array of AnyTuple, but a later expression is an
 					// array of a more specific tuple type.
@@ -140,37 +141,50 @@ func reportValuesLenError(expected, actual int) {
 		expected, actual))
 }
 
-// rightHasMoreSpecificTuple returns true if the left and right types are
-// equivalent, but the right type is constrained by a more specific nested
-// tuple than the left type.
-func rightHasMoreSpecificTuple(left, right *types.T) bool {
+// rightHasMoreSpecificTuple returns two values. The first return parameter is
+// true if the left and right types are equivalent, but the right type is
+// constrained by a more specific nested tuple than the left type. The second
+// return parameter is true if the types are equivalent.
+func rightHasMoreSpecificTuple(left, right *types.T) (isMoreSpecific bool, isEquivalent bool) {
 	if left.Family() != right.Family() {
-		return false
+		return false, false
 	}
 	if left.Family() == types.ArrayFamily && right.Family() == types.ArrayFamily {
 		return rightHasMoreSpecificTuple(left.ArrayContents(), right.ArrayContents())
 	}
 	if left.Family() == types.TupleFamily && right.Family() == types.TupleFamily {
 		if right == types.AnyTuple {
-			return false
+			return false, true
 		} else if left == types.AnyTuple {
-			return true
+			return true, true
 		} else if len(left.TupleContents()) != len(right.TupleContents()) {
-			return false
+			return false, false
 		}
-		ret := true
+		allEquivalent := true
+		atLeastOneMoreSpecific := false
 		for i, leftElem := range left.TupleContents() {
 			rightElem := right.TupleContents()[i]
-			// Only recurse if we are dealing with a container type.
-			if leftElem.Family() == types.ArrayFamily || leftElem.Family() == types.TupleFamily {
-				ret = ret && rightHasMoreSpecificTuple(leftElem, rightElem)
-			} else {
-				ret = ret && leftElem.Equivalent(rightElem)
-			}
+			elemIsMoreSpecific, elemIsEquivalent := rightHasMoreSpecificTuple(leftElem, rightElem)
+			allEquivalent = allEquivalent && elemIsEquivalent
+			atLeastOneMoreSpecific = atLeastOneMoreSpecific || elemIsMoreSpecific
 		}
-		return ret
+		return allEquivalent && atLeastOneMoreSpecific, allEquivalent
 	}
-	// For non-tuples and non-arrays, we don't want the right type to get
-	// preference over the left type.
-	return false
+	// At this point, both left and right are neither tuples nor arrays.
+	return false, left.Equivalent(right)
+}
+
+func (b *Builder) buildLiteralValuesClause(
+	values *tree.LiteralValuesClause, desiredTypes []*types.T, inScope *scope,
+) *scope {
+	outScope := inScope.push()
+	for colIdx := 0; colIdx < len(desiredTypes); colIdx++ {
+		// The column names for VALUES are column1, column2, etc.
+		colName := scopeColName(tree.Name(fmt.Sprintf("column%d", colIdx+1)))
+		b.synthesizeColumn(outScope, colName, desiredTypes[colIdx], nil, nil /* scalar */)
+	}
+
+	colList := colsToColList(outScope.cols)
+	outScope.expr = b.factory.ConstructLiteralValues(&opt.LiteralRows{Rows: values.Rows}, colList)
+	return outScope
 }

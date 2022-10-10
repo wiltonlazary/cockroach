@@ -25,10 +25,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/sidetransport"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/systemconfigwatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigkvsubscriber"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
@@ -38,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -45,17 +48,17 @@ import (
 // cockroach node with a single store using a local sender. Example
 // usage of a LocalTestCluster follows:
 //
-//   s := &LocalTestCluster{}
-//   s.Start(t, testutils.NewNodeTestBaseContext(),
-//           kv.InitFactoryForLocalTestCluster)
-//   defer s.Stop()
+//	s := &LocalTestCluster{}
+//	s.Start(t, testutils.NewNodeTestBaseContext(),
+//	        kv.InitFactoryForLocalTestCluster)
+//	defer s.Stop()
 //
 // Note that the LocalTestCluster is different from server.TestCluster
 // in that although it uses a distributed sender, there is no RPC traffic.
 type LocalTestCluster struct {
 	AmbientCtx        log.AmbientContext
 	Cfg               kvserver.StoreConfig
-	Manual            *hlc.ManualClock
+	Manual            *timeutil.ManualTime
 	Clock             *hlc.Clock
 	Gossip            *gossip.Gossip
 	Eng               storage.Engine
@@ -109,8 +112,8 @@ func (ltc *LocalTestCluster) Stopper() *stop.Stopper {
 // TestServer.Addr after Start() for client connections. Use Stop()
 // to shutdown the server after the test completes.
 func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFactory InitFactoryFn) {
-	manualClock := hlc.NewManualClock(123)
-	clock := hlc.NewClock(manualClock.UnixNano, 50*time.Millisecond)
+	manualClock := timeutil.NewManualTime(timeutil.Unix(0, 123))
+	clock := hlc.NewClock(manualClock, 50*time.Millisecond /* maxOffset */)
 	cfg := kvserver.TestStoreConfig(clock)
 	tr := cfg.AmbientCtx.Tracer
 	ltc.stopper = stop.NewStopper(stop.WithTracer(tr))
@@ -131,15 +134,16 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	ltc.tester = t
 	cfg.RPCContext = rpc.NewContext(ctx, rpc.ContextOptions{
-		TenantID: roachpb.SystemTenantID,
-		Config:   baseCtx,
-		Clock:    ltc.Clock,
-		Stopper:  ltc.stopper,
-		Settings: cfg.Settings,
-		NodeID:   nc,
+		TenantID:  roachpb.SystemTenantID,
+		Config:    baseCtx,
+		Clock:     ltc.Clock.WallClock(),
+		MaxOffset: ltc.Clock.MaxOffset(),
+		Stopper:   ltc.stopper,
+		Settings:  cfg.Settings,
+		NodeID:    nc,
 	})
 	cfg.RPCContext.NodeID.Set(ctx, nodeID)
-	clusterID := cfg.RPCContext.ClusterID
+	clusterID := cfg.RPCContext.StorageClusterID
 	server := rpc.NewServer(cfg.RPCContext) // never started
 	ltc.Gossip = gossip.New(ambient, clusterID, nc, cfg.RPCContext, server, ltc.stopper, metric.NewRegistry(), roachpb.Locality{}, zonepb.DefaultZoneConfigRef())
 	var err error
@@ -182,6 +186,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 	active, renewal := cfg.NodeLivenessDurations()
 	cfg.NodeLiveness = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx:              cfg.AmbientCtx,
+		Stopper:                 ltc.stopper,
 		Clock:                   cfg.Clock,
 		DB:                      cfg.DB,
 		Gossip:                  cfg.Gossip,
@@ -190,14 +195,14 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		Settings:                cfg.Settings,
 		HistogramWindowInterval: cfg.HistogramWindowInterval,
 	})
-	kvserver.TimeUntilStoreDead.Override(ctx, &cfg.Settings.SV, kvserver.TestTimeUntilStoreDead)
-	cfg.StorePool = kvserver.NewStorePool(
+	storepool.TimeUntilStoreDead.Override(ctx, &cfg.Settings.SV, storepool.TestTimeUntilStoreDead)
+	cfg.StorePool = storepool.NewStorePool(
 		cfg.AmbientCtx,
 		cfg.Settings,
 		cfg.Gossip,
 		cfg.Clock,
 		cfg.NodeLiveness.GetNodeCount,
-		kvserver.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
+		storepool.MakeStorePoolNodeLivenessFunc(cfg.NodeLiveness),
 		/* deterministic */ false,
 	)
 	cfg.Transport = transport
@@ -217,14 +222,20 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 		t.Fatal(err)
 	}
 	cfg.SpanConfigSubscriber = spanconfigkvsubscriber.New(
-		ltc.stopper,
-		ltc.DB,
 		clock,
 		rangeFeedFactory,
 		keys.SpanConfigurationsTableID,
 		1<<20, /* 1 MB */
 		cfg.DefaultSpanConfig,
+		cfg.Settings,
 		nil,
+		nil,
+	)
+	cfg.SystemConfigProvider = systemconfigwatcher.New(
+		keys.SystemSQLCodec,
+		cfg.Clock,
+		rangeFeedFactory,
+		zonepb.DefaultZoneConfigRef(),
 	)
 
 	ltc.Store = kvserver.NewStore(ctx, cfg, ltc.Eng, nodeDesc)
@@ -265,7 +276,7 @@ func (ltc *LocalTestCluster) Start(t testing.TB, baseCtx *base.Config, initFacto
 
 	if !ltc.DisableLivenessHeartbeat {
 		cfg.NodeLiveness.Start(ctx,
-			liveness.NodeLivenessStartOptions{Stopper: ltc.stopper, Engines: []storage.Engine{ltc.Eng}})
+			liveness.NodeLivenessStartOptions{Engines: []storage.Engine{ltc.Eng}})
 	}
 
 	if err := ltc.Store.Start(ctx, ltc.stopper); err != nil {

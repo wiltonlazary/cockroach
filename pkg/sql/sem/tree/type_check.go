@@ -15,18 +15,28 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/cast"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"golang.org/x/text/language"
+)
+
+// OnTypeCheck* functions are hooks which get called if not nil and the
+// type checking of the relevant function is made.
+var (
+	OnTypeCheckArraySubscript   func()
+	OnTypeCheckJSONBSubscript   func()
+	OnTypeCheckIfErr            func()
+	OnTypeCheckArrayConstructor func()
+	OnTypeCheckArrayFlatten     func()
 )
 
 // SemaContext defines the context in which to perform semantic analysis on an
@@ -44,19 +54,18 @@ type SemaContext struct {
 	// SearchPath indicates where to search for unqualified function
 	// names. The path elements must be normalized via Name.Normalize()
 	// already.
-	SearchPath sessiondata.SearchPath
+	SearchPath SearchPath
 
 	// TypeResolver manages resolving type names into *types.T's.
 	TypeResolver TypeReferenceResolver
 
+	// FunctionResolver manages resolving functions names into
+	// *FunctionDefinitons.
+	FunctionResolver FunctionReferenceResolver
+
 	// TableNameResolver is used to resolve the fully qualified
 	// name of a table given its ID.
 	TableNameResolver QualifiedNameResolver
-
-	// IntervalStyleEnabled determines whether IntervalStyle is enabled.
-	IntervalStyleEnabled bool
-	// DateStyleEnabled determines whether DateStyle is enabled.
-	DateStyleEnabled bool
 
 	Properties SemaProperties
 
@@ -318,7 +327,7 @@ func (expr *BinaryExpr) TypeCheck(
 		if len(fns) > 0 {
 			noneAcceptNull := true
 			for _, e := range fns {
-				if e.(*BinOp).NullableArgs {
+				if e.(*BinOp).CalledOnNullInput {
 					noneAcceptNull = false
 					break
 				}
@@ -352,13 +361,12 @@ func (expr *BinaryExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s", expr.Operator)
 	}
 
-	// Register operator usage in telemetry.
-	if binOp.counter != nil {
-		telemetry.Inc(binOp.counter)
+	if binOp.OnTypeCheck != nil {
+		binOp.OnTypeCheck()
 	}
 
 	expr.Left, expr.Right = leftTyped, rightTyped
-	expr.Fn = binOp
+	expr.Op = binOp
 	expr.typ = binOp.returnType()(typedSubExprs)
 	return expr, nil
 }
@@ -422,32 +430,19 @@ func invalidCastError(castFrom, castTo *types.T) error {
 }
 
 // resolveCast checks that the cast from the two types is valid. If allowStable
-// is false, it also checks that the cast has VolatilityImmutable.
+// is false, it also checks that the cast has Immutable.
 //
 // On success, any relevant telemetry counters are incremented.
-func resolveCast(
-	context string,
-	castFrom, castTo *types.T,
-	allowStable bool,
-	intervalStyleEnabled bool,
-	dateStyleEnabled bool,
-) error {
+func resolveCast(context string, castFrom, castTo *types.T, allowStable bool) error {
 	toFamily := castTo.Family()
 	fromFamily := castFrom.Family()
 	switch {
 	case toFamily == types.ArrayFamily && fromFamily == types.ArrayFamily:
-		err := resolveCast(
-			context,
-			castFrom.ArrayContents(),
-			castTo.ArrayContents(),
-			allowStable,
-			intervalStyleEnabled,
-			dateStyleEnabled,
-		)
+		err := resolveCast(context, castFrom.ArrayContents(), castTo.ArrayContents(), allowStable)
 		if err != nil {
 			return err
 		}
-		telemetry.Inc(GetCastCounter(fromFamily, toFamily))
+		onCastTypeCheckHook(fromFamily, toFamily)
 		return nil
 
 	case toFamily == types.EnumFamily && fromFamily == types.EnumFamily:
@@ -456,7 +451,7 @@ func resolveCast(
 		if !castFrom.Equivalent(castTo) {
 			return invalidCastError(castFrom, castTo)
 		}
-		telemetry.Inc(GetCastCounter(fromFamily, toFamily))
+		onCastTypeCheckHook(fromFamily, toFamily)
 		return nil
 
 	case toFamily == types.TupleFamily && fromFamily == types.TupleFamily:
@@ -474,37 +469,53 @@ func resolveCast(
 		}
 		for i, from := range fromTuple {
 			to := toTuple[i]
-			err := resolveCast(
-				context,
-				from,
-				to,
-				allowStable,
-				intervalStyleEnabled,
-				dateStyleEnabled,
-			)
+			err := resolveCast(context, from, to, allowStable)
 			if err != nil {
 				return err
 			}
 		}
-		telemetry.Inc(GetCastCounter(fromFamily, toFamily))
+		onCastTypeCheckHook(fromFamily, toFamily)
 		return nil
 
 	default:
-		cast, ok := lookupCast(castFrom, castTo, intervalStyleEnabled, dateStyleEnabled)
+		cast, ok := cast.LookupCast(castFrom, castTo)
 		if !ok {
 			return invalidCastError(castFrom, castTo)
 		}
-		if !allowStable && cast.volatility >= VolatilityStable {
+		if !allowStable && cast.Volatility >= volatility.Stable {
 			err := NewContextDependentOpsNotAllowedError(context)
 			err = pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s::%s", castFrom, castTo)
-			if cast.volatilityHint != "" {
-				err = errors.WithHint(err, cast.volatilityHint)
+			if cast.VolatilityHint != "" {
+				err = errors.WithHint(err, cast.VolatilityHint)
 			}
 			return err
 		}
-		telemetry.Inc(GetCastCounter(fromFamily, toFamily))
+		onCastTypeCheckHook(fromFamily, toFamily)
 		return nil
 	}
+}
+
+// CastCounterType represents a cast from one family to another.
+type CastCounterType struct {
+	From, To types.Family
+}
+
+// OnCastTypeCheck is a map of CastCounterTypes to their hook.
+var OnCastTypeCheck map[CastCounterType]func()
+
+// onCastTypeCheckHook performs the registered hook for the given cast on type check.
+func onCastTypeCheckHook(from, to types.Family) {
+	// The given map has not been populated, so do not expect any telemetry.
+	if OnCastTypeCheck == nil {
+		return
+	}
+	if f, ok := OnCastTypeCheck[CastCounterType{From: from, To: to}]; ok {
+		f()
+		return
+	}
+	panic(errors.AssertionFailedf(
+		"no cast counter found for cast from %s to %s", from.Name(), to.Name(),
+	))
 }
 
 func isArrayExpr(expr Expr) bool {
@@ -580,14 +591,7 @@ func (expr *CastExpr) TypeCheck(
 		allowStable = false
 		context = semaCtx.Properties.required.context
 	}
-	err = resolveCast(
-		context,
-		castFrom,
-		exprType,
-		allowStable,
-		semaCtx != nil && semaCtx.IntervalStyleEnabled,
-		semaCtx != nil && semaCtx.DateStyleEnabled,
-	)
+	err = resolveCast(context, castFrom, exprType, allowStable)
 	if err != nil {
 		return nil, err
 	}
@@ -601,33 +605,65 @@ func (expr *CastExpr) TypeCheck(
 func (expr *IndirectionExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
-	for i, t := range expr.Indirection {
-		if t.Slice {
-			return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
-		}
-		if i > 0 {
-			return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
-		}
-
-		beginExpr, err := typeCheckAndRequire(ctx, semaCtx, t.Begin, types.Int, "ARRAY subscript")
-		if err != nil {
-			return nil, err
-		}
-		t.Begin = beginExpr
-	}
-
 	subExpr, err := expr.Expr.TypeCheck(ctx, semaCtx, types.MakeArray(desired))
 	if err != nil {
 		return nil, err
 	}
 	typ := subExpr.ResolvedType()
-	if typ.Family() != types.ArrayFamily {
-		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array", typ)
-	}
 	expr.Expr = subExpr
-	expr.typ = typ.ArrayContents()
 
-	telemetry.Inc(sqltelemetry.ArraySubscriptCounter)
+	switch typ.Family() {
+	case types.ArrayFamily:
+		expr.typ = typ.ArrayContents()
+		for i, t := range expr.Indirection {
+			if t.Slice {
+				return nil, unimplemented.NewWithIssuef(32551, "ARRAY slicing in %s", expr)
+			}
+			if i > 0 {
+				return nil, unimplemented.NewWithIssueDetailf(32552, "ind", "multidimensional indexing: %s", expr)
+			}
+
+			beginExpr, err := typeCheckAndRequire(ctx, semaCtx, t.Begin, types.Int, "ARRAY subscript")
+			if err != nil {
+				return nil, err
+			}
+			t.Begin = beginExpr
+		}
+
+		if OnTypeCheckArraySubscript != nil {
+			OnTypeCheckArraySubscript()
+		}
+	case types.JsonFamily:
+		expr.typ = typ
+		for _, t := range expr.Indirection {
+			if t.Slice {
+				return nil, pgerror.Newf(pgcode.DatatypeMismatch, "jsonb subscript does not support slices")
+			}
+			beginExpr, err := t.Begin.TypeCheck(ctx, semaCtx, types.Any)
+			if err != nil {
+				return nil, err
+			}
+			switch beginExpr.ResolvedType().Family() {
+			case types.IntFamily, types.StringFamily, types.UnknownFamily:
+			default:
+				return nil, errors.WithHint(
+					pgerror.Newf(
+						pgcode.DatatypeMismatch,
+						"unexpected JSON subscript type: %s",
+						beginExpr.ResolvedType().SQLString(),
+					),
+					"subscript type must be integer or text",
+				)
+			}
+			t.Begin = beginExpr
+		}
+
+		if OnTypeCheckJSONBSubscript != nil {
+			OnTypeCheckJSONBSubscript()
+		}
+	default:
+		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "cannot subscript type %s because it is not an array or json object", typ)
+	}
 	return expr, nil
 }
 
@@ -794,7 +830,7 @@ func (expr *CoalesceExpr) TypeCheck(
 ) (TypedExpr, error) {
 	typedSubExprs, retType, err := TypeCheckSameTypedExprs(ctx, semaCtx, desired, expr.Exprs...)
 	if err != nil {
-		return nil, decorateTypeCheckError(err, "incompatible %s expressions", log.Safe(expr.Name))
+		return nil, decorateTypeCheckError(err, "incompatible %s expressions", redact.Safe(expr.Name))
 	}
 
 	for i, subExpr := range typedSubExprs {
@@ -842,13 +878,12 @@ func (expr *ComparisonExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s", expr.Operator)
 	}
 
-	// Register operator usage in telemetry.
-	if cmpOp.counter != nil {
-		telemetry.Inc(cmpOp.counter)
+	if cmpOp.OnTypeCheck != nil {
+		cmpOp.OnTypeCheck()
 	}
 
 	expr.Left, expr.Right = leftTyped, rightTyped
-	expr.Fn = cmpOp
+	expr.Op = cmpOp
 	expr.typ = types.Bool
 	return expr, nil
 }
@@ -893,25 +928,20 @@ func NewInvalidFunctionUsageError(class FunctionClass, context string) error {
 
 // checkFunctionUsage checks whether a given built-in function is
 // allowed in the current context.
-func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinition) error {
-	if def.UnsupportedWithIssue != 0 {
-		// Note: no need to embed the function name in the message; the
-		// caller will add the function name as prefix.
-		const msg = "this function is not yet supported"
-		if def.UnsupportedWithIssue < 0 {
-			return unimplemented.New(def.Name+"()", msg)
-		}
-		return unimplemented.NewWithIssueDetail(def.UnsupportedWithIssue, def.Name, msg)
-	}
-	if def.Private {
-		return pgerror.Wrapf(errPrivateFunction, pgcode.ReservedName,
-			"%s()", errors.Safe(def.Name))
-	}
+func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *ResolvedFunctionDefinition) error {
 	if sc == nil {
 		// We can't check anything further. Give up.
 		return nil
 	}
 
+	// TODO(Chengxiong): Consider doing this check when we narrow down to an
+	// overload. This is fine at the moment since we don't allow creating
+	// aggregate/window functions yet. But, ideally, we should figure out a way
+	// to do this check after overload resolution.
+	fnCls, err := def.GetClass()
+	if err != nil {
+		return err
+	}
 	if expr.IsWindowFunctionApplication() {
 		if sc.Properties.required.rejectFlags&RejectWindowApplications != 0 {
 			return NewInvalidFunctionUsageError(WindowClass, sc.Properties.required.context)
@@ -925,7 +955,7 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 	} else {
 		// If it is an aggregate function *not used OVER a window*, then
 		// we have an aggregation.
-		if def.Class == AggregateClass {
+		if fnCls == AggregateClass {
 			if sc.Properties.Derived.inFuncExpr &&
 				sc.Properties.required.rejectFlags&RejectNestedAggregates != 0 {
 				return NewAggInAggError()
@@ -936,7 +966,7 @@ func (sc *SemaContext) checkFunctionUsage(expr *FuncExpr, def *FunctionDefinitio
 			sc.Properties.Derived.SeenAggregate = true
 		}
 	}
-	if def.Class == GeneratorClass {
+	if fnCls == GeneratorClass {
 		if sc.Properties.Derived.inFuncExpr &&
 			sc.Properties.required.rejectFlags&RejectNestedGenerators != 0 {
 			return NewInvalidNestedSRFError(sc.Properties.required.context)
@@ -960,14 +990,14 @@ func NewContextDependentOpsNotAllowedError(context string) error {
 	)
 }
 
-// checkVolatility checks whether an operator with the given volatility is
+// checkVolatility checks whether an operator with the given Volatility is
 // allowed in the current context.
-func (sc *SemaContext) checkVolatility(v Volatility) error {
+func (sc *SemaContext) checkVolatility(v volatility.V) error {
 	if sc == nil {
 		return nil
 	}
 	switch v {
-	case VolatilityVolatile:
+	case volatility.Volatile:
 		if sc.Properties.required.rejectFlags&RejectVolatileFunctions != 0 {
 			// The code FeatureNotSupported is a bit misleading here,
 			// because we probably can't support the feature at all. However
@@ -975,7 +1005,7 @@ func (sc *SemaContext) checkVolatility(v Volatility) error {
 			return pgerror.Newf(pgcode.FeatureNotSupported,
 				"volatile functions are not allowed in %s", sc.Properties.required.context)
 		}
-	case VolatilityStable:
+	case volatility.Stable:
 		if sc.Properties.required.rejectFlags&RejectStableOperators != 0 {
 			return NewContextDependentOpsNotAllowedError(sc.Properties.required.context)
 		}
@@ -985,8 +1015,12 @@ func (sc *SemaContext) checkVolatility(v Volatility) error {
 
 // CheckIsWindowOrAgg returns an error if the function definition is not a
 // window function or an aggregate.
-func CheckIsWindowOrAgg(def *FunctionDefinition) error {
-	switch def.Class {
+func CheckIsWindowOrAgg(def *ResolvedFunctionDefinition) error {
+	cls, err := def.GetClass()
+	if err != nil {
+		return err
+	}
+	switch cls {
 	case AggregateClass:
 	case WindowClass:
 	default:
@@ -1001,11 +1035,13 @@ func CheckIsWindowOrAgg(def *FunctionDefinition) error {
 func (expr *FuncExpr) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
-	var searchPath sessiondata.SearchPath
+	searchPath := EmptySearchPath
+	var resolver FunctionReferenceResolver
 	if semaCtx != nil {
 		searchPath = semaCtx.SearchPath
+		resolver = semaCtx.FunctionResolver
 	}
-	def, err := expr.Func.Resolve(searchPath)
+	def, err := expr.Func.Resolve(ctx, searchPath, resolver)
 	if err != nil {
 		return nil, err
 	}
@@ -1014,6 +1050,7 @@ func (expr *FuncExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue,
 			"%s()", def.Name)
 	}
+
 	if semaCtx != nil {
 		// We'll need to remember we are in a function application to
 		// generate suitable errors in checkFunctionUsage().  We cannot
@@ -1035,9 +1072,23 @@ func (expr *FuncExpr) TypeCheck(
 		}
 	}
 
-	typedSubExprs, fns, err := typeCheckOverloadedExprs(ctx, semaCtx, desired, def.Definition, false, expr.Exprs...)
+	overloadImpls := make([]overloadImpl, 0, len(def.Overloads))
+	for i := range def.Overloads {
+		overloadImpls = append(overloadImpls, def.Overloads[i])
+	}
+	typedSubExprs, fns, err := typeCheckOverloadedExprs(ctx, semaCtx, desired, overloadImpls, false, expr.Exprs...)
 	if err != nil {
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
+	}
+
+	var calledOnNullInputFns []overloadImpl
+	var notCalledOnNullInputFns []overloadImpl
+	for _, f := range fns {
+		if f.(QualifiedOverload).CalledOnNullInput {
+			calledOnNullInputFns = append(calledOnNullInputFns, f)
+		} else {
+			notCalledOnNullInputFns = append(notCalledOnNullInputFns, f)
+		}
 	}
 
 	// If the function is an aggregate that does not accept null arguments and we
@@ -1046,11 +1097,15 @@ func (expr *FuncExpr) TypeCheck(
 	// chooses the overload with preferred type for the given category. For
 	// example, float8 is the preferred type for the numeric category in Postgres.
 	// To match Postgres' behavior, we should add that logic here too.
-	if !def.NullableArgs && def.FunctionProperties.Class == AggregateClass {
+	funcCls, err := def.GetClass()
+	if err != nil {
+		return nil, err
+	}
+	if funcCls == AggregateClass {
 		for i := range typedSubExprs {
 			if typedSubExprs[i].ResolvedType().Family() == types.UnknownFamily {
 				var filtered []overloadImpl
-				for j := range fns {
+				for j := range notCalledOnNullInputFns {
 					if fns[j].params().GetAt(i).Equivalent(types.String) {
 						if filtered == nil {
 							filtered = make([]overloadImpl, 0, len(fns)-j)
@@ -1061,7 +1116,7 @@ func (expr *FuncExpr) TypeCheck(
 
 				// Only use the filtered list if it's not empty.
 				if filtered != nil {
-					fns = filtered
+					notCalledOnNullInputFns = filtered
 
 					// Cast the expression to a string so the execution engine will find
 					// the correct overload.
@@ -1069,13 +1124,14 @@ func (expr *FuncExpr) TypeCheck(
 				}
 			}
 		}
+		fns = append(calledOnNullInputFns, notCalledOnNullInputFns...)
 	}
 
 	// Return NULL if at least one overload is possible, no overload accepts
 	// NULL arguments, the function isn't a generator or aggregate builtin, and
 	// NULL is given as an argument.
-	if !def.NullableArgs && def.FunctionProperties.Class != GeneratorClass &&
-		def.FunctionProperties.Class != AggregateClass {
+	if len(fns) > 0 && len(calledOnNullInputFns) == 0 && funcCls != GeneratorClass &&
+		funcCls != AggregateClass {
 		for _, expr := range typedSubExprs {
 			if expr.ResolvedType().Family() == types.UnknownFamily {
 				return DNull, nil
@@ -1083,47 +1139,53 @@ func (expr *FuncExpr) TypeCheck(
 		}
 	}
 
-	// Throw a typing error if overload resolution found either no compatible candidates
-	// or if it found an ambiguity.
-	// TODO(nvanbenschoten): now that we can distinguish these, we can improve the
-	//   error message the two report (e.g. "add casts please")
-	if len(fns) != 1 {
-		typeNames := make([]string, 0, len(expr.Exprs))
-		for _, expr := range typedSubExprs {
-			typeNames = append(typeNames, expr.ResolvedType().String())
-		}
-		var desStr string
-		if desired.Family() != types.AnyFamily {
-			desStr = fmt.Sprintf(" (desired <%s>)", desired)
-		}
-		sig := fmt.Sprintf("%s(%s)%s", &expr.Func, strings.Join(typeNames, ", "), desStr)
-		if len(fns) == 0 {
-			return nil, pgerror.Newf(pgcode.UndefinedFunction, "unknown signature: %s", sig)
-		}
-		fnsStr := formatCandidates(expr.Func.String(), fns)
-		return nil, pgerror.Newf(pgcode.AmbiguousFunction, "ambiguous call: %s, candidates are:\n%s", sig, fnsStr)
+	if len(fns) == 0 {
+		return nil, pgerror.Newf(pgcode.UndefinedFunction, "unknown signature: %s", getFuncSig(expr, typedSubExprs, desired))
 	}
-	overloadImpl := fns[0].(*Overload)
+
+	// Get overloads from the most significant schema in search path.
+	favoredOverload, err := getMostSignificantOverload(
+		fns, searchPath, expr,
+		func() string { return getFuncSig(expr, typedSubExprs, desired) },
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Just pick the first overload from the search path.
+	overloadImpl := favoredOverload.Overload
+	if overloadImpl.Private {
+		return nil, pgerror.Wrapf(errPrivateFunction, pgcode.ReservedName,
+			"%s()", errors.Safe(def.Name))
+	}
+	if resolver != nil && overloadImpl.UDFContainsOnlySignature {
+		_, overloadImpl, err = resolver.ResolveFunctionByOID(ctx, overloadImpl.Oid)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	if expr.IsWindowFunctionApplication() {
 		// Make sure the window function application is of either a built-in window
 		// function or of a builtin aggregate function.
-		if err := CheckIsWindowOrAgg(def); err != nil {
-			return nil, err
+		if overloadImpl.Class != WindowClass && overloadImpl.Class != AggregateClass {
+			return nil, pgerror.Newf(pgcode.WrongObjectType,
+				"OVER specified, but %s() is neither a window function nor an aggregate function",
+				def.Name)
 		}
 		if expr.Type == DistinctFuncType {
 			return nil, pgerror.New(pgcode.FeatureNotSupported, "DISTINCT is not implemented for window functions")
 		}
 	} else {
 		// Make sure the window function builtins are used as window function applications.
-		if def.Class == WindowClass {
+		if funcCls == WindowClass {
 			return nil, pgerror.Newf(pgcode.WrongObjectType,
 				"window function %s() requires an OVER clause", &expr.Func)
 		}
 	}
 
 	if expr.Filter != nil {
-		if def.Class != AggregateClass {
+		if funcCls != AggregateClass {
 			// Same error message as Postgres. If we have a window function, only
 			// aggregates accept a FILTER clause.
 			return nil, pgerror.Newf(pgcode.WrongObjectType,
@@ -1151,7 +1213,7 @@ func (expr *FuncExpr) TypeCheck(
 		expr.Exprs[i] = subExpr
 	}
 	expr.fn = overloadImpl
-	expr.fnProps = &def.FunctionProperties
+	expr.fnProps = &overloadImpl.FunctionProperties
 	expr.typ = overloadImpl.returnType()(typedSubExprs)
 	if expr.typ == UnknownReturnType {
 		typeNames := make([]string, 0, len(expr.Exprs))
@@ -1168,8 +1230,8 @@ func (expr *FuncExpr) TypeCheck(
 	if err := semaCtx.checkVolatility(overloadImpl.Volatility); err != nil {
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s()", def.Name)
 	}
-	if overloadImpl.counter != nil {
-		telemetry.Inc(overloadImpl.counter)
+	if overloadImpl.OnTypeCheck != nil && *overloadImpl.OnTypeCheck != nil {
+		(*overloadImpl.OnTypeCheck)()
 	}
 	return expr, nil
 }
@@ -1209,7 +1271,9 @@ func (expr *IfErrExpr) TypeCheck(
 	expr.ErrCode = typedErrCode
 	expr.typ = retType
 
-	telemetry.Inc(sqltelemetry.IfErrCounter)
+	if OnTypeCheckIfErr != nil {
+		OnTypeCheckIfErr()
+	}
 	return expr, nil
 }
 
@@ -1302,6 +1366,16 @@ func (expr *NullIfExpr) TypeCheck(
 	if err != nil {
 		return nil, decorateTypeCheckError(err, "incompatible NULLIF expressions")
 	}
+	leftType := typedSubExprs[0].ResolvedType()
+	rightType := typedSubExprs[1].ResolvedType()
+	_, ok := CmpOps[treecmp.EQ].LookupImpl(leftType, rightType)
+	if !ok {
+		op := treecmp.ComparisonOperator{Symbol: treecmp.EQ}
+		err = pgerror.Newf(
+			pgcode.UndefinedFunction, "unsupported comparison operator: <%s> %s <%s>",
+			leftType, op, rightType)
+		return nil, decorateTypeCheckError(err, "incompatible NULLIF expressions")
+	}
 
 	expr.Expr1, expr.Expr2 = typedSubExprs[0], typedSubExprs[1]
 	expr.typ = retType
@@ -1382,16 +1456,16 @@ func (expr *AllColumnsSelector) TypeCheck(
 func (expr *RangeCond) TypeCheck(
 	ctx context.Context, semaCtx *SemaContext, desired *types.T,
 ) (TypedExpr, error) {
-	leftFromTyped, fromTyped, _, _, err := typeCheckComparisonOp(ctx, semaCtx, MakeComparisonOperator(GT), expr.Left, expr.From)
+	leftFromTyped, fromTyped, _, _, err := typeCheckComparisonOp(ctx, semaCtx, treecmp.MakeComparisonOperator(treecmp.GT), expr.Left, expr.From)
 	if err != nil {
 		return nil, err
 	}
-	leftToTyped, toTyped, _, _, err := typeCheckComparisonOp(ctx, semaCtx, MakeComparisonOperator(LT), expr.Left, expr.To)
+	leftToTyped, toTyped, _, _, err := typeCheckComparisonOp(ctx, semaCtx, treecmp.MakeComparisonOperator(treecmp.LT), expr.Left, expr.To)
 	if err != nil {
 		return nil, err
 	}
 	// Ensure that the boundaries of the comparison are well typed.
-	_, _, _, _, err = typeCheckComparisonOp(ctx, semaCtx, MakeComparisonOperator(LT), expr.From, expr.To)
+	_, _, _, _, err = typeCheckComparisonOp(ctx, semaCtx, treecmp.MakeComparisonOperator(treecmp.LT), expr.From, expr.To)
 	if err != nil {
 		return nil, err
 	}
@@ -1455,13 +1529,12 @@ func (expr *UnaryExpr) TypeCheck(
 		return nil, pgerror.Wrapf(err, pgcode.InvalidParameterValue, "%s", expr.Operator)
 	}
 
-	// Register operator usage in telemetry.
-	if unaryOp.counter != nil {
-		telemetry.Inc(unaryOp.counter)
+	if unaryOp.OnTypeCheck != nil {
+		unaryOp.OnTypeCheck()
 	}
 
 	expr.Expr = exprTyped
-	expr.fn = unaryOp
+	expr.op = unaryOp
 	expr.typ = unaryOp.returnType()(typedSubExprs)
 	return expr, nil
 }
@@ -1537,7 +1610,7 @@ func (expr *Tuple) TypeCheck(
 }
 
 var errAmbiguousArrayType = pgerror.Newf(pgcode.IndeterminateDatatype, "cannot determine type of empty array. "+
-	"Consider annotating with the desired type, for example ARRAY[]:::int[]")
+	"Consider casting to the desired type, for example ARRAY[]::int[]")
 
 // TypeCheck implements the Expr interface.
 func (expr *Array) TypeCheck(
@@ -1566,7 +1639,9 @@ func (expr *Array) TypeCheck(
 		expr.Exprs[i] = typedSubExprs[i]
 	}
 
-	telemetry.Inc(sqltelemetry.ArrayConstructorCounter)
+	if OnTypeCheckArrayConstructor != nil {
+		OnTypeCheckArrayConstructor()
+	}
 	return expr, nil
 }
 
@@ -1586,7 +1661,9 @@ func (expr *ArrayFlatten) TypeCheck(
 	expr.Subquery = subqueryTyped
 	expr.typ = types.MakeArray(subqueryTyped.ResolvedType())
 
-	telemetry.Inc(sqltelemetry.ArrayFlattenCounter)
+	if OnTypeCheckArrayFlatten != nil {
+		OnTypeCheckArrayFlatten()
+	}
 	return expr, nil
 }
 
@@ -1691,6 +1768,12 @@ func (d *DCollatedString) TypeCheck(
 // TypeCheck implements the Expr interface. It is implemented as an idempotent
 // identity function for Datum.
 func (d *DBytes) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
+	return d, nil
+}
+
+// TypeCheck implements the Expr interface. It is implemented as an idempotent
+// identity function for Datum.
+func (d *DEncodedKey) TypeCheck(_ context.Context, _ *SemaContext, _ *types.T) (TypedExpr, error) {
 	return d, nil
 }
 
@@ -1822,7 +1905,11 @@ func (d dNull) TypeCheck(_ context.Context, _ *SemaContext, desired *types.T) (T
 // typeCheckAndRequireTupleElems asserts that all elements in the Tuple are
 // comparable to the input Expr given the input comparison operator.
 func typeCheckAndRequireTupleElems(
-	ctx context.Context, semaCtx *SemaContext, expr TypedExpr, tuple *Tuple, op ComparisonOperator,
+	ctx context.Context,
+	semaCtx *SemaContext,
+	expr TypedExpr,
+	tuple *Tuple,
+	op treecmp.ComparisonOperator,
 ) (TypedExpr, error) {
 	tuple.typ = types.MakeTuple(make([]*types.T, len(tuple.Exprs)))
 	for i, subExpr := range tuple.Exprs {
@@ -1870,6 +1957,15 @@ func typeCheckAndRequire(
 		return nil, err
 	}
 	if typ := typedExpr.ResolvedType(); !(typ.Family() == types.UnknownFamily || typ.Equivalent(required)) {
+		// A void literal is output as an empty string (see DVoid.Format), so type
+		// annotation of an empty string as VOID ('':::VOID) should succeed.
+		if required.Family() == types.VoidFamily && typ.Family() == types.StringFamily {
+			if str, ok := expr.(*StrVal); ok {
+				if str.s == "" {
+					return DVoidDatum, nil
+				}
+			}
+		}
 		return nil, pgerror.Newf(pgcode.DatatypeMismatch, "incompatible %s type: %s", op, typ)
 	}
 	return typedExpr, nil
@@ -1891,7 +1987,7 @@ const (
 )
 
 func typeCheckComparisonOpWithSubOperator(
-	ctx context.Context, semaCtx *SemaContext, op, subOp ComparisonOperator, left, right Expr,
+	ctx context.Context, semaCtx *SemaContext, op, subOp treecmp.ComparisonOperator, left, right Expr,
 ) (_ TypedExpr, _ TypedExpr, _ *CmpOp, alwaysNull bool, _ error) {
 	// Parentheses are semantically unimportant and can be removed/replaced
 	// with its nested expression in our plan. This makes type checking cleaner.
@@ -2020,7 +2116,7 @@ func deepCheckValidCmpOp(ops cmpOpOverload, leftType, rightType *types.T) bool {
 	return true
 }
 
-func subOpCompError(leftType, rightType *types.T, subOp, op ComparisonOperator) error {
+func subOpCompError(leftType, rightType *types.T, subOp, op treecmp.ComparisonOperator) error {
 	sig := fmt.Sprintf(compSignatureWithSubOpFmt, leftType, subOp, op, rightType)
 	return pgerror.Newf(pgcode.InvalidParameterValue, unsupportedCompErrFmt, sig)
 }
@@ -2033,18 +2129,18 @@ func typeCheckSubqueryWithIn(left, right *types.T) error {
 		// accepted.
 		if len(right.TupleContents()) != 1 {
 			return pgerror.Newf(pgcode.InvalidParameterValue,
-				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, In, right))
+				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, treecmp.In, right))
 		}
 		if !left.EquivalentOrNull(right.TupleContents()[0], false /* allowNullTupleEquivalence */) {
 			return pgerror.Newf(pgcode.InvalidParameterValue,
-				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, In, right))
+				unsupportedCompErrFmt, fmt.Sprintf(compSignatureFmt, left, treecmp.In, right))
 		}
 	}
 	return nil
 }
 
 func typeCheckComparisonOp(
-	ctx context.Context, semaCtx *SemaContext, op ComparisonOperator, left, right Expr,
+	ctx context.Context, semaCtx *SemaContext, op treecmp.ComparisonOperator, left, right Expr,
 ) (_ TypedExpr, _ TypedExpr, _ *CmpOp, alwaysNull bool, _ error) {
 	foldedOp, foldedLeft, foldedRight, switched, _ := FoldComparisonExpr(op, left, right)
 	ops := CmpOps[foldedOp.Symbol]
@@ -2054,7 +2150,7 @@ func typeCheckComparisonOp(
 
 	_, rightIsSubquery := foldedRight.(SubqueryExpr)
 	switch {
-	case foldedOp.Symbol == In && rightIsTuple:
+	case foldedOp.Symbol == treecmp.In && rightIsTuple:
 		sameTypeExprs := make([]Expr, len(rightTuple.Exprs)+1)
 		sameTypeExprs[0] = foldedLeft
 		copy(sameTypeExprs[1:], rightTuple.Exprs)
@@ -2086,7 +2182,7 @@ func typeCheckComparisonOp(
 		}
 		return typedLeft, rightTuple, fn, false, nil
 
-	case foldedOp.Symbol == In && rightIsSubquery:
+	case foldedOp.Symbol == treecmp.In && rightIsSubquery:
 		typedLeft, err := foldedLeft.TypeCheck(ctx, semaCtx, types.Any)
 		if err != nil {
 			sigWithErr := fmt.Sprintf(compExprsFmt, left, op, right, err)
@@ -2161,7 +2257,7 @@ func typeCheckComparisonOp(
 		if len(fns) > 0 {
 			noneAcceptNull := true
 			for _, e := range fns {
-				if e.(*CmpOp).NullableArgs {
+				if e.(*CmpOp).CalledOnNullInput {
 					noneAcceptNull = false
 					break
 				}
@@ -2448,7 +2544,11 @@ func typeCheckSplitExprs(
 // typeCheckTupleComparison type checks a comparison between two tuples,
 // asserting that the elements of the two tuples are comparable at each index.
 func typeCheckTupleComparison(
-	ctx context.Context, semaCtx *SemaContext, op ComparisonOperator, left *Tuple, right *Tuple,
+	ctx context.Context,
+	semaCtx *SemaContext,
+	op treecmp.ComparisonOperator,
+	left *Tuple,
+	right *Tuple,
 ) (TypedExpr, TypedExpr, error) {
 	// All tuples must have the same length.
 	tupLen := len(left.Exprs)
@@ -2497,7 +2597,7 @@ func typeCheckSameTypedTupleExprs(
 	}
 
 	// All expressions within tuples at the same indexes must be the same type.
-	resTypes := types.MakeTuple(make([]*types.T, firstLen))
+	resTypes := types.MakeLabeledTuple(make([]*types.T, firstLen), first.Labels)
 	sameTypeExprs := make([]Expr, 0, len(exprs))
 	// We will be skipping nulls, so we need to keep track at which indices in
 	// exprs are the non-null tuples.
@@ -2555,7 +2655,10 @@ func typeCheckSameTypedTupleExprs(
 func checkAllExprsAreTuplesOrNulls(ctx context.Context, semaCtx *SemaContext, exprs []Expr) error {
 	for _, expr := range exprs {
 		_, isTuple := expr.(*Tuple)
-		isNull := expr == DNull
+		isNull, err := isNullOrAnnotatedNullTuple(ctx, semaCtx, expr)
+		if err != nil {
+			return err
+		}
 		if !(isTuple || isNull) {
 			// We avoid calling TypeCheck on Tuple exprs since that causes the
 			// types to be resolved, which we only want to do later in type-checking.
@@ -2590,6 +2693,28 @@ func checkTupleHasLength(t *Tuple, expectedLen int) error {
 		return pgerror.Newf(pgcode.DatatypeMismatch, "expected tuple %v to have a length of %d", t, expectedLen)
 	}
 	return nil
+}
+
+// isNullOrAnnotatedNullTuple returns true if the given expression is a DNull or
+// a DNull that is wrapped by an AnnotateTypeExpr with a type identical to
+// AnyTuple (e.g., NULL:::RECORD). An AnnotateTypeExpr should never have a tuple
+// type not identical to AnyTuple, because other tuple types could only be
+// expressed as composite types, and these are not yet supported. If the
+// AnnotateTypeExpr has a non-tuple type, the function returns false.
+func isNullOrAnnotatedNullTuple(
+	ctx context.Context, semaCtx *SemaContext, expr Expr,
+) (bool, error) {
+	if expr == DNull {
+		return true, nil
+	}
+	if annotate, ok := expr.(*AnnotateTypeExpr); ok && annotate.Expr == DNull {
+		annotateType, err := ResolveType(ctx, annotate.Type, semaCtx.GetTypeResolver())
+		if err != nil {
+			return false, err
+		}
+		return annotateType.Identical(types.AnyTuple), nil
+	}
+	return false, nil
 }
 
 type placeholderAnnotationVisitor struct {
@@ -2735,17 +2860,17 @@ func (*placeholderAnnotationVisitor) VisitPost(expr Expr) Expr { return expr }
 // provided Statement, annotating all placeholders with a type in either of the following
 // situations:
 //
-//  - the placeholder is the subject of an explicit type annotation in at least one
-//    of its occurrences. If it is subject to multiple explicit type annotations
-//    where the types are not all in agreement, or if the placeholder already has
-//    a type hint in the placeholder map which conflicts with the explicit type
-//    annotation type, an error will be thrown.
+//   - the placeholder is the subject of an explicit type annotation in at least one
+//     of its occurrences. If it is subject to multiple explicit type annotations
+//     where the types are not all in agreement, or if the placeholder already has
+//     a type hint in the placeholder map which conflicts with the explicit type
+//     annotation type, an error will be thrown.
 //
-//  - the placeholder is the subject to a cast of the same type in all
-//    occurrences of the placeholder. If the placeholder is subject to casts of
-//    multiple types, or if it has occurrences without a cast, no error will be
-//    thrown but the type will not be inferred. If the placeholder already has a
-//    type hint, that type will be kept regardless of any casts.
+//   - the placeholder is the subject to a cast of the same type in all
+//     occurrences of the placeholder. If the placeholder is subject to casts of
+//     multiple types, or if it has occurrences without a cast, no error will be
+//     thrown but the type will not be inferred. If the placeholder already has a
+//     type hint, that type will be kept regardless of any casts.
 //
 // See docs/RFCS/20160203_typing.md for more details on placeholder typing (in
 // particular section "First pass: placeholder annotations").
@@ -2787,11 +2912,11 @@ type stripFuncsVisitor struct{}
 func (v stripFuncsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 	switch t := expr.(type) {
 	case *UnaryExpr:
-		t.fn = nil
+		t.op = nil
 	case *BinaryExpr:
-		t.Fn = nil
+		t.Op = nil
 	case *ComparisonExpr:
-		t.Fn = nil
+		t.Op = nil
 	case *FuncExpr:
 		t.fn = nil
 		t.fnProps = nil
@@ -2800,3 +2925,89 @@ func (v stripFuncsVisitor) VisitPre(expr Expr) (recurse bool, newExpr Expr) {
 }
 
 func (stripFuncsVisitor) VisitPost(expr Expr) Expr { return expr }
+
+// getMostSignificantOverload returns the overload from the most significant
+// schema. If there are more than one overload available from the most
+// significant schema, ambiguity error will be thrown. If search path is not
+// given or no UDF found, there should be only one candidate overload and be
+// returned. Otherwise, ambiguity error is also thrown.
+//
+// Note: even the input is a slice of overloadImpl, they're essentially a slice
+// of QualifiedOverload. Also, the input should not be empty.
+func getMostSignificantOverload(
+	overloads []overloadImpl, searchPath SearchPath, expr *FuncExpr, getFuncSig func() string,
+) (QualifiedOverload, error) {
+	ambiguousError := func() error {
+		return pgerror.Newf(
+			pgcode.AmbiguousFunction,
+			"ambiguous call: %s, candidates are:\n%s",
+			getFuncSig(),
+			// Use "overloads" for the errors string since we want to print out
+			// candidates from all schemas.
+			formatCandidates(expr.Func.String(), overloads),
+		)
+	}
+	checkAmbiguity := func(oImpls []overloadImpl) (QualifiedOverload, error) {
+		if len(oImpls) > 1 {
+			// Throw ambiguity error if there are more than one candidate overloads from
+			// same schema.
+			return QualifiedOverload{}, ambiguousError()
+		}
+		return oImpls[0].(QualifiedOverload), nil
+	}
+
+	if searchPath == nil || searchPath == EmptySearchPath {
+		return checkAmbiguity(overloads)
+	}
+
+	udfFound := false
+	uniqueSchema := true
+	for i, o := range overloads {
+		if o.(QualifiedOverload).IsUDF {
+			udfFound = true
+		}
+		if i > 0 && o.(QualifiedOverload).Schema != overloads[i-1].(QualifiedOverload).Schema {
+			uniqueSchema = false
+		}
+	}
+
+	if !udfFound || uniqueSchema {
+		// If there is no UDF, there is no need to go through the search path. This
+		// is based on the fact that pg_catalog is either implicitly or explicitly
+		// in the search path. And there are quite a few hacks which make builtin
+		// function overrides with name qualified with a different schema from the
+		// original one which is not in search path.
+		//
+		// If all overloads are from the same schema, there is no need to go through
+		// the search path as well. This is because we only resolve functions from
+		// explicit schema or schemas on the search path. So if overloads are from
+		// the same schema, overloads are either from an explicit schema or from a
+		// schema on search path.
+		return checkAmbiguity(overloads)
+	}
+
+	found := false
+	var ret QualifiedOverload
+	for i, n := 0, searchPath.NumElements(); i < n; i++ {
+		schema := searchPath.GetSchema(i)
+		for i := range overloads {
+			if overloads[i].(QualifiedOverload).Schema == schema {
+				if found {
+					return QualifiedOverload{}, ambiguousError()
+				}
+				found = true
+				ret = overloads[i].(QualifiedOverload)
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		// This should never happen. Otherwise, it means we get function from a
+		// schema no on the given search path or we try to resolve a function on an
+		// explicit schema, but get some function from other schemas are fetched.
+		return QualifiedOverload{}, pgerror.Newf(pgcode.UndefinedFunction, "unknown signature: %s", getFuncSig())
+	}
+	return ret, nil
+}

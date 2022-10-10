@@ -18,6 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scdeps"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scrun"
@@ -30,7 +32,7 @@ func init() {
 		return &newSchemaChangeResumer{
 			job: job,
 		}
-	})
+	}, jobs.UsesTenantCostControl)
 }
 
 type newSchemaChangeResumer struct {
@@ -42,7 +44,9 @@ func (n *newSchemaChangeResumer) Resume(ctx context.Context, execCtxI interface{
 	return n.run(ctx, execCtxI)
 }
 
-func (n *newSchemaChangeResumer) OnFailOrCancel(ctx context.Context, execCtx interface{}) error {
+func (n *newSchemaChangeResumer) OnFailOrCancel(
+	ctx context.Context, execCtx interface{}, _ error,
+) error {
 	n.rollback = true
 	return n.run(ctx, execCtx)
 }
@@ -59,40 +63,61 @@ func (n *newSchemaChangeResumer) run(ctx context.Context, execCtxI interface{}) 
 	}
 	// TODO(ajwerner): Wait for leases on all descriptors before starting to
 	// avoid restarts.
-
+	if err := execCfg.JobRegistry.CheckPausepoint("newschemachanger.before.exec"); err != nil {
+		return err
+	}
 	payload := n.job.Payload()
-	progress := n.job.Progress()
-	newSchemaChangeProgress := progress.GetNewSchemaChange()
-	newSchemaChangeDetails := payload.GetNewSchemaChange()
 	deps := scdeps.NewJobRunDependencies(
 		execCfg.CollectionFactory,
+		execCfg.InternalExecutorFactory,
 		execCfg.DB,
-		execCfg.InternalExecutor,
 		execCfg.IndexBackfiller,
+		execCfg.IndexMerger,
 		NewRangeCounter(execCfg.DB, execCfg.DistSQLPlanner),
 		func(txn *kv.Txn) scexec.EventLogger {
 			return sql.NewSchemaChangerEventLogger(txn, execCfg, 0)
 		},
-		scdeps.NewPartitioner(execCfg.Settings, &execCtx.ExtendedEvalContext().EvalContext),
 		execCfg.JobRegistry,
 		n.job,
 		execCfg.Codec,
 		execCfg.Settings,
 		execCfg.IndexValidator,
-		execCfg.CommentUpdaterFactory,
+		func(ctx context.Context, descriptors *descs.Collection, txn *kv.Txn) scexec.DescriptorMetadataUpdater {
+			return descmetadata.NewMetadataUpdater(ctx,
+				execCfg.InternalExecutorFactory,
+				descriptors,
+				&execCfg.Settings.SV,
+				txn,
+				execCtx.SessionData(),
+			)
+		},
+		execCfg.StatsRefresher,
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		payload.Statement,
 		execCtx.SessionData(),
+		execCtx.ExtendedEvalContext().Tracing.KVTracingEnabled(),
 	)
 
-	return scrun.RunSchemaChangesInJob(
+	// If there are no descriptors left, then we can short circuit here.
+	if len(payload.DescriptorIDs) == 0 {
+		return nil
+	}
+
+	err := scrun.RunSchemaChangesInJob(
 		ctx,
 		execCfg.DeclarativeSchemaChangerTestingKnobs,
 		execCfg.Settings,
 		deps,
 		n.job.ID(),
-		*newSchemaChangeDetails,
-		*newSchemaChangeProgress,
+		payload.DescriptorIDs,
 		n.rollback,
 	)
+	// Return permanent errors back, otherwise we will try to retry
+	if sql.IsPermanentSchemaChangeError(err) {
+		return err
+	}
+	if err != nil {
+		return jobs.MarkAsRetryJobError(err)
+	}
+	return nil
 }

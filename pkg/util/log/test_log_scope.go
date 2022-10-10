@@ -13,7 +13,6 @@ package log
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"runtime"
 
@@ -140,34 +139,36 @@ func newLogScope(t tShim, mostlyInline bool) (sc *TestLogScope) {
 	sc.previous.exitOverrideHideStack = logging.mu.exitOverride.hideStack
 	logging.mu.Unlock()
 
-	defer func() {
-		// If any of the following initialization fails, we close the scope.
-		// We use the scope's Close() method as general-purpose finalizer,
-		// to avoid writing a complex defer function here.
-		if t.Failed() {
-			sc.Close(t)
+	err := func() error {
+		tempDir, err := os.MkdirTemp("", "log"+fileutil.EscapeFilename(t.Name()))
+		if err != nil {
+			return err
 		}
+		// Remember the directory name for the Close() function.
+		sc.logDir = tempDir
+
+		// Obtain the standard test configuration, with the configured
+		// destination directory.
+		cfg := getTestConfig(&sc.logDir, mostlyInline)
+
+		// Switch to the new configuration.
+		TestingResetActive()
+		sc.cleanupFn, err = ApplyConfig(cfg)
+		if err != nil {
+			return err
+		}
+
+		t.Logf("test logs captured to: %s", sc.logDir)
+		return nil
 	}()
-
-	tempDir, err := ioutil.TempDir("", "log"+fileutil.EscapeFilename(t.Name()))
 	if err != nil {
-		t.Fatal(err)
-	}
-	// Remember the directory name for the Close() function.
-	sc.logDir = tempDir
-
-	// Obtain the standard test configuration, with the configured
-	// destination directory.
-	cfg := getTestConfig(&sc.logDir, mostlyInline)
-
-	// Switch to the new configuration.
-	TestingResetActive()
-	sc.cleanupFn, err = ApplyConfig(cfg)
-	if err != nil {
+		// If any of the initialization failed, we close the scope. We use the
+		// scope's Close() method as general-purpose finalizer, to avoid writing
+		// a more complex function here.
+		sc.Close(t)
 		t.Fatal(err)
 	}
 
-	t.Logf("test logs captured to: %s", sc.logDir)
 	return sc
 }
 
@@ -226,10 +227,10 @@ func getTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Con
 		// We have two desired cases: -show-logs (mostlyInline = true)
 		// and without -show-logs (default, mostlyInline = false).
 
-		// In both cases, we emit output to files, with the STORAGE and
-		// HEALTH channels split into separate files.  We do keep a copy
-		// of HEALTH and STORAGE warning and errors on the main file
-		// though.
+		// In both cases, we emit output to files, with the STORAGE, HEALTH, and
+		// KV_DISTRIBUTION channels split into separate files.  We do keep a copy
+		// of HEALTH, STORAGE, and KV_DISTRIBUTION warning and errors on the main
+		// file though.
 		testConfig.Sinks.FileGroups = map[string]*logconfig.FileSinkConfig{
 			"storage": {
 				Channels: logconfig.SelectChannels(channel.STORAGE),
@@ -237,12 +238,16 @@ func getTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Con
 			"health": {
 				Channels: logconfig.SelectChannels(channel.HEALTH),
 			},
-			// Also add the WARNING+ events from STORAGE and CHANNEL into the
+			"kv-distribution": {
+				Channels: logconfig.SelectChannels(channel.KV_DISTRIBUTION),
+			},
+			// Also add the WARNING+ events from the separated channels into the
 			// default file group.
 			"default": {
 				Channels: logconfig.ChannelFilters{
 					Filters: map[logpb.Severity]logconfig.ChannelList{
-						severity.WARNING: {Channels: []logpb.Channel{channel.STORAGE, channel.HEALTH}},
+						severity.WARNING: {Channels: []logpb.Channel{channel.STORAGE, channel.HEALTH,
+							channel.KV_DISTRIBUTION}},
 					},
 				},
 			},
@@ -252,12 +257,13 @@ func getTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Con
 		if mostlyInline {
 			// User requested -show-logs.
 			//
-			// Include everything on stderr except STORAGE and HEALTH at
-			// severity below WARNING.
+			// Include everything on stderr except STORAGE, HEALTH, and
+			// KV_DISTRIBUTION at severity below WARNING.
 			testConfig.Sinks.Stderr.Filter = severity.INFO
 			testConfig.Sinks.Stderr.Channels.Filters = map[logpb.Severity]logconfig.ChannelList{
-				logpb.Severity_INFO:    {Channels: selectAllChannelsExceptStorageAndHealth()},
-				logpb.Severity_WARNING: {Channels: []logpb.Channel{channel.HEALTH, channel.STORAGE}},
+				logpb.Severity_INFO: {Channels: selectAllChannelsExceptSeparated()},
+				logpb.Severity_WARNING: {Channels: []logpb.Channel{channel.HEALTH, channel.STORAGE,
+					channel.KV_DISTRIBUTION}},
 			}
 		} else {
 			// Preferring file output only.
@@ -290,11 +296,11 @@ func getTestConfig(fileDir *string, mostlyInline bool) (testConfig logconfig.Con
 	return testConfig
 }
 
-func selectAllChannelsExceptStorageAndHealth() []logpb.Channel {
+func selectAllChannelsExceptSeparated() []logpb.Channel {
 	res := logconfig.AllChannels()
 	k := 0
 	for _, ch := range res {
-		if ch == channel.HEALTH || ch == channel.STORAGE {
+		if ch == channel.HEALTH || ch == channel.STORAGE || ch == channel.KV_DISTRIBUTION {
 			continue
 		}
 		res[k] = ch
@@ -395,9 +401,9 @@ func (l *TestLogScope) Close(t tShim) {
 				// If the test failed or there was a panic, we keep the log
 				// files for further investigation.
 				if inPanic {
-					fmt.Fprintln(OrigStderr, "\nERROR: a panic has occurred!\n"+
+					fmt.Fprint(OrigStderr, "\nERROR: a panic has occurred!\n"+
 						"Details cannot be printed yet because we are still unwinding.\n"+
-						"Hopefully the test harness prints the panic below, otherwise check the test logs.\n")
+						"Hopefully the test harness prints the panic below, otherwise check the test logs.\n\n")
 				}
 				fmt.Fprintln(OrigStderr, "test logs left over in:", l.logDir)
 			} else {

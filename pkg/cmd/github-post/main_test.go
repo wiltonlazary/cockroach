@@ -47,7 +47,7 @@ func TestListFailures(t *testing.T) {
 				testName:   "TestStopperWithCancelConcurrent",
 				title:      "util/stop: TestStopperWithCancelConcurrent failed",
 				message:    "this is just a testing issue",
-				mention:    []string{"@cockroachdb/server"},
+				mention:    []string{"@cockroachdb/kv"},
 				hasProject: true,
 			}},
 			formatter: defaultFormatter,
@@ -83,9 +83,11 @@ func TestListFailures(t *testing.T) {
 			fileName: "stress-unknown.json",
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/storage",
 			expIssues: []issue{{
-				testName: "(unknown)",
-				title:    "storage: package failed",
-				message:  "make: *** [bin/.submodules-initialized] Error 1",
+				testName:   "(unknown)",
+				title:      "storage: package failed",
+				message:    "make: *** [bin/.submodules-initialized] Error 1",
+				mention:    []string{"@cockroachdb/test-eng"},
+				hasProject: true,
 			}},
 			formatter: defaultFormatter,
 		},
@@ -143,14 +145,16 @@ TestAnchorKey - 1.01s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName: "(unknown)",
-					title:    "kv: package timed out",
+					testName: "TestXXX/sub3",
+					title:    "kv: TestXXX/sub3 timed out",
 					message: `Slow failing tests:
 TestXXX/sub3 - 0.50s
 
 Slow passing tests:
 TestXXA - 1.00s
 `,
+					mention:    []string{"@cockroachdb/test-eng"},
+					hasProject: true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -163,8 +167,8 @@ TestXXA - 1.00s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName: "(unknown)",
-					title:    "kv: package timed out",
+					testName: "TestXXX/sub1",
+					title:    "kv: TestXXX/sub1 timed out",
 					message: `Slow failing tests:
 TestXXX/sub1 - 0.49s
 
@@ -172,6 +176,8 @@ Slow passing tests:
 TestXXB - 1.01s
 TestXXA - 1.00s
 `,
+					mention:    []string{"@cockroachdb/test-eng"},
+					hasProject: true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -193,6 +199,8 @@ Slow passing tests:
 TestXXB - 1.01s
 TestXXA - 1.00s
 `,
+					mention:    []string{"@cockroachdb/test-eng"},
+					hasProject: true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -204,9 +212,11 @@ TestXXA - 1.00s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName: "TestXXX",
-					title:    "kv: TestXXX failed",
-					message:  `panic: induced panic`,
+					testName:   "TestXXX",
+					title:      "kv: TestXXX failed",
+					message:    `panic: induced panic`,
+					mention:    []string{"@cockroachdb/test-eng"},
+					hasProject: true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -218,9 +228,11 @@ TestXXA - 1.00s
 			expPkg:   "github.com/cockroachdb/cockroach/pkg/kv",
 			expIssues: []issue{
 				{
-					testName: "(unknown)",
-					title:    "kv: package failed",
-					message:  `panic: induced panic`,
+					testName:   "(unknown)",
+					title:      "kv: package failed",
+					message:    `panic: induced panic`,
+					mention:    []string{"@cockroachdb/test-eng"},
+					hasProject: true,
 				},
 			},
 			formatter: defaultFormatter,
@@ -235,7 +247,7 @@ TestXXA - 1.00s
 					testName: "TestMeta",
 					title:    "internal/metamorphic: TestMeta failed",
 					message:  "panic: induced panic",
-					expRepro: `go test -mod=vendor -tags 'invariants' -exec 'stress -p 1' -timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed 1600209371838097000 -ops "uniform:5000-25000"`,
+					expRepro: `go test -mod=vendor -tags 'invariants' -exec 'stress -p 1' -timeout 0 -test.v -run TestMeta$ ./internal/metamorphic -seed 1600209371838097000 -ops "uniform:5000-10000"`,
 				},
 			},
 			formatter: formatPebbleMetamorphicIssue,

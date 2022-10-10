@@ -1,5 +1,3 @@
-# LogicTest: !fakedist-spec-planning
-
 statement ok
 CREATE USER bar; CREATE USER all_user_db; CREATE USER all_user_schema
 
@@ -10,7 +8,7 @@ statement ok
 GRANT CREATE ON DATABASE test TO bar
 
 statement ok
-GRANT SELECT ON DATABASE test to testuser
+GRANT CONNECT ON DATABASE test to testuser
 
 statement ok
 GRANT CREATE ON SCHEMA test_schema TO bar
@@ -31,9 +29,6 @@ statement ok
 CREATE TABLE t (a INT, b INT);
 
 statement ok
-GRANT GRANT ON t TO bar;
-
-statement ok
 GRANT DELETE ON t TO bar;
 
 statement ok
@@ -44,9 +39,6 @@ GRANT SELECT ON seq TO bar;
 
 statement ok
 GRANT SELECT ON seq TO testuser;
-
-statement ok
-GRANT GRANT ON seq TO testuser;
 
 
 ## has_any_column_privilege
@@ -352,7 +344,7 @@ SELECT has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'syst
        has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'system'), 'TEMPORARY'),
        has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'system'), 'TEMP')
 ----
-false  false  false  false
+false  true  false  false
 
 query BBBB
 SELECT has_database_privilege((SELECT oid FROM pg_database WHERE datname = 'test'), 'CREATE'),
@@ -372,7 +364,7 @@ SELECT has_database_privilege('system', '  CrEaTe      '),
        has_database_privilege('system', 'TEMP'),
        has_database_privilege('system', '  CrEaTe      ,CONNECT')
 ----
-false  false  false  false  false
+false  true  false  false  true
 
 query BBBBB
 SELECT has_database_privilege('test', '  CrEaTe      '),
@@ -413,6 +405,7 @@ SELECT datname FROM pg_database WHERE has_database_privilege(datname, 'CONNECT')
 ----
 defaultdb
 postgres
+system
 test
 
 query T
@@ -512,14 +505,14 @@ SELECT has_function_privilege((SELECT oid FROM pg_proc LIMIT 1), 'EXECUTE')
 ----
 true
 
-query error pgcode 42883 unknown function: does_not_exist()
+query error pq: has_function_privilege\(\): invalid function signature: does_not_exist
 SELECT has_function_privilege('does_not_exist', 'EXECUTE')
 
 query error pgcode 42883 unknown function: does_not_exist()
 SELECT has_function_privilege('does_not_exist()', 'EXECUTE')
 
 query B
-SELECT has_function_privilege('version', '  EXECUTE      ')
+SELECT has_function_privilege('version()', '  EXECUTE      ')
 ----
 true
 
@@ -531,10 +524,15 @@ true
 query B
 SELECT has_function_privilege('cos(float)', 'EXECUTE WITH GRANT OPTION')
 ----
+false
+
+query B
+SELECT has_function_privilege('cos(float)', 'EXECUTE, EXECUTE WITH GRANT OPTION')
+----
 true
 
 query B
-SELECT has_function_privilege('version'::Name, 'EXECUTE')
+SELECT has_function_privilege('version()'::Name, 'EXECUTE')
 ----
 true
 
@@ -603,13 +601,13 @@ query BB
 SELECT has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'crdb_internal'), 'CREATE'),
        has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'crdb_internal'), 'USAGE')
 ----
-true  true
+false  true
 
 query BB
 SELECT has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog'), 'CREATE'),
        has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog'), 'USAGE')
 ----
-true  true
+false  true
 
 query BB
 SELECT has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'public'), 'CREATE'),
@@ -617,7 +615,7 @@ SELECT has_schema_privilege((SELECT oid FROM pg_namespace WHERE nspname = 'publi
 ----
 true  true
 
-query error pgcode 3F000 schema 'does_not_exist' does not exist
+query error pgcode 3F000 unknown schema "does_not_exist"
 SELECT has_schema_privilege('does_not_exist', 'CREATE')
 
 query BBB
@@ -770,16 +768,40 @@ SELECT has_sequence_privilege('seq', 'USAGE'),
        has_sequence_privilege('seq', 'SELECT'),
        has_sequence_privilege('seq', 'UPDATE')
 ----
-true  true  false
+false  true  false
 
 query BBB
 SELECT has_sequence_privilege('seq', 'USAGE WITH GRANT OPTION'),
        has_sequence_privilege('seq', 'SELECT WITH GRANT OPTION'),
        has_sequence_privilege('seq', 'UPDATE WITH GRANT OPTION')
 ----
-true  true  false
+false  false  false
 
 user root
+
+statement ok
+GRANT USAGE, SELECT, UPDATE ON seq TO testuser WITH GRANT OPTION
+
+# should be "true  true  true"
+query BBB
+SELECT has_sequence_privilege('testuser', 'seq', 'USAGE WITH GRANT OPTION'),
+       has_sequence_privilege('testuser', 'seq', 'SELECT WITH GRANT OPTION'),
+       has_sequence_privilege('testuser', 'seq', 'UPDATE WITH GRANT OPTION')
+----
+true  true  true
+
+# incorrectly grants USAGE (should only have SELECT AND UPDATE)
+# see https://github.com/cockroachdb/cockroach/issues/82414
+statement ok
+GRANT SELECT, UPDATE ON seq TO testuser WITH GRANT OPTION
+
+# should be "false  true  true"
+query BBB
+SELECT has_sequence_privilege('testuser', 'seq', 'USAGE WITH GRANT OPTION'),
+       has_sequence_privilege('testuser', 'seq', 'SELECT WITH GRANT OPTION'),
+       has_sequence_privilege('testuser', 'seq', 'UPDATE WITH GRANT OPTION')
+----
+true  true  true
 
 query error pgcode 42704 role 'no_user' does not exist
 SELECT has_sequence_privilege('no_user', 'seq', 'SELECT')
@@ -789,7 +811,7 @@ SELECT has_sequence_privilege('bar', 'seq', 'USAGE'),
        has_sequence_privilege('bar', 'seq', 'SELECT'),
        has_sequence_privilege('bar', 'seq', 'UPDATE')
 ----
-true  true  false
+false  true  false
 
 query BBB
 SELECT has_sequence_privilege('bar', 'seq', 'USAGE WITH GRANT OPTION'),
@@ -967,7 +989,7 @@ SELECT has_table_privilege('bar', 't', 'SELECT'),
        has_table_privilege('bar', 't', 'INSERT, UPDATE'),
        has_table_privilege('bar', 't', 'RULE')
 ----
-false  false  false  true  true  false  true  false  true  false  false
+false  false  false  true  true  false  false  false  true  false  false
 
 query BBBBBBBBBBB
 SELECT has_table_privilege('bar', 't', 'SELECT WITH GRANT OPTION'),
@@ -982,7 +1004,7 @@ SELECT has_table_privilege('bar', 't', 'SELECT WITH GRANT OPTION'),
        has_table_privilege('bar', 't', 'INSERT WITH GRANT OPTION, UPDATE WITH GRANT OPTION'),
        has_table_privilege('bar', 't', 'RULE WITH GRANT OPTION')
 ----
-false  false  false  true  true  false  true  false  true  false  false
+false  false  false  false  false  false  false  false  false  false  false
 
 
 ## has_tablespace_privilege
@@ -1285,8 +1307,6 @@ statement ok
 GRANT CREATE ON DATABASE my_db TO my_role;
 GRANT my_role TO testuser;
 
-user testuser
-
 statement ok
 use my_db
 
@@ -1298,8 +1318,7 @@ CREATE TABLE s.t()
 query B
 SELECT has_schema_privilege('testuser', 's', 'create')
 ----
-true
-
+false
 
 statement ok
 REVOKE USAGE ON SCHEMA s FROM testuser;
@@ -1316,7 +1335,7 @@ SELECT has_database_privilege('testuser', 'my_db', 'create'),
        has_schema_privilege('testuser', 'public', 'usage'),
        has_table_privilege('testuser', 's.t', 'select')
 ----
-true  true  true
+true  true  false
 
 user root
 
@@ -1324,8 +1343,6 @@ statement ok
 CREATE USER testuser2;
 GRANT testuser TO testuser2;
 GRANT ALL ON SCHEMA my_db.s TO testuser2
-
-user testuser2
 
 statement ok
 use my_db
@@ -1337,7 +1354,7 @@ SELECT has_schema_privilege('testuser', 's', 'create'),
        has_schema_privilege('testuser2', 's', 'create'),
        has_schema_privilege('testuser2', 's', 'usage')
 ----
-true false true true
+false  false  true  true
 
 # Confirm privilege checks on all objects with testuser2, should match testuser.
 query BBB
@@ -1345,4 +1362,20 @@ SELECT has_database_privilege('testuser2', 'my_db', 'create'),
        has_schema_privilege('testuser2', 'public', 'usage'),
        has_table_privilege('testuser2', 's.t', 'select')
 ----
-true  true  true
+true  true  false
+
+statement ok
+REVOKE my_role FROM testuser;
+REVOKE testuser FROM testuser2
+
+# Schema owner has all privileges
+statement ok
+CREATE SCHEMA owned_schema AUTHORIZATION testuser
+
+query BBBB
+SELECT has_schema_privilege('testuser', 'owned_schema', 'create'),
+       has_schema_privilege('testuser', 'owned_schema', 'usage'),
+       has_schema_privilege('testuser2', 'owned_schema', 'create'),
+       has_schema_privilege('testuser2', 'owned_schema', 'usage')
+----
+true true false false

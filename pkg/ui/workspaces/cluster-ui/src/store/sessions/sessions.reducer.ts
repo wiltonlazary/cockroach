@@ -11,22 +11,25 @@
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { DOMAIN_NAME, noopReducer } from "../utils";
+import moment, { Moment } from "moment";
 
 type SessionsResponse = cockroach.server.serverpb.ListSessionsResponse;
 
 export type SessionsState = {
   data: SessionsResponse;
+  lastUpdated: Moment | null;
   lastError: Error;
   valid: boolean;
 };
 
 const initialState: SessionsState = {
   data: null,
+  lastUpdated: null,
   lastError: null,
   valid: true,
 };
 
-const ssessionsSlice = createSlice({
+const sessionsSlice = createSlice({
   name: `${DOMAIN_NAME}/sessions`,
   initialState,
   reducers: {
@@ -34,6 +37,7 @@ const ssessionsSlice = createSlice({
       state.data = action.payload;
       state.valid = true;
       state.lastError = null;
+      state.lastUpdated = moment.utc();
     },
     failed: (state, action: PayloadAction<Error>) => {
       state.valid = false;
@@ -48,4 +52,4 @@ const ssessionsSlice = createSlice({
   },
 });
 
-export const { reducer, actions } = ssessionsSlice;
+export const { reducer, actions } = sessionsSlice;

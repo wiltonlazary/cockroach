@@ -54,11 +54,11 @@ const (
 	// The gap between floatNaNDesc and bytesMarker was left for
 	// compatibility reasons.
 	bytesMarker          byte = 0x12
-	bytesDescMarker      byte = bytesMarker + 1
-	timeMarker           byte = bytesDescMarker + 1
-	durationBigNegMarker byte = timeMarker + 1 // Only used for durations < MinInt64 nanos.
-	durationMarker       byte = durationBigNegMarker + 1
-	durationBigPosMarker byte = durationMarker + 1 // Only used for durations > MaxInt64 nanos.
+	bytesDescMarker           = bytesMarker + 1
+	timeMarker                = bytesDescMarker + 1
+	durationBigNegMarker      = timeMarker + 1 // Only used for durations < MinInt64 nanos.
+	durationMarker            = durationBigNegMarker + 1
+	durationBigPosMarker      = durationMarker + 1 // Only used for durations > MaxInt64 nanos.
 
 	decimalNaN              = durationBigPosMarker + 1 // 24
 	decimalNegativeInfinity = decimalNaN + 1
@@ -374,6 +374,31 @@ func EncodeUvarintAscending(b []byte, v uint64) []byte {
 	}
 }
 
+// EncodedLengthUvarintAscending returns the length of the variable length
+// representation, i.e. the number of bytes appended by EncodeUvarintAscending.
+func EncodedLengthUvarintAscending(v uint64) int {
+	switch {
+	case v <= intSmall:
+		return 1
+	case v <= 0xff:
+		return 2
+	case v <= 0xffff:
+		return 3
+	case v <= 0xffffff:
+		return 4
+	case v <= 0xffffffff:
+		return 5
+	case v <= 0xffffffffff:
+		return 6
+	case v <= 0xffffffffffff:
+		return 7
+	case v <= 0xffffffffffffff:
+		return 8
+	default:
+		return 9
+	}
+}
+
 // EncodeUvarintDescending encodes the uint64 value so that it sorts in
 // reverse order, from largest to smallest.
 func EncodeUvarintDescending(b []byte, v uint64) []byte {
@@ -444,6 +469,31 @@ func EncLenUvarintDescending(v uint64) int {
 		return 1
 	}
 	return 2 + highestByteIndex(v)
+}
+
+// GetUvarintLen is similar to DecodeUvarintAscending except that it returns the
+// length of the prefix that encodes a uint64 value in bytes without actually
+// decoding the value. An error is returned if b does not contain a valid
+// encoding of an unsigned int datum.
+func GetUvarintLen(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, errors.Errorf("insufficient bytes to decode uvarint value")
+	}
+	length := int(b[0]) - intZero
+	if length <= intSmall {
+		return 1, nil
+	}
+	length -= intSmall
+	if length < 0 || length > 8 {
+		return 0, errors.Errorf("invalid uvarint length of %d", length)
+	} else if len(b) <= length {
+		// Note: we use <= for comparison here as opposed to the < in
+		// DecodeUvarintAscending because in the latter the first byte for the
+		// uvarint is removed as part of decoding. We need to account for the first
+		// byte when assessing the size.
+		return 0, errors.Errorf("insufficient bytes to decode uvarint value: %q", b)
+	}
+	return 1 + length, nil
 }
 
 // DecodeUvarintAscending decodes a uint64 encoded uint64 from the input
@@ -769,6 +819,11 @@ func EncodeJSONEmptyArray(b []byte) []byte {
 // AddJSONPathTerminator adds a json path terminator to a byte array.
 func AddJSONPathTerminator(b []byte) []byte {
 	return append(b, escape, escapedTerm)
+}
+
+// AddJSONPathSeparator adds a json path separator to a byte array.
+func AddJSONPathSeparator(b []byte) []byte {
+	return append(b, escape, escapedJSONObjectKeyTerm)
 }
 
 // EncodeJSONEmptyObject returns a byte array b with a byte to signify an empty JSON object.
@@ -1408,12 +1463,13 @@ func DecodeDurationDescending(b []byte) ([]byte, duration.Duration, error) {
 // backing word array as a byte array, using byte array encoding and escaped
 // special bytes (via  `encodeBytesAscendingWithoutTerminatorOrPrefix`).
 // There are two arguments against this alternative:
-// - the bytes must be encoded big endian, but the most common architectures
-//   running CockroachDB are little-endian, so the bytes would need
-//   to be reordered prior to encoding.
-// - when decoding or skipping over a value, the decoding/sizing loop
-//   would need to look at every byte of the encoding to find the
-//   terminator.
+//   - the bytes must be encoded big endian, but the most common architectures
+//     running CockroachDB are little-endian, so the bytes would need
+//     to be reordered prior to encoding.
+//   - when decoding or skipping over a value, the decoding/sizing loop
+//     would need to look at every byte of the encoding to find the
+//     terminator.
+//
 // In contrast, the chosen encoding using varints is endianness-agnostic
 // and enables fast decoding/skipping thanks ot the tag bytes.
 func EncodeBitArrayAscending(b []byte, d bitarray.BitArray) []byte {
@@ -1536,6 +1592,7 @@ func DecodeBitArrayDescending(b []byte) ([]byte, bitarray.BitArray, error) {
 
 // Type represents the type of a value encoded by
 // Encode{Null,NotNull,Varint,Uvarint,Float,Bytes}.
+//
 //go:generate stringer -type=Type
 type Type encodingtype.T
 
@@ -1827,6 +1884,9 @@ func PrettyPrintValue(valDirs []Direction, b []byte, sep string) string {
 	if allDecoded {
 		return s1
 	}
+	// If we failed to decoded everything above, assume the key was the result of a
+	// `PrefixEnd()`. Attempt to undo PrefixEnd & retry the process, otherwise return
+	// what we were able to decode.
 	if undoPrefixEnd, ok := UndoPrefixEnd(b); ok {
 		// When we UndoPrefixEnd, we may have lost a tail of 0xFFs. Try to add
 		// enough of them to get something decoded. This is best-effort, we have to stop
@@ -1845,6 +1905,66 @@ func PrettyPrintValue(valDirs []Direction, b []byte, sep string) string {
 	return s1
 }
 
+// PrettyPrintValuesWithTypes returns a slice containing each contiguous decodable value
+// in the provided byte slice along with a slice containing the type of each value.
+// The directions each value is encoded may be provided. If valDirs is nil,
+// all values are decoded and printed with the default direction (ascending).
+func PrettyPrintValuesWithTypes(valDirs []Direction, b []byte) (vals []string, types []Type) {
+	vals1, types1, allDecoded := prettyPrintValuesWithTypesImpl(valDirs, b)
+	if allDecoded {
+		return vals1, types1
+	}
+	// If we failed to decoded everything above, assume the key was the result of a
+	// `PrefixEnd()`. Attempt to undo PrefixEnd & retry the process, otherwise return
+	// what we were able to decode.
+	if undoPrefixEnd, ok := UndoPrefixEnd(b); ok {
+		// When we UndoPrefixEnd, we may have lost a tail of 0xFFs. Try to add
+		// enough of them to get something decoded. This is best-effort, we have to stop
+		// somewhere.
+		cap := 20
+		if len(valDirs) > len(b) {
+			cap = len(valDirs) - len(b)
+		}
+		for i := 0; i < cap; i++ {
+			if vals2, types2, allDecoded := prettyPrintValuesWithTypesImpl(valDirs, undoPrefixEnd); allDecoded {
+				vals2 = append(vals2, "PrefixEnd")
+				types2 = append(types2, Bytes)
+				return vals2, types2
+			}
+			undoPrefixEnd = append(undoPrefixEnd, 0xFF)
+		}
+	}
+	return vals1, types1
+}
+
+func prettyPrintValuesWithTypesImpl(
+	valDirs []Direction, b []byte,
+) (vals []string, types []Type, allDecoded bool) {
+	allDecoded = true
+	for len(b) > 0 {
+		var valDir Direction
+		if len(valDirs) > 0 {
+			valDir = valDirs[0]
+			valDirs = valDirs[1:]
+		}
+
+		bb, s, err := prettyPrintFirstValue(valDir, b)
+		if err != nil {
+			// If we fail to decode, mark as unknown and attempt
+			// to continue - it's possible we can still decode the
+			// remainder of the key bytes.
+			allDecoded = false
+			vals = append(vals, "???")
+			types = append(types, Unknown)
+		} else {
+			vals = append(vals, s)
+			types = append(types, PeekType(b))
+		}
+		b = bb
+	}
+	return vals, types, allDecoded
+}
+
 func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bool) {
 	allDecoded := true
 	var buf strings.Builder
@@ -1861,6 +1981,9 @@ func prettyPrintValueImpl(valDirs []Direction, b []byte, sep string) (string, bo
 
 		bb, s, err := prettyPrintFirstValue(valDir, b)
 		if err != nil {
+			// If we fail to decode, mark as unknown and attempt
+			// to continue - it's possible we can still decode the
+			// remainder of the key bytes.
 			allDecoded = false
 			buf.WriteString(sep)
 			buf.WriteByte('?')
@@ -2085,8 +2208,8 @@ func prettyPrintFirstValue(dir Direction, b []byte) ([]byte, string, error) {
 //
 // Formally:
 //
-//     PrefixEnd(UndoPrefixEnd(p)) = p for all non-minimal prefixes p
-//     UndoPrefixEnd(PrefixEnd(p)) = p for all non-maximal prefixes p
+//	PrefixEnd(UndoPrefixEnd(p)) = p for all non-minimal prefixes p
+//	UndoPrefixEnd(PrefixEnd(p)) = p for all non-maximal prefixes p
 //
 // A minimal prefix is any prefix that consists only of one or more 0x00 bytes;
 // analogously, a maximal prefix is any prefix that consists only of one or more
@@ -2134,10 +2257,10 @@ const MaxNonsortingUvarintLen = 10
 // EncodeNonsortingUvarint encodes a uint64, appends it to the supplied buffer,
 // and returns the final buffer. The encoding used is similar to
 // encoding/binary, but with the most significant bits first:
-// - Unsigned integers are serialized 7 bits at a time, starting with the
-//   most significant bits.
-// - The most significant bit (msb) in each output byte indicates if there
-//   is a continuation byte (msb = 1).
+//   - Unsigned integers are serialized 7 bits at a time, starting with the
+//     most significant bits.
+//   - The most significant bit (msb) in each output byte indicates if there
+//     is a continuation byte (msb = 1).
 func EncodeNonsortingUvarint(appendTo []byte, x uint64) []byte {
 	switch {
 	case x < (1 << 7):
@@ -2476,12 +2599,16 @@ func EncodeJSONValue(appendTo []byte, colID uint32, data []byte) []byte {
 // returned colID should be discarded.)
 //
 // Concretely:
-//     b := ...
-//     typeOffset, _, colID, typ, err := DecodeValueTag(b)
-//     _, _, _, typ, err := DecodeValueTag(b[typeOffset:])
+//
+//	b := ...
+//	typeOffset, _, colID, typ, err := DecodeValueTag(b)
+//	_, _, _, typ, err := DecodeValueTag(b[typeOffset:])
+//
 // will return the same typ and err and
-//     DecodeFooValue(b)
-//     DecodeFooValue(b[typeOffset:])
+//
+//	DecodeFooValue(b)
+//	DecodeFooValue(b[typeOffset:])
+//
 // will return the same thing. PeekValueLength works as expected with either of
 // `b` or `b[typeOffset:]`.
 func DecodeValueTag(b []byte) (typeOffset int, dataOffset int, colID uint32, typ Type, err error) {
@@ -3142,4 +3269,47 @@ func IsArrayKeyDone(buf []byte, dir Direction) bool {
 		expected = arrayKeyDescendingTerminator
 	}
 	return buf[0] == expected
+}
+
+// BytesNext returns the next possible byte slice, using the extra capacity
+// of the provided slice if possible, and if not, appending an \x00.
+func BytesNext(b []byte) []byte {
+	if cap(b) > len(b) {
+		bNext := b[:len(b)+1]
+		if bNext[len(bNext)-1] == 0 {
+			return bNext
+		}
+	}
+	// TODO(spencer): Do we need to enforce KeyMaxLength here?
+	// Switched to "make and copy" pattern in #4963 for performance.
+	bn := make([]byte, len(b)+1)
+	copy(bn, b)
+	bn[len(bn)-1] = 0
+	return bn
+}
+
+// BytesPrevish returns a previous byte slice in lexicographical ordering. It is
+// impossible in general to find the exact previous byte slice, because it has
+// an infinite number of 0xff bytes at the end, so this returns the nearest
+// previous slice right-padded with 0xff up to length bytes. It may reuse the
+// given slice when possible.
+func BytesPrevish(b []byte, length int) []byte {
+	bLen := len(b)
+	// An empty slice has no previous slice.
+	if bLen == 0 {
+		return b
+	}
+	// If the last byte is 0, just remove it.
+	if b[bLen-1] == 0 {
+		return b[:bLen-1]
+	}
+	// Otherwise, decrement the last byte and right-pad with 0xff.
+	if bLen > length {
+		length = bLen
+	}
+	buf := make([]byte, length)
+	copy(buf, b)
+	buf[bLen-1]--
+	copy(buf[bLen:], bytes.Repeat([]byte{0xff}, length-bLen))
+	return buf
 }

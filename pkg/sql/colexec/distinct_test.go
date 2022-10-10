@@ -405,7 +405,7 @@ func TestDistinct(t *testing.T) {
 				}
 				tc.runTests(t, colexectestutils.OrderedVerifier, func(input []colexecop.Operator) (colexecop.Operator, error) {
 					return newPartiallyOrderedDistinct(
-						testAllocator, input[0], tc.distinctCols, orderedCols, tc.typs, tc.nullsAreDistinct, tc.errorOnDup,
+						testAllocator, testAllocator, input[0], tc.distinctCols, orderedCols, tc.typs, tc.nullsAreDistinct, tc.errorOnDup,
 					)
 				})
 			}
@@ -630,18 +630,15 @@ func BenchmarkDistinct(b *testing.B) {
 			return NewUnorderedDistinct(allocator, input, distinctCols, typs, false /* nullsAreDistinct */, "" /* errorOnDup */), nil
 		},
 		func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
-			return newPartiallyOrderedDistinct(allocator, input, distinctCols, distinctCols[:numOrderedCols], typs, false /* nullsAreDistinct */, "" /* errorOnDup */)
+			return newPartiallyOrderedDistinct(allocator, allocator, input, distinctCols, distinctCols[:numOrderedCols], typs, false /* nullsAreDistinct */, "" /* errorOnDup */)
 		},
 		func(allocator *colmem.Allocator, input colexecop.Operator, distinctCols []uint32, numOrderedCols int, typs []*types.T) (colexecop.Operator, error) {
 			return colexecbase.NewOrderedDistinct(input, distinctCols, typs, false /* nullsAreDistinct */, "" /* errorOnDup */), nil
 		},
 	}
 	unorderedShuffled := "UnorderedShuffled"
-	// TODO(yuzefovich): remove Unordered in 22.2 without renaming
-	// unorderedShuffled (#75106).
-	distinctNames := []string{"Unordered", "PartiallyOrdered", "Ordered", unorderedShuffled}
-	distinctConstructors = append(distinctConstructors, distinctConstructors[0])
-	orderedColsFraction := []float64{0, 0.5, 1.0, 0}
+	distinctNames := []string{unorderedShuffled, "PartiallyOrdered", "Ordered"}
+	orderedColsFraction := []float64{0, 0.5, 1.0}
 	for distinctIdx, distinctConstructor := range distinctConstructors {
 		runDistinctBenchmarks(
 			ctx,

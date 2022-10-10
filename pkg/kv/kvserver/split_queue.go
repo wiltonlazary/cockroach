@@ -56,6 +56,8 @@ type splitQueue struct {
 	loadBasedCount telemetry.Counter
 }
 
+var _ queueImpl = &splitQueue{}
+
 // newSplitQueue returns a new instance of splitQueue.
 func newSplitQueue(store *Store, db *kv.DB) *splitQueue {
 	var purgChan <-chan time.Time
@@ -140,7 +142,7 @@ func (sq *splitQueue) shouldQueue(
 		repl.GetMaxBytes(), repl.shouldBackpressureWrites(), confReader)
 
 	if !shouldQ && repl.SplitByLoadEnabled() {
-		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(timeutil.Now()); splitKey != nil {
+		if splitKey := repl.loadBasedSplitter.MaybeSplitKey(ctx, timeutil.Now()); splitKey != nil {
 			shouldQ, priority = true, 1.0 // default priority
 		}
 	}
@@ -153,9 +155,9 @@ func (sq *splitQueue) shouldQueue(
 type unsplittableRangeError struct{}
 
 func (unsplittableRangeError) Error() string         { return "could not find valid split key" }
-func (unsplittableRangeError) purgatoryErrorMarker() {}
+func (unsplittableRangeError) PurgatoryErrorMarker() {}
 
-var _ purgatoryError = unsplittableRangeError{}
+var _ PurgatoryError = unsplittableRangeError{}
 
 // process synchronously invokes admin split for each proposed split key.
 func (sq *splitQueue) process(
@@ -167,7 +169,7 @@ func (sq *splitQueue) process(
 		// attempts because splits can race with other descriptor modifications.
 		// On seeing a ConditionFailedError, don't return an error and enqueue
 		// this replica again in case it still needs to be split.
-		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying")
+		log.Infof(ctx, "split saw concurrent descriptor modification; maybe retrying; err: %v", err)
 		sq.MaybeAddAsync(ctx, r, sq.store.Clock().NowAsClockTimestamp())
 		return false, nil
 	}
@@ -217,10 +219,10 @@ func (sq *splitQueue) processAttempt(
 	}
 
 	now := timeutil.Now()
-	if splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(now); splitByLoadKey != nil {
+	if splitByLoadKey := r.loadBasedSplitter.MaybeSplitKey(ctx, now); splitByLoadKey != nil {
 		batchHandledQPS, _ := r.QueriesPerSecond()
 		raftAppliedQPS := r.WritesPerSecond()
-		splitQPS := r.loadBasedSplitter.LastQPS(now)
+		splitQPS := r.loadBasedSplitter.LastQPS(ctx, now)
 		reason := fmt.Sprintf(
 			"load at key %s (%.2f splitQPS, %.2f batches/sec, %.2f raft mutations/sec)",
 			splitByLoadKey,
@@ -265,6 +267,11 @@ func (sq *splitQueue) processAttempt(
 	return false, nil
 }
 
+func (*splitQueue) postProcessScheduled(
+	ctx context.Context, replica replicaInQueue, priority float64,
+) {
+}
+
 // timer returns interval between processing successive queued splits.
 func (*splitQueue) timer(_ time.Duration) time.Duration {
 	return splitQueueTimerDuration
@@ -273,4 +280,8 @@ func (*splitQueue) timer(_ time.Duration) time.Duration {
 // purgatoryChan returns the split queue's purgatory channel.
 func (sq *splitQueue) purgatoryChan() <-chan time.Time {
 	return sq.purgChan
+}
+
+func (sq *splitQueue) updateChan() <-chan time.Time {
+	return nil
 }

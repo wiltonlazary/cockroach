@@ -19,6 +19,9 @@ import (
 // test harness.
 type Test interface {
 	Cockroach() string // path to main cockroach binary
+	// CockroachShort returns the path to cockroach-short binary compiled with
+	// --crdb_test build tag, or an empty string if no such binary was given.
+	CockroachShort() string
 	Name() string
 	BuildVersion() *version.Version
 	IsBuildVersion(string) bool // "vXX.YY"
@@ -32,8 +35,10 @@ type Test interface {
 	// through all registered roachtests to change how they register the test.
 	Spec() interface{}
 	VersionsBinaryOverride() map[string]string
+	SkipInit() bool
 	Skip(args ...interface{})
 	Skipf(format string, args ...interface{})
+	Error(args ...interface{})
 	Errorf(string, ...interface{})
 	FailNow()
 	Fatal(args ...interface{})
@@ -49,6 +54,7 @@ type Test interface {
 	Status(args ...interface{})
 	WorkerStatus(args ...interface{})
 	WorkerProgress(float64)
+	IsDebug() bool
 
 	// DeprecatedWorkload returns the path to the workload binary.
 	// Don't use this, invoke `./cockroach workload` instead.

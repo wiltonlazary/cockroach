@@ -13,7 +13,7 @@ package reltest
 
 import (
 	"flag"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 
@@ -93,9 +93,9 @@ func (s Suite) writeYAML(t *testing.T) {
 	require.NoError(t, err)
 	tdp := testutils.TestDataPath(t, s.Name)
 	if rewrite {
-		require.NoError(t, ioutil.WriteFile(tdp, out, 0777))
+		require.NoError(t, os.WriteFile(tdp, out, 0777))
 	} else {
-		exp, err := ioutil.ReadFile(tdp)
+		exp, err := os.ReadFile(tdp)
 		require.NoError(t, err)
 		require.Equal(t, exp, out)
 	}
@@ -111,6 +111,8 @@ func (s Suite) toYAML(t *testing.T) *yaml.Node {
 			s.encodeData(t),
 			scalarYAML("attributes"),
 			s.encodeAttributes(t),
+			scalarYAML("rules"),
+			s.encodeRules(t),
 			scalarYAML("queries"),
 			s.encodeQueries(t),
 			scalarYAML("comparisons"),
@@ -159,6 +161,16 @@ func (s Suite) encodeComparisons(t *testing.T) *yaml.Node {
 	for _, ct := range s.ComparisonTests {
 		n.Content = append(n.Content, ct.encode(t))
 	}
+	return &n
+}
+
+func (s Suite) encodeRules(t *testing.T) *yaml.Node {
+	n := yaml.Node{Kind: yaml.SequenceNode}
+	s.Schema.ForEachRule(func(def rel.RuleDef) {
+		var r yaml.Node
+		require.NoError(t, r.Encode(def))
+		n.Content = append(n.Content, &r)
+	})
 	return &n
 }
 

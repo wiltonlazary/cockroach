@@ -13,6 +13,7 @@ package colexec
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -87,7 +89,7 @@ func TestValues(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-					return NewValuesOp(testAllocator, &spec), nil
+					return NewValuesOp(testAllocator, &spec, math.MaxInt64), nil
 				})
 		}
 	}
@@ -128,12 +130,13 @@ func BenchmarkValues(b *testing.B) {
 	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	post := execinfrapb.PostProcessSpec{}
 
@@ -142,7 +145,7 @@ func BenchmarkValues(b *testing.B) {
 			// Measure the vectorized values operator.
 			subBenchmarkValues(ctx, b, numRows, numCols, "valuesOpNative",
 				func(spec *execinfrapb.ValuesCoreSpec) (colexecop.Operator, error) {
-					return NewValuesOp(testAllocator, spec), nil
+					return NewValuesOp(testAllocator, spec, math.MaxInt64), nil
 				})
 
 			// For comparison, also measure the row-based values processor wrapped in
@@ -158,7 +161,7 @@ func BenchmarkValues(b *testing.B) {
 					if err != nil {
 						b.Fatal(err)
 					}
-					return NewBufferingColumnarizer(
+					return NewBufferingColumnarizerForTests(
 						testAllocator, &flowCtx, 0, proc.(execinfra.RowSource),
 					), nil
 				})

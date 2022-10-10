@@ -1,21 +1,30 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "scplan",
-    srcs = ["plan.go"],
+    srcs = [
+        "plan.go",
+        "plan_explain.go",
+    ],
     importpath = "github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scplan",
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/jobs/jobspb",
         "//pkg/sql/schemachanger/scop",
         "//pkg/sql/schemachanger/scpb",
-        "//pkg/sql/schemachanger/scplan/internal/deprules",
         "//pkg/sql/schemachanger/scplan/internal/opgen",
+        "//pkg/sql/schemachanger/scplan/internal/rules",
         "//pkg/sql/schemachanger/scplan/internal/scgraph",
         "//pkg/sql/schemachanger/scplan/internal/scgraphviz",
-        "//pkg/sql/schemachanger/scplan/internal/scopt",
         "//pkg/sql/schemachanger/scplan/internal/scstage",
+        "//pkg/sql/schemachanger/screl",
+        "//pkg/util",
+        "//pkg/util/log",
+        "//pkg/util/timeutil",
+        "//pkg/util/treeprinter",
         "@com_github_cockroachdb_errors//:errors",
+        "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
 
@@ -26,11 +35,13 @@ go_test(
         "main_test.go",
         "plan_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     deps = [
         ":scplan",
         "//pkg/base",
-        "//pkg/security",
+        "//pkg/ccl/utilccl",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/catalog/descpb",
@@ -58,3 +69,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

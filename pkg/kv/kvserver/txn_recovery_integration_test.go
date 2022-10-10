@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,8 +85,7 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			stopper := stop.NewStopper()
 			defer stopper.Stop(ctx)
-			manual := hlc.NewManualClock(123)
-			cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+			cfg := TestStoreConfig(hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 123)), time.Nanosecond) /* maxOffset */)
 			// Set the RecoverIndeterminateCommitsOnFailedPushes flag to true so
 			// that a push on a STAGING transaction record immediately launches
 			// the transaction recovery process.
@@ -203,20 +203,19 @@ func TestTxnRecoveryFromStaging(t *testing.T) {
 // transaction. The test contains a subtest for each of the combinations of the
 // following boolean options:
 //
-// - pushAbort: configures whether or not the high-priority operation is a
+//   - pushAbort: configures whether or not the high-priority operation is a
 //     read (false) or a write (true), which dictates the kind of push
 //     operation dispatched against the staging transaction.
 //
-// - newEpoch: configures whether or not the staging transaction wrote the
+//   - newEpoch: configures whether or not the staging transaction wrote the
 //     intent which the high-priority operation conflicts with at a higher
 //     epoch than it is staged at. If true, the staging transaction is not
 //     implicitly committed.
 //
-// - newTimestamp: configures whether or not the staging transaction wrote the
+//   - newTimestamp: configures whether or not the staging transaction wrote the
 //     intent which the high-priority operation conflicts with at a higher
 //     timestamp than it is staged at. If true, the staging transaction is not
 //     implicitly committed.
-//
 func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -225,8 +224,8 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 	run := func(t *testing.T, pushAbort, newEpoch, newTimestamp bool) {
 		stopper := stop.NewStopper()
 		defer stopper.Stop(ctx)
-		manual := hlc.NewManualClock(123)
-		cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
+		manual := timeutil.NewManualTime(timeutil.Unix(0, 123))
+		cfg := TestStoreConfig(hlc.NewClock(manual, time.Nanosecond) /* maxOffset */)
 		store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{createSystemRanges: true}, &cfg)
 
 		// Create a transaction that will get stuck performing a parallel
@@ -251,7 +250,7 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 			h2.Txn.BumpEpoch()
 		}
 		if newTimestamp {
-			manual.Increment(100)
+			manual.Advance(100)
 			h2.Txn.WriteTimestamp = store.Clock().Now()
 		}
 		_, pErr = kv.SendWrappedWith(ctx, store.TestSender(), h2, &pArgs)
@@ -277,7 +276,7 @@ func TestTxnRecoveryFromStagingWithHighPriority(t *testing.T) {
 			gArgs := getArgs(keyB)
 			conflictArgs = &gArgs
 		}
-		manual.Increment(100)
+		manual.Advance(100)
 		conflictH := roachpb.Header{
 			UserPriority: roachpb.MaxUserPriority,
 			Timestamp:    store.Clock().Now(),

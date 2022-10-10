@@ -16,6 +16,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/password"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -32,14 +34,20 @@ func TestVerifyPassword(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t,
+		base.TestServerArgs{
+			// Need to disable the test tenant here because it appears as
+			// though we don't have all the same roles in the tenant as we
+			// have in the host cluster (like root).
+			DisableDefaultTestTenant: true,
+		},
+	)
 	defer s.Stopper().Stop(ctx)
 
+	mon := sql.MakeInternalExecutorMemMonitor(sql.MemoryMetrics{}, s.ClusterSettings())
+	mon.StartNoReserved(ctx, s.(*server.TestServer).Server.PGServer().SQLServer.GetBytesMonitor())
 	ie := sql.MakeInternalExecutor(
-		context.Background(),
-		s.(*server.TestServer).Server.PGServer().SQLServer,
-		sql.MemoryMetrics{},
-		s.ExecutorConfig().(sql.ExecutorConfig).Settings,
+		s.(*server.TestServer).Server.PGServer().SQLServer, sql.MemoryMetrics{}, mon,
 	)
 
 	ts := s.(*server.TestServer)
@@ -128,7 +136,7 @@ func TestVerifyPassword(t *testing.T) {
 	} {
 		t.Run(tc.testName, func(t *testing.T) {
 			execCfg := s.ExecutorConfig().(sql.ExecutorConfig)
-			username := security.MakeSQLUsernameFromPreNormalizedString(tc.username)
+			username := username.MakeSQLUsernameFromPreNormalizedString(tc.username)
 			exists, canLoginSQL, canLoginDBConsole, isSuperuser, _, pwRetrieveFn, err := sql.GetUserSessionInitInfo(
 				context.Background(), &execCfg, &ie, username, "", /* databaseName */
 			)
@@ -154,7 +162,7 @@ func TestVerifyPassword(t *testing.T) {
 				validDBConsole = false
 			}
 			if exists && (canLoginSQL || canLoginDBConsole) {
-				var hashedPassword security.PasswordHash
+				var hashedPassword password.PasswordHash
 				expired, hashedPassword, err = pwRetrieveFn(ctx)
 				if err != nil {
 					t.Errorf(
@@ -165,7 +173,12 @@ func TestVerifyPassword(t *testing.T) {
 					)
 				}
 
-				pwCompare, err := security.CompareHashAndCleartextPassword(ctx, hashedPassword, tc.password)
+				pwCompare, err := password.CompareHashAndCleartextPassword(
+					ctx,
+					hashedPassword,
+					tc.password,
+					security.GetExpensiveHashComputeSem(ctx),
+				)
 				if err != nil {
 					t.Error(err)
 					valid = false

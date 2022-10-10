@@ -98,7 +98,7 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 	if n.Placement != tree.DataPlacementUnspecified {
 		if !p.EvalContext().SessionData().PlacementEnabled {
 			return nil, errors.WithHint(pgerror.New(
-				pgcode.FeatureNotSupported,
+				pgcode.ExperimentalFeature,
 				"PLACEMENT requires that the session setting enable_multiregion_placement_policy "+
 					"is enabled",
 			),
@@ -132,6 +132,20 @@ func (p *planner) CreateDatabase(ctx context.Context, n *tree.CreateDatabase) (p
 		return nil, pgerror.New(
 			pgcode.InsufficientPrivilege,
 			"permission denied to create database",
+		)
+	}
+
+	if n.PrimaryRegion == tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion != tree.SecondaryRegionNotSpecifiedName {
+		return nil, pgerror.New(
+			pgcode.InvalidDatabaseDefinition,
+			"PRIMARY REGION must be specified when using SECONDARY REGION",
+		)
+	}
+
+	if n.PrimaryRegion != tree.PrimaryRegionNotSpecifiedName && n.SecondaryRegion == n.PrimaryRegion {
+		return nil, pgerror.New(
+			pgcode.InvalidDatabaseDefinition,
+			"SECONDARY REGION can not be the same as the PRIMARY REGION",
 		)
 	}
 

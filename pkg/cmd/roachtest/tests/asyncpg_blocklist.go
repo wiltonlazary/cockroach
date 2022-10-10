@@ -13,6 +13,7 @@ package tests
 var asyncpgBlocklists = blocklistsForVersion{
 	{"v21.2", "asyncpgBlocklist21_2", asyncpgBlocklist21_2, "asyncpgIgnoreList21_2", asyncpgIgnoreList21_2},
 	{"v22.1", "asyncpgBlocklist22_1", asyncpgBlocklist22_1, "asyncpgIgnoreList22_1", asyncpgIgnoreList22_1},
+	{"v22.2", "asyncpgBlocklist22_2", asyncpgBlocklist22_2, "asyncpgIgnoreList22_2", asyncpgIgnoreList22_2},
 }
 
 // These are lists of known asyncpg test errors and failures.
@@ -23,11 +24,9 @@ var asyncpgBlocklists = blocklistsForVersion{
 // Please keep these lists alphabetized for easy diffing.
 // After a failed run, an updated version of this blocklist should be available
 // in the test log.
-var asyncpgBlocklist22_1 = asyncpgBlocklist21_2
+var asyncpgBlocklist22_2 = asyncpgBlocklist22_1
 
-var asyncpgBlocklist21_2 = blocklist{}
-
-var asyncpgIgnoreList22_1 = blocklist{
+var asyncpgBlocklist22_1 = blocklist{
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_in_pool":               "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_in_transaction":        "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_silent":                "unknown",
@@ -37,7 +36,6 @@ var asyncpgIgnoreList22_1 = blocklist{
 	"test_cache_invalidation.TestCacheInvalidation.test_type_cache_invalidation_in_transaction":           "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_type_cache_invalidation_on_change_attr":           "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_type_cache_invalidation_on_drop_type_attr":        "unknown",
-	"test_cancellation.TestCancellation.test_cancellation_03":                                             "unknown",
 	"test_codecs.TestCodecs.test_array_with_custom_json_text_codec":                                       "unknown",
 	"test_codecs.TestCodecs.test_composites_in_arrays":                                                    "unknown",
 	"test_codecs.TestCodecs.test_enum":                                                                    "unknown",
@@ -72,7 +70,6 @@ var asyncpgIgnoreList22_1 = blocklist{
 	"test_cursor.TestIterableCursor.test_cursor_iterable_02":                                              "unknown",
 	"test_exceptions.TestExceptions.test_exceptions_str":                                                  "unknown",
 	"test_exceptions.TestExceptions.test_exceptions_unpacking":                                            "unknown",
-	"test_execute.TestExecuteMany.test_executemany_client_failure_after_writes":                           "unknown",
 	"test_execute.TestExecuteMany.test_executemany_client_failure_in_transaction":                         "unknown",
 	"test_execute.TestExecuteMany.test_executemany_client_server_failure_conflict":                        "unknown",
 	"test_execute.TestExecuteMany.test_executemany_prepare":                                               "unknown",
@@ -83,7 +80,6 @@ var asyncpgIgnoreList22_1 = blocklist{
 	"test_execute.TestExecuteMany.test_executemany_timeout_flow_control":                                  "unknown",
 	"test_execute.TestExecuteScript.test_execute_script_3":                                                "unknown",
 	"test_execute.TestExecuteScript.test_execute_script_check_transactionality":                           "unknown",
-	"test_execute.TestExecuteScript.test_execute_script_interrupted_close":                                "unknown",
 	"test_introspection.TestIntrospection.test_introspection_no_stmt_cache_01":                            "unknown",
 	"test_introspection.TestIntrospection.test_introspection_no_stmt_cache_02":                            "unknown",
 	"test_introspection.TestIntrospection.test_introspection_no_stmt_cache_03":                            "unknown",
@@ -96,12 +92,7 @@ var asyncpgIgnoreList22_1 = blocklist{
 	"test_listeners.TestLogListeners.test_log_listener_01":                                                "unknown",
 	"test_listeners.TestLogListeners.test_log_listener_02":                                                "unknown",
 	"test_listeners.TestLogListeners.test_log_listener_03":                                                "unknown",
-	"test_pool.TestPool.test_pool_handles_query_cancel_in_release":                                        "unknown",
-	"test_pool.TestPool.test_pool_handles_task_cancel_in_release":                                         "unknown",
-	"test_pool.TestPool.test_pool_init_race":                                                              "unknown",
-	"test_pool.TestPool.test_pool_init_run_until_complete":                                                "unknown",
 	"test_pool.TestPool.test_pool_remote_close":                                                           "unknown",
-	"test_prepare.TestPrepare.test_prepare_06_interrupted_close":                                          "unknown",
 	"test_prepare.TestPrepare.test_prepare_08_big_result":                                                 "unknown",
 	"test_prepare.TestPrepare.test_prepare_09_raise_error":                                                "unknown",
 	"test_prepare.TestPrepare.test_prepare_14_explain":                                                    "unknown",
@@ -115,19 +106,10 @@ var asyncpgIgnoreList22_1 = blocklist{
 	"test_record.TestRecord.test_record_subclass_02":                                                      "unknown",
 	"test_record.TestRecord.test_record_subclass_03":                                                      "unknown",
 	"test_record.TestRecord.test_record_subclass_04":                                                      "unknown",
-	"test_timeout.TestConnectionCommandTimeout.test_command_timeout_01":                                   "unknown",
-	"test_timeout.TestTimeout.test_timeout_04":                                                            "unknown",
-	"test_timeout.TestTimeout.test_timeout_06":                                                            "unknown",
 	"test_utils.TestUtils.test_mogrify_multiple":                                                          "unknown",
 	"test_utils.TestUtils.test_mogrify_simple":                                                            "unknown",
-	"test_pool.TestPool.test_pool_handles_transaction_exit_in_asyncgen_1":                                 "unknown",
-	"test_pool.TestPool.test_pool_handles_transaction_exit_in_asyncgen_2":                                 "unknown",
-	"test_listeners.TestListeners.test_dangling_listener_warns":                                           "unknown",
-	"test_pool.TestPool.test_pool_01":                                                                     "unknown",
-	"test_pool.TestPool.test_pool_init_and_use_race":                                                      "unknown",
 }
-
-var asyncpgIgnoreList21_2 = blocklist{
+var asyncpgBlocklist21_2 = blocklist{
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_in_pool":               "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_in_transaction":        "unknown",
 	"test_cache_invalidation.TestCacheInvalidation.test_prepare_cache_invalidation_silent":                "unknown",
@@ -221,3 +203,7 @@ var asyncpgIgnoreList21_2 = blocklist{
 	"test_utils.TestUtils.test_mogrify_multiple":                                                          "unknown",
 	"test_utils.TestUtils.test_mogrify_simple":                                                            "unknown",
 }
+
+var asyncpgIgnoreList22_2 = asyncpgIgnoreList22_1
+var asyncpgIgnoreList22_1 = asyncpgIgnoreList21_2
+var asyncpgIgnoreList21_2 = blocklist{}

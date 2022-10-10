@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -56,9 +57,9 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 		PrimaryIndex: descpb.IndexDescriptor{
 			ID: 1, Name: "pri", KeyColumnIDs: []descpb.ColumnID{1},
 			KeyColumnNames:      []string{"c1"},
-			KeyColumnDirections: []descpb.IndexDescriptor_Direction{descpb.IndexDescriptor_ASC},
+			KeyColumnDirections: []catpb.IndexColumn_Direction{catpb.IndexColumn_ASC},
 			EncodingType:        descpb.PrimaryIndexEncoding,
-			Version:             descpb.LatestPrimaryIndexDescriptorVersion,
+			Version:             descpb.LatestIndexDescriptorVersion,
 		},
 		Mutations: []descpb.DescriptorMutation{
 			{
@@ -66,12 +67,12 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 					Index: &descpb.IndexDescriptor{
 						ID: 2, Name: "new_hash_index", KeyColumnIDs: []descpb.ColumnID{2, 3},
 						KeyColumnNames: []string{"c2", "c3"},
-						KeyColumnDirections: []descpb.IndexDescriptor_Direction{
-							descpb.IndexDescriptor_ASC,
-							descpb.IndexDescriptor_ASC,
+						KeyColumnDirections: []catpb.IndexColumn_Direction{
+							catpb.IndexColumn_ASC,
+							catpb.IndexColumn_ASC,
 						},
 						EncodingType: descpb.PrimaryIndexEncoding,
-						Version:      descpb.LatestPrimaryIndexDescriptorVersion,
+						Version:      descpb.LatestIndexDescriptorVersion,
 						Sharded: catpb.ShardedDescriptor{
 							IsSharded:    true,
 							Name:         "c3",
@@ -118,11 +119,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{3},
-						Hidden:    true,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{3},
+						FromHashShardedColumn: true,
 					},
 				},
 			},
@@ -134,11 +135,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{2},
-						Hidden:    false,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{2},
+						FromHashShardedColumn: false,
 					},
 				},
 			},
@@ -150,11 +151,11 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 				desc: &descpb.ConstraintToUpdate{
 					ConstraintType: descpb.ConstraintToUpdate_CHECK,
 					Check: descpb.TableDescriptor_CheckConstraint{
-						Expr:      "some fake expr",
-						Name:      "some fake name",
-						Validity:  descpb.ConstraintValidity_Validating,
-						ColumnIDs: []descpb.ColumnID{2, 3},
-						Hidden:    false,
+						Expr:                  "some fake expr",
+						Name:                  "some fake name",
+						Validity:              descpb.ConstraintValidity_Validating,
+						ColumnIDs:             []descpb.ColumnID{2, 3},
+						FromHashShardedColumn: false,
 					},
 				},
 			},
@@ -180,5 +181,53 @@ func TestShouldSkipConstraintValidation(t *testing.T) {
 			require.Equal(t, tc.expectedResult, isSkipping)
 		})
 	}
+}
 
+func TestMultiStageFractionScaler(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	stages := []float32{0.4, 0.8, 1.0}
+	t.Run("returns a fraction within the range of the given stage", func(t *testing.T) {
+		s := multiStageFractionScaler{initial: 0.0, stages: stages}
+		f, err := s.fractionCompleteFromStageFraction(0, 0.0)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.0), f)
+
+		f, err = s.fractionCompleteFromStageFraction(0, 0.5)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.20), f)
+
+		f, err = s.fractionCompleteFromStageFraction(0, 1.0)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.40), f)
+
+		f, err = s.fractionCompleteFromStageFraction(1, 0.0)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.40), f)
+	})
+	t.Run("returns a fraction that is always >= initial", func(t *testing.T) {
+		s := multiStageFractionScaler{initial: float32(0.60), stages: stages}
+		f, err := s.fractionCompleteFromStageFraction(0, 0.0)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.60), f)
+
+		f, err = s.fractionCompleteFromStageFraction(0, 1.0)
+		require.NoError(t, err)
+		assert.Equal(t, float32(0.60), f)
+	})
+	t.Run("errors if given an unknown stage", func(t *testing.T) {
+		s := multiStageFractionScaler{initial: float32(0.60), stages: stages}
+		_, err := s.fractionCompleteFromStageFraction(5, 0.0)
+		require.Error(t, err)
+	})
+	t.Run("errors if given a negative fraction", func(t *testing.T) {
+		s := multiStageFractionScaler{initial: float32(0.60), stages: stages}
+		_, err := s.fractionCompleteFromStageFraction(0, -float32(0.60))
+		require.Error(t, err)
+	})
+	t.Run("errors if given a fraction above 1", func(t *testing.T) {
+		s := multiStageFractionScaler{initial: float32(0.60), stages: stages}
+		_, err := s.fractionCompleteFromStageFraction(0, 1.60)
+		require.Error(t, err)
+	})
 }

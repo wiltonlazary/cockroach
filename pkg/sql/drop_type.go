@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -197,7 +198,10 @@ func (p *planner) addBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
 	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
-		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{
+			Required:    true,
+			AvoidLeased: true,
+		})
 	if err != nil {
 		return err
 	}
@@ -224,7 +228,10 @@ func (p *planner) removeBackRefsFromAllTypesInTable(
 	ctx context.Context, desc *tabledesc.Mutable,
 ) error {
 	_, dbDesc, err := p.Descriptors().GetImmutableDatabaseByID(
-		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{Required: true})
+		ctx, p.txn, desc.GetParentID(), tree.DatabaseLookupFlags{
+			Required:    true,
+			AvoidLeased: true,
+		})
 	if err != nil {
 		return err
 	}
@@ -248,6 +255,12 @@ func (p *planner) dropTypeImpl(
 ) error {
 	if typeDesc.Dropped() {
 		return errors.Errorf("type %q is already being dropped", typeDesc.Name)
+	}
+
+	// Exit early with an error if the type is undergoing a declarative schema
+	// change.
+	if catalog.HasConcurrentDeclarativeSchemaChange(typeDesc) {
+		return scerrors.ConcurrentSchemaChangeError(typeDesc)
 	}
 
 	// Actually mark the type as dropped.

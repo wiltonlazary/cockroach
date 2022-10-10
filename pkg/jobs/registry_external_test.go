@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -60,7 +60,7 @@ func TestRoundtripJob(t *testing.T) {
 	jobID := registry.MakeJobID()
 	record := jobs.Record{
 		Description:   "beep boop",
-		Username:      security.MakeSQLUsernameFromPreNormalizedString("robot"),
+		Username:      username.MakeSQLUsernameFromPreNormalizedString("robot"),
 		DescriptorIDs: descpb.IDs{42},
 		Details:       jobspb.RestoreDetails{},
 		Progress:      jobspb.RestoreProgress{},
@@ -374,7 +374,7 @@ func TestGCDurationControl(t *testing.T) {
 
 	jobs.RegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
 		return jobs.FakeResumer{}
-	})
+	}, jobs.UsesTenantCostControl)
 	s, sqlDB, kvDB := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
@@ -454,7 +454,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 			OnResume:     execFn,
 			FailOrCancel: execFn,
 		}
-	})
+	}, jobs.UsesTenantCostControl)
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),

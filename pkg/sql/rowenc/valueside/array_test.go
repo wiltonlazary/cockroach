@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -123,7 +124,7 @@ func TestArrayEncoding(t *testing.T) {
 		})
 
 		t.Run("decode "+test.name, func(t *testing.T) {
-			d, _, err := decodeArray(&tree.DatumAlloc{}, test.datum.ParamTyp, test.encoding)
+			d, _, err := decodeArray(&tree.DatumAlloc{}, types.MakeArray(test.datum.ParamTyp), test.encoding)
 			hasNulls := d.(*tree.DArray).HasNulls
 			if test.datum.HasNulls != hasNulls {
 				t.Fatalf("expected %v to have HasNulls=%t, got %t", test.encoding, test.datum.HasNulls, hasNulls)
@@ -131,7 +132,7 @@ func TestArrayEncoding(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			evalContext := tree.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
+			evalContext := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
 			if d.Compare(evalContext, &test.datum) != 0 {
 				t.Fatalf("expected %v to decode to %s, got %s", test.encoding, test.datum.String(), d.String())
 			}

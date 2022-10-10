@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 )
@@ -141,7 +142,7 @@ const (
 	fmtFormatByteLiterals
 
 	// FmtMarkRedactionNode instructs the pretty printer to redact datums,
-	// constants, and simples names (i.e. Name, UnrestrictedName) from statements.
+	// constants, and simple names (i.e. Name, UnrestrictedName) from statements.
 	FmtMarkRedactionNode
 
 	// FmtSummary instructs the pretty printer to produced a summarized version
@@ -163,6 +164,11 @@ const (
 	// - Show columns up to 15 characters.
 	// - Show condition up to 15 characters.
 	FmtSummary
+
+	// FmtOmitNameRedaction instructs the pretty printer to omit redaction
+	// for simple names (i.e. Name, UnrestrictedName) from statements.
+	// This flag *overrides* `FmtMarkRedactionNode` above.
+	FmtOmitNameRedaction
 )
 
 // PasswordSubstitution is the string that replaces
@@ -268,6 +274,8 @@ type FmtCtx struct {
 	// indexedTypeFormatter is an optional interceptor for formatting
 	// IDTypeReferences differently than normal.
 	indexedTypeFormatter func(*FmtCtx, *OIDTypeReference)
+	// small scratch buffer to reduce allocations.
+	scratch [64]byte
 }
 
 // FmtCtxOption is an option to pass into NewFmtCtx.
@@ -651,7 +659,15 @@ func (ctx *FmtCtx) formatNodeMaybeMarkRedaction(n NodeFormatter) {
 		case *Placeholder:
 			// Placeholders should be printed as placeholder markers.
 			// Deliberately empty so we format as normal.
-		case Datum, Constant, *Name, *UnrestrictedName:
+		case *Name, *UnrestrictedName:
+			if ctx.flags.HasFlags(FmtOmitNameRedaction) {
+				break
+			}
+			ctx.WriteString(string(redact.StartMarker()))
+			v.Format(ctx)
+			ctx.WriteString(string(redact.EndMarker()))
+			return
+		case Datum, Constant:
 			ctx.WriteString(string(redact.StartMarker()))
 			v.Format(ctx)
 			ctx.WriteString(string(redact.EndMarker()))
@@ -659,4 +675,12 @@ func (ctx *FmtCtx) formatNodeMaybeMarkRedaction(n NodeFormatter) {
 		}
 		n.Format(ctx)
 	}
+}
+
+func init() {
+	ctx := NewFmtCtx(FmtSimple)
+	if len(ctx.scratch) < uuid.RFC4122StrSize {
+		panic(errors.AssertionFailedf("FmtCtx scratch must be at least %d bytes", uuid.RFC4122StrSize))
+	}
+	ctx.Close()
 }

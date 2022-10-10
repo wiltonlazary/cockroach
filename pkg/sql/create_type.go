@@ -18,15 +18,16 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catprivilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/enum"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
@@ -164,10 +165,9 @@ func getCreateTypeParams(
 		sqltelemetry.IncrementUserDefinedSchemaCounter(sqltelemetry.UserDefinedSchemaUsedByObject)
 	}
 
-	err = catalogkv.CheckObjectCollision(
+	err = params.p.Descriptors().Direct().CheckObjectCollision(
 		params.ctx,
 		params.p.txn,
-		params.ExecCfg().Codec,
 		db.GetID(),
 		schema.GetID(),
 		name,
@@ -184,24 +184,21 @@ func getCreateTypeParams(
 // a collision. findFreeArrayTypeName performs this logic to find a free name
 // for the array type based off of a type with the input name.
 func findFreeArrayTypeName(
-	ctx context.Context, txn *kv.Txn, codec keys.SQLCodec, parentID, schemaID descpb.ID, name string,
+	ctx context.Context,
+	txn *kv.Txn,
+	col *descs.Collection,
+	parentID, schemaID descpb.ID,
+	name string,
 ) (string, error) {
 	arrayName := "_" + name
 	for {
 		// See if there is a collision with the current name.
-		exists, _, err := catalogkv.LookupObjectID(
-			ctx,
-			txn,
-			codec,
-			parentID,
-			schemaID,
-			arrayName,
-		)
+		objectID, err := col.Direct().LookupObjectID(ctx, txn, parentID, schemaID, arrayName)
 		if err != nil {
 			return "", err
 		}
 		// If we found an empty spot, then break out.
-		if !exists {
+		if objectID == descpb.InvalidID {
 			break
 		}
 		// Otherwise, append another "_" to the front of the name.
@@ -225,7 +222,7 @@ func CreateEnumArrayTypeDesc(
 	var elemTyp *types.T
 	switch t := typDesc.Kind; t {
 	case descpb.TypeDescriptor_ENUM, descpb.TypeDescriptor_MULTIREGION_ENUM:
-		elemTyp = types.MakeEnum(typedesc.TypeIDToOID(typDesc.GetID()), typedesc.TypeIDToOID(id))
+		elemTyp = types.MakeEnum(catid.TypeIDToOID(typDesc.GetID()), catid.TypeIDToOID(id))
 	default:
 		return nil, errors.AssertionFailedf("cannot make array type for kind %s", t.String())
 	}
@@ -259,7 +256,7 @@ func (p *planner) createArrayType(
 	arrayTypeName, err := findFreeArrayTypeName(
 		params.ctx,
 		params.p.txn,
-		params.ExecCfg().Codec,
+		params.p.Descriptors(),
 		db.GetID(),
 		schemaID,
 		typ.Type(),
@@ -270,7 +267,7 @@ func (p *planner) createArrayType(
 	arrayTypeKey := catalogkeys.MakeObjectNameKey(params.ExecCfg().Codec, db.GetID(), schemaID, arrayTypeName)
 
 	// Generate the stable ID for the array type.
-	id, err := catalogkv.GenerateUniqueDescID(params.ctx, params.ExecCfg().DB, params.ExecCfg().Codec)
+	id, err := params.EvalContext().DescIDGenerator.GenerateUniqueDescID(params.ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -293,7 +290,6 @@ func (p *planner) createArrayType(
 		arrayTypeKey,
 		id,
 		arrayTypDesc,
-		params.EvalContext().Settings,
 		jobStr,
 	); err != nil {
 		return 0, err
@@ -303,9 +299,7 @@ func (p *planner) createArrayType(
 
 func (p *planner) createUserDefinedEnum(params runParams, n *createTypeNode) error {
 	// Generate a stable ID for the new type.
-	id, err := catalogkv.GenerateUniqueDescID(
-		params.ctx, params.ExecCfg().DB, params.ExecCfg().Codec,
-	)
+	id, err := params.EvalContext().DescIDGenerator.GenerateUniqueDescID(params.ctx)
 	if err != nil {
 		return err
 	}
@@ -350,7 +344,7 @@ func CreateEnumTypeDesc(
 		schema.GetDefaultPrivilegeDescriptor(),
 		dbDesc.GetID(),
 		params.SessionData().User(),
-		tree.Types,
+		privilege.Types,
 		dbDesc.GetPrivileges(),
 	)
 
@@ -421,7 +415,6 @@ func (p *planner) createEnumWithID(
 		catalogkeys.MakeObjectNameKey(params.ExecCfg().Codec, dbDesc.GetID(), schema.GetID(), typeName.Type()),
 		id,
 		typeDesc,
-		params.EvalContext().Settings,
 		typeName.String(),
 	); err != nil {
 		return err

@@ -15,9 +15,13 @@ import (
 	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cancelchecker"
@@ -28,7 +32,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-type aggregateFuncs []tree.AggregateFunc
+type aggregateFuncs []eval.AggregateFunc
 
 func (af aggregateFuncs) close(ctx context.Context) {
 	for _, f := range af {
@@ -83,6 +87,7 @@ type aggregatorBase struct {
 // trailingMetaCallback is passed as part of ProcStateOpts; the inputs to drain
 // are in aggregatorBase.
 func (ag *aggregatorBase) init(
+	ctx context.Context,
 	self execinfra.RowSource,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
@@ -92,9 +97,8 @@ func (ag *aggregatorBase) init(
 	output execinfra.RowReceiver,
 	trailingMetaCallback func() []execinfrapb.ProducerMetadata,
 ) error {
-	ctx := flowCtx.EvalCtx.Ctx()
-	memMonitor := execinfra.NewMonitor(ctx, flowCtx.EvalCtx.Mon, "aggregator-mem")
-	if execinfra.ShouldCollectStats(ctx, flowCtx) {
+	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "aggregator-mem")
+	if execstats.ShouldCollectStats(ctx, flowCtx.CollectStats) {
 		input = newInputStatCollector(input)
 		ag.ExecStatsForTrace = ag.execStatsForTrace
 	}
@@ -116,7 +120,7 @@ func (ag *aggregatorBase) init(
 	// grouped-by values for each bucket.  ag.funcs is updated to contain all
 	// the functions which need to be fed values.
 	ag.inputTypes = input.OutputTypes()
-	semaCtx := flowCtx.NewSemaContext(flowCtx.EvalCtx.Txn)
+	semaCtx := flowCtx.NewSemaContext(flowCtx.Txn)
 	for i, aggInfo := range spec.Aggregations {
 		if aggInfo.FilterColIdx != nil {
 			col := *aggInfo.FilterColIdx
@@ -130,8 +134,8 @@ func (ag *aggregatorBase) init(
 				)
 			}
 		}
-		constructor, arguments, outputType, err := execinfrapb.GetAggregateConstructor(
-			flowCtx.EvalCtx, semaCtx, &aggInfo, ag.inputTypes,
+		constructor, arguments, outputType, err := execagg.GetAggregateConstructor(
+			ctx, flowCtx.EvalCtx, semaCtx, &aggInfo, ag.inputTypes,
 		)
 		if err != nil {
 			return err
@@ -144,7 +148,7 @@ func (ag *aggregatorBase) init(
 	}
 
 	return ag.ProcessorBase.Init(
-		self, post, ag.outputTypes, flowCtx, processorID, output, memMonitor,
+		ctx, self, post, ag.outputTypes, flowCtx, processorID, output, memMonitor,
 		execinfra.ProcStateOpts{
 			InputsToDrain:        []execinfra.RowSource{ag.input},
 			TrailingMetaCallback: trailingMetaCallback,
@@ -167,21 +171,21 @@ func (ag *aggregatorBase) execStatsForTrace() *execinfrapb.ComponentStats {
 	}
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (ag *aggregatorBase) ChildCount(verbose bool) int {
-	if _, ok := ag.input.(execinfra.OpNode); ok {
+	if _, ok := ag.input.(execopnode.OpNode); ok {
 		return 1
 	}
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (ag *aggregatorBase) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (ag *aggregatorBase) Child(nth int, verbose bool) execopnode.OpNode {
 	if nth == 0 {
-		if n, ok := ag.input.(execinfra.OpNode); ok {
+		if n, ok := ag.input.(execopnode.OpNode); ok {
 			return n
 		}
-		panic("input to aggregatorBase is not an execinfra.OpNode")
+		panic("input to aggregatorBase is not an execopnode.OpNode")
 	}
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }
@@ -223,13 +227,13 @@ type orderedAggregator struct {
 
 var _ execinfra.Processor = &hashAggregator{}
 var _ execinfra.RowSource = &hashAggregator{}
-var _ execinfra.OpNode = &hashAggregator{}
+var _ execopnode.OpNode = &hashAggregator{}
 
 const hashAggregatorProcName = "hash aggregator"
 
 var _ execinfra.Processor = &orderedAggregator{}
 var _ execinfra.RowSource = &orderedAggregator{}
-var _ execinfra.OpNode = &orderedAggregator{}
+var _ execopnode.OpNode = &orderedAggregator{}
 
 const orderedAggregatorProcName = "ordered aggregator"
 
@@ -247,6 +251,7 @@ const (
 )
 
 func newAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.AggregatorSpec,
@@ -255,10 +260,10 @@ func newAggregator(
 	output execinfra.RowReceiver,
 ) (execinfra.Processor, error) {
 	if spec.IsRowCount() {
-		return newCountAggregator(flowCtx, processorID, input, post, output)
+		return newCountAggregator(ctx, flowCtx, processorID, input, post, output)
 	}
 	if len(spec.OrderedGroupCols) == len(spec.GroupCols) {
-		return newOrderedAggregator(flowCtx, processorID, spec, input, post, output)
+		return newOrderedAggregator(ctx, flowCtx, processorID, spec, input, post, output)
 	}
 
 	ag := &hashAggregator{
@@ -267,6 +272,7 @@ func newAggregator(
 	}
 
 	if err := ag.init(
+		ctx,
 		ag,
 		flowCtx,
 		processorID,
@@ -290,6 +296,7 @@ func newAggregator(
 }
 
 func newOrderedAggregator(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.AggregatorSpec,
@@ -300,6 +307,7 @@ func newOrderedAggregator(
 	ag := &orderedAggregator{}
 
 	if err := ag.init(
+		ctx,
 		ag,
 		flowCtx,
 		processorID,
@@ -874,7 +882,7 @@ func (ag *orderedAggregator) accumulateRow(row rowenc.EncDatumRow) error {
 }
 
 type aggregateFuncHolder struct {
-	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc
+	create func(*eval.Context, tree.Datums) eval.AggregateFunc
 
 	// arguments is the list of constant (non-aggregated) arguments to the
 	// aggregate, for instance, the separator in string_agg.
@@ -886,11 +894,11 @@ type aggregateFuncHolder struct {
 
 const (
 	sizeOfAggregateFuncs = int64(unsafe.Sizeof(aggregateFuncs{}))
-	sizeOfAggregateFunc  = int64(unsafe.Sizeof(tree.AggregateFunc(nil)))
+	sizeOfAggregateFunc  = int64(unsafe.Sizeof(eval.AggregateFunc(nil)))
 )
 
 func (ag *aggregatorBase) newAggregateFuncHolder(
-	create func(*tree.EvalContext, tree.Datums) tree.AggregateFunc, arguments tree.Datums,
+	create func(*eval.Context, tree.Datums) eval.AggregateFunc, arguments tree.Datums,
 ) *aggregateFuncHolder {
 	return &aggregateFuncHolder{
 		create:    create,

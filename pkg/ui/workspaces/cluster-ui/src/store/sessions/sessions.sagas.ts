@@ -8,15 +8,31 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import { all, call, delay, put, takeLatest } from "redux-saga/effects";
+import {
+  all,
+  call,
+  put,
+  takeLatest,
+  AllEffect,
+  PutEffect,
+  SelectEffect,
+  select,
+} from "redux-saga/effects";
 
 import { actions } from "./sessions.reducer";
+import { actions as clusterLockActions } from "../clusterLocks/clusterLocks.reducer";
 import { getSessions } from "src/api/sessionsApi";
-import { CACHE_INVALIDATION_PERIOD, throttleWithReset } from "../utils";
-import { rootActions } from "../reducers";
+import { selectIsTenant } from "../uiConfig";
 
-export function* refreshSessionsSaga() {
-  yield put(actions.request());
+export function* refreshSessionsAndClusterLocksSaga(): Generator<
+  AllEffect<PutEffect> | SelectEffect | PutEffect
+> {
+  const isTenant = yield select(selectIsTenant);
+  if (isTenant) {
+    yield put(actions.request());
+    return;
+  }
+  yield all([put(actions.request()), put(clusterLockActions.request())]);
 }
 
 export function* requestSessionsSaga(): any {
@@ -28,26 +44,9 @@ export function* requestSessionsSaga(): any {
   }
 }
 
-export function* receivedStatementsSaga(delayMs: number) {
-  yield delay(delayMs);
-  yield put(actions.invalidated());
-}
-
-export function* sessionsSaga(
-  cacheInvalidationPeriod: number = CACHE_INVALIDATION_PERIOD,
-) {
+export function* sessionsSaga() {
   yield all([
-    throttleWithReset(
-      cacheInvalidationPeriod,
-      actions.refresh,
-      [actions.invalidated, actions.failed, rootActions.resetState],
-      refreshSessionsSaga,
-    ),
+    takeLatest(actions.refresh, refreshSessionsAndClusterLocksSaga),
     takeLatest(actions.request, requestSessionsSaga),
-    takeLatest(
-      actions.received,
-      receivedStatementsSaga,
-      cacheInvalidationPeriod,
-    ),
   ]);
 }

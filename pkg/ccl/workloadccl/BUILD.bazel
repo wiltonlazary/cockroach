@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,7 +15,7 @@ go_library(
         "//pkg/cloud/amazon",
         "//pkg/cloud/azure",
         "//pkg/cloud/gcp",
-        "//pkg/security",
+        "//pkg/security/username",
         "//pkg/settings/cluster",
         "//pkg/util/ctxgroup",
         "//pkg/util/humanizeutil",
@@ -34,12 +35,13 @@ go_test(
         "fixture_test.go",
         "main_test.go",
     ],
+    args = ["-test.timeout=55s"],
     embed = [":workloadccl"],
     deps = [
         "//pkg/base",
         "//pkg/ccl",
         "//pkg/ccl/utilccl",
-        "//pkg/security",
+        "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/stats",
@@ -58,3 +60,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

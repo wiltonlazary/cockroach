@@ -11,6 +11,7 @@
 package distribution
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -21,15 +22,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testcat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/testutils/testexpr"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 )
 
 func TestBuildProvided(t *testing.T) {
 	tc := testcat.New()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	var f norm.Factory
-	f.Init(evalCtx, tc)
+	f.Init(context.Background(), evalCtx, tc)
 
 	testCases := []struct {
 		leftDist  []string
@@ -99,7 +100,7 @@ func TestBuildProvided(t *testing.T) {
 				)
 			}
 
-			res := BuildProvided(evalCtx, expr, &physical.Distribution{})
+			res := BuildProvided(context.Background(), evalCtx, expr, &physical.Distribution{})
 			if res.String() != expected.String() {
 				t.Errorf("expected '%s', got '%s'", expected, res)
 			}

@@ -16,24 +16,34 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/inverted"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil"
 	"github.com/cockroachdb/errors"
 )
 
 func init() {
-	if numOperators != 58 {
-		// If this error occurs please make sure the new op is the last one in order
-		// to not invalidate existing plan gists/hashes. If we are just adding an
-		// operator at the end there's no need to update version below and we can
-		// just bump the hardcoded literal here.
+	if numOperators != 60 {
+		// This error occurs when an operator has been added or removed in
+		// pkg/sql/opt/exec/explain/factory.opt. If an operator is added at the
+		// end of factory.opt, simply adjust the hardcoded value above. If an
+		// operator is removed or added anywhere else in factory.opt, increment
+		// gistVersion below. Note that we currently do not have a mechanism for
+		// decoding gists of older versions. This means that if gistVersion is
+		// incremented in a release, upgrading a cluster to that release will
+		// cause decoding errors for any previously generated plan gists.
 		panic(errors.AssertionFailedf("Operator field changed (%d), please update check and consider incrementing version", numOperators))
 	}
 }
@@ -44,7 +54,7 @@ func init() {
 // efficient encoding version should be incremented.
 //
 // Version history:
-//   1. Initial version.
+//  1. Initial version.
 var gistVersion = 1
 
 // PlanGist is a compact representation of a logical plan meant to be used as
@@ -92,7 +102,11 @@ type PlanGistFactory struct {
 	hash   util.FNV64
 
 	nodeStack []*Node
-	catalog   cat.Catalog
+
+	// catalog is used to resolve table and index ids that are stored in the gist.
+	// catalog can be nil when decoding gists via decode_external_plan_gist in which
+	// case we don't attempt to resolve tables or indexes.
+	catalog cat.Catalog
 }
 
 var _ exec.Factory = &PlanGistFactory{}
@@ -139,8 +153,24 @@ func (f *PlanGistFactory) PlanGist() PlanGist {
 }
 
 // DecodePlanGistToRows converts a gist to a logical plan and returns the rows.
-func DecodePlanGistToRows(gist string, catalog cat.Catalog) ([]string, error) {
-	flags := Flags{HideValues: true, Redact: RedactAll}
+func DecodePlanGistToRows(gist string, catalog cat.Catalog) (_ []string, retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// This code allows us to propagate internal errors without having
+			// to add error checks everywhere throughout the code. This is only
+			// possible because the code does not update shared state and does
+			// not manipulate locks.
+			if ok, e := errorutil.ShouldCatch(r); ok {
+				retErr = e
+			} else {
+				// Other panic objects can't be considered "safe" and thus are
+				// propagated as crashes that terminate the session.
+				panic(r)
+			}
+		}
+	}()
+
+	flags := Flags{HideValues: true, Redact: RedactAll, OnlyShape: true}
 	ob := NewOutputBuilder(flags)
 	explainPlan, err := DecodePlanGistToPlan(gist, catalog)
 	if err != nil {
@@ -167,22 +197,6 @@ func DecodePlanGistToPlan(s string, cat cat.Catalog) (plan *Plan, retErr error) 
 	f.buffer.Reset()
 	f.buffer.Write(bytes)
 	plan = &Plan{}
-
-	defer func() {
-		if r := recover(); r != nil {
-			// This code allows us to propagate internal errors without having to add
-			// error checks everywhere throughout the code. This is only possible
-			// because the code does not update shared state and does not manipulate
-			// locks.
-			if ok, e := errorutil.ShouldCatch(r); ok {
-				retErr = e
-			} else {
-				// Other panic objects can't be considered "safe" and thus are
-				// propagated as crashes that terminate the session.
-				panic(r)
-			}
-		}
-	}()
 
 	ver := f.decodeInt()
 	if ver != gistVersion {
@@ -274,31 +288,28 @@ func (f *PlanGistFactory) decodeID() cat.StableID {
 }
 
 func (f *PlanGistFactory) decodeTable() cat.Table {
+	if f.catalog == nil {
+		return &unknownTable{}
+	}
 	id := f.decodeID()
 	ds, _, err := f.catalog.ResolveDataSourceByID(context.TODO(), cat.Flags{}, id)
-	// If we can't resolve the id just return nil, this will result in the plan
-	// showing "unknown table".
-	if err != nil {
-		return nil
+	if err == nil {
+		return ds.(cat.Table)
 	}
-
-	return ds.(cat.Table)
+	if pgerror.GetPGCode(err) == pgcode.UndefinedTable {
+		return &unknownTable{}
+	}
+	panic(err)
 }
 
 func (f *PlanGistFactory) decodeIndex(tbl cat.Table) cat.Index {
 	id := f.decodeID()
-	// If tbl is null just return nil after consuming the id, plan will display
-	// "unknown table".
-	if tbl == nil {
-		return nil
-	}
 	for i, n := 0, tbl.IndexCount(); i < n; i++ {
 		if tbl.Index(i).ID() == id {
 			return tbl.Index(i)
 		}
 	}
-
-	return nil
+	return &unknownIndex{}
 }
 
 // TODO: implement this and figure out how to test...
@@ -378,18 +389,28 @@ func (f *PlanGistFactory) encodeScanParams(params exec.ScanParams) {
 	f.encodeFastIntSet(params.NeededCols)
 
 	if params.IndexConstraint != nil {
-		f.encodeInt(params.IndexConstraint.Spans.Count())
+		// Encode 1 to represent one or more spans. We don't encode the exact
+		// number of spans so that two queries with the same plan but a
+		// different number of spans have the same gist.
+		f.encodeInt(1)
 	} else {
 		f.encodeInt(0)
 	}
 
 	if params.InvertedConstraint != nil {
-		f.encodeInt(params.InvertedConstraint.Len())
+		// Encode 1 to represent one or more spans. We don't encode the exact
+		// number of spans so that two queries with the same plan but a
+		// different number of spans have the same gist.
+		f.encodeInt(1)
 	} else {
 		f.encodeInt(0)
 	}
 
-	f.encodeInt(int(params.HardLimit))
+	if params.HardLimit > 0 {
+		f.encodeInt(1)
+	} else {
+		f.encodeInt(0)
+	}
 }
 
 func (f *PlanGistFactory) decodeScanParams() exec.ScanParams {
@@ -416,7 +437,18 @@ func (f *PlanGistFactory) decodeScanParams() exec.ScanParams {
 
 	hardLimit := f.decodeInt()
 
-	return exec.ScanParams{NeededCols: neededCols, IndexConstraint: idxConstraint, InvertedConstraint: invertedConstraint, HardLimit: int64(hardLimit)}
+	// Since we no longer record the limit value and its just a bool tell the emit code
+	// to just print "limit", instead the misleading "limit: 1".
+	if hardLimit > 0 {
+		hardLimit = -1
+	}
+
+	return exec.ScanParams{
+		NeededCols:         neededCols,
+		IndexConstraint:    idxConstraint,
+		InvertedConstraint: invertedConstraint,
+		HardLimit:          int64(hardLimit),
+	}
 }
 
 func (f *PlanGistFactory) encodeRows(rows [][]tree.TypedExpr) {
@@ -427,3 +459,268 @@ func (f *PlanGistFactory) decodeRows() [][]tree.TypedExpr {
 	numRows := f.decodeInt()
 	return make([][]tree.TypedExpr, numRows)
 }
+
+// unknownTable implements the cat.Table interface and is used to represent
+// tables that cannot be decoded. This can happen when tables in plan gists are
+// dropped and are no longer in the catalog.
+type unknownTable struct{}
+
+func (u *unknownTable) ID() cat.StableID {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) PostgresDescriptorID() catid.DescID {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) Equals(other cat.Object) bool {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) Name() tree.Name {
+	return "?"
+}
+
+func (u *unknownTable) CollectTypes(ord int) (descpb.IDs, error) {
+	return nil, errors.AssertionFailedf("not implemented")
+}
+
+func (u *unknownTable) IsVirtualTable() bool {
+	return false
+}
+
+func (u *unknownTable) IsSystemTable() bool {
+	return false
+}
+
+func (u *unknownTable) IsMaterializedView() bool {
+	return false
+}
+
+func (u *unknownTable) ColumnCount() int {
+	return 0
+}
+
+func (u *unknownTable) Column(i int) *cat.Column {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) IndexCount() int {
+	return 0
+}
+
+func (u *unknownTable) WritableIndexCount() int {
+	return 0
+}
+
+func (u *unknownTable) DeletableIndexCount() int {
+	return 0
+}
+
+func (u *unknownTable) Index(i cat.IndexOrdinal) cat.Index {
+	return &unknownIndex{}
+}
+
+func (u *unknownTable) StatisticCount() int {
+	return 0
+}
+
+func (u *unknownTable) Statistic(i int) cat.TableStatistic {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) CheckCount() int {
+	return 0
+}
+
+func (u *unknownTable) Check(i int) cat.CheckConstraint {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) FamilyCount() int {
+	return 0
+}
+
+func (u *unknownTable) Family(i int) cat.Family {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) OutboundForeignKeyCount() int {
+	return 0
+}
+
+func (u *unknownTable) OutboundForeignKey(i int) cat.ForeignKeyConstraint {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) InboundForeignKeyCount() int {
+	return 0
+}
+
+func (u *unknownTable) InboundForeignKey(i int) cat.ForeignKeyConstraint {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) UniqueCount() int {
+	return 0
+}
+
+func (u *unknownTable) Unique(i cat.UniqueOrdinal) cat.UniqueConstraint {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownTable) Zone() cat.Zone {
+	return cat.EmptyZone()
+}
+
+func (u *unknownTable) IsPartitionAllBy() bool {
+	return false
+}
+
+func (u *unknownTable) IsRefreshViewRequired() bool {
+	return false
+}
+
+// HomeRegion is part of the cat.Table interface.
+func (u *unknownTable) HomeRegion() (region string, ok bool) {
+	return "", false
+}
+
+// IsGlobalTable is part of the cat.Table interface.
+func (u *unknownTable) IsGlobalTable() bool {
+	return false
+}
+
+// IsRegionalByRow is part of the cat.Table interface.
+func (u *unknownTable) IsRegionalByRow() bool {
+	return false
+}
+
+// HomeRegionColName is part of the cat.Table interface.
+func (u *unknownTable) HomeRegionColName() (colName string, ok bool) {
+	return "", false
+}
+
+// GetDatabaseID is part of the cat.Table interface.
+func (u *unknownTable) GetDatabaseID() descpb.ID {
+	return 0
+}
+
+var _ cat.Table = &unknownTable{}
+
+// unknownTable implements the cat.Index interface and is used to represent
+// indexes that cannot be decoded. This can happen when indexes in plan gists
+// are dropped and are no longer in the catalog.
+type unknownIndex struct{}
+
+func (u *unknownIndex) ID() cat.StableID {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownIndex) Name() tree.Name {
+	return "?"
+}
+
+func (u *unknownIndex) Table() cat.Table {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownIndex) Ordinal() cat.IndexOrdinal {
+	return 0
+}
+
+func (u *unknownIndex) IsUnique() bool {
+	return false
+}
+
+func (u *unknownIndex) IsInverted() bool {
+	return false
+}
+
+func (u *unknownIndex) IsNotVisible() bool {
+	return false
+}
+
+func (u *unknownIndex) ColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) ExplicitColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) KeyColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) LaxKeyColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) NonInvertedPrefixColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) Column(i int) cat.IndexColumn {
+	var col cat.Column
+	col.Init(
+		i,
+		cat.StableID(0),
+		"?",
+		cat.Ordinary,
+		types.Int,
+		true, /* nullable */
+		cat.Visible,
+		nil, /* defaultExpr */
+		nil, /* computedExpr */
+		nil, /* onUpdateExpr */
+		cat.NotGeneratedAsIdentity,
+		nil, /* generatedAsIdentitySequenceOption */
+	)
+	return cat.IndexColumn{
+		Column:     &col,
+		Descending: false,
+	}
+}
+
+func (u *unknownIndex) InvertedColumn() cat.IndexColumn {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownIndex) Predicate() (string, bool) {
+	return "", false
+}
+
+func (u *unknownIndex) Zone() cat.Zone {
+	return cat.EmptyZone()
+}
+
+func (u *unknownIndex) Span() roachpb.Span {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+func (u *unknownIndex) ImplicitColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) ImplicitPartitioningColumnCount() int {
+	return 0
+}
+
+func (u *unknownIndex) GeoConfig() geoindex.Config {
+	return geoindex.Config{}
+}
+
+func (u *unknownIndex) Version() descpb.IndexDescriptorVersion {
+	return descpb.LatestIndexDescriptorVersion
+}
+
+func (u *unknownIndex) PartitionCount() int {
+	return 0
+}
+
+func (u *unknownIndex) Partition(i int) cat.Partition {
+	panic(errors.AssertionFailedf("not implemented"))
+}
+
+var _ cat.Index = &unknownIndex{}

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -107,7 +109,7 @@ func TestClosedTimestampCanServe(t *testing.T) {
 			baWrite.Txn = &txn
 			baWrite.Add(r)
 			baWrite.RangeID = repls[0].RangeID
-			if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock().Now); err != nil {
+			if err := baWrite.SetActiveTimestamp(tc.Server(0).Clock()); err != nil {
 				t.Fatal(err)
 			}
 
@@ -254,6 +256,11 @@ func TestClosedTimestampCantServeWithConflictingIntent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Set a long txn liveness threshold so that the txn cannot be aborted.
+	// Note: we want the defer to fire *after* the server has stopped to
+	// avoid data races.
+	defer txnwait.TestingOverrideTxnLivenessThreshold(time.Hour)()
+
 	ctx := context.Background()
 	tc, _, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, aggressiveResolvedTimestampClusterArgs, "cttest", "kv")
 	defer tc.Stopper().Stop(ctx)
@@ -275,9 +282,6 @@ func TestClosedTimestampCantServeWithConflictingIntent(t *testing.T) {
 		require.Nil(t, err)
 		txn.Update(resp.Header().Txn)
 	}
-
-	// Set a long txn liveness threshold so that the txn cannot be aborted.
-	defer txnwait.TestingOverrideTxnLivenessThreshold(time.Hour)()
 
 	// runFollowerReads attempts to perform a follower read on a different key on
 	// each replica, using the provided timestamp as the request timestamp.
@@ -589,7 +593,7 @@ func TestClosedTimestampCantServeForNonTransactionalBatch(t *testing.T) {
 		// Otherwise, all three should succeed.
 		baRead.Txn = nil
 		if tsFromServer {
-			baRead.TimestampFromServerClock = true
+			baRead.TimestampFromServerClock = (*hlc.ClockTimestamp)(&ts)
 			verifyNotLeaseHolderErrors(t, baRead, repls, 2)
 		} else {
 			testutils.SucceedsSoon(t, func() error {
@@ -605,6 +609,8 @@ func TestClosedTimestampCantServeForNonTransactionalBatch(t *testing.T) {
 func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	skip.UnderRace(t)
 
 	for _, test := range []struct {
 		name string
@@ -676,7 +682,7 @@ func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 					},
 					Knobs: base.TestingKnobs{
 						Server: &server.TestingKnobs{
-							ClockSource: manual.UnixNano,
+							WallClock: manual,
 						},
 						Store: &kvserver.StoreTestingKnobs{
 							// This test suspends the merge txn right before it can apply the
@@ -705,12 +711,12 @@ func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 			// lease but not over the RHS lease.
 			tc, _ := setupTestClusterWithDummyRange(t, clusterArgs, "cttest" /* dbName */, "kv" /* tableName */, numNodes)
 			defer tc.Stopper().Stop(ctx)
-			_, err := tc.ServerConn(0).Exec(fmt.Sprintf(`
+			sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+			sqlDB.ExecMultiple(t, strings.Split(fmt.Sprintf(`
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
-`, 5*time.Second, 100*time.Millisecond))
-			require.NoError(t, err)
+`, 5*time.Second, 100*time.Millisecond), ";")...)
 			leftDesc, rightDesc := splitDummyRangeInTestCluster(t, tc, "cttest", "kv", hlc.Timestamp{} /* splitExpirationTime */)
 
 			leftLeaseholder := getCurrentLeaseholder(t, tc, leftDesc)
@@ -770,7 +776,7 @@ SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
 			require.NoError(t, err)
 			r, err := store.GetReplica(rightDesc.RangeID)
 			require.NoError(t, err)
-			maxClosed := r.GetClosedTimestamp(ctx)
+			maxClosed := r.GetCurrentClosedTimestamp(ctx)
 			// Note that maxClosed would not necessarily be below the freeze start if
 			// this was a LEAD_FOR_GLOBAL_READS range.
 			assert.True(t, maxClosed.LessEq(freezeStartTimestamp),
@@ -805,7 +811,7 @@ SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
 				mergedLeaseholder, err := leftLeaseholderStore.GetReplica(leftDesc.RangeID)
 				require.NoError(t, err)
 				writeTime := rhsLeaseStart.Prev()
-				require.True(t, mergedLeaseholder.GetClosedTimestamp(ctx).Less(writeTime))
+				require.True(t, mergedLeaseholder.GetCurrentClosedTimestamp(ctx).Less(writeTime))
 				var baWrite roachpb.BatchRequest
 				baWrite.Header.RangeID = leftDesc.RangeID
 				baWrite.Header.Timestamp = writeTime
@@ -1098,6 +1104,10 @@ func countNotLeaseHolderErrors(ba roachpb.BatchRequest, repls []*kvserver.Replic
 const testingTargetDuration = 300 * time.Millisecond
 
 const testingSideTransportInterval = 100 * time.Millisecond
+
+// TODO(nvanbenschoten): this is a pretty bad variable name to leak into the
+// global scope of the kvserver_test package. At least one test was using it
+// unintentionally. Remove it.
 const numNodes = 3
 
 func replsForRange(
@@ -1182,12 +1192,13 @@ func setupClusterForClosedTSTesting(
 	dbName, tableName string,
 ) (tc serverutils.TestClusterInterface, db0 *gosql.DB, kvTableDesc roachpb.RangeDescriptor) {
 	tc, desc := setupTestClusterWithDummyRange(t, clusterArgs, dbName, tableName, numNodes)
-	_, err := tc.ServerConn(0).Exec(fmt.Sprintf(`
+	sqlRunner := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	sqlRunner.ExecMultiple(t, strings.Split(fmt.Sprintf(`
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
-`, targetDuration, targetDuration/4))
-	require.NoError(t, err)
+`, targetDuration, targetDuration/4),
+		";")...)
 
 	return tc, tc.ServerConn(0), desc
 }

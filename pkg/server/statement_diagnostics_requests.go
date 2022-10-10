@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -30,6 +30,8 @@ type stmtDiagnosticsRequest struct {
 	Completed              bool
 	StatementDiagnosticsID int
 	RequestedAt            time.Time
+	// Zero value indicates that we're sampling every execution.
+	SamplingProbability float64
 	// Zero value indicates that there is no minimum latency set on the request.
 	MinExecutionLatency time.Duration
 	// Zero value indicates that the request never expires.
@@ -82,7 +84,11 @@ func (s *statusServer) CreateStatementDiagnosticsReport(
 	}
 
 	err := s.stmtDiagnosticsRequester.InsertRequest(
-		ctx, req.StatementFingerprint, req.MinExecutionLatency, req.ExpiresAfter,
+		ctx,
+		req.StatementFingerprint,
+		req.SamplingProbability,
+		req.MinExecutionLatency,
+		req.ExpiresAfter,
 	)
 	if err != nil {
 		return nil, err
@@ -106,7 +112,7 @@ func (s *statusServer) CancelStatementDiagnosticsReport(
 	}
 
 	var response serverpb.CancelStatementDiagnosticsReportResponse
-	err := s.stmtDiagnosticsRequester.CancelRequest(ctx, req.StatementFingerprint)
+	err := s.stmtDiagnosticsRequester.CancelRequest(ctx, req.RequestID)
 	if err != nil {
 		response.Canceled = false
 		response.Error = err.Error()
@@ -118,7 +124,7 @@ func (s *statusServer) CancelStatementDiagnosticsReport(
 
 // StatementDiagnosticsRequests retrieves all statement diagnostics
 // requests in the `system.statement_diagnostics_requests` table that
-// have not yet expired.
+// have either completed or have not yet expired.
 func (s *statusServer) StatementDiagnosticsRequests(
 	ctx context.Context, _ *serverpb.StatementDiagnosticsReportsRequest,
 ) (*serverpb.StatementDiagnosticsReportsResponse, error) {
@@ -131,25 +137,25 @@ func (s *statusServer) StatementDiagnosticsRequests(
 
 	var err error
 
-	// TODO(yuzefovich): remove this version gating in 22.2.
+	// TODO(irfansharif): Remove this version gating in 23.1.
 	var extraColumns string
-	if s.admin.server.st.Version.IsActive(ctx, clusterversion.AlterSystemStmtDiagReqs) {
+	if s.admin.server.st.Version.IsActive(ctx, clusterversion.SampledStmtDiagReqs) {
 		extraColumns = `,
-			min_execution_latency,
-			expires_at`
+			sampling_probability`
 	}
-
 	// TODO(davidh): Add pagination to this request.
 	it, err := s.internalExecutor.QueryIteratorEx(ctx, "stmt-diag-get-all", nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
+			User: username.RootUserName(),
 		},
 		fmt.Sprintf(`SELECT
 			id,
 			statement_fingerprint,
 			completed,
 			statement_diagnostics_id,
-			requested_at%s
+			requested_at,
+			min_execution_latency,
+			expires_at%s
 		FROM
 			system.statement_diagnostics_requests`, extraColumns))
 	if err != nil {
@@ -176,15 +182,19 @@ func (s *statusServer) StatementDiagnosticsRequests(
 			req.RequestedAt = requestedAt.Time
 		}
 		if extraColumns != "" {
-			if minExecutionLatency, ok := row[5].(*tree.DInterval); ok {
-				req.MinExecutionLatency = time.Duration(minExecutionLatency.Duration.Nanos())
+			if samplingProbability, ok := row[7].(*tree.DFloat); ok {
+				req.SamplingProbability = float64(*samplingProbability)
 			}
-			if expiresAt, ok := row[6].(*tree.DTimestampTZ); ok {
-				req.ExpiresAt = expiresAt.Time
-				// Don't return already expired requests.
-				if req.ExpiresAt.Before(timeutil.Now()) {
-					continue
-				}
+		}
+
+		if minExecutionLatency, ok := row[5].(*tree.DInterval); ok {
+			req.MinExecutionLatency = time.Duration(minExecutionLatency.Duration.Nanos())
+		}
+		if expiresAt, ok := row[6].(*tree.DTimestampTZ); ok {
+			req.ExpiresAt = expiresAt.Time
+			// Don't return already expired requests.
+			if !completed && req.ExpiresAt.Before(timeutil.Now()) {
+				continue
 			}
 		}
 
@@ -224,7 +234,7 @@ func (s *statusServer) StatementDiagnostics(
 	var err error
 	row, err := s.internalExecutor.QueryRowEx(ctx, "stmt-diag-get-one", nil, /* txn */
 		sessiondata.InternalExecutorOverride{
-			User: security.RootUserName(),
+			User: username.RootUserName(),
 		},
 		`SELECT
 			id,

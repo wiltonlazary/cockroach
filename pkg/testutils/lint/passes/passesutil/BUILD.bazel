@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -15,6 +16,7 @@ go_test(
     name = "passesutil_test",
     size = "small",
     srcs = ["passes_util_test.go"],
+    args = ["-test.timeout=55s"],
     data = [
         "//pkg/testutils/lint/passes/forbiddenmethod:testdata",
         "//pkg/testutils/lint/passes/unconvert:testdata",
@@ -29,3 +31,5 @@ go_test(
         "@org_golang_x_tools//go/analysis/analysistest",
     ],
 )
+
+get_x_data(name = "get_x_data")

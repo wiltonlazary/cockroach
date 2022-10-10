@@ -23,13 +23,10 @@ type NodeIterator func(n *screl.Node) error
 // ForEachNode iterates the nodes in the graph.
 func (g *Graph) ForEachNode(it NodeIterator) error {
 	for _, m := range g.targetNodes {
-		for i := 0; i < scpb.NumStatus; i++ {
+		for i := range scpb.Status_name {
 			if ts, ok := m[scpb.Status(i)]; ok {
 				if err := it(ts); err != nil {
-					if iterutil.Done(err) {
-						err = nil
-					}
-					return err
+					return iterutil.Map(err)
 				}
 			}
 		}
@@ -43,15 +40,14 @@ type EdgeIterator func(e Edge) error
 
 // ForEachEdge iterates the edges in the graph.
 func (g *Graph) ForEachEdge(it EdgeIterator) error {
-	for _, e := range g.edges {
+	for _, e := range g.opEdges {
 		if err := it(e); err != nil {
-			if iterutil.Done(err) {
-				err = nil
-			}
-			return err
+			return iterutil.Map(err)
 		}
 	}
-	return nil
+	return g.depEdges.iterate(func(de *DepEdge) error {
+		return it(de)
+	})
 }
 
 // DepEdgeIterator is used to iterate dep edges. Return iterutil.StopIteration
@@ -61,11 +57,11 @@ type DepEdgeIterator func(de *DepEdge) error
 // ForEachDepEdgeFrom iterates the dep edges in the graph with the selected
 // source.
 func (g *Graph) ForEachDepEdgeFrom(n *screl.Node, it DepEdgeIterator) (err error) {
-	return g.depEdgesFrom.iterateSourceNode(n, it)
+	return g.depEdges.iterateFromNode(n, it)
 }
 
 // ForEachDepEdgeTo iterates the dep edges in the graph with the selected
 // destination.
 func (g *Graph) ForEachDepEdgeTo(n *screl.Node, it DepEdgeIterator) (err error) {
-	return g.depEdgesTo.iterateSourceNode(n, it)
+	return g.depEdges.iterateToNode(n, it)
 }

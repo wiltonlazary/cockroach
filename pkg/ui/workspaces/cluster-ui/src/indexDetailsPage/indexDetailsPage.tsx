@@ -15,13 +15,18 @@ import { SortSetting } from "src/sortedtable";
 import styles from "./indexDetailsPage.module.scss";
 import { baseHeadingClasses } from "src/transactionsPage/transactionsPageClasses";
 import { CaretRight } from "../icon/caretRight";
-import { Breadcrumbs } from "../breadcrumbs";
-import { Search as IndexIcon } from "@cockroachlabs/icons";
+import { BreadcrumbItem, Breadcrumbs } from "../breadcrumbs";
+import { Caution, Search as IndexIcon } from "@cockroachlabs/icons";
 import { SqlBox } from "src/sql";
 import { Col, Row, Tooltip } from "antd";
+import "antd/lib/col/style";
+import "antd/lib/row/style";
+import "antd/lib/tooltip/style";
 import { SummaryCard } from "../summaryCard";
-import { formatDate } from "antd/es/date-picker/utils";
 import moment, { Moment } from "moment";
+import { Heading } from "@cockroachlabs/ui-components";
+import { Anchor } from "../anchor";
+import { Count, DATE_FORMAT_24_UTC, performanceTuningRecipes } from "../util";
 
 const cx = classNames.bind(styles);
 
@@ -52,6 +57,7 @@ export interface IndexDetailsPageData {
   tableName: string;
   indexName: string;
   details: IndexDetails;
+  breadcrumbItems: BreadcrumbItem[];
 }
 
 interface IndexDetails {
@@ -61,6 +67,12 @@ interface IndexDetails {
   totalReads: number;
   lastRead: Moment;
   lastReset: Moment;
+  indexRecommendations: IndexRecommendation[];
+}
+
+interface IndexRecommendation {
+  type: string;
+  reason: string;
 }
 
 export interface IndexDetailPageActions {
@@ -90,11 +102,11 @@ export class IndexDetailsPage extends React.Component<
     };
   }
 
-  componentDidMount() {
+  componentDidMount(): void {
     this.refresh();
   }
 
-  componentDidUpdate() {
+  componentDidUpdate(): void {
     this.refresh();
   }
 
@@ -110,40 +122,103 @@ export class IndexDetailsPage extends React.Component<
     }
   }
 
-  private getTimestampString(timestamp: Moment) {
+  private getTimestampString(timestamp: Moment): string {
     const minDate = moment.utc("0001-01-01"); // minimum value as per UTC
     if (timestamp.isSame(minDate)) {
       return "Never";
     } else {
-      return formatDate(timestamp, "MMM DD, YYYY [at] h:mm A [(UTC)]");
+      return timestamp.format(DATE_FORMAT_24_UTC);
     }
   }
 
-  render() {
+  private renderIndexRecommendations(
+    indexRecommendations: IndexRecommendation[],
+  ) {
+    if (indexRecommendations.length === 0) {
+      return (
+        <tr>
+          <td>None</td>
+        </tr>
+      );
+    }
+    return indexRecommendations.map(recommendation => {
+      let recommendationType: string;
+      switch (recommendation.type) {
+        case "DROP_UNUSED":
+          recommendationType = "Drop unused index";
+      }
+      // TODO(thomas): using recommendation.type as the key seems not good.
+      //  - if it is possible for an index to have multiple recommendations of the same type
+      //  this could cause issues.
+      return (
+        <tr
+          key={recommendationType}
+          className={cx("index-recommendations-rows")}
+        >
+          <td
+            className={cx(
+              "index-recommendations-rows__header",
+              "icon__container",
+            )}
+          >
+            <Caution className={cx("icon--s", "icon--warning")} />
+            {recommendationType}
+          </td>
+          <td
+            className={cx(
+              "index-recommendations-rows__content",
+              "index-recommendations__tooltip-anchor",
+            )}
+          >
+            <span className={cx("summary-card--label")}>Reason:</span>{" "}
+            {recommendation.reason}{" "}
+            <Anchor href={performanceTuningRecipes} target="_blank">
+              Learn more
+            </Anchor>
+          </td>
+        </tr>
+      );
+    });
+  }
+
+  private renderBreadcrumbs() {
+    if (this.props.breadcrumbItems) {
+      return (
+        <Breadcrumbs
+          items={this.props.breadcrumbItems}
+          divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+        />
+      );
+    }
+    // If no props are passed, render db-console breadcrumb links by default.
+    return (
+      <Breadcrumbs
+        items={[
+          { link: "/databases", name: "Databases" },
+          {
+            link: `/database/${this.props.databaseName}`,
+            name: "Tables",
+          },
+          {
+            link: `/database/${this.props.databaseName}/table/${this.props.tableName}`,
+            name: `Table: ${this.props.tableName}`,
+          },
+          {
+            link: `/database/${this.props.databaseName}/table/${this.props.tableName}/index/${this.props.indexName}`,
+            name: `Index: ${this.props.indexName}`,
+          },
+        ]}
+        divider={<CaretRight className={cx("icon--xxs", "icon--primary")} />}
+      />
+    );
+  }
+
+  render(): React.ReactElement {
     return (
       <div className={cx("page-container")}>
         <div className="root table-area">
           <section className={baseHeadingClasses.wrapper}>
-            <Breadcrumbs
-              items={[
-                { link: "/databases", name: "Databases" },
-                {
-                  link: `/database/${this.props.databaseName}`,
-                  name: "Tables",
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}`,
-                  name: `Table: ${this.props.tableName}`,
-                },
-                {
-                  link: `/database/${this.props.databaseName}/table/${this.props.tableName}/index/${this.props.indexName}`,
-                  name: `Index: ${this.props.indexName}`,
-                },
-              ]}
-              divider={
-                <CaretRight className={cx("icon--xxs", "icon--primary")} />
-              }
-            />
+            {this.renderBreadcrumbs()}
           </section>
           <div className={cx("header-container")}>
             <h3
@@ -157,7 +232,7 @@ export class IndexDetailsPage extends React.Component<
             <div className={cx("reset-info")}>
               <Tooltip
                 placement="bottom"
-                title="Index stats accumulate from the time they were last cleared. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster."
+                title="Index stats accumulate from the time the index was created or had its stats reset.. Clicking ‘Reset all index stats’ will reset index stats for the entire cluster. Last reset is the timestamp at which the last reset started."
               >
                 <div className={cx("last-reset", "underline")}>
                   Last reset:{" "}
@@ -166,7 +241,11 @@ export class IndexDetailsPage extends React.Component<
               </Tooltip>
               <div>
                 <a
-                  className={cx("action", "separator")}
+                  className={cx(
+                    "action",
+                    "separator",
+                    "index-stats__reset-btn",
+                  )}
                   onClick={() =>
                     this.props.resetIndexUsageStats(
                       this.props.databaseName,
@@ -187,7 +266,7 @@ export class IndexDetailsPage extends React.Component<
             </Row>
             <Row gutter={18}>
               <Col className="gutter-row" span={18}>
-                <SummaryCard className={cx("summary-card")}>
+                <SummaryCard className={cx("summary-card--row")}>
                   <table className="table">
                     <tbody>
                       <tr className={cx("summary-card--row", "table__row")}>
@@ -203,7 +282,7 @@ export class IndexDetailsPage extends React.Component<
                         </td>
                         <td className="table__cell">
                           <p className={cx("summary-card--value")}>
-                            {this.props.details.totalReads}
+                            {Count(this.props.details.totalReads)}
                           </p>
                         </td>
                       </tr>
@@ -226,6 +305,20 @@ export class IndexDetailsPage extends React.Component<
                           </p>
                         </td>
                       </tr>
+                    </tbody>
+                  </table>
+                </SummaryCard>
+              </Col>
+            </Row>
+            <Row gutter={18}>
+              <Col className="gutter-row" span={18}>
+                <SummaryCard className={cx("summary-card--row")}>
+                  <Heading type="h5">Index recommendations</Heading>
+                  <table>
+                    <tbody>
+                      {this.renderIndexRecommendations(
+                        this.props.details.indexRecommendations,
+                      )}
                     </tbody>
                   </table>
                 </SummaryCard>

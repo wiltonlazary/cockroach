@@ -11,31 +11,40 @@
 package amazon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/url"
 	"path"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/types"
 )
 
@@ -58,22 +67,66 @@ const (
 	// KMS ID to be used for server side encryption.
 	AWSServerSideEncryptionKMSID = "AWS_SERVER_KMS_ID"
 
+	// S3StorageClassParam is the query parameter used in S3 URIs to configure the
+	// storage class for written objects.
+	S3StorageClassParam = "S3_STORAGE_CLASS"
+
 	// S3RegionParam is the query parameter for the 'endpoint' in an S3 URI.
 	S3RegionParam = "AWS_REGION"
 
 	// KMSRegionParam is the query parameter for the 'region' in every KMS URI.
 	KMSRegionParam = "REGION"
+
+	// AssumeRoleParam is the query parameter for the chain of AWS Role ARNs to
+	// assume.
+	AssumeRoleParam = "ASSUME_ROLE"
+
+	// scheme component of an S3 URI.
+	scheme = "s3"
 )
 
 type s3Storage struct {
 	bucket   *string
-	conf     *roachpb.ExternalStorage_S3
+	conf     *cloudpb.ExternalStorage_S3
 	ioConf   base.ExternalIODirConfig
 	settings *cluster.Settings
 	prefix   string
 
 	opts   s3ClientConfig
 	cached *s3Client
+}
+
+var _ request.Retryer = &customRetryer{}
+
+// customRetryer implements the `request.Retryer` interface and allows for
+// customization of the retry behaviour of an AWS client.
+type customRetryer struct {
+	client.DefaultRetryer
+}
+
+// isErrReadConnectionReset returns true if the underlying error is a read
+// connection reset error.
+//
+// NB: A read connection reset error is thrown when the SDK is unable to read
+// the response of an underlying API request due to a connection reset. The
+// DefaultRetryer in the AWS SDK does not treat this error as a retryable error
+// since the SDK does not have knowledge about the idempotence of the request,
+// and whether it is safe to retry -
+// https://github.com/aws/aws-sdk-go/pull/2926#issuecomment-553637658.
+//
+// In CRDB all operations with s3 (read, write, list) are considered idempotent,
+// and so we can treat the read connection reset error as retryable too.
+func isErrReadConnectionReset(err error) bool {
+	// The error string must match the one in
+	// github.com/aws/aws-sdk-go/aws/request/connection_reset_error.go. This is
+	// unfortunate but the only solution until the SDK exposes a specialized error
+	// code or type for this class of errors.
+	return err != nil && strings.Contains(err.Error(), "read: connection reset")
+}
+
+// ShouldRetry implements the request.Retryer interface.
+func (sr *customRetryer) ShouldRetry(r *request.Request) bool {
+	return sr.DefaultRetryer.ShouldRetry(r) || isErrReadConnectionReset(r.Error)
 }
 
 // s3Client wraps an SDK client and uploader for a given session.
@@ -89,27 +142,37 @@ var reuseSession = settings.RegisterBoolSetting(
 	true,
 )
 
+var usePutObject = settings.RegisterBoolSetting(
+	settings.TenantWritable,
+	"cloudstorage.s3.buffer_and_put_uploads.enabled",
+	"construct files in memory before uploading via PutObject (may cause crashes due to memory usage)",
+	false,
+)
+
 // s3ClientConfig is the immutable config used to initialize an s3 session.
 // It contains values copied from corresponding fields in ExternalStorage_S3
 // which are used by the session (but not those that are only used by individual
 // requests).
 type s3ClientConfig struct {
 	// copied from ExternalStorage_S3.
-	endpoint, region, bucket, accessKey, secret, tempToken, auth string
+	endpoint, region, bucket, accessKey, secret, tempToken, auth, roleARN string
+	delegateRoleARNs                                                      []string
 	// log.V(2) decides session init params so include it in key.
 	verbose bool
 }
 
-func clientConfig(conf *roachpb.ExternalStorage_S3) s3ClientConfig {
+func clientConfig(conf *cloudpb.ExternalStorage_S3) s3ClientConfig {
 	return s3ClientConfig{
-		endpoint:  conf.Endpoint,
-		region:    conf.Region,
-		bucket:    conf.Bucket,
-		accessKey: conf.AccessKey,
-		secret:    conf.Secret,
-		tempToken: conf.TempToken,
-		auth:      conf.Auth,
-		verbose:   log.V(2),
+		endpoint:         conf.Endpoint,
+		region:           conf.Region,
+		bucket:           conf.Bucket,
+		accessKey:        conf.AccessKey,
+		secret:           conf.Secret,
+		tempToken:        conf.TempToken,
+		auth:             conf.Auth,
+		verbose:          log.V(2),
+		roleARN:          conf.RoleARN,
+		delegateRoleARNs: conf.DelegateRoleARNs,
 	}
 }
 
@@ -130,7 +193,7 @@ const (
 )
 
 // S3URI returns the string URI for a given bucket and path.
-func S3URI(bucket, path string, conf *roachpb.ExternalStorage_S3) string {
+func S3URI(bucket, path string, conf *cloudpb.ExternalStorage_S3) string {
 	q := make(url.Values)
 	setIf := func(key, value string) {
 		if value != "" {
@@ -145,6 +208,11 @@ func S3URI(bucket, path string, conf *roachpb.ExternalStorage_S3) string {
 	setIf(cloud.AuthParam, conf.Auth)
 	setIf(AWSServerSideEncryptionMode, conf.ServerEncMode)
 	setIf(AWSServerSideEncryptionKMSID, conf.ServerKMSID)
+	setIf(S3StorageClassParam, conf.StorageClass)
+	if conf.RoleARN != "" {
+		roles := append(conf.DelegateRoleARNs, conf.RoleARN)
+		q.Set(AssumeRoleParam, strings.Join(roles, ","))
+	}
 
 	s3URL := url.URL{
 		Scheme:   "s3",
@@ -156,20 +224,29 @@ func S3URI(bucket, path string, conf *roachpb.ExternalStorage_S3) string {
 	return s3URL.String()
 }
 
-func parseS3URL(_ cloud.ExternalStorageURIContext, uri *url.URL) (roachpb.ExternalStorage, error) {
-	conf := roachpb.ExternalStorage{}
-	conf.Provider = roachpb.ExternalStorageProvider_s3
-	conf.S3Config = &roachpb.ExternalStorage_S3{
-		Bucket:        uri.Host,
-		Prefix:        uri.Path,
-		AccessKey:     uri.Query().Get(AWSAccessKeyParam),
-		Secret:        uri.Query().Get(AWSSecretParam),
-		TempToken:     uri.Query().Get(AWSTempTokenParam),
-		Endpoint:      uri.Query().Get(AWSEndpointParam),
-		Region:        uri.Query().Get(S3RegionParam),
-		Auth:          uri.Query().Get(cloud.AuthParam),
-		ServerEncMode: uri.Query().Get(AWSServerSideEncryptionMode),
-		ServerKMSID:   uri.Query().Get(AWSServerSideEncryptionKMSID),
+func parseS3URL(_ cloud.ExternalStorageURIContext, uri *url.URL) (cloudpb.ExternalStorage, error) {
+	s3URL := cloud.ConsumeURL{URL: uri}
+	conf := cloudpb.ExternalStorage{}
+	if s3URL.Host == "" {
+		return conf, errors.New("empty host component; s3 URI must specify a target bucket")
+	}
+
+	conf.Provider = cloudpb.ExternalStorageProvider_s3
+	assumeRole, delegateRoles := cloud.ParseRoleString(s3URL.ConsumeParam(AssumeRoleParam))
+	conf.S3Config = &cloudpb.ExternalStorage_S3{
+		Bucket:           s3URL.Host,
+		Prefix:           s3URL.Path,
+		AccessKey:        s3URL.ConsumeParam(AWSAccessKeyParam),
+		Secret:           s3URL.ConsumeParam(AWSSecretParam),
+		TempToken:        s3URL.ConsumeParam(AWSTempTokenParam),
+		Endpoint:         s3URL.ConsumeParam(AWSEndpointParam),
+		Region:           s3URL.ConsumeParam(S3RegionParam),
+		Auth:             s3URL.ConsumeParam(cloud.AuthParam),
+		ServerEncMode:    s3URL.ConsumeParam(AWSServerSideEncryptionMode),
+		ServerKMSID:      s3URL.ConsumeParam(AWSServerSideEncryptionKMSID),
+		StorageClass:     s3URL.ConsumeParam(S3StorageClassParam),
+		RoleARN:          assumeRole,
+		DelegateRoleARNs: delegateRoles,
 		/* NB: additions here should also update s3QueryParams() serializer */
 	}
 	conf.S3Config.Prefix = strings.TrimLeft(conf.S3Config.Prefix, "/")
@@ -181,12 +258,60 @@ func parseS3URL(_ cloud.ExternalStorageURIContext, uri *url.URL) (roachpb.Extern
 	// contain spaces. We can convert any space characters we see to +
 	// characters to recover the original secret.
 	conf.S3Config.Secret = strings.Replace(conf.S3Config.Secret, " ", "+", -1)
+
+	// Validate that all the passed in parameters are supported.
+	if unknownParams := s3URL.RemainingQueryParams(); len(unknownParams) > 0 {
+		return cloudpb.ExternalStorage{}, errors.Errorf(
+			`unknown S3 query parameters: %s`, strings.Join(unknownParams, ", "))
+	}
+
+	// Validate the authentication parameters are set correctly.
+	switch conf.S3Config.Auth {
+	case "", cloud.AuthParamSpecified:
+		if conf.S3Config.AccessKey == "" {
+			return cloudpb.ExternalStorage{}, errors.Errorf(
+				"%s is set to '%s', but %s is not set",
+				cloud.AuthParam,
+				cloud.AuthParamSpecified,
+				AWSAccessKeyParam,
+			)
+		}
+		if conf.S3Config.Secret == "" {
+			return cloudpb.ExternalStorage{}, errors.Errorf(
+				"%s is set to '%s', but %s is not set",
+				cloud.AuthParam,
+				cloud.AuthParamSpecified,
+				AWSSecretParam,
+			)
+		}
+	case cloud.AuthParamImplicit:
+	default:
+		return cloudpb.ExternalStorage{}, errors.Errorf("unsupported value %s for %s",
+			conf.S3Config.Auth, cloud.AuthParam)
+	}
+
+	// Ensure that a KMS ID is specified if server side encryption is set to use
+	// KMS.
+	if conf.S3Config.ServerEncMode != "" {
+		switch conf.S3Config.ServerEncMode {
+		case string(aes256Enc):
+		case string(kmsEnc):
+			if conf.S3Config.ServerKMSID == "" {
+				return cloudpb.ExternalStorage{}, errors.New("AWS_SERVER_KMS_ID param must be set" +
+					" when using aws:kms server side encryption mode.")
+			}
+		default:
+			return cloudpb.ExternalStorage{}, errors.Newf("unsupported server encryption mode %s. "+
+				"Supported values are `aws:kms` and `AES256`.", conf.S3Config.ServerEncMode)
+		}
+	}
+
 	return conf, nil
 }
 
 // MakeS3Storage returns an instance of S3 ExternalStorage.
 func MakeS3Storage(
-	ctx context.Context, args cloud.ExternalStorageContext, dest roachpb.ExternalStorage,
+	ctx context.Context, args cloud.ExternalStorageContext, dest cloudpb.ExternalStorage,
 ) (cloud.ExternalStorage, error) {
 	telemetry.Count("external-io.s3")
 	conf := dest.S3Config
@@ -261,7 +386,7 @@ func MakeS3Storage(
 	s3ClientCache.Lock()
 	defer s3ClientCache.Unlock()
 
-	if s3ClientCache.key == s.opts {
+	if reflect.DeepEqual(s3ClientCache.key, s.opts) {
 		s.cached = s3ClientCache.client
 		return s, nil
 	}
@@ -280,6 +405,22 @@ func MakeS3Storage(
 	return s, nil
 }
 
+type awsLogAdapter struct {
+	ctx context.Context
+}
+
+func (l *awsLogAdapter) Log(vals ...interface{}) {
+	log.Infof(l.ctx, "s3: %s", fmt.Sprint(vals...))
+}
+
+func newLogAdapter(ctx context.Context) *awsLogAdapter {
+	return &awsLogAdapter{
+		ctx: logtags.AddTags(context.Background(), logtags.FromContext(ctx)),
+	}
+}
+
+var awsVerboseLogging = aws.LogLevel(aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors)
+
 // newClient creates a client from the passed s3ClientConfig and if the passed
 // config's region is empty, used the passed bucket to determine a region and
 // configures the client with it as well as returning it (so the caller can
@@ -287,11 +428,10 @@ func MakeS3Storage(
 func newClient(
 	ctx context.Context, conf s3ClientConfig, settings *cluster.Settings,
 ) (s3Client, string, error) {
-
 	// Open a span if client creation will do IO/RPCs to find creds/bucket region.
 	if conf.region == "" || conf.auth == cloud.AuthParamImplicit {
 		var sp *tracing.Span
-		ctx, sp = tracing.ChildSpan(ctx, "open s3 client")
+		ctx, sp = tracing.ChildSpan(ctx, "s3.newClient")
 		defer sp.Finish()
 	}
 
@@ -312,32 +452,69 @@ func newClient(
 		opts.Config.HTTPClient = client
 	}
 
-	switch conf.auth {
-	case "", cloud.AuthParamSpecified:
-		opts.Config.WithCredentials(credentials.NewStaticCredentials(conf.accessKey, conf.secret, conf.tempToken))
-	case cloud.AuthParamImplicit:
-		opts.SharedConfigState = session.SharedConfigEnable
-	}
-
 	// TODO(yevgeniy): Revisit retry logic.  Retrying 10 times seems arbitrary.
 	opts.Config.MaxRetries = aws.Int(10)
 
 	opts.Config.CredentialsChainVerboseErrors = aws.Bool(true)
 
+	opts.Config.Logger = newLogAdapter(ctx)
 	if conf.verbose {
-		opts.Config.LogLevel = aws.LogLevel(aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors)
+		opts.Config.LogLevel = awsVerboseLogging
 	}
 
-	sess, err := session.NewSessionWithOptions(opts)
-	if err != nil {
-		return s3Client{}, "", errors.Wrap(err, "new aws session")
+	retryer := &customRetryer{
+		DefaultRetryer: client.DefaultRetryer{
+			NumMaxRetries: *opts.Config.MaxRetries,
+		},
+	}
+	opts.Config.Retryer = retryer
+
+	var sess *session.Session
+	var err error
+
+	switch conf.auth {
+	case "", cloud.AuthParamSpecified:
+		sess, err = session.NewSessionWithOptions(opts)
+		if err != nil {
+			return s3Client{}, "", errors.Wrap(err, "new aws session")
+		}
+		sess.Config.Credentials = credentials.NewStaticCredentials(conf.accessKey, conf.secret, conf.tempToken)
+	case cloud.AuthParamImplicit:
+		opts.SharedConfigState = session.SharedConfigEnable
+		sess, err = session.NewSessionWithOptions(opts)
+		if err != nil {
+			return s3Client{}, "", errors.Wrap(err, "new aws session")
+		}
+	}
+
+	if conf.roleARN != "" {
+		if !settings.Version.IsActive(ctx, clusterversion.SupportAssumeRoleAuth) {
+			return s3Client{}, "", errors.New("cannot authenticate to cloud storage via assume role until cluster has fully upgraded to 22.2")
+		}
+
+		for _, role := range conf.delegateRoleARNs {
+			intermediateCreds := stscreds.NewCredentials(sess, role)
+			opts.Config.Credentials = intermediateCreds
+
+			sess, err = session.NewSessionWithOptions(opts)
+			if err != nil {
+				return s3Client{}, "", errors.Wrap(err, "session with intermediate credentials")
+			}
+		}
+
+		creds := stscreds.NewCredentials(sess, conf.roleARN)
+		opts.Config.Credentials = creds
+		sess, err = session.NewSessionWithOptions(opts)
+		if err != nil {
+			return s3Client{}, "", errors.Wrap(err, "session with assume role credentials")
+		}
 	}
 
 	region := conf.region
 	if region == "" {
 		if err := cloud.DelayedRetry(ctx, "s3manager.GetBucketRegion", s3ErrDelay, func() error {
 			region, err = s3manager.GetBucketRegion(ctx, sess, conf.bucket, "us-east-1")
-			return nil
+			return err
 		}); err != nil {
 			return s3Client{}, "", errors.Wrap(err, "could not find s3 bucket's region")
 		}
@@ -345,7 +522,9 @@ func newClient(
 	sess.Config.Region = aws.String(region)
 
 	c := s3.New(sess)
-	u := s3manager.NewUploader(sess)
+	u := s3manager.NewUploader(sess, func(uploader *s3manager.Uploader) {
+		uploader.PartSize = cloud.WriteChunkSize.Get(&settings.SV)
+	})
 	return s3Client{client: c, uploader: u}, region, nil
 }
 
@@ -377,9 +556,9 @@ func (s *s3Storage) getUploader(ctx context.Context) (*s3manager.Uploader, error
 	return client.uploader, nil
 }
 
-func (s *s3Storage) Conf() roachpb.ExternalStorage {
-	return roachpb.ExternalStorage{
-		Provider: roachpb.ExternalStorageProvider_s3,
+func (s *s3Storage) Conf() cloudpb.ExternalStorage {
+	return cloudpb.ExternalStorage{
+		Provider: cloudpb.ExternalStorageProvider_s3,
 		S3Config: s.conf,
 	}
 }
@@ -388,21 +567,63 @@ func (s *s3Storage) ExternalIOConf() base.ExternalIODirConfig {
 	return s.ioConf
 }
 
+func (s *s3Storage) RequiresExternalIOAccounting() bool { return true }
+
 func (s *s3Storage) Settings() *cluster.Settings {
 	return s.settings
 }
 
+type putUploader struct {
+	b      *bytes.Buffer
+	client *s3.S3
+	input  *s3.PutObjectInput
+}
+
+func (u *putUploader) Write(p []byte) (int, error) {
+	return u.b.Write(p)
+}
+
+func (u *putUploader) Close() error {
+	u.input.Body = bytes.NewReader(u.b.Bytes())
+	_, err := u.client.PutObject(u.input)
+	return err
+}
+
+func (s *s3Storage) putUploader(ctx context.Context, basename string) (io.WriteCloser, error) {
+	client, err := s.getClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 4<<20))
+
+	return &putUploader{
+		b: buf,
+		input: &s3.PutObjectInput{
+			Bucket:               s.bucket,
+			Key:                  aws.String(path.Join(s.prefix, basename)),
+			ServerSideEncryption: nilIfEmpty(s.conf.ServerEncMode),
+			SSEKMSKeyId:          nilIfEmpty(s.conf.ServerKMSID),
+			StorageClass:         nilIfEmpty(s.conf.StorageClass),
+		},
+		client: client,
+	}, nil
+}
+
 func (s *s3Storage) Writer(ctx context.Context, basename string) (io.WriteCloser, error) {
-	ctx, sp := tracing.ChildSpan(ctx, "s3.Writer")
-	defer sp.Finish()
-	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("s3.Writer: %s", path.Join(s.prefix, basename))})
+	if usePutObject.Get(&s.settings.SV) {
+		return s.putUploader(ctx, basename)
+	}
 
 	uploader, err := s.getUploader(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	ctx, sp := tracing.ChildSpan(ctx, "s3.Writer")
+	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("s3.Writer: %s", path.Join(s.prefix, basename))})
 	return cloud.BackgroundPipe(ctx, func(ctx context.Context, r io.Reader) error {
+		defer sp.Finish()
 		// Upload the file to S3.
 		// TODO(dt): test and tune the uploader parameters.
 		_, err := uploader.UploadWithContext(ctx, &s3manager.UploadInput{
@@ -411,6 +632,7 @@ func (s *s3Storage) Writer(ctx context.Context, basename string) (io.WriteCloser
 			Body:                 r,
 			ServerSideEncryption: nilIfEmpty(s.conf.ServerEncMode),
 			SSEKMSKeyId:          nilIfEmpty(s.conf.ServerKMSID),
+			StorageClass:         nilIfEmpty(s.conf.StorageClass),
 		})
 		return errors.Wrap(err, "upload failed")
 	}), nil
@@ -448,7 +670,7 @@ func (s *s3Storage) openStreamAt(
 }
 
 // ReadFile is shorthand for ReadFileAt with offset 0.
-func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadCloser, error) {
+func (s *s3Storage) ReadFile(ctx context.Context, basename string) (ioctx.ReadCloserCtx, error) {
 	reader, _, err := s.ReadFileAt(ctx, basename, 0)
 	return reader, err
 }
@@ -456,7 +678,7 @@ func (s *s3Storage) ReadFile(ctx context.Context, basename string) (io.ReadClose
 // ReadFileAt opens a reader at the requested offset.
 func (s *s3Storage) ReadFileAt(
 	ctx context.Context, basename string, offset int64,
-) (io.ReadCloser, int64, error) {
+) (ioctx.ReadCloserCtx, int64, error) {
 	ctx, sp := tracing.ChildSpan(ctx, "s3.ReadFileAt")
 	defer sp.Finish()
 	sp.RecordStructured(&types.StringValue{Value: fmt.Sprintf("s3.ReadFileAt: %s", path.Join(s.prefix, basename))})
@@ -476,9 +698,18 @@ func (s *s3Storage) ReadFileAt(
 		}
 	} else {
 		if stream.ContentLength == nil {
-			return nil, 0, errors.New("expected content length")
+			log.Warningf(ctx, "Content length missing from S3 GetObject (is this actually s3?); attempting to lookup size with separate call...")
+			// Some not-actually-s3 services may not set it, or set it in a way the
+			// official SDK finds it (e.g. if they don't use the expected checksummer)
+			// so try a Size() request.
+			x, err := s.Size(ctx, basename)
+			if err != nil {
+				return nil, 0, errors.Wrap(err, "content-length missing from GetObject and Size() failed")
+			}
+			size = x
+		} else {
+			size = *stream.ContentLength
 		}
-		size = *stream.ContentLength
 	}
 	opener := func(ctx context.Context, pos int64) (io.ReadCloser, error) {
 		s, err := s.openStreamAt(ctx, basename, pos)
@@ -515,11 +746,23 @@ func (s *s3Storage) List(ctx context.Context, prefix, delim string, fn cloud.Lis
 				return false
 			}
 		}
+
 		return true
 	}
 
+	var s3Input *s3.ListObjectsInput
+	// Add an environment variable toggle for s3 storage to list prefixes with a
+	// paging marker that's the prefix with an additional /. This allows certain
+	// s3 clones which return s3://<prefix>/ as the first result of listing
+	// s3://<prefix> to exclude that result.
+	if envutil.EnvOrDefaultBool("COCKROACH_S3_LIST_WITH_PREFIX_SLASH_MARKER", false) {
+		s3Input = &s3.ListObjectsInput{Bucket: s.bucket, Prefix: aws.String(dest), Delimiter: nilIfEmpty(delim), Marker: aws.String(dest + "/")}
+	} else {
+		s3Input = &s3.ListObjectsInput{Bucket: s.bucket, Prefix: aws.String(dest), Delimiter: nilIfEmpty(delim)}
+	}
+
 	if err := client.ListObjectsPagesWithContext(
-		ctx, &s3.ListObjectsInput{Bucket: s.bucket, Prefix: aws.String(dest), Delimiter: nilIfEmpty(delim)}, pageFn,
+		ctx, s3Input, pageFn,
 	); err != nil {
 		return errors.Wrap(err, `failed to list s3 bucket`)
 	}
@@ -590,6 +833,6 @@ func s3ErrDelay(err error) time.Duration {
 }
 
 func init() {
-	cloud.RegisterExternalStorageProvider(roachpb.ExternalStorageProvider_s3,
-		parseS3URL, MakeS3Storage, cloud.RedactedParams(AWSSecretParam, AWSTempTokenParam), "s3")
+	cloud.RegisterExternalStorageProvider(cloudpb.ExternalStorageProvider_s3,
+		parseS3URL, MakeS3Storage, cloud.RedactedParams(AWSSecretParam, AWSTempTokenParam), scheme)
 }

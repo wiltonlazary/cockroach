@@ -52,9 +52,11 @@ type Shared struct {
 
 	// HasSubquery is true if the subtree rooted at this node contains a subquery.
 	// The subquery can be a Subquery, Exists, Any, or ArrayFlatten expression.
-	// Subqueries are the only place where a relational node can be nested within a
-	// scalar expression.
 	HasSubquery bool
+
+	// HasUDF is true if the subtree rooted at this node contains a UDF
+	// invocation.
+	HasUDF bool
 
 	// HasCorrelatedSubquery is true if the scalar expression tree contains a
 	// subquery having one or more outer columns. The subquery can be a Subquery,
@@ -169,9 +171,10 @@ type Relational struct {
 	// For more details, see the header comment for FuncDepSet.
 	FuncDeps FuncDepSet
 
-	// Stats is the set of statistics that apply to this relational expression.
-	// See statistics.go and memo/statistics_builder.go for more details.
-	Stats Statistics
+	// stats is the set of statistics that apply to this relational expression.
+	// See statistics.go and memo/statistics_builder.go for more details. It is
+	// unexported to avoid accidental copying.
+	stats Statistics
 
 	// Rule encapsulates the set of properties that are maintained to assist
 	// with specific sets of transformation rules. They are not intended to be
@@ -338,6 +341,12 @@ type Scalar struct {
 		// been set.
 		HasHoistableSubquery bool
 	}
+}
+
+// Statistics returns the set of statistics that apply to the relational
+// expression.
+func (r *Relational) Statistics() *Statistics {
+	return &r.stats
 }
 
 // IsAvailable returns true if the specified rule property has been populated

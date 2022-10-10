@@ -136,6 +136,10 @@ type ExecStmt struct {
 	// stats reporting.
 	ParseStart time.Time
 	ParseEnd   time.Time
+
+	// LastInBatch indicates if this command contains the last query in a
+	// simple protocol Query message that contains a batch of 1 or more queries.
+	LastInBatch bool
 }
 
 // command implements the Command interface.
@@ -163,6 +167,9 @@ type ExecPortal struct {
 	// TimeReceived is the time at which the exec message was received
 	// from the client. Used to compute the service latency.
 	TimeReceived time.Time
+	// FollowedBySync is true if the next command after this is a Sync. This is
+	// used to enable the 1PC txn fast path in the extended protocol.
+	FollowedBySync bool
 }
 
 // command implements the Command interface.
@@ -211,7 +218,7 @@ var _ Command = PrepareStmt{}
 // DescribeStmt is the Command for producing info about a prepared statement or
 // portal.
 type DescribeStmt struct {
-	Name string
+	Name tree.Name
 	Type pgwirebase.PrepareType
 }
 
@@ -314,20 +321,32 @@ var _ Command = Flush{}
 
 // CopyIn is the command for execution of the Copy-in pgwire subprotocol.
 type CopyIn struct {
-	Stmt *tree.CopyFrom
+	ParsedStmt parser.Statement
+	Stmt       *tree.CopyFrom
 	// Conn is the network connection. Execution of the CopyFrom statement takes
 	// control of the connection.
 	Conn pgwirebase.Conn
 	// CopyDone is decremented once execution finishes, signaling that control of
 	// the connection is being handed back to the network routine.
 	CopyDone *sync.WaitGroup
+	// TimeReceived is the time at which the message was received
+	// from the client. Used to compute the service latency.
+	TimeReceived time.Time
+	// ParseStart/ParseEnd are the timing info for parsing of the query. Used for
+	// stats reporting.
+	ParseStart time.Time
+	ParseEnd   time.Time
 }
 
 // command implements the Command interface.
 func (CopyIn) command() string { return "copy" }
 
-func (CopyIn) String() string {
-	return "CopyIn"
+func (c CopyIn) String() string {
+	s := "(empty)"
+	if c.Stmt != nil {
+		s = c.Stmt.String()
+	}
+	return fmt.Sprintf("CopyIn: %s", s)
 }
 
 var _ Command = CopyIn{}
@@ -386,9 +405,9 @@ func (buf *StmtBuf) Init() {
 // Close() is idempotent.
 func (buf *StmtBuf) Close() {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	buf.mu.closed = true
 	buf.mu.cond.Signal()
-	buf.mu.Unlock()
 }
 
 // Push adds a Command to the end of the buffer. If a CurCmd() call was blocked
@@ -442,36 +461,6 @@ func (buf *StmtBuf) CurCmd() (Command, CmdPos, error) {
 	}
 }
 
-// isNextCmdSync peeks at the next command, and returns true if it is a Sync
-// message. If there is not another command in the buffer already, then false
-// is returned. The position is reset before returning, so this does not
-// affect the curPos.
-//
-// If the buffer has previously been Close()d, or is closed while this is
-// blocked, io.EOF is returned.
-func (buf *StmtBuf) isNextCmdSync() (bool, error) {
-	buf.mu.Lock()
-	prev := buf.mu.curPos
-	buf.mu.curPos++
-	defer func() {
-		buf.mu.curPos = prev
-		buf.mu.Unlock()
-	}()
-	if buf.mu.closed {
-		return false, io.EOF
-	}
-	curPos := buf.mu.curPos
-	cmdIdx, err := buf.translatePosLocked(curPos)
-	if err != nil {
-		return false, err
-	}
-	if cmdIdx < buf.mu.data.Len() {
-		_, isSync := buf.mu.data.Get(cmdIdx).(Sync)
-		return isSync, nil
-	}
-	return false, nil
-}
-
 // translatePosLocked translates an absolute position of a command (counting
 // from the connection start) to the index of the respective command in the
 // buffer (so, it returns an index relative to the start of the buffer).
@@ -517,9 +506,9 @@ func (buf *StmtBuf) Ltrim(ctx context.Context, pos CmdPos) {
 // yet. The previous CmdPos is returned.
 func (buf *StmtBuf) AdvanceOne() CmdPos {
 	buf.mu.Lock()
+	defer buf.mu.Unlock()
 	prev := buf.mu.curPos
 	buf.mu.curPos++
-	buf.mu.Unlock()
 	return prev
 }
 
@@ -535,18 +524,21 @@ func (buf *StmtBuf) AdvanceOne() CmdPos {
 // It is an error to start seeking when the cursor is positioned on an empty
 // slot.
 func (buf *StmtBuf) seekToNextBatch() error {
-	buf.mu.Lock()
-	curPos := buf.mu.curPos
-	cmdIdx, err := buf.translatePosLocked(curPos)
-	if err != nil {
-		buf.mu.Unlock()
+	if err := func() error {
+		buf.mu.Lock()
+		defer buf.mu.Unlock()
+		curPos := buf.mu.curPos
+		cmdIdx, err := buf.translatePosLocked(curPos)
+		if err != nil {
+			return err
+		}
+		if cmdIdx == buf.mu.data.Len() {
+			return errors.AssertionFailedf("invalid seek start point")
+		}
+		return nil
+	}(); err != nil {
 		return err
 	}
-	if cmdIdx == buf.mu.data.Len() {
-		buf.mu.Unlock()
-		return errors.AssertionFailedf("invalid seek start point")
-	}
-	buf.mu.Unlock()
 
 	var foundSync bool
 	for !foundSync {
@@ -555,18 +547,21 @@ func (buf *StmtBuf) seekToNextBatch() error {
 		if err != nil {
 			return err
 		}
-		buf.mu.Lock()
-		cmdIdx, err := buf.translatePosLocked(pos)
-		if err != nil {
-			buf.mu.Unlock()
+		if err := func() error {
+			buf.mu.Lock()
+			defer buf.mu.Unlock()
+			cmdIdx, err := buf.translatePosLocked(pos)
+			if err != nil {
+				return err
+			}
+
+			if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
+				foundSync = true
+			}
+			return nil
+		}(); err != nil {
 			return err
 		}
-
-		if _, ok := buf.mu.data.Get(cmdIdx).(Sync); ok {
-			foundSync = true
-		}
-
-		buf.mu.Unlock()
 	}
 	return nil
 }

@@ -17,6 +17,8 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/errors"
 	"github.com/golang/geo/s2"
 	"github.com/twpayne/go-geom"
@@ -36,15 +38,21 @@ func NewCartesianBoundingBox() *CartesianBoundingBox {
 
 // Repr is the string representation of the CartesianBoundingBox.
 func (b *CartesianBoundingBox) Repr() string {
-	// fmt.Sprintf with %f does not truncate leading zeroes, so use
-	// FormatFloat instead.
-	return fmt.Sprintf(
-		"BOX(%s %s,%s %s)",
-		strconv.FormatFloat(b.LoX, 'f', -1, 64),
-		strconv.FormatFloat(b.LoY, 'f', -1, 64),
-		strconv.FormatFloat(b.HiX, 'f', -1, 64),
-		strconv.FormatFloat(b.HiY, 'f', -1, 64),
-	)
+	return string(b.AppendFormat(nil))
+}
+
+// AppendFormat appends string representation of the CartesianBoundingBox
+// to the buffer, and returns modified buffer.
+func (b *CartesianBoundingBox) AppendFormat(buf []byte) []byte {
+	buf = append(buf, "BOX("...)
+	buf = strconv.AppendFloat(buf, b.LoX, 'f', -1, 64)
+	buf = append(buf, ' ')
+	buf = strconv.AppendFloat(buf, b.LoY, 'f', -1, 64)
+	buf = append(buf, ',')
+	buf = strconv.AppendFloat(buf, b.HiX, 'f', -1, 64)
+	buf = append(buf, ' ')
+	buf = strconv.AppendFloat(buf, b.HiY, 'f', -1, 64)
+	return append(buf, ')')
 }
 
 // ParseCartesianBoundingBox parses a box2d string into a bounding box.
@@ -56,7 +64,7 @@ func ParseCartesianBoundingBox(s string) (CartesianBoundingBox, error) {
 		return b, errors.Wrapf(err, "error parsing box2d")
 	}
 	if numScanned != 5 || strings.ToLower(prefix) != "box" {
-		return b, errors.Newf("expected format 'box(min_x min_y,max_x max_y)'")
+		return b, pgerror.Newf(pgcode.InvalidParameterValue, "expected format 'box(min_x min_y,max_x max_y)'")
 	}
 	return b, nil
 }
@@ -232,7 +240,7 @@ func boundingBoxFromGeomT(g geom.T, soType geopb.SpatialObjectType) (*geopb.Boun
 			HiY: rect.Lat.Hi,
 		}, nil
 	}
-	return nil, errors.Newf("unknown spatial type: %s", soType)
+	return nil, pgerror.Newf(pgcode.InvalidParameterValue, "unknown spatial type: %s", soType)
 }
 
 // BoundingBoxFromGeomTGeometryType returns an appropriate bounding box for a Geometry type.

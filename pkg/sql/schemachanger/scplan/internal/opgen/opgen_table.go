@@ -19,40 +19,50 @@ func init() {
 	opRegistry.register((*scpb.Table)(nil),
 		toPublic(
 			scpb.Status_ABSENT,
-			equiv(scpb.Status_TXN_DROPPED),
 			equiv(scpb.Status_DROPPED),
-			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.Table) scop.Op {
+			to(scpb.Status_TXN_DROPPED,
+				emit(func(this *scpb.Table) *scop.NotImplemented {
 					return notImplemented(this)
+				}),
+			),
+			to(scpb.Status_PUBLIC,
+				emit(func(this *scpb.Table) *scop.MarkDescriptorAsPublic {
+					return &scop.MarkDescriptorAsPublic{
+						DescriptorID: this.TableID,
+					}
 				}),
 			),
 		),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_TXN_DROPPED,
-				emit(func(this *scpb.Table) scop.Op {
-					return &scop.MarkDescriptorAsDroppedSynthetically{
-						DescID: this.TableID,
+				emit(func(this *scpb.Table, md *targetsWithElementMap) *scop.MarkDescriptorAsSyntheticallyDropped {
+					return &scop.MarkDescriptorAsSyntheticallyDropped{
+						DescriptorID: this.TableID,
 					}
 				}),
 			),
 			to(scpb.Status_DROPPED,
-				minPhase(scop.PreCommitPhase),
 				revertible(false),
-				emit(func(this *scpb.Table) scop.Op {
+				emit(func(this *scpb.Table) *scop.MarkDescriptorAsDropped {
 					return &scop.MarkDescriptorAsDropped{
-						DescID: this.TableID,
+						DescriptorID: this.TableID,
+					}
+				}),
+				emit(func(this *scpb.Table) *scop.RemoveAllTableComments {
+					return &scop.RemoveAllTableComments{
+						TableID: this.TableID,
 					}
 				}),
 			),
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PostCommitPhase),
-				emit(func(this *scpb.Table, ts scpb.TargetState) scop.Op {
-					return newLogEventOp(this, ts)
+				emit(func(this *scpb.Table, md *targetsWithElementMap) *scop.LogEvent {
+					return newLogEventOp(this, md)
 				}),
-				emit(func(this *scpb.Table) scop.Op {
-					return &scop.CreateGcJobForTable{
-						TableID: this.TableID,
+				emit(func(this *scpb.Table, md *targetsWithElementMap) *scop.CreateGCJobForTable {
+					return &scop.CreateGCJobForTable{
+						TableID:             this.TableID,
+						StatementForDropJob: statementForDropJob(this, md),
 					}
 				}),
 			),

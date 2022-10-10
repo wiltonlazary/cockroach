@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -36,11 +37,12 @@ type valuesProcessor struct {
 
 var _ execinfra.Processor = &valuesProcessor{}
 var _ execinfra.RowSource = &valuesProcessor{}
-var _ execinfra.OpNode = &valuesProcessor{}
+var _ execopnode.OpNode = &valuesProcessor{}
 
 const valuesProcName = "values"
 
 func newValuesProcessor(
+	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	processorID int32,
 	spec *execinfrapb.ValuesCoreSpec,
@@ -63,7 +65,7 @@ func newValuesProcessor(
 		v.typs[i] = spec.Columns[i].Type
 	}
 	if err := v.Init(
-		v, post, v.typs, flowCtx, processorID, output, nil /* memMonitor */, execinfra.ProcStateOpts{},
+		ctx, v, post, v.typs, flowCtx, processorID, output, nil /* memMonitor */, execinfra.ProcStateOpts{},
 	); err != nil {
 		return nil, err
 	}
@@ -112,12 +114,12 @@ func (v *valuesProcessor) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetad
 	return nil, v.DrainHelper()
 }
 
-// ChildCount is part of the execinfra.OpNode interface.
+// ChildCount is part of the execopnode.OpNode interface.
 func (v *valuesProcessor) ChildCount(verbose bool) int {
 	return 0
 }
 
-// Child is part of the execinfra.OpNode interface.
-func (v *valuesProcessor) Child(nth int, verbose bool) execinfra.OpNode {
+// Child is part of the execopnode.OpNode interface.
+func (v *valuesProcessor) Child(nth int, verbose bool) execopnode.OpNode {
 	panic(errors.AssertionFailedf("invalid index %d", nth))
 }

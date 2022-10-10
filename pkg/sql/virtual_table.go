@@ -34,7 +34,7 @@ import (
 type virtualTableGenerator func() (tree.Datums, error)
 
 // cleanupFunc is a function to cleanup resources created by the generator.
-type cleanupFunc func()
+type cleanupFunc func(ctx context.Context)
 
 // rowPusher is an interface for lazy generators to push rows into
 // and then suspend until the next row has been requested.
@@ -62,10 +62,10 @@ type virtualTableGeneratorResponse struct {
 
 // setupGenerator takes in a worker that generates rows eagerly and transforms
 // it into a lazy row generator. It returns two functions:
-// * next: A handle that can be called to generate a row from the worker. Next
-//   cannot be called once cleanup has been called.
-// * cleanup: Performs all cleanup. This function must be called exactly once
-//   to ensure that resources are cleaned up.
+//   - next: A handle that can be called to generate a row from the worker. Next
+//     cannot be called once cleanup has been called.
+//   - cleanup: Performs all cleanup. This function must be called exactly once
+//     to ensure that resources are cleaned up.
 func setupGenerator(
 	ctx context.Context,
 	worker func(ctx context.Context, pusher rowPusher) error,
@@ -74,7 +74,7 @@ func setupGenerator(
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	cleanup = func() {
+	cleanup = func(context.Context) {
 		cancel()
 		wg.Wait()
 	}
@@ -167,12 +167,12 @@ func setupGenerator(
 type virtualTableNode struct {
 	columns    colinfo.ResultColumns
 	next       virtualTableGenerator
-	cleanup    func()
+	cleanup    func(ctx context.Context)
 	currentRow tree.Datums
 }
 
 func (p *planner) newVirtualTableNode(
-	columns colinfo.ResultColumns, next virtualTableGenerator, cleanup func(),
+	columns colinfo.ResultColumns, next virtualTableGenerator, cleanup func(ctx context.Context),
 ) *virtualTableNode {
 	return &virtualTableNode{
 		columns: columns,
@@ -200,7 +200,7 @@ func (n *virtualTableNode) Values() tree.Datums {
 
 func (n *virtualTableNode) Close(ctx context.Context) {
 	if n.cleanup != nil {
-		n.cleanup()
+		n.cleanup(ctx)
 	}
 }
 
@@ -258,7 +258,7 @@ var _ rowPusher = &vTableLookupJoinNode{}
 func (v *vTableLookupJoinNode) startExec(params runParams) error {
 	v.run.keyCtx = constraint.KeyContext{EvalCtx: params.EvalContext()}
 	v.run.rows = rowcontainer.NewRowContainer(
-		params.EvalContext().Mon.MakeBoundAccount(),
+		params.p.Mon().MakeBoundAccount(),
 		colinfo.ColTypeInfoFromResCols(v.columns),
 	)
 	v.run.indexKeyDatums = make(tree.Datums, len(v.columns))
@@ -268,7 +268,7 @@ func (v *vTableLookupJoinNode) startExec(params runParams) error {
 		params.p.txn,
 		v.dbName,
 		tree.DatabaseLookupFlags{
-			Required: true, AvoidLeased: params.p.avoidLeasedDescriptors,
+			Required: true, AvoidLeased: params.p.skipDescriptorCache,
 		},
 	)
 	if err != nil {
@@ -342,9 +342,12 @@ func (v *vTableLookupJoinNode) pushRow(lookedUpRow ...tree.Datum) error {
 		v.run.row = append(v.run.row, lookedUpRow[i-1])
 	}
 	// Run the predicate and exit if we don't match, or if there was an error.
-	if ok, err := v.pred.eval(v.run.params.EvalContext(),
+	if ok, err := v.pred.eval(
+		v.run.params.ctx,
+		v.run.params.EvalContext(),
 		v.run.row[:len(v.inputCols)],
-		v.run.row[len(v.inputCols):]); !ok || err != nil {
+		v.run.row[len(v.inputCols):],
+	); !ok || err != nil {
 		return err
 	}
 	_, err := v.run.rows.AddRow(v.run.params.ctx, v.run.row)

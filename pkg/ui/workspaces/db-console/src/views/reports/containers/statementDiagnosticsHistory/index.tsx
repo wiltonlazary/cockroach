@@ -47,6 +47,9 @@ import {
   SortSetting,
   ColumnDescriptor,
 } from "@cockroachlabs/cluster-ui";
+import { cancelStatementDiagnosticsReportAction } from "src/redux/statements";
+import { trackCancelDiagnosticsBundleAction } from "src/redux/analyticsActions";
+import { DATE_FORMAT_24_UTC } from "src/util/format";
 
 type StatementDiagnosticsHistoryViewProps = MapStateToProps &
   MapDispatchToProps;
@@ -94,9 +97,9 @@ class StatementDiagnosticsHistoryView extends React.Component<
       title: "Activated on",
       name: "activated_on",
       cell: record =>
-        moment(record.requested_at.seconds.toNumber() * 1000).format(
-          "LL[ at ]h:mm a",
-        ),
+        moment
+          .utc(record.requested_at.seconds.toNumber() * 1000)
+          .format(DATE_FORMAT_24_UTC),
       sort: record => moment(record.requested_at.seconds.toNumber() * 1000),
     },
     {
@@ -113,9 +116,13 @@ class StatementDiagnosticsHistoryView extends React.Component<
           return <StatementColumn fingerprint={fingerprint} />;
         }
 
+        const base = `/statement/${implicitTxn}`;
+        const statementFingerprintID = statement.id.toString();
+        const path = `${base}/${encodeURIComponent(statementFingerprintID)}`;
+
         return (
           <Link
-            to={`/statement/${implicitTxn}/${encodeURIComponent(query)}`}
+            to={path}
             className="crl-statements-diagnostics-view__statements-link"
           >
             <StatementColumn fingerprint={fingerprint} />
@@ -164,7 +171,19 @@ class StatementDiagnosticsHistoryView extends React.Component<
             </div>
           );
         }
-        return null;
+        return (
+          <div className="crl-statements-diagnostics-view__actions-column cell--show-on-hover nodes-table__link">
+            <Button
+              size="small"
+              type="secondary"
+              onClick={() => {
+                this.props.onDiagnosticCancelRequest(record);
+              }}
+            >
+              Cancel request
+            </Button>
+          </div>
+        );
       },
     },
   ];
@@ -191,14 +210,14 @@ class StatementDiagnosticsHistoryView extends React.Component<
     if (totalCount <= this.tablePageSize) {
       return (
         <div className="diagnostics-history-view__table-header">
-          <Text>{`${totalCount} traces`}</Text>
+          <Text>{`${totalCount} diagnostics bundles`}</Text>
         </div>
       );
     }
 
     return (
       <div className="diagnostics-history-view__table-header">
-        <Text>{`${this.tablePageSize} of ${totalCount} traces`}</Text>
+        <Text>{`${this.tablePageSize} of ${totalCount} diagnostics bundles`}</Text>
       </div>
     );
   };
@@ -266,6 +285,7 @@ interface MapStateToProps {
 }
 
 interface MapDispatchToProps {
+  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => void;
   refresh: () => void;
 }
 
@@ -277,6 +297,10 @@ const mapStateToProps = (state: AdminUIState): MapStateToProps => ({
 });
 
 const mapDispatchToProps = (dispatch: AppDispatch): MapDispatchToProps => ({
+  onDiagnosticCancelRequest: (report: IStatementDiagnosticsReport) => {
+    dispatch(cancelStatementDiagnosticsReportAction(report.id));
+    dispatch(trackCancelDiagnosticsBundleAction(report.statement_fingerprint));
+  },
   refresh: () => {
     dispatch(invalidateStatementDiagnosticsRequests());
     dispatch(refreshStatementDiagnosticsRequests());

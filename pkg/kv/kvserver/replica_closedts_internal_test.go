@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -509,7 +510,8 @@ func (r *mockReceiver) HTML() string {
 	return ""
 }
 
-// Test that r.GetClosedTimestamp() mixes its sources of information correctly.
+// Test that r.GetCurrentClosedTimestamp() mixes its sources of information
+// correctly.
 func TestReplicaClosedTimestamp(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -558,8 +560,8 @@ func TestReplicaClosedTimestamp(t *testing.T) {
 			r.ts = test.sidetransportClosed
 			r.lai = test.sidetransportLAI
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(123) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 123)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.DontCloseTimestamps = true
 			cfg.ClosedTimestampReceiver = &r
 			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
@@ -567,7 +569,7 @@ func TestReplicaClosedTimestamp(t *testing.T) {
 			tc.repl.mu.state.RaftClosedTimestamp = test.raftClosed
 			tc.repl.mu.state.LeaseAppliedIndex = uint64(test.applied)
 			tc.repl.mu.Unlock()
-			require.Equal(t, test.expClosed, tc.repl.GetClosedTimestamp(ctx))
+			require.Equal(t, test.expClosed, tc.repl.GetCurrentClosedTimestamp(ctx))
 		})
 	}
 }
@@ -651,8 +653,8 @@ func TestQueryResolvedTimestamp(t *testing.T) {
 
 			// Create a single range.
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.DontCloseTimestamps = true
 			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
@@ -690,8 +692,8 @@ func TestQueryResolvedTimestampResolvesAbandonedIntents(t *testing.T) {
 
 	// Create a single range.
 	var tc testContext
-	tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-	cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+	tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+	cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 	cfg.TestingKnobs.DontCloseTimestamps = true
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
@@ -726,7 +728,8 @@ func TestQueryResolvedTimestampResolvesAbandonedIntents(t *testing.T) {
 	require.Nil(t, pErr)
 	require.True(t, intentExists())
 
-	// Inject a closed timestamp.
+	// Bump the clock and inject a closed timestamp.
+	tc.manualClock.AdvanceTo(ts20.GoTime())
 	tc.repl.mu.Lock()
 	tc.repl.mu.state.RaftClosedTimestamp = ts20
 	tc.repl.mu.Unlock()
@@ -952,8 +955,8 @@ func TestServerSideBoundedStalenessNegotiation(t *testing.T) {
 
 				// Create a single range.
 				var tc testContext
-				tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-				cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+				tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+				cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 				cfg.TestingKnobs.DontCloseTimestamps = true
 				tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
@@ -1129,8 +1132,8 @@ func TestServerSideBoundedStalenessNegotiationWithResumeSpan(t *testing.T) {
 
 			// Create a single range.
 			var tc testContext
-			tc.manualClock = hlc.NewManualClock(1) // required by StartWithStoreConfig
-			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock.UnixNano, 100*time.Nanosecond))
+			tc.manualClock = timeutil.NewManualTime(timeutil.Unix(0, 1)) // required by StartWithStoreConfig
+			cfg := TestStoreConfig(hlc.NewClock(tc.manualClock, 100*time.Nanosecond) /* maxOffset */)
 			cfg.TestingKnobs.DontCloseTimestamps = true
 			tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 

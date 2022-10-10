@@ -18,7 +18,8 @@ import * as protos from "@cockroachlabs/crdb-protobuf-client";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
 import { RequestError } from "src/util";
 
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
+type IStatementDiagnosticsReport =
+  cockroach.server.serverpb.IStatementDiagnosticsReport;
 type IStatementStatistics = protos.cockroach.sql.IStatementStatistics;
 type IExecStats = protos.cockroach.sql.IExecStats;
 
@@ -92,6 +93,8 @@ const statementStats: Required<IStatementStatistics> = {
     mean: 2,
     squared_diffs: 0.005,
   },
+  plan_gists: ["Ais="],
+  index_recommendations: [""],
   exec_stats: execStats,
   last_exec_timestamp: {
     seconds: Long.fromInt(1599670292),
@@ -244,6 +247,7 @@ const diagnosticsReportsInProgress: IStatementDiagnosticsReport[] = [
 ];
 
 const aggregatedTs = Date.parse("Sep 15 2021 01:00:00 GMT") * 1e-3;
+const lastUpdated = moment("Sep 15 2021 01:30:00 GMT");
 const aggregationInterval = 3600; // 1 hour
 
 const statementsPagePropsFixture: StatementsPageProps = {
@@ -269,7 +273,7 @@ const statementsPagePropsFixture: StatementsPageProps = {
   },
   sortSetting: {
     ascending: false,
-    columnTitle: "executionCount"
+    columnTitle: "executionCount",
   },
   search: "",
   filters: {
@@ -282,54 +286,58 @@ const statementsPagePropsFixture: StatementsPageProps = {
     regions: "",
     nodes: "",
   },
+  lastUpdated,
   // Aggregate key values in these statements will need to change if implementation
   // of 'statementKey' in appStats.ts changes.
   statements: [
     {
       aggregatedFingerprintID: "1253500548539870016",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(1253500548539870016).toString(16),
       label:
-        "SELECT IFNULL(a, b)\n" +
-        "    FROM (\n" +
-        "          SELECT (SELECT code FROM promo_codes WHERE code > $1 ORDER BY code LIMIT _) AS a,\n" +
-        "                 (SELECT code FROM promo_codes ORDER BY code LIMIT _) AS b\n" +
-        "         )",
+        "SELECT IFNULL(a, b) FROM (SELECT (SELECT code FROM promo_codes WHERE code > $1 ORDER BY code LIMIT _) AS a, (SELECT code FROM promo_codes ORDER BY code LIMIT _) AS b)",
       summary: "SELECT IFNULL(a, b) FROM (SELECT)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "1985666523427702831",
-      label: "INSERT INTO vehicles VALUES ($1, $2, __more6__)",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(1985666523427702831).toString(16),
+      label: "INSERT INTO vehicles VALUES ($1, $2, __more1_10__)",
       summary: "INSERT INTO vehicles",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "13649565517143827225",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13649565517143827225).toString(16),
       label:
-        "SELECT IFNULL(a, b)\n" +
-        "    FROM (\n" +
-        "          SELECT (SELECT id FROM users WHERE city = $1 AND id > $2 ORDER BY id LIMIT _) AS a,\n" +
-        "                 (SELECT id FROM users WHERE city = $1 ORDER BY id LIMIT _) AS b\n" +
-        "         )",
+        "SELECT IFNULL(a, b) FROM (SELECT (SELECT id FROM users WHERE (city = $1) AND (id > $2) ORDER BY id LIMIT _) AS a, (SELECT id FROM users WHERE city = $1 ORDER BY id LIMIT _) AS b)",
       summary: "SELECT IFNULL(a, b) FROM (SELECT)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "1533636712988872414",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(1533636712988872414).toString(16),
       label:
         "UPSERT INTO vehicle_location_histories VALUES ($1, $2, now(), $3, $4)",
       summary: "UPSERT INTO vehicle_location_histories",
@@ -337,33 +345,42 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "2461578209191418170",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(2461578209191418170).toString(16),
       label: "INSERT INTO user_promo_codes VALUES ($1, $2, $3, now(), _)",
       summary: "INSERT INTO user_promo_codes",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "4705782015019656142",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(4705782015019656142).toString(16),
       label: "SELECT city, id FROM vehicles WHERE city = $1",
       summary: "SELECT city, id FROM vehicles",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: true,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "2298970482983227199",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(2298970482983227199).toString(16),
       label:
         "INSERT INTO rides VALUES ($1, $2, $2, $3, $4, $5, _, now(), _, $6)",
       summary: "INSERT INTO rides",
@@ -371,22 +388,28 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "4716433305747424413",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(4716433305747424413).toString(16),
       label: "SELECT IFNULL(a, b) FROM (SELECT  AS a, AS b)",
       summary: "SELECT IFNULL(a, b) FROM (SELECT)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "367828504526856403",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(367828504526856403).toString(16),
       label:
         "UPDATE rides SET end_address = $3, end_time = now() WHERE (city = $1) AND (id = $2)",
       summary: "UPDATE rides SET end_address = $... WHERE (city = $1) AND...",
@@ -394,22 +417,28 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "14972494059652918390",
-      label: "INSERT INTO users VALUES ($1, $2, __more3__)",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(14972494059652918390).toString(16),
+      label: "INSERT INTO users VALUES ($1, $2, __more1_10__)",
       summary: "INSERT INTO users",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "15897033026745880862",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(15897033026745880862).toString(16),
       label:
         "SELECT count(*) FROM user_promo_codes WHERE ((city = $1) AND (user_id = $2)) AND (code = $3)",
       summary: "SELECT count(*) FROM user_promo_codes",
@@ -417,33 +446,42 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: true,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '49958554803360403681',
-      label: "INSERT INTO promo_codes VALUES ($1, $2, __more3__)",
+      aggregatedFingerprintID: "49958554803360403681",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(49958554803360403681).toString(16),
+      label: "INSERT INTO promo_codes VALUES ($1, $2, __more1_10__)",
       summary: "INSERT INTO promo_codes",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '9233296116064220812',
+      aggregatedFingerprintID: "9233296116064220812",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(9233296116064220812).toString(16),
       label: "ALTER TABLE users SCATTER FROM (_, _) TO (_, _)",
       summary: "ALTER TABLE users SCATTER FROM (_, _) TO (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '6117473345491440803',
+      aggregatedFingerprintID: "6117473345491440803",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(6117473345491440803).toString(16),
       label:
         "ALTER TABLE rides ADD FOREIGN KEY (vehicle_city, vehicle_id) REFERENCES vehicles (city, id)",
       summary:
@@ -452,65 +490,73 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '1301242584620444873',
+      aggregatedFingerprintID: "1301242584620444873",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(1301242584620444873).toString(16),
       label: "SHOW database",
       summary: "SHOW database",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
       diagnosticsReports,
     },
     {
-      aggregatedFingerprintID: '11195381626529102926',
+      aggregatedFingerprintID: "11195381626529102926",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(11195381626529102926).toString(16),
       label:
-        "CREATE TABLE IF NOT EXISTS promo_codes (\n" +
-        "      code            VARCHAR NOT NULL,\n" +
-        "      description     VARCHAR NULL,\n" +
-        "      creation_time   TIMESTAMP NULL,\n" +
-        "      expiration_time TIMESTAMP NULL,\n" +
-        "      rules           JSONB NULL,\n" +
-        "      PRIMARY KEY (code ASC)\n" +
-        "  )",
+        "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
       summary:
         "CREATE TABLE IF NOT EXISTS promo_codes (code VARCHAR NOT NULL, description VARCHAR NULL, creation_time TIMESTAMP NULL, expiration_time TIMESTAMP NULL, rules JSONB NULL, PRIMARY KEY (code ASC))",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '18127289707013477303',
+      aggregatedFingerprintID: "18127289707013477303",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(18127289707013477303).toString(16),
       label: "ALTER TABLE users SPLIT AT VALUES (_, _)",
       summary: "ALTER TABLE users SPLIT AT VALUES (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '2499764450427976233',
+      aggregatedFingerprintID: "2499764450427976233",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(2499764450427976233).toString(16),
       label: "ALTER TABLE vehicles SCATTER FROM (_, _) TO (_, _)",
       summary: "ALTER TABLE vehicles SCATTER FROM (_, _) TO (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '818321793552651414',
+      aggregatedFingerprintID: "818321793552651414",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(818321793552651414).toString(16),
       label:
         "ALTER TABLE vehicle_location_histories ADD FOREIGN KEY (city, ride_id) REFERENCES rides (city, id)",
       summary:
@@ -519,64 +565,72 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '13217779306501326587',
+      aggregatedFingerprintID: "13217779306501326587",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13217779306501326587).toString(16),
       label:
-        'CREATE TABLE IF NOT EXISTS user_promo_codes (\n' +
-        '      city        VARCHAR NOT NULL,\n' +
-        '      user_id     UUID NOT NULL,\n' +
-        '      code        VARCHAR NOT NULL,\n' +
-        '      "timestamp" TIMESTAMP NULL,\n' +
-        '      usage_count INT8 NULL,\n' +
-        '      PRIMARY KEY (city ASC, user_id ASC, code ASC)\n' +
-        '  )',
+        'CREATE TABLE IF NOT EXISTS user_promo_codes (city VARCHAR NOT NULL, user_id UUID NOT NULL, code VARCHAR NOT NULL, "timestamp" TIMESTAMP NULL, usage_count INT8 NULL, PRIMARY KEY (city ASC, user_id ASC, code ASC))',
       summary:
         'CREATE TABLE IF NOT EXISTS user_promo_codes (city VARCHAR NOT NULL, user_id UUID NOT NULL, code VARCHAR NOT NULL, "timestamp" TIMESTAMP NULL, usage_count INT8 NULL, PRIMARY KEY (city ASC, user_id ASC, code ASC))',
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '6325213731862855938',
-      label: "INSERT INTO users VALUES ($1, $2, __more3__), (__more40__)",
+      aggregatedFingerprintID: "6325213731862855938",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(6325213731862855938).toString(16),
+      label: "INSERT INTO users VALUES ($1, $2, __more1_10__), (__more10_100__)",
       summary: "INSERT INTO users VALUES",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '17372586739449521577',
+      aggregatedFingerprintID: "17372586739449521577",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(17372586739449521577).toString(16),
       label: "ALTER TABLE rides SCATTER FROM (_, _) TO (_, _)",
       summary: "ALTER TABLE rides SCATTER FROM (_, _) TO (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '17098541896015126122',
+      aggregatedFingerprintID: "17098541896015126122",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(17098541896015126122).toString(16),
       label: 'SET CLUSTER SETTING "cluster.organization" = $1',
       summary: 'SET CLUSTER SETTING "cluster.organization" = $1',
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '13350023170184726428',
+      aggregatedFingerprintID: "13350023170184726428",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13350023170184726428).toString(16),
       label:
         "ALTER TABLE vehicles ADD FOREIGN KEY (city, owner_id) REFERENCES users (city, id)",
       summary:
@@ -585,159 +639,149 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '2695725667586429780',
+      aggregatedFingerprintID: "2695725667586429780",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(2695725667586429780).toString(16),
       label:
-        "CREATE TABLE IF NOT EXISTS rides (\n" +
-        "      id            UUID NOT NULL,\n" +
-        "      city          VARCHAR NOT NULL,\n" +
-        "      vehicle_city  VARCHAR NULL,\n" +
-        "      rider_id      UUID NULL,\n" +
-        "      vehicle_id    UUID NULL,\n" +
-        "      start_address VARCHAR NULL,\n" +
-        "      end_address   VARCHAR NULL,\n" +
-        "      start_time    TIMESTAMP NULL,\n" +
-        "      end_time      TIMESTAMP NULL,\n" +
-        "      revenue       DECIMAL(10,2) NULL,\n" +
-        "      PRIMARY KEY (city ASC, id ASC),\n" +
-        "      INDEX rides_auto_index_fk_city_ref_users (city ASC, rider_id ASC),\n" +
-        "      INDEX rides_auto_index_fk_vehicle_city_ref_vehicles (vehicle_city ASC, vehicle_id ASC),\n" +
-        "      CONSTRAINT check_vehicle_city_city CHECK (vehicle_city = city)\n" +
-        "  )",
+        "CREATE TABLE IF NOT EXISTS rides (id UUID NOT NULL, city VARCHAR NOT NULL, vehicle_city VARCHAR NULL, rider_id UUID NULL, vehicle_id UUID NULL, start_address VARCHAR NULL, end_address VARCHAR NULL, start_time TIMESTAMP NULL, end_time TIMESTAMP NULL, revenue DECIMAL(10,2) NULL, PRIMARY KEY (city ASC, id ASC), INDEX rides_auto_index_fk_city_ref_users (city ASC, rider_id ASC), INDEX rides_auto_index_fk_vehicle_city_ref_vehicles (vehicle_city ASC, vehicle_id ASC), CONSTRAINT check_vehicle_city_city CHECK (vehicle_city = city))",
       summary:
         "CREATE TABLE IF NOT EXISTS rides (id UUID NOT NULL, city VARCHAR NOT NULL, vehicle_city VARCHAR NULL, rider_id UUID NULL, vehicle_id UUID NULL, start_address VARCHAR NULL, end_address VARCHAR NULL, start_time TIMESTAMP NULL, end_time TIMESTAMP NULL, revenue DECIMAL(10,2) NULL, PRIMARY KEY (city ASC, id ASC), INDEX rides_auto_index_fk_city_ref_users (city ASC, rider_id ASC), INDEX rides_auto_index_fk_vehicle_city_ref_vehicles (vehicle_city ASC, vehicle_id ASC), CONSTRAINT check_vehicle_city_city CHECK (vehicle_city = city))",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '6754865160812330169',
+      aggregatedFingerprintID: "6754865160812330169",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(6754865160812330169).toString(16),
       label:
-        "CREATE TABLE IF NOT EXISTS vehicles (\n" +
-        "      id               UUID NOT NULL,\n" +
-        "      city             VARCHAR NOT NULL,\n" +
-        "      type             VARCHAR NULL,\n" +
-        "      owner_id         UUID NULL,\n" +
-        "      creation_time    TIMESTAMP NULL,\n" +
-        "      status           VARCHAR NULL,\n" +
-        "      current_location VARCHAR NULL,\n" +
-        "      ext              JSONB NULL,\n" +
-        "      PRIMARY KEY (city ASC, id ASC),\n" +
-        "      INDEX vehicles_auto_index_fk_city_ref_users (city ASC, owner_id ASC)\n" +
-        "  )",
+        "CREATE TABLE IF NOT EXISTS vehicles (id UUID NOT NULL, city VARCHAR NOT NULL, type VARCHAR NULL, owner_id UUID NULL, creation_time TIMESTAMP NULL, status VARCHAR NULL, current_location VARCHAR NULL, ext JSONB NULL, PRIMARY KEY (city ASC, id ASC), INDEX vehicles_auto_index_fk_city_ref_users (city ASC, owner_id ASC))",
       summary:
         "CREATE TABLE IF NOT EXISTS vehicles (id UUID NOT NULL, city VARCHAR NOT NULL, type VARCHAR NULL, owner_id UUID NULL, creation_time TIMESTAMP NULL, status VARCHAR NULL, current_location VARCHAR NULL, ext JSONB NULL, PRIMARY KEY (city ASC, id ASC), INDEX vehicles_auto_index_fk_city_ref_users (city ASC, owner_id ASC))",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '6810471486115018510',
-      label: "INSERT INTO rides VALUES ($1, $2, __more8__), (__more400__)",
+      aggregatedFingerprintID: "6810471486115018510",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(6810471486115018510).toString(16),
+      label: "INSERT INTO rides VALUES ($1, $2, __more1_10__), (__more400__)",
       summary: "INSERT INTO rides",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '13265908854908549668',
+      aggregatedFingerprintID: "13265908854908549668",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13265908854908549668).toString(16),
       label: "ALTER TABLE vehicles SPLIT AT VALUES (_, _)",
       summary: "ALTER TABLE vehicles SPLIT AT VALUES (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '18377382163116490400',
+      aggregatedFingerprintID: "18377382163116490400",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(18377382163116490400).toString(16),
       label: "SET sql_safe_updates = _",
       summary: "SET sql_safe_updates = _",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '8695470234690735168',
+      aggregatedFingerprintID: "8695470234690735168",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(8695470234690735168).toString(16),
       label:
-        "CREATE TABLE IF NOT EXISTS users (\n" +
-        "      id          UUID NOT NULL,\n" +
-        "      city        VARCHAR NOT NULL,\n" +
-        "      name        VARCHAR NULL,\n" +
-        "      address     VARCHAR NULL,\n" +
-        "      credit_card VARCHAR NULL,\n" +
-        "      PRIMARY KEY (city ASC, id ASC)\n" +
-        "  )",
+        "CREATE TABLE IF NOT EXISTS users (id UUID NOT NULL, city VARCHAR NOT NULL, name VARCHAR NULL, address VARCHAR NULL, credit_card VARCHAR NULL, PRIMARY KEY (city ASC, id ASC))",
       summary:
         "CREATE TABLE IF NOT EXISTS users (id UUID NOT NULL, city VARCHAR NOT NULL, name VARCHAR NULL, address VARCHAR NULL, credit_card VARCHAR NULL, PRIMARY KEY (city ASC, id ASC))",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '9261848985398568228',
+      aggregatedFingerprintID: "9261848985398568228",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(9261848985398568228).toString(16),
       label:
-        'CREATE TABLE IF NOT EXISTS vehicle_location_histories (\n' +
-        '      city        VARCHAR NOT NULL,\n' +
-        '      ride_id     UUID NOT NULL,\n' +
-        '      "timestamp" TIMESTAMP NOT NULL,\n' +
-        '      lat         FLOAT8 NULL,\n' +
-        '      long        FLOAT8 NULL,\n' +
-        '      PRIMARY KEY (city ASC, ride_id ASC, "timestamp" ASC)\n' +
-        '  )',
+        'CREATE TABLE IF NOT EXISTS vehicle_location_histories (city VARCHAR NOT NULL, ride_id UUID NOT NULL, "timestamp" TIMESTAMP NOT NULL, lat FLOAT8 NULL, long FLOAT8 NULL, PRIMARY KEY (city ASC, ride_id ASC, "timestamp" ASC))',
       summary:
         'CREATE TABLE IF NOT EXISTS vehicle_location_histories (city VARCHAR NOT NULL, ride_id UUID NOT NULL, "timestamp" TIMESTAMP NOT NULL, lat FLOAT8 NULL, long FLOAT8 NULL, PRIMARY KEY (city ASC, ride_id ASC, "timestamp" ASC))',
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
-      aggregatedFingerprintID: '4176684928840388768',
+      aggregatedFingerprintID: "4176684928840388768",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(4176684928840388768).toString(16),
       label: "SELECT * FROM crdb_internal.node_build_info",
       summary: "SELECT * FROM crdb_internal.node_build_info",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "15868120298061590648",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(15868120298061590648).toString(16),
       label: "CREATE DATABASE movr",
       summary: "CREATE DATABASE movr",
       implicitTxn: true,
       aggregatedTs,
       aggregationInterval,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
       diagnosticsReports: diagnosticsReportsInProgress,
     },
     {
       aggregatedFingerprintID: "13070583869906258880",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13070583869906258880).toString(16),
       label:
         "SELECT count(*) > _ FROM [SHOW ALL CLUSTER SETTINGS] AS _ (v) WHERE v = _",
       summary: "SELECT count(*) > _ FROM [SHOW ALL CLUSTER SETTINGS] AS...",
@@ -745,22 +789,28 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "641287435601027145",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(641287435601027145).toString(16),
       label: 'SET CLUSTER SETTING "enterprise.license" = $1',
       summary: 'SET CLUSTER SETTING "enterprise.license" = $1',
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "16743225271705059729",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(16743225271705059729).toString(16),
       label:
         "ALTER TABLE rides ADD FOREIGN KEY (city, rider_id) REFERENCES users (city, id)",
       summary:
@@ -769,11 +819,14 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "6075815909800602827",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(6075815909800602827).toString(16),
       label:
         "ALTER TABLE user_promo_codes ADD FOREIGN KEY (city, user_id) REFERENCES users (city, id)",
       summary:
@@ -782,63 +835,79 @@ const statementsPagePropsFixture: StatementsPageProps = {
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "5158086166870396309",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(5158086166870396309).toString(16),
       label:
-        "INSERT INTO promo_codes VALUES ($1, $2, __more3__), (__more900__)",
+        "INSERT INTO promo_codes VALUES ($1, $2, __more1_10__), (__more900__)",
       summary: "INSERT INTO promo_codes",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "13494397675172244644",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(13494397675172244644).toString(16),
       label: "ALTER TABLE rides SPLIT AT VALUES (_, _)",
       summary: "ALTER TABLE rides SPLIT AT VALUES (_, _)",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "101921598584277094",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(101921598584277094).toString(16),
       label: "SELECT value FROM crdb_internal.node_build_info WHERE field = _",
       summary: "SELECT value FROM crdb_internal.node_build_info",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "7880339715822034020",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(7880339715822034020).toString(16),
       label:
-        "INSERT INTO vehicle_location_histories VALUES ($1, $2, __more3__), (__more900__)",
+        "INSERT INTO vehicle_location_histories VALUES ($1, $2, __more1_10__), (__more900__)",
       summary: "INSERT INTO vehicle_location_histories",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
     {
       aggregatedFingerprintID: "16819876564846676829",
-      label: "INSERT INTO vehicles VALUES ($1, $2, __more6__), (__more10__)",
+      aggregatedFingerprintHexID:
+        Long.fromNumber(16819876564846676829).toString(16),
+      label: "INSERT INTO vehicles VALUES ($1, $2, __more1_10__), (__more1_10__)",
       summary: "INSERT INTO vehicles",
       aggregatedTs,
       aggregationInterval,
       implicitTxn: true,
       database: "defaultdb",
+      applicationName: "app",
       fullScan: false,
       stats: statementStats,
     },
@@ -847,22 +916,26 @@ const statementsPagePropsFixture: StatementsPageProps = {
   timeScale: {
     windowSize: moment.duration(5, "day"),
     sampleSize: moment.duration(5, "minutes"),
-    windowEnd: moment.utc("2021.12.12"),
-    key: "Custom"
+    fixedWindowEnd: moment.utc("2021.12.12"),
+    key: "Custom",
   },
   apps: ["$ internal", "movr", "$ cockroach demo"],
   totalFingerprints: 95,
   lastReset: "2020-04-13 07:22:23",
   columns: null,
+  isTenant: false,
+  hasViewActivityRedactedRole: false,
   dismissAlertMessage: noop,
   refreshStatementDiagnosticsRequests: noop,
   refreshStatements: noop,
+  refreshUserSQLRoles: noop,
+  refreshNodes: noop,
   resetSQLStats: noop,
   onTimeScaleChange: noop,
   onActivateStatementDiagnostics: noop,
   onDiagnosticsModalOpen: noop,
   onSearchComplete: noop,
-  onDiagnosticsReportDownload: noop,
+  onSelectDiagnosticsReportDropdownOption: noop,
   onColumnsChange: noop,
   onSortingChange: noop,
   onFilterChange: noop,

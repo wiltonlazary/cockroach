@@ -11,9 +11,9 @@
 package geogfn
 
 import (
-	"fmt"
-
 	"github.com/cockroachdb/cockroach/pkg/geo"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/golang/geo/s2"
 )
 
@@ -25,19 +25,20 @@ import (
 // precision for Covers will be for up to 1cm.
 //
 // Current limitations (which are also limitations in PostGIS):
-// * POLYGON/LINESTRING only works as "contains" - if any point of the LINESTRING
-//   touches the boundary of the polygon, we will return false but should be true - e.g.
+//
+//   - POLYGON/LINESTRING only works as "contains" - if any point of the LINESTRING
+//     touches the boundary of the polygon, we will return false but should be true - e.g.
 //     SELECT st_covers(
-//       'multipolygon(((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)), ((1.0 0.0, 2.0 0.0, 2.0 1.0, 1.0 1.0, 1.0 0.0)))',
-//       'linestring(0.0 0.0, 1.0 0.0)'::geography
+//     'multipolygon(((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)), ((1.0 0.0, 2.0 0.0, 2.0 1.0, 1.0 1.0, 1.0 0.0)))',
+//     'linestring(0.0 0.0, 1.0 0.0)'::geography
 //     );
 //
-// * Furthermore, LINESTRINGS that are covered in multiple POLYGONs inside
-//   MULTIPOLYGON but NOT within a single POLYGON in the MULTIPOLYGON
-//   currently return false but should be true, e.g.
+//   - Furthermore, LINESTRINGS that are covered in multiple POLYGONs inside
+//     MULTIPOLYGON but NOT within a single POLYGON in the MULTIPOLYGON
+//     currently return false but should be true, e.g.
 //     SELECT st_covers(
-//       'multipolygon(((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)), ((1.0 0.0, 2.0 0.0, 2.0 1.0, 1.0 1.0, 1.0 0.0)))',
-//       'linestring(0.0 0.0, 2.0 0.0)'::geography
+//     'multipolygon(((0.0 0.0, 1.0 0.0, 1.0 1.0, 0.0 1.0, 0.0 0.0)), ((1.0 0.0, 2.0 0.0, 2.0 1.0, 1.0 1.0, 1.0 0.0)))',
+//     'linestring(0.0 0.0, 2.0 0.0)'::geography
 //     );
 func Covers(a geo.Geography, b geo.Geography) (bool, error) {
 	if a.SRID() != b.SRID() {
@@ -111,7 +112,7 @@ func regionCovers(aRegion s2.Region, bRegion s2.Region) (bool, error) {
 		case *s2.Polygon:
 			return false, nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	case *s2.Polyline:
 		switch bRegion := bRegion.(type) {
@@ -122,7 +123,7 @@ func regionCovers(aRegion s2.Region, bRegion s2.Region) (bool, error) {
 		case *s2.Polygon:
 			return false, nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	case *s2.Polygon:
 		switch bRegion := bRegion.(type) {
@@ -133,10 +134,10 @@ func regionCovers(aRegion s2.Region, bRegion s2.Region) (bool, error) {
 		case *s2.Polygon:
 			return polygonCoversPolygon(aRegion, bRegion), nil
 		default:
-			return false, fmt.Errorf("unknown s2 type of b: %#v", bRegion)
+			return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of b: %#v", bRegion)
 		}
 	}
-	return false, fmt.Errorf("unknown s2 type of a: %#v", aRegion)
+	return false, pgerror.Newf(pgcode.InvalidParameterValue, "unknown s2 type of a: %#v", aRegion)
 }
 
 // polylineCoversPoints returns whether a polyline covers a given point.

@@ -24,6 +24,7 @@ import (
 var writeTests = []struct {
 	Input   [][]string
 	Output  string
+	Escape  rune
 	UseCRLF bool
 }{
 	{Input: [][]string{{"abc"}}, Output: "abc\n"},
@@ -50,6 +51,10 @@ var writeTests = []struct {
 	{Input: [][]string{{"a", "a", ""}}, Output: "a,a,\n"},
 	{Input: [][]string{{"a", "a", "a"}}, Output: "a,a,a\n"},
 	{Input: [][]string{{`\.`}}, Output: "\"\\.\"\n"},
+	{Input: [][]string{{`\.ab☃`}}, Output: "\\.ab☃\n"},
+	// Previous versions of csv.Writer didn't quote a string containing a custom escape character, which was
+	// probably a bug despite previously being asserted in this test. But also nothing actually used a custom escape character.
+	{Input: [][]string{{`"`, `,`, `x"`, `x`, `xx,`}}, Escape: 'x', Output: `"x"",",","xxx"","xx","xxxx,"` + "\n"},
 }
 
 func TestWrite(t *testing.T) {
@@ -57,6 +62,9 @@ func TestWrite(t *testing.T) {
 		b := &bytes.Buffer{}
 		f := NewWriter(b)
 		f.UseCRLF = tt.UseCRLF
+		if tt.Escape != 0 {
+			f.Escape = tt.Escape
+		}
 		err := f.WriteAll(tt.Input)
 		if err != nil {
 			t.Errorf("Unexpected error: %s\n", err)

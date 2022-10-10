@@ -17,7 +17,7 @@ import (
 	"crypto/tls"
 	gosql "database/sql"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -28,9 +28,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
@@ -39,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -92,24 +93,25 @@ func TestSSLEnforcement(t *testing.T) {
 
 	newRPCContext := func(cfg *base.Config) *rpc.Context {
 		return rpc.NewContext(ctx, rpc.ContextOptions{
-			TenantID: roachpb.SystemTenantID,
-			Config:   cfg,
-			Clock:    hlc.NewClock(hlc.UnixNano, 1),
-			Stopper:  s.Stopper(),
-			Settings: s.ClusterSettings(),
+			TenantID:  roachpb.SystemTenantID,
+			Config:    cfg,
+			Clock:     &timeutil.DefaultTimeSource{},
+			MaxOffset: time.Nanosecond,
+			Stopper:   s.Stopper(),
+			Settings:  s.ClusterSettings(),
 		})
 	}
 
 	// HTTPS with client certs for security.RootUser.
-	rootCertsContext := newRPCContext(testutils.NewTestBaseContext(security.RootUserName()))
+	rootCertsContext := newRPCContext(testutils.NewTestBaseContext(username.RootUserName()))
 	// HTTPS with client certs for security.NodeUser.
 	nodeCertsContext := newRPCContext(testutils.NewNodeTestBaseContext())
 	// HTTPS with client certs for TestUser.
-	testCertsContext := newRPCContext(testutils.NewTestBaseContext(security.TestUserName()))
+	testCertsContext := newRPCContext(testutils.NewTestBaseContext(username.TestUserName()))
 	// HTTPS without client certs. The user does not matter.
 	noCertsContext := insecureCtx{}
 	// Plain http.
-	plainHTTPCfg := testutils.NewTestBaseContext(security.TestUserName())
+	plainHTTPCfg := testutils.NewTestBaseContext(username.TestUserName())
 	plainHTTPCfg.Insecure = true
 	insecureContext := newRPCContext(plainHTTPCfg)
 
@@ -232,7 +234,7 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 		{"timelord", "12345", "", "VALID UNTIL $1",
 			[]interface{}{timeutil.Now().Add(59 * time.Minute).In(shanghaiLoc)}},
 	} {
-		username := security.MakeSQLUsernameFromPreNormalizedString(user.username)
+		username := username.MakeSQLUsernameFromPreNormalizedString(user.username)
 		cmd := fmt.Sprintf(
 			"CREATE USER %s WITH PASSWORD '%s' %s %s",
 			username.SQLIdentifier(), user.password, user.loginFlag, user.validUntilClause)
@@ -273,7 +275,7 @@ func TestVerifyPasswordDBConsole(t *testing.T) {
 		{"user with VALID UNTIL NULL should succeed", "cthon98", "12345", true},
 	} {
 		t.Run(tc.testName, func(t *testing.T) {
-			username := security.MakeSQLUsernameFromPreNormalizedString(tc.username)
+			username := username.MakeSQLUsernameFromPreNormalizedString(tc.username)
 			valid, expired, err := ts.authentication.verifyPasswordDBConsole(context.Background(), username, tc.password)
 			if err != nil {
 				t.Errorf(
@@ -303,7 +305,7 @@ func TestCreateSession(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
-	username := security.TestUserName()
+	username := username.TestUserName()
 
 	// Create an authentication, noting the time before and after creation. This
 	// lets us ensure that the timestamps created are accurate.
@@ -395,7 +397,7 @@ func TestVerifySession(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
-	sessionUsername := security.TestUserName()
+	sessionUsername := username.TestUserName()
 	id, origSecret, err := ts.authentication.newAuthSession(context.Background(), sessionUsername)
 	if err != nil {
 		t.Fatal(err)
@@ -485,7 +487,7 @@ func TestAuthenticationAPIUserLogin(t *testing.T) {
 	tryLogin := func(username, password string) (*http.Response, error) {
 		// We need to instantiate our own HTTP Request, because we must inspect
 		// the returned headers.
-		httpClient, err := ts.GetHTTPClient()
+		httpClient, err := ts.GetUnauthenticatedHTTPClient()
 		if util.RaceEnabled {
 			httpClient.Timeout += 30 * time.Second
 		}
@@ -610,7 +612,7 @@ func TestLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	invalidAuthClient, err := s.GetHTTPClient()
+	invalidAuthClient, err := s.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,11 +648,11 @@ func TestAuthenticationMux(t *testing.T) {
 	tsrv := s.(*TestServer)
 
 	// Both the normal and authenticated client will be used for each test.
-	normalClient, err := tsrv.GetHTTPClient()
+	normalClient, err := tsrv.GetUnauthenticatedHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	authClient, err := tsrv.GetAdminAuthenticatedHTTPClient()
+	authClient, err := tsrv.GetAdminHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +674,7 @@ func TestAuthenticationMux(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		if a, e := resp.StatusCode, expected; a != e {
-			message, err := ioutil.ReadAll(resp.Body)
+			message, err := io.ReadAll(resp.Body)
 			if err != nil {
 				message = []byte(err.Error())
 			}
@@ -756,7 +758,7 @@ func TestGRPCAuthentication(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			_ = stream.Send(&kvserver.RaftMessageRequestBatch{})
+			_ = stream.Send(&kvserverpb.RaftMessageRequestBatch{})
 			_, err = stream.Recv()
 			return err
 		}},
@@ -815,7 +817,7 @@ func TestGRPCAuthentication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tlsConfig, err := certManager.GetClientTLSConfig(security.TestUserName())
+	tlsConfig, err := certManager.GetClientTLSConfig(username.TestUserName())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,7 +832,7 @@ func TestGRPCAuthentication(t *testing.T) {
 	for _, subsystem := range subsystems {
 		t.Run(fmt.Sprintf("bad-user/%s", subsystem.name), func(t *testing.T) {
 			err := subsystem.sendRPC(ctx, conn)
-			if exp := `user \[testuser\] is not allowed to perform this RPC`; !testutils.IsError(err, exp) {
+			if exp := `client certificate CN=testuser,O=Cockroach cannot be used to perform RPC on tenant {1}`; !testutils.IsError(err, exp) {
 				t.Errorf("expected %q error, but got %v", exp, err)
 			}
 		})

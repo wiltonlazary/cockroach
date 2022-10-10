@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 
 go_library(
@@ -6,6 +7,9 @@ go_library(
     importpath = "github.com/cockroachdb/cockroach/pkg/cmd/roachprod-stress",
     visibility = ["//visibility:private"],
     deps = [
+        "//pkg/roachprod",
+        "//pkg/roachprod/logger",
+        "//pkg/roachprod/ssh",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
     ],
@@ -16,3 +20,5 @@ go_binary(
     embed = [":roachprod-stress_lib"],
     visibility = ["//visibility:public"],
 )
+
+get_x_data(name = "get_x_data")

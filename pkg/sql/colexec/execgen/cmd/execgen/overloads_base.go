@@ -17,7 +17,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/col/typeconv"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treecmp"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
@@ -42,15 +43,15 @@ import (
 //
 // Here is the diagram of relationships for argTypeOverload struct:
 //
-//   argTypeOverloadBase            overloadBase
-//            \          \              |
-//            \           ------        |
-//            ↓                 ↓       ↓
-//   argWidthOverloadBase       argTypeOverload
-//               \                /
-//                \              | (single)
-//                ↓              ↓
-//                argWidthOverload
+//	argTypeOverloadBase            overloadBase
+//	         \          \              |
+//	         \           ------        |
+//	         ↓                 ↓       ↓
+//	argWidthOverloadBase       argTypeOverload
+//	            \                /
+//	             \              | (single)
+//	             ↓              ↓
+//	             argWidthOverload
 //
 // lastArgTypeOverload is similar in nature to argTypeOverload in that it
 // describes an overloaded argument, but that argument is the last one, so the
@@ -61,15 +62,15 @@ import (
 //
 // Here is the diagram of relationships for lastArgTypeOverload struct:
 //
-//   argTypeOverloadBase            overloadBase
-//            \          \              |
-//            \           ------        |
-//            ↓                 ↓       ↓
-//   argWidthOverloadBase     lastArgTypeOverload
-//               \                /
-//                \              | (multiple)
-//                ↓              ↓
-//                lastArgWidthOverload
+//	argTypeOverloadBase            overloadBase
+//	         \          \              |
+//	         \           ------        |
+//	         ↓                 ↓       ↓
+//	argWidthOverloadBase     lastArgTypeOverload
+//	            \                /
+//	             \              | (multiple)
+//	             ↓              ↓
+//	             lastArgWidthOverload
 //
 // Two argument overload consists of multiple corresponding to each other
 // argTypeOverloads and lastArgTypeOverloads.
@@ -81,21 +82,21 @@ import (
 // These structs (or their "resolved" equivalents) are intended to be used by
 // the code generation with the following patterns:
 //
-//   switch canonicalTypeFamily {
-//     switch width {
-//       <resolved one arg overload>
-//     }
-//   }
+//	switch canonicalTypeFamily {
+//	  switch width {
+//	    <resolved one arg overload>
+//	  }
+//	}
 //
-//   switch leftCanonicalTypeFamily {
-//     switch leftWidth {
-//       switch rightCanonicalTypeFamily {
-//         switch rightWidth {
-//           <resolved two arg overload>
-//         }
-//       }
-//     }
-//   }
+//	switch leftCanonicalTypeFamily {
+//	  switch leftWidth {
+//	    switch rightCanonicalTypeFamily {
+//	      switch rightWidth {
+//	        <resolved two arg overload>
+//	      }
+//	    }
+//	  }
+//	}
 type overloadBase struct {
 	kind overloadKind
 
@@ -104,8 +105,8 @@ type overloadBase struct {
 	// Only one of CmpOp and BinOp will be set, depending on whether the
 	// overload is a binary operator or a comparison operator. Neither of the
 	// fields will be set when it is a hash or cast overload.
-	CmpOp tree.ComparisonOperator
-	BinOp tree.BinaryOperatorSymbol
+	CmpOp treecmp.ComparisonOperator
+	BinOp treebin.BinaryOperatorSymbol
 }
 
 // overloadKind describes the type of an overload. The word "kind" was chosen
@@ -122,7 +123,7 @@ func (b *overloadBase) String() string {
 	return fmt.Sprintf("%s: %s", b.Name, b.OpStr)
 }
 
-func toString(family types.Family) string {
+func familyToString(family types.Family) string {
 	switch family {
 	case typeconv.DatumVecCanonicalTypeFamily:
 		return "typeconv.DatumVecCanonicalTypeFamily"
@@ -139,7 +140,7 @@ type argTypeOverloadBase struct {
 func newArgTypeOverloadBase(canonicalTypeFamily types.Family) *argTypeOverloadBase {
 	return &argTypeOverloadBase{
 		CanonicalTypeFamily:    canonicalTypeFamily,
-		CanonicalTypeFamilyStr: toString(canonicalTypeFamily),
+		CanonicalTypeFamilyStr: familyToString(canonicalTypeFamily),
 	}
 }
 
@@ -311,10 +312,16 @@ type twoArgsResolvedOverload struct {
 	*overloadBase
 	Left  *argWidthOverload
 	Right *lastArgWidthOverload
+
+	// Negatable and CaseInsensitive are only used by the LIKE overloads. We
+	// cannot easily extract out a separate struct for those since we're reusing
+	// the same templates as all of the selection / projection operators.
+	Negatable       bool
+	CaseInsensitive bool
 }
 
 // NeedsBinaryOverloadHelper returns true iff the overload is such that it needs
-// access to execgen.BinaryOverloadHelper.
+// access to colexecutils.BinaryOverloadHelper.
 func (o *twoArgsResolvedOverload) NeedsBinaryOverloadHelper() bool {
 	return o.kind == binaryOverload && o.Right.RetVecMethod == "Datum"
 }
@@ -358,7 +365,7 @@ type twoArgsResolvedOverloadRightWidthInfo struct {
 
 type assignFunc func(op *lastArgWidthOverload, targetElem, leftElem, rightElem, targetCol, leftCol, rightCol string) string
 type compareFunc func(targetElem, leftElem, rightElem, leftCol, rightCol string) string
-type castFunc func(to, from, evalCtx, toType string) string
+type castFunc func(to, from, evalCtx, toType, buf string) string
 type hashFunc func(targetElem, vElem, vVec, vIdx string) string
 
 // Assign produces a Go source string that assigns the "targetElem" variable to

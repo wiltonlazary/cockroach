@@ -13,13 +13,13 @@ package colrpc
 import (
 	"context"
 	"io"
-	"math"
 	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow/go/arrow/array"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/colserde"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
@@ -328,13 +328,17 @@ func (i *Inbox) Next() coldata.Batch {
 		return coldata.ZeroBatch
 	}
 
+	var ungracefulStreamTermination bool
 	defer func() {
 		// Catch any panics that occur and close the Inbox in order to not leak
 		// the goroutine listening for context cancellation. The Inbox must
 		// still be closed during normal termination.
 		if panicObj := recover(); panicObj != nil {
-			// Only close the Inbox here in case of an ungraceful termination.
-			i.close()
+			if ungracefulStreamTermination {
+				// Only close the Inbox here in case of an ungraceful
+				// termination.
+				i.close()
+			}
 			err := logcrash.PanicAsError(0, panicObj)
 			log.VEventf(i.Ctx, 1, "Inbox encountered an error in Next: %v", err)
 			// Note that here we use InternalError to propagate the error
@@ -363,21 +367,38 @@ func (i *Inbox) Next() coldata.Batch {
 			// to handle it.
 			err = pgerror.Wrap(err, pgcode.InternalConnectionFailure, "inbox communication error")
 			i.errCh <- err
+			ungracefulStreamTermination = true
 			colexecerror.ExpectedError(err)
 		}
 		if len(m.Data.Metadata) != 0 {
+			// If an error was encountered, it needs to be propagated
+			// immediately. All other metadata will simply be buffered and
+			// returned in DrainMeta.
+			var receivedErr error
 			for _, rpm := range m.Data.Metadata {
 				meta, ok := execinfrapb.RemoteProducerMetaToLocalMeta(i.Ctx, rpm)
 				if !ok {
 					continue
 				}
-				if meta.Err != nil {
-					// If an error was encountered, it needs to be propagated
-					// immediately. All other metadata will simply be buffered
-					// and returned in DrainMeta.
-					colexecerror.ExpectedError(meta.Err)
+				if meta.Err != nil && receivedErr == nil {
+					receivedErr = meta.Err
+				} else {
+					// Note that if multiple errors are sent in a single
+					// message, then we'll propagate the first one right away
+					// (via a panic below) and will buffer the rest to be
+					// returned in DrainMeta. The caller will catch the panic
+					// and will transition to draining, so this all works out.
+					//
+					// We choose this way of handling multiple errors rather
+					// than something like errors.CombineErrors() since we want
+					// to keep errors unchanged (e.g. roachpb.ErrPriority() will
+					// be called on each error in the DistSQLReceiver).
+					i.bufferedMeta = append(i.bufferedMeta, meta)
+					colexecutils.AccountForMetadata(i.allocator, i.bufferedMeta[len(i.bufferedMeta)-1:])
 				}
-				i.bufferedMeta = append(i.bufferedMeta, meta)
+			}
+			if receivedErr != nil {
+				colexecerror.ExpectedError(receivedErr)
 			}
 			// Continue until we get the next batch or EOF.
 			continue
@@ -390,7 +411,7 @@ func (i *Inbox) Next() coldata.Batch {
 		atomic.AddInt64(&i.statsAtomics.bytesRead, numSerializedBytes)
 		// Update the allocator since we're holding onto the serialized bytes
 		// for now.
-		i.allocator.AdjustMemoryUsage(numSerializedBytes)
+		i.allocator.AdjustMemoryUsageAfterAllocation(numSerializedBytes)
 		// Do admission control after memory accounting for the serialized bytes
 		// and before deserialization.
 		if i.admissionQ != nil {
@@ -408,8 +429,9 @@ func (i *Inbox) Next() coldata.Batch {
 			colexecerror.InternalError(err)
 		}
 		// We rely on the outboxes to produce reasonably sized batches.
-		const maxBatchMemSize = math.MaxInt64
-		i.scratch.b, _ = i.allocator.ResetMaybeReallocate(i.typs, i.scratch.b, batchLength, maxBatchMemSize)
+		i.scratch.b, _ = i.allocator.ResetMaybeReallocateNoMemLimit(
+			i.typs, i.scratch.b, batchLength,
+		)
 		i.allocator.PerformOperation(i.scratch.b.ColVecs(), func() {
 			if err := i.converter.ArrowToBatch(i.scratch.data, batchLength, i.scratch.b); err != nil {
 				colexecerror.InternalError(err)
@@ -460,7 +482,15 @@ func (i *Inbox) sendDrainSignal(ctx context.Context) error {
 // not be called concurrently with Next.
 func (i *Inbox) DrainMeta() []execinfrapb.ProducerMetadata {
 	allMeta := i.bufferedMeta
-	i.bufferedMeta = i.bufferedMeta[:0]
+	// Eagerly lose the reference to the metadata since it might be of
+	// non-trivial footprint.
+	i.bufferedMeta = nil
+	// We also no longer need the scratch batch.
+	i.scratch.b = nil
+	// The allocator tracks the memory usage for a few things (the scratch batch
+	// as well as the metadata), and when this function returns, we no longer
+	// reference any of those, so we can release all of the allocations.
+	defer i.allocator.ReleaseAll()
 
 	if i.done {
 		// Next exhausted the stream of metadata.

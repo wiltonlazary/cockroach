@@ -13,49 +13,124 @@ package delegate
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/sql/decodeusername"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/oidext"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util"
 )
 
 // delegateShowGrants implements SHOW GRANTS which returns grant details for the
 // specified objects and users.
 // Privileges: None.
-//   Notes: postgres does not have a SHOW GRANTS statement.
-//          mysql only returns the user's privileges.
+//
+//	Notes: postgres does not have a SHOW GRANTS statement.
+//	       mysql only returns the user's privileges.
 func (d *delegator) delegateShowGrants(n *tree.ShowGrants) (tree.Statement, error) {
 	var params []string
 
 	const dbPrivQuery = `
 SELECT database_name,
        grantee,
-       privilege_type
+       privilege_type,
+			 is_grantable::boolean
   FROM "".crdb_internal.cluster_database_privileges`
 	const schemaPrivQuery = `
 SELECT table_catalog AS database_name,
        table_schema AS schema_name,
        grantee,
-       privilege_type
+       privilege_type,
+       is_grantable::boolean
   FROM "".information_schema.schema_privileges`
 	const tablePrivQuery = `
 SELECT table_catalog AS database_name,
        table_schema AS schema_name,
        table_name,
        grantee,
-       privilege_type
+       privilege_type,
+       is_grantable::boolean
 FROM "".information_schema.table_privileges`
 	const typePrivQuery = `
 SELECT type_catalog AS database_name,
        type_schema AS schema_name,
        type_name,
        grantee,
-       privilege_type
+       privilege_type,
+       is_grantable::boolean
 FROM "".information_schema.type_privileges`
+	const systemPrivilegeQuery = `
+SELECT a.username AS grantee,
+       privilege,
+       a.privilege
+       IN (
+          SELECT unnest(grant_options)
+            FROM system.privileges
+           WHERE username = a.username
+        ) AS is_grantable
+  FROM (
+        SELECT username, unnest(privileges) AS privilege
+          FROM system.privileges
+       ) AS a
+`
+	const externalConnectionPrivilegeQuery = `
+SELECT *
+  FROM (
+        SELECT name,
+               a.username AS grantee,
+               privilege,
+               a.privilege
+               IN (
+                  SELECT unnest(grant_options)
+                    FROM system.privileges
+                   WHERE username = a.username
+                ) AS grantable
+          FROM (
+                SELECT regexp_extract(
+                        path,
+                        e'/externalconn/(\\S+)'
+                       ) AS name,
+                       username,
+                       unnest(privileges) AS privilege
+                  FROM system.privileges
+                 WHERE path ~* '^/externalconn/'
+               ) AS a
+       )
+`
+	// Query grants data for user-defined functions. Builtin functions are not
+	// included.
+	udfQuery := fmt.Sprintf(`
+WITH fn_grants AS (
+  SELECT routine_catalog as database_name,
+         routine_schema as schema_name,
+         reverse(split_part(reverse(specific_name), '_', 1))::OID as function_id,
+         routine_name as function_name,
+         grantee,
+         privilege_type,
+         is_grantable::boolean
+  FROM "".information_schema.role_routine_grants
+  WHERE reverse(split_part(reverse(specific_name), '_', 1))::INT > %d
+)
+SELECT database_name,
+       schema_name,
+       function_id,
+       concat(
+				 function_name,
+         '(',
+				 pg_get_function_identity_arguments(function_id),
+         ')'
+			 ) as function_signature,
+       grantee,
+       privilege_type,
+       is_grantable
+  FROM fn_grants
+`, oidext.CockroachPredefinedOIDMax)
 
 	var source bytes.Buffer
 	var cond bytes.Buffer
@@ -93,15 +168,30 @@ FROM "".information_schema.type_privileges`
 		currDB := d.evalCtx.SessionData().Database
 
 		for _, schema := range n.Targets.Schemas {
-			_, _, err := d.catalog.ResolveSchema(d.ctx, cat.Flags{AvoidDescriptorCaches: true}, &schema)
-			if err != nil {
-				return nil, err
+			if schema.SchemaName == tree.Name('*') {
+				allSchemas, err := d.catalog.GetAllSchemaNamesForDB(d.ctx, schema.CatalogName.String())
+				if err != nil {
+					return nil, err
+				}
+
+				for _, sc := range allSchemas {
+					_, _, err := d.catalog.ResolveSchema(d.ctx, cat.Flags{AvoidDescriptorCaches: true}, &sc)
+					if err != nil {
+						return nil, err
+					}
+					params = append(params, fmt.Sprintf("(%s,%s)", lexbase.EscapeSQLString(sc.Catalog()), lexbase.EscapeSQLString(sc.Schema())))
+				}
+			} else {
+				_, _, err := d.catalog.ResolveSchema(d.ctx, cat.Flags{AvoidDescriptorCaches: true}, &schema)
+				if err != nil {
+					return nil, err
+				}
+				dbName := currDB
+				if schema.ExplicitCatalog {
+					dbName = schema.Catalog()
+				}
+				params = append(params, fmt.Sprintf("(%s,%s)", lexbase.EscapeSQLString(dbName), lexbase.EscapeSQLString(schema.Schema())))
 			}
-			dbName := currDB
-			if schema.ExplicitCatalog {
-				dbName = schema.Catalog()
-			}
-			params = append(params, fmt.Sprintf("(%s,%s)", lexbase.EscapeSQLString(dbName), lexbase.EscapeSQLString(schema.Schema())))
 		}
 
 		fmt.Fprint(&source, schemaPrivQuery)
@@ -158,6 +248,39 @@ FROM "".information_schema.type_privileges`
 				strings.Join(params, ","),
 			)
 		}
+	} else if n.Targets != nil && len(n.Targets.Functions) > 0 {
+		fmt.Fprint(&source, udfQuery)
+		orderBy = "1,2,3,4,5,6"
+		fnResolved := util.MakeFastIntSet()
+		for _, fn := range n.Targets.Functions {
+			un := fn.FuncName.ToUnresolvedObjectName().ToUnresolvedName()
+			fd, err := d.catalog.ResolveFunction(d.ctx, un, &d.evalCtx.SessionData().SearchPath)
+			if err != nil {
+				return nil, err
+			}
+			argTypes, err := fn.InputArgTypes(d.ctx, d.catalog)
+			if err != nil {
+				return nil, err
+			}
+			ol, err := fd.MatchOverload(argTypes, fn.FuncName.Schema(), &d.evalCtx.SessionData().SearchPath)
+			if err != nil {
+				return nil, err
+			}
+			fnResolved.Add(int(ol.Oid))
+		}
+		params = make([]string, fnResolved.Len())
+		for i, fnID := range fnResolved.Ordered() {
+			params[i] = strconv.Itoa(fnID)
+		}
+		fmt.Fprintf(&cond, `WHERE function_id IN (%s)`, strings.Join(params, ","))
+	} else if n.Targets != nil && n.Targets.System {
+		orderBy = "1,2,3"
+		fmt.Fprint(&source, systemPrivilegeQuery)
+		cond.WriteString(`WHERE true`)
+	} else if n.Targets != nil && len(n.Targets.ExternalConnections) > 0 {
+		orderBy = "1,2,3, 4"
+		fmt.Fprint(&source, externalConnectionPrivilegeQuery)
+		cond.WriteString(`WHERE true`)
 	} else {
 		orderBy = "1,2,3,4,5"
 
@@ -167,7 +290,7 @@ FROM "".information_schema.type_privileges`
 			// if the type of target is table.
 			var allTables tree.TableNames
 
-			for _, tableTarget := range n.Targets.Tables {
+			for _, tableTarget := range n.Targets.Tables.TablePatterns {
 				tableGlob, err := tableTarget.NormalizeTablePattern()
 				if err != nil {
 					return nil, err
@@ -201,21 +324,25 @@ FROM "".information_schema.type_privileges`
 		} else {
 			// No target: only look at types, tables and schemas in the current database.
 			source.WriteString(
-				`SELECT database_name, schema_name, table_name AS relation_name, grantee, privilege_type FROM (`,
+				`SELECT database_name, schema_name, table_name AS relation_name, grantee, privilege_type, is_grantable FROM (`,
 			)
 			source.WriteString(tablePrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, schema_name, NULL::STRING AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, schema_name, NULL::STRING AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(schemaPrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, NULL::STRING AS schema_name, NULL::STRING AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, NULL::STRING AS schema_name, NULL::STRING AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(dbPrivQuery)
 			source.WriteByte(')')
 			source.WriteString(` UNION ALL ` +
-				`SELECT database_name, schema_name, type_name AS relation_name, grantee, privilege_type FROM (`)
+				`SELECT database_name, schema_name, type_name AS relation_name, grantee, privilege_type, is_grantable FROM (`)
 			source.WriteString(typePrivQuery)
+			source.WriteByte(')')
+			source.WriteString(` UNION ALL ` +
+				`SELECT database_name, schema_name, function_signature AS relation_name, grantee, privilege_type, is_grantable FROM (`)
+			source.WriteString(udfQuery)
 			source.WriteByte(')')
 			// If the current database is set, restrict the command to it.
 			if currDB := d.evalCtx.SessionData().Database; currDB != "" {
@@ -228,7 +355,9 @@ FROM "".information_schema.type_privileges`
 
 	if n.Grantees != nil {
 		params = params[:0]
-		grantees, err := n.Grantees.ToSQLUsernames(d.evalCtx.SessionData(), security.UsernameValidation)
+		grantees, err := decodeusername.FromRoleSpecList(
+			d.evalCtx.SessionData(), username.PurposeValidation, n.Grantees,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -240,11 +369,12 @@ FROM "".information_schema.type_privileges`
 	query := fmt.Sprintf(`
 		SELECT * FROM (%s) %s ORDER BY %s
 	`, source.String(), cond.String(), orderBy)
-
 	// Terminate on invalid users.
 	for _, p := range n.Grantees {
 
-		user, err := p.ToSQLUsername(d.evalCtx.SessionData(), security.UsernameValidation)
+		user, err := decodeusername.FromRoleSpec(
+			d.evalCtx.SessionData(), username.PurposeValidation, p,
+		)
 		if err != nil {
 			return nil, err
 		}

@@ -14,7 +14,10 @@
 package physicalplan
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -23,8 +26,8 @@ import (
 // ExprContext is an interface containing objects necessary for creating
 // execinfrapb.Expressions.
 type ExprContext interface {
-	// EvalContext returns the tree.EvalContext for planning.
-	EvalContext() *tree.EvalContext
+	// EvalContext returns the eval.Context for planning.
+	EvalContext() *eval.Context
 
 	// IsLocal returns true if the current plan is local.
 	IsLocal() bool
@@ -36,8 +39,8 @@ type fakeExprContext struct{}
 
 var _ ExprContext = fakeExprContext{}
 
-func (fakeExprContext) EvalContext() *tree.EvalContext {
-	return &tree.EvalContext{}
+func (fakeExprContext) EvalContext() *eval.Context {
+	return &eval.Context{}
 }
 
 func (fakeExprContext) IsLocal() bool {
@@ -55,18 +58,18 @@ func (fakeExprContext) IsLocal() bool {
 //
 // ctx can be nil in which case a fakeExprCtx will be used.
 func MakeExpression(
-	expr tree.TypedExpr, ctx ExprContext, indexVarMap []int,
+	ctx context.Context, expr tree.TypedExpr, exprContext ExprContext, indexVarMap []int,
 ) (execinfrapb.Expression, error) {
 	if expr == nil {
 		return execinfrapb.Expression{}, nil
 	}
-	if ctx == nil {
-		ctx = &fakeExprContext{}
+	if exprContext == nil {
+		exprContext = &fakeExprContext{}
 	}
 
 	// Always replace the subqueries with their results (they must have been
 	// executed before the main query).
-	evalCtx := ctx.EvalContext()
+	evalCtx := exprContext.EvalContext()
 	subqueryVisitor := &evalAndReplaceSubqueryVisitor{
 		evalCtx: evalCtx,
 	}
@@ -81,22 +84,22 @@ func MakeExpression(
 		expr = RemapIVarsInTypedExpr(expr, indexVarMap)
 	}
 	expression := execinfrapb.Expression{LocalExpr: expr}
-	if ctx.IsLocal() {
+	if exprContext.IsLocal() {
 		return expression, nil
 	}
 
 	// Since the plan is not fully local, serialize the expression.
-	fmtCtx := execinfrapb.ExprFmtCtxBase(evalCtx)
+	fmtCtx := execinfrapb.ExprFmtCtxBase(ctx, evalCtx)
 	fmtCtx.FormatNode(expr)
 	if log.V(1) {
-		log.Infof(evalCtx.Ctx(), "Expr %s:\n%s", fmtCtx.String(), tree.ExprDebugString(expr))
+		log.Infof(ctx, "Expr %s:\n%s", fmtCtx.String(), tree.ExprDebugString(expr))
 	}
 	expression.Expr = fmtCtx.CloseAndGetString()
 	return expression, nil
 }
 
 type evalAndReplaceSubqueryVisitor struct {
-	evalCtx *tree.EvalContext
+	evalCtx *eval.Context
 	err     error
 }
 

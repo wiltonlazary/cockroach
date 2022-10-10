@@ -11,9 +11,11 @@
 package colexecargs
 
 import (
+	"context"
 	"sync"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 )
@@ -32,8 +34,8 @@ func NewExprHelper() *ExprHelper {
 // ExprHelper is a utility struct that helps with expression handling in the
 // vectorized engine.
 type ExprHelper struct {
-	helper  execinfrapb.ExprHelper
 	SemaCtx *tree.SemaContext
+	helper  execinfrapb.ExprHelper
 }
 
 // ProcessExpr processes the given expression and returns a well-typed
@@ -41,12 +43,12 @@ type ExprHelper struct {
 //
 // evalCtx will not be mutated.
 func (h *ExprHelper) ProcessExpr(
-	expr execinfrapb.Expression, evalCtx *tree.EvalContext, typs []*types.T,
+	ctx context.Context, expr execinfrapb.Expression, evalCtx *eval.Context, typs []*types.T,
 ) (tree.TypedExpr, error) {
 	if expr.LocalExpr != nil {
 		return expr.LocalExpr, nil
 	}
 	h.helper.Types = typs
 	tempVars := tree.MakeIndexedVarHelper(&h.helper, len(typs))
-	return execinfrapb.DeserializeExpr(expr.Expr, h.SemaCtx, evalCtx, &tempVars)
+	return execinfrapb.DeserializeExpr(ctx, expr.Expr, h.SemaCtx, evalCtx, &tempVars)
 }

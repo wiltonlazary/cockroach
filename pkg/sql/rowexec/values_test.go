@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -43,14 +44,15 @@ func TestValuesProcessor(t *testing.T) {
 
 				out := &distsqlutils.RowBuffer{}
 				st := cluster.MakeTestingClusterSettings()
-				evalCtx := tree.NewTestingEvalContext(st)
+				evalCtx := eval.NewTestingEvalContext(st)
 				defer evalCtx.Stop(context.Background())
 				flowCtx := execinfra.FlowCtx{
 					Cfg:     &execinfra.ServerConfig{Settings: st},
 					EvalCtx: evalCtx,
+					Mon:     evalCtx.TestingMon,
 				}
 
-				v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{}, out)
+				v, err := newValuesProcessor(context.Background(), &flowCtx, 0 /* processorID */, &spec, &execinfrapb.PostProcessSpec{}, out)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -100,12 +102,13 @@ func BenchmarkValuesProcessor(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 	post := execinfrapb.PostProcessSpec{}
 	output := rowDisposer{}
@@ -122,7 +125,7 @@ func BenchmarkValuesProcessor(b *testing.B) {
 				b.SetBytes(int64(8 * numRows * numCols))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					v, err := newValuesProcessor(&flowCtx, 0 /* processorID */, &spec, &post, &output)
+					v, err := newValuesProcessor(ctx, &flowCtx, 0 /* processorID */, &spec, &post, &output)
 					if err != nil {
 						b.Fatal(err)
 					}

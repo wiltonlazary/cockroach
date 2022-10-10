@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecargs"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexectestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec/colexecutils"
@@ -135,8 +135,8 @@ func TestOutboxInbox(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticNodeID)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
 	// Generate a random cancellation scenario.
@@ -486,8 +486,8 @@ func TestInboxHostCtxCancellation(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
-	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticNodeID)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
+	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx, clock, stopper, execinfra.StaticSQLInstanceID)
 	require.NoError(t, err)
 
 	rng, _ := randutil.NewTestRand()
@@ -574,7 +574,7 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+		hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
 
@@ -648,6 +648,15 @@ func TestOutboxInboxMetadataPropagation(t *testing.T) {
 				return len(meta) == 1 && errors.Is(meta[0].Err, expectedError)
 			},
 			test: func(ctx context.Context, inbox *Inbox) []execinfrapb.ProducerMetadata {
+				defer func() {
+					// Make sure that the error is not propagated for the second
+					// time.
+					//
+					// We still need to drain to simulate what happens in
+					// production - there, the consumer of the inbox would
+					// transition into draining upon receiving the error.
+					require.True(t, len(inbox.DrainMeta()) == 0)
+				}()
 				for {
 					var b coldata.Batch
 					if err := colexecerror.CatchVectorizedRuntimeError(func() {
@@ -757,7 +766,7 @@ func BenchmarkOutboxInbox(b *testing.B) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+		hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(b, err)
 
@@ -830,7 +839,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 	defer stopper.Stop(ctx)
 
 	_, mockServer, addr, err := execinfrapb.StartMockDistSQLServer(ctx,
-		hlc.NewClock(hlc.UnixNano, time.Nanosecond), stopper, execinfra.StaticNodeID,
+		hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */), stopper, execinfra.StaticSQLInstanceID,
 	)
 	require.NoError(t, err)
 	dialer := &execinfrapb.MockDialer{Addr: addr}
@@ -861,7 +870,7 @@ func TestOutboxStreamIDPropagation(t *testing.T) {
 		outbox.Run(
 			ctx,
 			dialer,
-			roachpb.NodeID(0),
+			base.SQLInstanceID(0),
 			execinfrapb.FlowID{UUID: uuid.MakeV4()},
 			outboxStreamID,
 			nil, /* flowCtxCancel */
@@ -933,11 +942,11 @@ func TestInboxCtxStreamIDTagging(t *testing.T) {
 			}, nil)
 
 			inboxTested := make(chan struct{})
-			go func() {
+			go func(tester func(*Inbox)) {
 				inbox.Init(ctx)
-				tc.test(inbox)
+				tester(inbox)
 				inboxTested <- struct{}{}
-			}()
+			}(tc.test)
 
 			<-ctxExtract
 			require.NoError(t, rpcLayer.client.CloseSend())

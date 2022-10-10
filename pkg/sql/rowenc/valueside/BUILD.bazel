@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -14,10 +15,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/geo",
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/lex",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/util/encoding",
@@ -26,6 +28,7 @@ go_library(
         "//pkg/util/timeutil/pgdate",
         "//pkg/util/uuid",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_cockroachdb_redact//:redact",
         "@com_github_lib_pq//oid",
     ],
 )
@@ -36,11 +39,13 @@ go_test(
         "array_test.go",
         "valueside_test.go",
     ],
+    args = ["-test.timeout=295s"],
     embed = [":valueside"],
     deps = [
-        "//pkg/roachpb:with-mocks",
+        "//pkg/roachpb",
         "//pkg/settings/cluster",
         "//pkg/sql/randgen",
+        "//pkg/sql/sem/eval",
         "//pkg/sql/sem/tree",
         "//pkg/sql/types",
         "//pkg/testutils",
@@ -52,3 +57,5 @@ go_test(
         "@com_github_stretchr_testify//require",
     ],
 )
+
+get_x_data(name = "get_x_data")

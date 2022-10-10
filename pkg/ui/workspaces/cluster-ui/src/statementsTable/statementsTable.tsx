@@ -16,12 +16,15 @@ import {
   longToInt,
   StatementSummary,
   StatementStatistics,
+  Count,
+  TimestampToNumber,
+  TimestampToMoment,
+  unset,
 } from "src/util";
+import { DATE_FORMAT } from "src/util/format";
 import {
   countBarChart,
-  rowsReadBarChart,
   bytesReadBarChart,
-  rowsWrittenBarChart,
   latencyBarChart,
   contentionBarChart,
   maxMemUsageBarChart,
@@ -42,11 +45,12 @@ import {
   statisticsTableTitles,
   NodeNames,
   StatisticType,
-  formatAggregationIntervalColumn,
 } from "../statsTableUtil/statsTableUtil";
 
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
-type ICollectedStatementStatistics = cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
+type IStatementDiagnosticsReport =
+  cockroach.server.serverpb.IStatementDiagnosticsReport;
+type ICollectedStatementStatistics =
+  cockroach.server.serverpb.StatementsResponse.ICollectedStatementStatistics;
 import styles from "./statementsTable.module.scss";
 const cx = classNames.bind(styles);
 
@@ -70,12 +74,7 @@ function makeCommonColumns(
   };
 
   const countBar = countBarChart(statements, defaultBarChartOptions);
-  const rowsReadBar = rowsReadBarChart(statements, defaultBarChartOptions);
   const bytesReadBar = bytesReadBarChart(statements, defaultBarChartOptions);
-  const rowsWrittenBar = rowsWrittenBarChart(
-    statements,
-    defaultBarChartOptions,
-  );
   const latencyBar = latencyBarChart(statements, defaultBarChartOptions);
   const contentionBar = contentionBarChart(
     statements,
@@ -93,17 +92,6 @@ function makeCommonColumns(
 
   return [
     {
-      name: "aggregationInterval",
-      title: statisticsTableTitles.aggregationInterval(statType),
-      className: cx("statements-table__interval_time"),
-      cell: (stmt: AggregateStatistics) =>
-        formatAggregationIntervalColumn(
-          stmt.aggregatedTs,
-          stmt.aggregationInterval,
-        ),
-      sort: (stmt: AggregateStatistics) => stmt.aggregatedTs,
-    },
-    {
       name: "executionCount",
       title: statisticsTableTitles.executionCount(statType),
       className: cx("statements-table__col-count"),
@@ -119,12 +107,27 @@ function makeCommonColumns(
       showByDefault: false,
     },
     {
-      name: "rowsRead",
-      title: statisticsTableTitles.rowsRead(statType),
+      name: "applicationName",
+      title: statisticsTableTitles.applicationName(statType),
+      className: cx("statements-table__col-app-name"),
+      cell: (stmt: AggregateStatistics) =>
+        stmt.applicationName?.length > 0 ? stmt.applicationName : unset,
+      sort: (stmt: AggregateStatistics) => stmt.applicationName,
+      showByDefault: false,
+    },
+    {
+      name: "rowsProcessed",
+      title: statisticsTableTitles.rowsProcessed(statType),
       className: cx("statements-table__col-rows-read"),
-      cell: rowsReadBar,
+      cell: (stmt: AggregateStatistics) =>
+        `${Count(Number(stmt.stats.rows_read.mean))} Reads / ${Count(
+          Number(stmt.stats.rows_written?.mean),
+        )} Writes`,
       sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.rows_read.mean)),
+        FixLong(
+          Number(stmt.stats.rows_read.mean) +
+            Number(stmt.stats.rows_written?.mean),
+        ),
     },
     {
       name: "bytesRead",
@@ -132,14 +135,6 @@ function makeCommonColumns(
       cell: bytesReadBar,
       sort: (stmt: AggregateStatistics) =>
         FixLong(Number(stmt.stats.bytes_read.mean)),
-    },
-    {
-      name: "rowsWritten",
-      title: statisticsTableTitles.rowsWritten(statType),
-      cell: rowsWrittenBar,
-      sort: (stmt: AggregateStatistics) =>
-        FixLong(Number(stmt.stats.rows_written?.mean)),
-      showByDefault: false,
     },
     {
       name: "time",
@@ -199,11 +194,28 @@ function makeCommonColumns(
       sort: (stmt: AggregateStatistics) => stmt.regionNodes.sort().join(", "),
       hideIfTenant: true,
     },
+    {
+      name: "lastExecTimestamp",
+      title: statisticsTableTitles.lastExecTimestamp(statType),
+      cell: (stmt: AggregateStatistics) =>
+        TimestampToMoment(stmt.stats.last_exec_timestamp).format(DATE_FORMAT),
+      sort: (stmt: AggregateStatistics) =>
+        TimestampToNumber(stmt.stats.last_exec_timestamp),
+      showByDefault: false,
+    },
+    {
+      name: "statementFingerprintId",
+      title: statisticsTableTitles.statementFingerprintId(statType),
+      cell: (stmt: AggregateStatistics) => stmt.aggregatedFingerprintHexID,
+      sort: (stmt: AggregateStatistics) => stmt.aggregatedFingerprintHexID,
+      showByDefault: false,
+    },
   ];
 }
 
 export interface AggregateStatistics {
   aggregatedFingerprintID: string;
+  aggregatedFingerprintHexID: string;
   // label is either shortStatement (StatementsPage) or nodeId (StatementDetails).
   label: string;
   // summary exists only for SELECT/INSERT/UPSERT/UPDATE statements, and is
@@ -214,6 +226,7 @@ export interface AggregateStatistics {
   implicitTxn: boolean;
   fullScan: boolean;
   database: string;
+  applicationName: string;
   stats: StatementStatistics;
   drawer?: boolean;
   firstCellBordered?: boolean;
@@ -225,7 +238,10 @@ export interface AggregateStatistics {
 
 export class StatementsSortedTable extends SortedTable<AggregateStatistics> {}
 
-export function shortStatement(summary: StatementSummary, original: string) {
+export function shortStatement(
+  summary: StatementSummary,
+  original: string,
+): string {
   switch (summary.statement) {
     case "update":
       return "UPDATE " + summary.table;
@@ -246,7 +262,7 @@ export function shortStatement(summary: StatementSummary, original: string) {
 
 export function makeStatementFingerprintColumn(
   statType: StatisticType,
-  selectedApp: string,
+  selectedApps: string[],
   search?: string,
   onStatementClick?: (statement: string) => void,
 ): ColumnDescriptor<AggregateStatistics> {
@@ -254,7 +270,7 @@ export function makeStatementFingerprintColumn(
     name: "statements",
     title: statisticsTableTitles.statements(statType),
     className: cx("cl-table__col-query-text"),
-    cell: StatementTableCell.statements(search, selectedApp, onStatementClick),
+    cell: StatementTableCell.statements(search, selectedApps, onStatementClick),
     sort: stmt => stmt.label,
     alwaysShow: true,
   };
@@ -262,21 +278,24 @@ export function makeStatementFingerprintColumn(
 
 export function makeStatementsColumns(
   statements: AggregateStatistics[],
-  selectedApp: string,
+  selectedApps: string[],
   // totalWorkload is the sum of service latency of all statements listed on the table.
   totalWorkload: number,
   nodeRegions: { [nodeId: string]: string },
   statType: StatisticType,
   isTenant: boolean,
+  hasViewActivityRedactedRole: boolean,
   search?: string,
   activateDiagnosticsRef?: React.RefObject<ActivateDiagnosticsModalRef>,
-  onDiagnosticsDownload?: (report: IStatementDiagnosticsReport) => void,
+  onSelectDiagnosticsReportDropdownOption?: (
+    report: IStatementDiagnosticsReport,
+  ) => void,
   onStatementClick?: (statement: string) => void,
 ): ColumnDescriptor<AggregateStatistics>[] {
   const columns: ColumnDescriptor<AggregateStatistics>[] = [
     makeStatementFingerprintColumn(
       statType,
-      selectedApp,
+      selectedApps,
       search,
       onStatementClick,
     ),
@@ -285,13 +304,13 @@ export function makeStatementsColumns(
     ...makeCommonColumns(statements, totalWorkload, nodeRegions, statType),
   );
 
-  if (activateDiagnosticsRef && !isTenant) {
+  if (activateDiagnosticsRef && !isTenant && !hasViewActivityRedactedRole) {
     const diagnosticsColumn: ColumnDescriptor<AggregateStatistics> = {
       name: "diagnostics",
       title: statisticsTableTitles.diagnostics(statType),
       cell: StatementTableCell.diagnostics(
         activateDiagnosticsRef,
-        onDiagnosticsDownload,
+        onSelectDiagnosticsReportDropdownOption,
       ),
       sort: stmt => {
         if (stmt.diagnosticsReports?.length > 0) {

@@ -115,7 +115,7 @@ func (r *replicationCriticalLocalitiesReportSaver) loadPreviousVersion(
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 		row := it.Cur()
 		key := localityKey{}
-		key.ZoneID = (config.SystemTenantObjectID)(*row[0].(*tree.DInt))
+		key.ZoneID = (config.ObjectID)(*row[0].(*tree.DInt))
 		key.SubzoneID = base.SubzoneID(*row[1].(*tree.DInt))
 		key.locality = (LocalityRepr)(*row[2].(*tree.DString))
 		r.previousVersion[key] = localityStatus{(int32)(*row[3].(*tree.DInt))}
@@ -372,7 +372,11 @@ func (v *criticalLocalitiesVisitor) visitSameZone(ctx context.Context, r *roachp
 func (v *criticalLocalitiesVisitor) countRange(
 	ctx context.Context, zoneKey ZoneKey, r *roachpb.RangeDescriptor,
 ) {
-	stores := v.storeResolver(r)
+	replicas := r.Replicas().Descriptors()
+	stores := make([]roachpb.StoreDescriptor, len(replicas))
+	for i, r := range replicas {
+		stores[i] = v.storeResolver(r.StoreID)
+	}
 
 	// Collect all the localities of all the replicas. Note that we collect
 	// "expanded" localities: if a replica has a multi-tier locality like

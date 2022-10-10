@@ -24,32 +24,110 @@ import "github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 //
 // This mechanism can be used to provide a "window" of compatibility when new
 // features are added. Example:
-//  - we start with Version=1; distsql servers with version 1 only accept
-//    requests with version 1.
-//  - a new distsql feature is added; Version is bumped to 2. The
-//    planner does not yet use this feature by default; it still issues
-//    requests with version 1.
-//  - MinAcceptedVersion is still 1, i.e. servers with version 2
-//    accept both versions 1 and 2.
-//  - after an upgrade cycle, we can enable the feature in the planner,
-//    requiring version 2.
-//  - at some later point, we can choose to deprecate version 1 and have
-//    servers only accept versions >= 2 (by setting
-//    MinAcceptedVersion to 2).
+//   - we start with Version=1; distsql servers with version 1 only accept
+//     requests with version 1.
+//   - a new distsql feature is added; Version is bumped to 2. The
+//     planner does not yet use this feature by default; it still issues
+//     requests with version 1.
+//   - MinAcceptedVersion is still 1, i.e. servers with version 2
+//     accept both versions 1 and 2.
+//   - after an upgrade cycle, we can enable the feature in the planner,
+//     requiring version 2.
+//   - at some later point, we can choose to deprecate version 1 and have
+//     servers only accept versions >= 2 (by setting
+//     MinAcceptedVersion to 2).
+//
+// Why does this all matter? Because of rolling upgrades, distsql servers across
+// nodes may not have an overlapping window of compatibility, so only a subset
+// of nodes can participate in a distsql flow on a given version -- hurting
+// performance. However, we'll take the performance hit to prevent a distsql
+// flow from blowing up. Here's an example:
+//
+// Suppose that nodes running 21.2 can handle flows with distsql version 59.
+// Say we introduced a new distsql processor spec, ExportSpec,
+// in 22.1 but didn't bump the distsql version from 59 to 60.
+//
+// During a rolling upgrade, suppose Node A has upgraded to 22.1 and plans a
+// distSQL flow that uses the new ExportSpec. Node A thinks any node with distsql
+// version 59 can handle this flow, which includes nodes still running a 21.2
+// binary! As soon as a node running a 21.2 binary receives a ExportSpec proto,
+// it will not recognize it, causing the distsql flow to error out.
+//
+// To avoid this sad tale, consider bumping the distsql version if you:
+// - Modify a distsql processor spec in a released binary
+// - Create a new distql processor spec
+// - More examples below
+//
+// A few changes don't need to bump the distsql version:
+// - Modifying a distsql processor spec that isn't on a released binary yet
+// - Renaming any field or the processor spec itself. Nodes are naive to proto field names.
 //
 // ATTENTION: When updating these fields, add a brief description of what
 // changed to the version history below.
-const Version execinfrapb.DistSQLVersion = 58
+const Version execinfrapb.DistSQLVersion = 69
 
 // MinAcceptedVersion is the oldest version that the server is compatible with.
 // A server will not accept flows with older versions.
-const MinAcceptedVersion execinfrapb.DistSQLVersion = 58
+const MinAcceptedVersion execinfrapb.DistSQLVersion = 69
 
 /*
 
 **  VERSION HISTORY **
 
 Please add new entries at the top.
+
+- Version: 69 (MinAcceptedVersion: 69)
+  - ProducerMessage no longer includes the typing information.
+
+- Version: 68 (MinAcceptedVersion: 68)
+  - ZigzagJoinerSpec now uses descpb.IndexFetchSpec instead of table and
+    index descriptors.
+
+- Version: 67 (MinAcceptedVersion: 67)
+  - InvertedJoinerSpec now uses descpb.IndexFetchSpec instead of table and
+    index descriptors.
+
+- Version: 66 (MinAcceptedVersion: 66)
+  - Processor columns for inverted index keys now are presented as having
+    a new EncodedKey type.
+
+- Version: 65 (MinAcceptedVersion: 65)
+  - adds the RestoreValidation field to the RestoreDataSpec and SplitAndScatterSpec
+
+- Version: 64 (MinAcceptedVersion: 63)
+  - final_covar_samp, final_corr, and final_sqrdiff aggregate functions were
+    introduced to support local and final aggregation of the corresponding
+    builtin functions. It would be unrecognized by a server running older
+    versions, hence the version bump.
+    However, a server running v64 can still process all plans from servers
+    running v63, thus the MinAcceptedVersion is kept at 63.
+
+- Version: 63 (MinAcceptedVersion: 63):
+ - Changed JoinReaderSpec to use a descpb.IndexFetchSpec and a list of family
+   IDs instead of table and index descriptors.
+
+- Version: 62 (MinAcceptedVersion: 62):
+ - Changed TableReaderSpec to use a descpb.IndexFetchSpec instead of table and
+   index descriptors.
+
+- Version: 61 (MinAcceptedVersion: 60)
+  - final_regr_avgx, final_regr_avgy, final_regr_intercept, final_regr_r2, and
+    final_regr_slope aggregate functions were introduced to support local and
+    final aggregation of the corresponding builtin functions. It would be
+    unrecognized by a server running older versions, hence the version bump.
+    However, a server running v61 can still process all plans from servers
+    running v60, thus the MinAcceptedVersion is kept at 60.
+
+- Version: 60 (MinAcceptedVersion: 60):
+ - Deprecated ExportWriterSpec and ParquetWriterSpec and merged them into ExportSpec
+
+- Version: 59 (MinAcceptedVersion: 58)
+  - final_regr_sxx, final_regr_sxy, and final_regr_syy aggregate functions were
+    introduced to support local and final aggregation of the corresponding
+    builtin functions. It would be unrecognized by a server running older
+    versions, hence the version bump. However, a server running v59 can still
+    process all plans from servers running v58, thus the MinAcceptedVersion is
+    kept at 58.
 
 - Version: 58 (MinAcceptedVersion: 58)
 	- TableReaderSpec now contains a specific list of column IDs and the internal

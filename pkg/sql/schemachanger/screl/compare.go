@@ -16,26 +16,22 @@ import (
 )
 
 // equalityAttrs are used to sort elements.
-var equalityAttrs = []rel.Attr{
-	rel.Type,
-	DescID,
-	ReferencedDescID,
-	ColumnID,
-	ConstraintType,
-	ConstraintOrdinal,
-	Name,
-	Username,
-	IndexID,
-	TargetStatus,
-	CurrentStatus,
-}
+var equalityAttrs = func() []rel.Attr {
+	s := make([]rel.Attr, 0, AttrMax)
+	s = append(s, rel.Type)
+	for a := Attr(1); a <= AttrMax; a++ {
+		// Do not compare on slice attributes.
+		if !Schema.IsSliceAttr(a) {
+			s = append(s, a)
+		}
+	}
+	return s
+}()
 
-// EqualElements returns true if the two elements are equal.
-func EqualElements(a, b scpb.Element) bool {
+// EqualElementKeys returns true if the two elements are equal over all of
+// their scalar attributes and have the same type. Note that two elements
+// which differ only in the contents of slice attributes will be considered
+// equal by this function.
+func EqualElementKeys(a, b scpb.Element) bool {
 	return Schema.EqualOn(equalityAttrs, a, b)
-}
-
-// CompareElements orders two elements.
-func CompareElements(a, b scpb.Element) (less, eq bool) {
-	return Schema.CompareOn(equalityAttrs, a, b)
 }

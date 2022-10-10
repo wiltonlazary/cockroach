@@ -46,7 +46,7 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	defer cancel()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	cfg := Config{
 		Stopper: stopper,
 		Clock:   clock,
@@ -71,7 +71,7 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 	// Txn1 is in the pending state but is expired.
 	txn1 := newTransaction("txn1", key, 1, clock)
 	txn1.ReadTimestamp.WallTime -= int64(100 * time.Second)
-	txn1.LastHeartbeat = txn1.ReadTimestamp.UnsafeToClockTimestamp().ToTimestamp()
+	txn1.LastHeartbeat = txn1.ReadTimestamp
 	// Txn2 is in the staging state and is not old enough to have expired so the
 	// code ought to send nothing.
 	txn2 := newTransaction("txn2", key, 1, clock)
@@ -247,7 +247,7 @@ func TestCleanupTxnIntentsOnGCAsync(t *testing.T) {
 // synchronously or returns an error when there are too many concurrently
 // running tasks.
 func TestCleanupIntentsAsyncThrottled(t *testing.T) {
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	stopper := stop.NewStopper()
 	defer stopper.Stop(context.Background())
 	cfg := Config{
@@ -297,7 +297,7 @@ func TestCleanupIntentsAsync(t *testing.T) {
 		intents   []roachpb.Intent
 		sendFuncs []sendFunc
 	}
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
 	testIntents := []roachpb.Intent{
 		roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key("a")),
@@ -346,7 +346,7 @@ func TestCleanupIntentsAsync(t *testing.T) {
 func TestCleanupMultipleIntentsAsync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	txn1 := newTransaction("txn1", roachpb.Key("a"), 1, clock)
 	txn2 := newTransaction("txn2", roachpb.Key("c"), 1, clock)
 	testIntents := []roachpb.Intent{
@@ -460,7 +460,7 @@ func (sf *sendFuncs) drain(t *testing.T) {
 // CleanupIntentsAsync properly forwards the ignored seqnum list in
 // the resolve intent requests.
 func TestCleanupTxnIntentsAsyncWithPartialRollback(t *testing.T) {
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	txn := newTransaction("txn", roachpb.Key("a"), 1, clock)
 	txn.LockSpans = []roachpb.Span{
 		{Key: roachpb.Key("a")},
@@ -565,7 +565,7 @@ func TestCleanupTxnIntentsAsync(t *testing.T) {
 	for _, c := range cases {
 		t.Run("", func(t *testing.T) {
 			stopper := stop.NewStopper()
-			clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 			cfg := Config{
 				Stopper: stopper,
 				Clock:   clock,
@@ -592,7 +592,7 @@ func TestCleanupTxnIntentsAsync(t *testing.T) {
 func TestCleanupMultipleTxnIntentsAsync(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	txn1 := newTransaction("txn1", roachpb.Key("a"), 1, clock)
 	txn2 := newTransaction("txn2", roachpb.Key("c"), 1, clock)
 	testEndTxnIntents := []result.EndTxnIntents{
@@ -685,7 +685,7 @@ func TestCleanupMultipleTxnIntentsAsync(t *testing.T) {
 // and returns the appropriate errors.
 func TestCleanupIntents(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	txn := newTransaction("txn", roachpb.Key("a"), roachpb.MinUserPriority, clock)
 	// Set txn.ID to a very small value so it's sorted deterministically first.
 	txn.ID = uuid.UUID{15: 0x01}

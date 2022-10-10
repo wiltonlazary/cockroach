@@ -44,7 +44,7 @@ more difficult. Example usage:
 	}
 	api.Call(ctx, "done")
 
-Problems with errgroup
+# Problems with errgroup
 
 The bugs this package attempts to prevent are: misuse of shadowed
 ctx variables after errgroup closure and confusion in the face of
@@ -116,7 +116,6 @@ Now the final api.Call is correct. But the other api.Call is incorrect
 and the ctx.Done receive is incorrect because they are using the wrong
 context and thus won't correctly exit early if the errgroup needs to
 exit early.
-
 */
 package ctxgroup
 
@@ -138,6 +137,9 @@ type Group struct {
 // returns an error, even if no Go invocation did. In particular, calling
 // Wait() after Done has been closed is guaranteed to return an error.
 func (g Group) Wait() error {
+	if g.ctx == nil {
+		return nil
+	}
 	ctxErr := g.ctx.Err()
 	err := g.wrapped.Wait()
 	if err != nil {

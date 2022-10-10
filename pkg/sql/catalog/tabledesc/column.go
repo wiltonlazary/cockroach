@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
@@ -195,7 +196,7 @@ func (w column) CheckCanBeOutboundFKRef() error {
 // GetPGAttributeNum returns the PGAttributeNum of the column descriptor
 // if the PGAttributeNum is set (non-zero). Returns the ID of the
 // column descriptor if the PGAttributeNum is not set.
-func (w column) GetPGAttributeNum() uint32 {
+func (w column) GetPGAttributeNum() descpb.PGAttributeNum {
 	return w.desc.GetPGAttributeNum()
 }
 
@@ -233,13 +234,32 @@ func (w column) GetGeneratedAsIdentityType() catpb.GeneratedAsIdentityType {
 	return w.desc.GeneratedAsIdentityType
 }
 
-// GetGeneratedAsIdentitySequenceOption returns the column's `GENERATED AS
-// IDENTITY` sequence option if it exists, empty string otherwise.
-func (w column) GetGeneratedAsIdentitySequenceOption() string {
+// GetGeneratedAsIdentitySequenceOptionStr returns the string representation
+// of the column's `GENERATED AS IDENTITY` sequence option if it exists, empty
+// string otherwise.
+func (w column) GetGeneratedAsIdentitySequenceOptionStr() string {
 	if !w.HasGeneratedAsIdentitySequenceOption() {
 		return ""
 	}
 	return strings.TrimSpace(*w.desc.GeneratedAsIdentitySequenceOption)
+}
+
+// GetGeneratedAsIdentitySequenceOption returns the column's `GENERATED AS
+// IDENTITY` sequence option if it exists, and possible error.
+// If the column is not an identity column, return nil for both sequence option
+// and the error.
+// Note it doesn't return the sequence owner info.
+func (w column) GetGeneratedAsIdentitySequenceOption(
+	defaultIntSize int32,
+) (*descpb.TableDescriptor_SequenceOpts, error) {
+	if !w.HasGeneratedAsIdentitySequenceOption() {
+		return nil, nil
+	}
+	seqOpts, err := schemaexpr.ParseSequenceOpts(*w.desc.GeneratedAsIdentitySequenceOption, defaultIntSize)
+	if err != nil {
+		return nil, err
+	}
+	return seqOpts, nil
 }
 
 // HasGeneratedAsIdentitySequenceOption returns true if there is a
@@ -251,28 +271,30 @@ func (w column) HasGeneratedAsIdentitySequenceOption() bool {
 
 // columnCache contains precomputed slices of catalog.Column interfaces.
 type columnCache struct {
-	all        []catalog.Column
-	public     []catalog.Column
-	writable   []catalog.Column
-	deletable  []catalog.Column
-	nonDrop    []catalog.Column
-	visible    []catalog.Column
-	accessible []catalog.Column
-	readable   []catalog.Column
-	withUDTs   []catalog.Column
-	system     []catalog.Column
-	index      []indexColumnCache
+	all                  []catalog.Column
+	public               []catalog.Column
+	writable             []catalog.Column
+	deletable            []catalog.Column
+	nonDrop              []catalog.Column
+	visible              []catalog.Column
+	accessible           []catalog.Column
+	readable             []catalog.Column
+	withUDTs             []catalog.Column
+	system               []catalog.Column
+	familyDefaultColumns []descpb.IndexFetchSpec_FamilyDefaultColumn
+	index                []indexColumnCache
 }
 
 type indexColumnCache struct {
-	all       []catalog.Column
-	allDirs   []descpb.IndexDescriptor_Direction
-	key       []catalog.Column
-	keyDirs   []descpb.IndexDescriptor_Direction
-	stored    []catalog.Column
-	keySuffix []catalog.Column
-	full      []catalog.Column
-	fullDirs  []descpb.IndexDescriptor_Direction
+	all          []catalog.Column
+	allDirs      []catpb.IndexColumn_Direction
+	key          []catalog.Column
+	keyDirs      []catpb.IndexColumn_Direction
+	stored       []catalog.Column
+	keySuffix    []catalog.Column
+	full         []catalog.Column
+	fullDirs     []catpb.IndexColumn_Direction
+	keyAndSuffix []descpb.IndexFetchSpec_KeyColumn
 }
 
 // newColumnCache returns a fresh fully-populated columnCache struct for the
@@ -336,6 +358,20 @@ func newColumnCache(desc *descpb.TableDescriptor, mutations *mutationCache) *col
 			lazyAllocAppendColumn(&c.withUDTs, col, numDeletable)
 		}
 	}
+
+	// Populate familyDefaultColumns.
+	for i := range desc.Families {
+		if f := &desc.Families[i]; f.DefaultColumnID != 0 {
+			if c.familyDefaultColumns == nil {
+				c.familyDefaultColumns = make([]descpb.IndexFetchSpec_FamilyDefaultColumn, 0, len(desc.Families)-i)
+			}
+			c.familyDefaultColumns = append(c.familyDefaultColumns, descpb.IndexFetchSpec_FamilyDefaultColumn{
+				FamilyID:        f.ID,
+				DefaultColumnID: f.DefaultColumnID,
+			})
+		}
+	}
+
 	// Populate the per-index column cache
 	c.index = make([]indexColumnCache, 0, 1+len(desc.Indexes)+len(mutations.indexes))
 	c.index = append(c.index, makeIndexColumnCache(&desc.PrimaryIndex, c.all))
@@ -355,7 +391,7 @@ func makeIndexColumnCache(idx *descpb.IndexDescriptor, all []catalog.Column) (ic
 	nKeySuffix := len(idx.KeySuffixColumnIDs)
 	nStored := len(idx.StoreColumnIDs)
 	nAll := nKey + nKeySuffix + nStored
-	ic.allDirs = make([]descpb.IndexDescriptor_Direction, nAll)
+	ic.allDirs = make([]catpb.IndexColumn_Direction, nAll)
 	// Only copy key column directions, others will remain at ASC (default value).
 	copy(ic.allDirs, idx.KeyColumnDirections)
 	ic.all = make([]catalog.Column, 0, nAll)
@@ -372,6 +408,43 @@ func makeIndexColumnCache(idx *descpb.IndexDescriptor, all []catalog.Column) (ic
 	}
 	ic.full = ic.all[:nFull]
 	ic.fullDirs = ic.allDirs[:nFull]
+
+	// Populate keyAndSuffix. Note that this method can be called on an incomplete
+	// (mutable) descriptor (e.g. as part of initializing a new descriptor); this
+	// code needs to tolerate any descriptor state (like having no key columns, or
+	// having uninitialized column IDs).
+	var invertedColumnID descpb.ColumnID
+	if nKey > 0 && idx.Type == descpb.IndexDescriptor_INVERTED {
+		invertedColumnID = idx.InvertedColumnID()
+	}
+	var compositeIDs catalog.TableColSet
+	for _, colID := range idx.CompositeColumnIDs {
+		compositeIDs.Add(colID)
+	}
+	ic.keyAndSuffix = make([]descpb.IndexFetchSpec_KeyColumn, nKey+nKeySuffix)
+	for i := range ic.keyAndSuffix {
+		col := ic.all[i]
+		if col == nil {
+			ic.keyAndSuffix[i].Name = "invalid"
+			continue
+		}
+		colID := col.GetID()
+		typ := col.GetType()
+		if colID != 0 && colID == invertedColumnID {
+			typ = idx.InvertedColumnKeyType()
+		}
+		ic.keyAndSuffix[i] = descpb.IndexFetchSpec_KeyColumn{
+			IndexFetchSpec_Column: descpb.IndexFetchSpec_Column{
+				Name:          col.GetName(),
+				ColumnID:      colID,
+				Type:          typ,
+				IsNonNullable: !col.IsNullable(),
+			},
+			Direction:   ic.allDirs[i],
+			IsComposite: compositeIDs.Contains(colID),
+			IsInverted:  colID == invertedColumnID,
+		}
+	}
 	return ic
 }
 

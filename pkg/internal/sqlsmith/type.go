@@ -43,6 +43,10 @@ func (s *Smither) pickAnyType(typ *types.T) *types.T {
 		if typ.ArrayContents().Family() == types.AnyFamily {
 			typ = randgen.RandArrayContentsType(s.rnd)
 		}
+	case types.DecimalFamily:
+		if s.disableDecimals {
+			typ = s.randType()
+		}
 	}
 	return typ
 }
@@ -54,7 +58,30 @@ func (s *Smither) randScalarType() *types.T {
 	if s.types != nil {
 		scalarTypes = s.types.scalarTypes
 	}
-	return randgen.RandTypeFromSlice(s.rnd, scalarTypes)
+	typ := randgen.RandTypeFromSlice(s.rnd, scalarTypes)
+	if s.disableDecimals {
+		for typ.Family() == types.DecimalFamily {
+			typ = randgen.RandTypeFromSlice(s.rnd, scalarTypes)
+		}
+	}
+	return typ
+}
+
+// isScalarType returns true if t is a member of types.Scalar, or a user defined
+// enum.
+// Requires s.lock to be held.
+func (s *Smither) isScalarType(t *types.T) bool {
+	s.lock.AssertRHeld()
+	scalarTypes := types.Scalar
+	if s.types != nil {
+		scalarTypes = s.types.scalarTypes
+	}
+	for i := range scalarTypes {
+		if t.Equivalent(scalarTypes[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Smither) randType() *types.T {
@@ -64,7 +91,13 @@ func (s *Smither) randType() *types.T {
 	if s.types != nil {
 		seedTypes = s.types.seedTypes
 	}
-	return randgen.RandTypeFromSlice(s.rnd, seedTypes)
+	typ := randgen.RandTypeFromSlice(s.rnd, seedTypes)
+	if s.disableDecimals {
+		for typ.Family() == types.DecimalFamily {
+			typ = randgen.RandTypeFromSlice(s.rnd, seedTypes)
+		}
+	}
+	return typ
 }
 
 func (s *Smither) makeDesiredTypes() []*types.T {

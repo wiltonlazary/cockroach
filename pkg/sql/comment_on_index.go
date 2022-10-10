@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
 	"github.com/cockroachdb/cockroach/pkg/sql/privilege"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -23,10 +24,10 @@ import (
 )
 
 type commentOnIndexNode struct {
-	n         *tree.CommentOnIndex
-	tableDesc *tabledesc.Mutable
-	index     catalog.Index
-	commenter scexec.CommentUpdater
+	n               *tree.CommentOnIndex
+	tableDesc       *tabledesc.Mutable
+	index           catalog.Index
+	metadataUpdater scexec.DescriptorMetadataUpdater
 }
 
 // CommentOnIndex adds a comment on an index.
@@ -40,7 +41,7 @@ func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (p
 		return nil, err
 	}
 
-	tableDesc, index, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE)
+	_, tableDesc, index, err := p.getTableAndIndex(ctx, &n.Index, privilege.CREATE, true /* skipCache */)
 	if err != nil {
 		return nil, err
 	}
@@ -49,8 +50,11 @@ func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (p
 		n:         n,
 		tableDesc: tableDesc,
 		index:     index,
-		commenter: p.execCfg.CommentUpdaterFactory.NewCommentUpdater(
+		metadataUpdater: descmetadata.NewMetadataUpdater(
 			ctx,
+			p.ExecCfg().InternalExecutorFactory,
+			p.Descriptors(),
+			&p.ExecCfg().Settings.SV,
 			p.txn,
 			p.SessionData(),
 		)}, nil
@@ -58,7 +62,7 @@ func (p *planner) CommentOnIndex(ctx context.Context, n *tree.CommentOnIndex) (p
 
 func (n *commentOnIndexNode) startExec(params runParams) error {
 	if n.n.Comment != nil {
-		err := n.commenter.UpsertDescriptorComment(
+		err := n.metadataUpdater.UpsertDescriptorComment(
 			int64(n.tableDesc.ID),
 			int64(n.index.GetID()),
 			keys.IndexCommentType,
@@ -68,7 +72,7 @@ func (n *commentOnIndexNode) startExec(params runParams) error {
 			return err
 		}
 	} else {
-		err := n.commenter.DeleteDescriptorComment(
+		err := n.metadataUpdater.DeleteDescriptorComment(
 			int64(n.tableDesc.ID), int64(n.index.GetID()), keys.IndexCommentType)
 		if err != nil {
 			return err

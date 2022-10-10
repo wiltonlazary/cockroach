@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
@@ -44,12 +45,11 @@ const (
 // If tableName is anonymous then no table name is included in the formatted
 // string. For example:
 //
-//   INDEX i (a) WHERE b > 0
+//	INDEX i (a) WHERE b > 0
 //
 // If tableName is not anonymous, then "ON" and the name is included:
 //
-//   INDEX i ON t (a) WHERE b > 0
-//
+//	INDEX i ON t (a) WHERE b > 0
 func IndexForDisplay(
 	ctx context.Context,
 	table catalog.TableDescriptor,
@@ -127,8 +127,12 @@ func indexForDisplay(
 	f.WriteByte(')')
 
 	if index.IsSharded() {
-		fmt.Fprintf(f, " USING HASH WITH BUCKET_COUNT = %v",
-			index.Sharded.ShardBuckets)
+		if f.HasFlags(tree.FmtPGCatalog) {
+			fmt.Fprintf(f, " USING HASH WITH (bucket_count=%v)",
+				index.Sharded.ShardBuckets)
+		} else {
+			f.WriteString(" USING HASH")
+		}
 	}
 
 	if !isPrimary && len(index.StoreColumnNames) > 0 {
@@ -168,6 +172,10 @@ func indexForDisplay(
 		} else {
 			f.WriteString(pred)
 		}
+	}
+
+	if index.NotVisible {
+		f.WriteString(" NOT VISIBLE")
 	}
 
 	return f.CloseAndGetString(), nil
@@ -211,7 +219,17 @@ func FormatIndexElements(
 		} else {
 			f.FormatNameP(&index.KeyColumnNames[i])
 		}
-		if index.Type != descpb.IndexDescriptor_INVERTED {
+		if index.Type == descpb.IndexDescriptor_INVERTED &&
+			col.GetID() == index.InvertedColumnID() && len(index.InvertedColumnKinds) > 0 {
+			switch index.InvertedColumnKinds[0] {
+			case catpb.InvertedIndexColumnKind_TRIGRAM:
+				f.WriteString(" gin_trgm_ops")
+			}
+		}
+		// The last column of an inverted index cannot have a DESC direction.
+		// Since the default direction is ASC, we omit the direction entirely
+		// for inverted index columns.
+		if i < n-1 || index.Type != descpb.IndexDescriptor_INVERTED {
 			f.WriteByte(' ')
 			f.WriteString(index.KeyColumnDirections[i].String())
 		}
@@ -224,6 +242,7 @@ func FormatIndexElements(
 func formatStorageConfigs(
 	table catalog.TableDescriptor, index *descpb.IndexDescriptor, f *tree.FmtCtx,
 ) error {
+	numCustomSettings := 0
 	if index.GeoConfig.S2Geometry != nil || index.GeoConfig.S2Geography != nil {
 		var s2Config *geoindex.S2Config
 
@@ -235,7 +254,6 @@ func formatStorageConfigs(
 		}
 
 		defaultS2Config := geoindex.DefaultS2Config()
-		numCustomSettings := 0
 		if *s2Config != *defaultS2Config {
 			for _, check := range []struct {
 				key        string
@@ -294,10 +312,21 @@ func formatStorageConfigs(
 				}
 			}
 		}
+	}
 
+	if index.IsSharded() {
 		if numCustomSettings > 0 {
-			f.WriteString(")")
+			f.WriteString(", ")
+		} else {
+			f.WriteString(" WITH (")
 		}
+		f.WriteString(`bucket_count=`)
+		f.WriteString(strconv.FormatInt(int64(index.Sharded.ShardBuckets), 10))
+		numCustomSettings++
+	}
+
+	if numCustomSettings > 0 {
+		f.WriteString(")")
 	}
 
 	return nil

@@ -11,9 +11,11 @@
 import React from "react";
 import classNames from "classnames/bind";
 import { Modal as AntModal } from "antd";
+import "antd/lib/modal/style";
 import { Button } from "../button";
 import { Text, TextTypes } from "../text";
 import styles from "./modal.module.scss";
+import SpinIcon from "../icon/spin";
 
 export interface ModalProps {
   title?: string;
@@ -23,6 +25,7 @@ export interface ModalProps {
   cancelText?: string;
   visible: boolean;
   className?: string;
+  okLoading?: boolean;
 }
 
 const cx = classNames.bind(styles);
@@ -36,6 +39,7 @@ export const Modal: React.FC<ModalProps> = ({
   visible,
   title,
   className,
+  okLoading,
 }) => {
   return (
     <AntModal
@@ -51,7 +55,13 @@ export const Modal: React.FC<ModalProps> = ({
         <Button onClick={onCancel} type="secondary" key="cancelButton">
           {cancelText}
         </Button>,
-        <Button onClick={onOk} type="primary" key="okButton">
+        <Button
+          onClick={onOk}
+          type="primary"
+          key="okButton"
+          icon={okLoading ? <SpinIcon width={15} height={15} /> : undefined}
+          disabled={okLoading}
+        >
           {okText}
         </Button>,
       ]}

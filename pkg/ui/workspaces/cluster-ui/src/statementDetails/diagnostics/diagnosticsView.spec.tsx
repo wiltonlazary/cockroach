@@ -11,7 +11,6 @@
 import React from "react";
 import { assert } from "chai";
 import { mount, ReactWrapper } from "enzyme";
-import sinon from "sinon";
 import Long from "long";
 import { MemoryRouter } from "react-router-dom";
 import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
@@ -21,9 +20,8 @@ import { DiagnosticsView } from "./diagnosticsView";
 import { Table } from "src/table";
 import { TestStoreProvider } from "src/test-utils";
 
-type IStatementDiagnosticsReport = cockroach.server.serverpb.IStatementDiagnosticsReport;
-
-const sandbox = sinon.createSandbox();
+type IStatementDiagnosticsReport =
+  cockroach.server.serverpb.IStatementDiagnosticsReport;
 
 const activateDiagnosticsRef = { current: { showModalFor: jest.fn() } };
 
@@ -45,10 +43,6 @@ function generateDiagnosticsRequest(
 describe("DiagnosticsView", () => {
   let wrapper: ReactWrapper;
   const statementFingerprint = "some-id";
-
-  beforeEach(() => {
-    sandbox.reset();
-  });
 
   describe("With Empty state", () => {
     beforeEach(() => {
@@ -128,6 +122,28 @@ describe("DiagnosticsView", () => {
         .findWhere(n => n.prop("children") === "Activate diagnostics")
         .first();
       assert.isFalse(activateButtonComponent.exists());
+    });
+
+    it("Cancel request button shows if diagnostics is requested and waiting query", () => {
+      const diagnosticsRequests: IStatementDiagnosticsReport[] = [
+        generateDiagnosticsRequest({ completed: false }),
+        generateDiagnosticsRequest(),
+      ];
+      wrapper = mount(
+        <TestStoreProvider>
+          <DiagnosticsView
+            activateDiagnosticsRef={activateDiagnosticsRef}
+            statementFingerprint={statementFingerprint}
+            hasData={true}
+            diagnosticsReports={diagnosticsRequests}
+            dismissAlertMessage={() => {}}
+          />
+        </TestStoreProvider>,
+      );
+      const cancelButtonComponent = wrapper
+        .findWhere(n => n.prop("children") === "Cancel request")
+        .first();
+      assert.isTrue(cancelButtonComponent.exists());
     });
   });
 });

@@ -11,6 +11,7 @@
 package keyside
 
 import (
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -38,7 +39,7 @@ func Encode(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, error) {
 		return encoding.EncodeNullDescending(b), nil
 	}
 
-	switch t := tree.UnwrapDatum(nil, val).(type) {
+	switch t := eval.UnwrapDatum(nil, val).(type) {
 	case *tree.DBool:
 		var x int64
 		if *t {
@@ -162,14 +163,17 @@ func Encode(b []byte, val tree.Datum, dir encoding.Direction) ([]byte, error) {
 		return encoding.EncodeBitArrayDescending(b, t.BitArray), nil
 	case *tree.DOid:
 		if dir == encoding.Ascending {
-			return encoding.EncodeVarintAscending(b, int64(t.DInt)), nil
+			return encoding.EncodeVarintAscending(b, int64(t.Oid)), nil
 		}
-		return encoding.EncodeVarintDescending(b, int64(t.DInt)), nil
+		return encoding.EncodeVarintDescending(b, int64(t.Oid)), nil
 	case *tree.DEnum:
 		if dir == encoding.Ascending {
 			return encoding.EncodeBytesAscending(b, t.PhysicalRep), nil
 		}
 		return encoding.EncodeBytesDescending(b, t.PhysicalRep), nil
+	case *tree.DEncodedKey:
+		// DEncodedKey carries an already encoded key.
+		return append(b, []byte(*t)...), nil
 	case *tree.DJSON:
 		return nil, unimplemented.NewWithIssue(35706, "unable to encode JSON as a table key")
 	}

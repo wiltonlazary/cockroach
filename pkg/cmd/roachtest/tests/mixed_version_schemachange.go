@@ -13,6 +13,7 @@ package tests
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
@@ -27,8 +28,12 @@ func registerSchemaChangeMixedVersions(r registry.Registry) {
 		// This tests the work done for 20.1 that made schema changes jobs and in
 		// addition prevented making any new schema changes on a mixed cluster in
 		// order to prevent bugs during upgrades.
-		Cluster: r.MakeClusterSpec(4),
+		Cluster:    r.MakeClusterSpec(4),
+		NativeLibs: registry.LibGEOS,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
 			maxOps := 100
 			concurrency := 5
 			if c.IsLocal() {
@@ -56,12 +61,6 @@ func runSchemaChangeWorkloadStep(loadNode, maxOps, concurrency int) versionStep 
 		t.L().Printf("Workload step run: %d", numFeatureRuns)
 		runCmd := []string{
 			"./workload run schemachange --verbose=1",
-			// The workload is still in development and occasionally discovers schema
-			// change errors so for now we don't fail on them but only on panics, server
-			// crashes, deadlocks, etc.
-			// TODO(spaskob): remove when https://github.com/cockroachdb/cockroach/issues/47430
-			// is closed.
-			"--tolerate-errors=true",
 			fmt.Sprintf("--max-ops %d", maxOps),
 			fmt.Sprintf("--concurrency %d", concurrency),
 			fmt.Sprintf("{pgurl:1-%d}", u.c.Spec().NodeCount),

@@ -24,7 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -42,10 +44,10 @@ func TestTxnVerboseTrace(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	tracer := tracing.NewTracer()
-	ctx, sp := tracing.StartVerboseTrace(context.Background(), tracer, "test-txn")
+	ctx, sp := tracer.StartSpanCtx(context.Background(), "test-txn", tracing.WithRecording(tracingpb.RecordingVerbose))
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	if err := db.Txn(ctx, func(ctx context.Context, txn *Txn) error {
@@ -55,7 +57,7 @@ func TestTxnVerboseTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	log.Event(ctx, "txn complete")
-	collectedSpans := sp.FinishAndGetRecording(tracing.RecordingVerbose)
+	collectedSpans := sp.FinishAndGetRecording(tracingpb.RecordingVerbose)
 	dump := collectedSpans.String()
 	// dump:
 	//    0.105ms      0.000ms    event:inside txn
@@ -140,7 +142,7 @@ func TestInitPut(t *testing.T) {
 	// This test is mostly an excuse to exercise otherwise unused code.
 	// TODO(vivekmenezes): update test or remove when InitPut is being
 	// considered sufficiently tested and this path exercised.
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		br := ba.CreateReply()
 		return br, nil
@@ -162,7 +164,7 @@ func TestTransactionConfig(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	dbCtx := DefaultDBContext(stopper)
 	dbCtx.UserPriority = 101
 	db := NewDBWithContext(
@@ -208,7 +210,7 @@ func TestCommitTransactionOnce(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	count := 0
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		count++
@@ -234,7 +236,7 @@ func TestAbortMutatingTransaction(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	var calls []roachpb.Method
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
 		calls = append(calls, ba.Methods()...)
@@ -267,7 +269,7 @@ func TestAbortMutatingTransaction(t *testing.T) {
 func TestRunTransactionRetryOnErrors(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	testCases := []struct {
 		err   error
 		retry bool // Expect retry?
@@ -347,7 +349,7 @@ func TestTransactionStatus(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 	for _, write := range []bool{true, false} {
 		for _, commit := range []bool{true, false} {
@@ -387,7 +389,7 @@ func TestCommitInBatchWrongTxn(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
@@ -411,7 +413,7 @@ func TestSetPriority(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	var expected roachpb.UserPriority
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(
 		func(ba roachpb.BatchRequest) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -453,7 +455,7 @@ func TestWrongTxnRetry(t *testing.T) {
 	ctx := context.Background()
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	var retries int
@@ -483,7 +485,7 @@ func TestBatchMixRawRequest(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	clock := hlc.NewClock(hlc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClockWithSystemTimeSource(time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), newTestTxnFactory(nil), clock, stopper)
 
 	b := &Batch{}
@@ -501,8 +503,7 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	mc := hlc.NewManualClock(1)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+	clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
 	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), MakeMockTxnSenderFactory(
 		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -510,14 +511,14 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 		}), clock, stopper)
 	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
 
-	if txn.deadline() != nil {
+	if !txn.deadline().IsEmpty() {
 		t.Errorf("unexpected initial deadline: %s", txn.deadline())
 	}
 
 	deadline := hlc.Timestamp{WallTime: 10, Logical: 1}
 	err := txn.UpdateDeadline(ctx, deadline)
 	require.NoError(t, err, "Deadline update failed")
-	if d := *txn.deadline(); d != deadline {
+	if d := txn.deadline(); d != deadline {
 		t.Errorf("unexpected deadline: %s", d)
 	}
 
@@ -526,37 +527,16 @@ func TestUpdateDeadlineMaybe(t *testing.T) {
 	futureDeadline := hlc.Timestamp{WallTime: 11, Logical: 1}
 	err = txn.UpdateDeadline(ctx, futureDeadline)
 	require.NoError(t, err, "Future deadline update failed")
-	if d := *txn.deadline(); d != futureDeadline {
+	if d := txn.deadline(); d != futureDeadline {
 		t.Errorf("unexpected deadline: %s", d)
 	}
 
 	pastDeadline := hlc.Timestamp{WallTime: 9, Logical: 1}
 	err = txn.UpdateDeadline(ctx, pastDeadline)
 	require.NoError(t, err, "Past deadline update failed")
-	if d := *txn.deadline(); d != pastDeadline {
+	if d := txn.deadline(); d != pastDeadline {
 		t.Errorf("unexpected deadline: %s", d)
 	}
-}
-
-// Test that, if SetSystemConfigTrigger() fails, the systemConfigTrigger has not
-// been set.
-func TestAnchoringErrorNoTrigger(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-	ctx := context.Background()
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-
-	mc := hlc.NewManualClock(1)
-	clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
-	db := NewDB(log.MakeTestingAmbientCtxWithNewTracer(), MakeMockTxnSenderFactory(
-		func(context.Context, *roachpb.Transaction, roachpb.BatchRequest,
-		) (*roachpb.BatchResponse, *roachpb.Error) {
-			return nil, nil
-		}), clock, stopper)
-	txn := NewTxn(ctx, db, 0 /* gatewayNodeID */)
-	require.EqualError(t, txn.SetSystemConfigTrigger(true /* forSystemTenant */), "unimplemented")
-	require.False(t, txn.systemConfigTrigger)
 }
 
 // TestTxnNegotiateAndSend tests the behavior of NegotiateAndSend, both when the
@@ -572,8 +552,7 @@ func TestTxnNegotiateAndSend(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "fast-path", func(t *testing.T, fastPath bool) {
 		ts10 := hlc.Timestamp{WallTime: 10}
 		ts20 := hlc.Timestamp{WallTime: 20}
-		mc := hlc.NewManualClock(1)
-		clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+		clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
 		txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
 			_ context.Context, ba roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -685,8 +664,7 @@ func TestTxnNegotiateAndSendWithDeadline(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			mc := hlc.NewManualClock(1)
-			clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+			clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
 			txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
 				_ context.Context, ba roachpb.BatchRequest,
 			) (*roachpb.BatchResponse, *roachpb.Error) {
@@ -743,8 +721,7 @@ func TestTxnNegotiateAndSendWithResumeSpan(t *testing.T) {
 	testutils.RunTrueAndFalse(t, "fast-path", func(t *testing.T, fastPath bool) {
 		ts10 := hlc.Timestamp{WallTime: 10}
 		ts20 := hlc.Timestamp{WallTime: 20}
-		mc := hlc.NewManualClock(1)
-		clock := hlc.NewClock(mc.UnixNano, time.Nanosecond)
+		clock := hlc.NewClock(timeutil.NewManualTime(timeutil.Unix(0, 1)), time.Nanosecond /* maxOffset */)
 		txnSender := MakeMockTxnSenderFactoryWithNonTxnSender(nil /* senderFunc */, func(
 			_ context.Context, ba roachpb.BatchRequest,
 		) (*roachpb.BatchResponse, *roachpb.Error) {

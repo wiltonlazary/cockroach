@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 exports_files(["config.go"])
@@ -25,6 +26,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/build",
+        "//pkg/util/humanizeutil",
         "//pkg/util/log/logpb",
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_dustin_go_humanize//:go-humanize",
@@ -40,6 +42,7 @@ go_test(
         "export_test.go",
         "validate_test.go",
     ],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     embed = [":logconfig"],
     deps = [
@@ -48,3 +51,5 @@ go_test(
         "@in_gopkg_yaml_v2//:yaml_v2",
     ],
 )
+
+get_x_data(name = "get_x_data")

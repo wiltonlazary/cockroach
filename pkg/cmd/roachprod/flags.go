@@ -39,42 +39,36 @@ var (
 	destroyAllLocal       bool
 	extendLifetime        time.Duration
 	wipePreserveCerts     bool
+	grafanaConfig         string
+	grafanaurlOpen        bool
+	grafanaDumpDir        string
 	listDetails           bool
 	listJSON              bool
 	listMine              bool
 	listPattern           string
 	secure                = false
 	extraSSHOptions       = ""
-	nodeEnv               = []string{
-		// NOTE: The defaults are also copied in roachtest's invocation of roachprod
-		// (which overrides the default). On changes, consider updating that one
-		// too.
-
-		// RPC compressions costs around 5% on kv95, so we disable it. It might help
-		// when moving snapshots around, though.
-		"COCKROACH_ENABLE_RPC_COMPRESSION=false",
-		// Get rid of an annoying popup in the UI.
-		"COCKROACH_UI_RELEASE_NOTES_SIGNUP_DISMISSED=true",
-	}
-	tag               string
-	external          = false
-	pgurlCertsDir     string
-	adminurlOpen      = false
-	adminurlPath      = ""
-	adminurlIPs       = false
-	useTreeDist       = true
-	sig               = 9
-	waitFlag          = false
-	createVMOpts      = vm.DefaultCreateOpts()
-	startOpts         = roachprod.DefaultStartOpts()
-	stageOS           string
-	stageDir          string
-	logsDir           string
-	logsFilter        string
-	logsProgramFilter string
-	logsFrom          time.Time
-	logsTo            time.Time
-	logsInterval      time.Duration
+	nodeEnv               []string
+	tag                   string
+	external              = false
+	pgurlCertsDir         string
+	adminurlOpen          = false
+	adminurlPath          = ""
+	adminurlIPs           = false
+	useTreeDist           = true
+	sig                   = 9
+	waitFlag              = false
+	maxWait               = 0
+	createVMOpts          = vm.DefaultCreateOpts()
+	startOpts             = roachprod.DefaultStartOpts()
+	stageOS               string
+	stageDir              string
+	logsDir               string
+	logsFilter            string
+	logsProgramFilter     string
+	logsFrom              time.Time
+	logsTo                time.Time
+	logsInterval          time.Duration
 
 	monitorOpts        install.MonitorOpts
 	cachedHostsCluster string
@@ -188,7 +182,7 @@ func initFlags() {
 	startCmd.Flags().StringArrayVarP(&startOpts.ExtraArgs,
 		"args", "a", nil, "node arguments")
 	startCmd.Flags().StringArrayVarP(&nodeEnv,
-		"env", "e", nodeEnv, "node environment variables")
+		"env", "e", config.DefaultEnvVars(), "node environment variables")
 	startCmd.Flags().BoolVar(&startOpts.EncryptedStores,
 		"encrypt", startOpts.EncryptedStores, "start nodes with encryption at rest turned on")
 	startCmd.Flags().BoolVar(&startOpts.SkipInit,
@@ -204,6 +198,7 @@ func initFlags() {
 
 	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
 	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
+	stopCmd.Flags().IntVar(&maxWait, "max-wait", maxWait, "approx number of seconds to wait for processes to exit")
 
 	wipeCmd.Flags().BoolVar(&wipePreserveCerts, "preserve-certs", false, "do not wipe certificates")
 
@@ -240,6 +235,15 @@ func initFlags() {
 	cachedHostsCmd.Flags().StringVar(&cachedHostsCluster,
 		"cluster", "", "print hosts matching cluster")
 
+	grafanaStartCmd.Flags().StringVar(&grafanaConfig,
+		"grafana-config", "", "URL to grafana json config")
+
+	grafanaURLCmd.Flags().BoolVar(&grafanaurlOpen,
+		"open", false, "open the grafana dashboard url on the browser")
+
+	grafanaDumpCmd.Flags().StringVar(&grafanaDumpDir, "dump-dir", "",
+		"the absolute path to dump prometheus data to (use the contained 'prometheus-docker-run.sh' to visualize")
+
 	for _, cmd := range []*cobra.Command{createCmd, destroyCmd, extendCmd, logsCmd} {
 		cmd.Flags().StringVarP(&username, "username", "u", os.Getenv("ROACHPROD_USER"),
 			"Username to run under, detect if blank")
@@ -256,6 +260,8 @@ func initFlags() {
 	for _, cmd := range []*cobra.Command{startCmd, startTenantCmd} {
 		cmd.Flags().BoolVar(&startOpts.Sequential,
 			"sequential", startOpts.Sequential, "start nodes sequentially so node IDs match hostnames")
+		cmd.Flags().Int64Var(&startOpts.NumFilesLimit, "num-files-limit", startOpts.NumFilesLimit,
+			"limit the number of files that can be created by the cockroach process")
 	}
 
 	for _, cmd := range []*cobra.Command{
@@ -275,7 +281,7 @@ func initFlags() {
 		cmd.Flags().StringVarP(&config.Binary,
 			"binary", "b", config.Binary, "the remote cockroach binary to use")
 	}
-	for _, cmd := range []*cobra.Command{startCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd} {
+	for _, cmd := range []*cobra.Command{startCmd, startTenantCmd, sqlCmd, pgurlCmd, adminurlCmd, runCmd} {
 		cmd.Flags().BoolVar(&secure,
 			"secure", false, "use a secure cluster")
 	}

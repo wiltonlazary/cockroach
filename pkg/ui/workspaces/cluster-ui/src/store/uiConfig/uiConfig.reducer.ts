@@ -13,35 +13,33 @@ import { merge } from "lodash";
 import { DOMAIN_NAME } from "../utils";
 import { createSelector } from "reselect";
 import { AppState } from "../reducers";
+import { cockroach } from "@cockroachlabs/crdb-protobuf-client";
+export type UserSQLRolesRequest = cockroach.server.serverpb.UserSQLRolesRequest;
 
 export type UIConfigState = {
   isTenant: boolean;
+  userSQLRoles: string[];
+  hasViewActivityRedactedRole: boolean;
   pages: {
     statementDetails: {
       showStatementDiagnosticsLink: boolean;
     };
-    sessions?: {
-      showTerminateActions?: boolean;
-    };
     sessionDetails: {
       showGatewayNodeLink: boolean;
-      showTerminateActions?: boolean;
     };
   };
 };
 
 const initialState: UIConfigState = {
   isTenant: false,
+  userSQLRoles: [],
+  hasViewActivityRedactedRole: false,
   pages: {
     statementDetails: {
       showStatementDiagnosticsLink: true,
     },
-    sessions: {
-      showTerminateActions: false,
-    },
     sessionDetails: {
       showGatewayNodeLink: false,
-      showTerminateActions: false,
     },
   },
 };
@@ -59,6 +57,7 @@ const uiConfigSlice = createSlice({
     update: (state, action: PayloadAction<Partial<UIConfigState>>) => {
       merge(state, action.payload);
     },
+    refreshUserSQLRoles: (_, action?: PayloadAction<UserSQLRolesRequest>) => {},
   },
 });
 
@@ -70,6 +69,11 @@ export const selectUIConfig = createSelector(
 export const selectIsTenant = createSelector(
   selectUIConfig,
   uiConfig => uiConfig.isTenant,
+);
+
+export const selectHasViewActivityRedactedRole = createSelector(
+  selectUIConfig,
+  uiConfig => uiConfig.userSQLRoles.includes("VIEWACTIVITYREDACTED"),
 );
 
 export const { actions, reducer } = uiConfigSlice;

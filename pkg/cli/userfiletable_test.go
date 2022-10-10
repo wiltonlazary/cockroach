@@ -13,7 +13,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,10 +21,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -82,7 +83,7 @@ func Example_userfile_upload() {
 }
 
 func createTestDirWithNontrivialSubtree() (string, func() error, error) {
-	tmpDir, err := ioutil.TempDir("", testUserfileUploadTempDirPrefix)
+	tmpDir, err := os.MkdirTemp("", testUserfileUploadTempDirPrefix)
 	if err != nil {
 		return "", nil, err
 	}
@@ -115,7 +116,7 @@ func createTestDirWithNontrivialSubtree() (string, func() error, error) {
 	}
 	for i, relPath := range filesRelativePaths {
 		contents := fmt.Sprintf("content %d", i+1)
-		if err := ioutil.WriteFile(filepath.Join(testDir, relPath), []byte(contents), 0666); err != nil {
+		if err := os.WriteFile(filepath.Join(testDir, relPath), []byte(contents), 0666); err != nil {
 			return "", cleanup, err
 		}
 	}
@@ -357,7 +358,7 @@ func checkUserFileContent(
 	ctx context.Context,
 	t *testing.T,
 	execcCfg interface{},
-	user security.SQLUsername,
+	user username.SQLUsername,
 	userfileURI string,
 	expectedContent []byte,
 ) {
@@ -366,7 +367,7 @@ func checkUserFileContent(
 	require.NoError(t, err)
 	reader, err := store.ReadFile(ctx, "")
 	require.NoError(t, err)
-	got, err := ioutil.ReadAll(reader)
+	got, err := ioctx.ReadAll(ctx, reader)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(got, expectedContent))
 }
@@ -437,14 +438,14 @@ func TestUserFileUploadRecursive(t *testing.T) {
 						// specified.
 						if tc.name == "destination-not-full-URI" {
 							destinationFileURI = constructUserfileDestinationURI("",
-								filepath.Join(dstDir, relPath), security.RootUserName())
+								filepath.Join(dstDir, relPath), username.RootUserName())
 						}
 
-						fileContent, err := ioutil.ReadFile(path)
+						fileContent, err := os.ReadFile(path)
 						if err != nil {
 							return err
 						}
-						checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+						checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(),
 							destinationFileURI, fileContent)
 						return nil
 					})
@@ -492,7 +493,7 @@ func TestUserFileUpload(t *testing.T) {
 	} {
 		// Write local file.
 		filePath := filepath.Join(dir, fmt.Sprintf("file%d.csv", i))
-		err := ioutil.WriteFile(filePath, tc.fileContent, 0666)
+		err := os.WriteFile(filePath, tc.fileContent, 0666)
 		require.NoError(t, err)
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("destination-not-full-URI", func(t *testing.T) {
@@ -502,8 +503,8 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
-					constructUserfileDestinationURI("", destination, security.RootUserName()),
+				checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(),
+					constructUserfileDestinationURI("", destination, username.RootUserName()),
 					tc.fileContent)
 			})
 
@@ -513,7 +514,7 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+				checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(),
 					destination, tc.fileContent)
 			})
 
@@ -525,7 +526,7 @@ func TestUserFileUpload(t *testing.T) {
 					destination))
 				require.NoError(t, err)
 
-				checkUserFileContent(ctx, t, c.ExecutorConfig(), security.RootUserName(),
+				checkUserFileContent(ctx, t, c.ExecutorConfig(), username.RootUserName(),
 					destination, tc.fileContent)
 			})
 
@@ -603,12 +604,12 @@ func TestUserfile(t *testing.T) {
 	sort.Strings(fileNames)
 
 	localFilePath := filepath.Join(dir, "test.csv")
-	err := ioutil.WriteFile(localFilePath, []byte("a"), 0666)
+	err := os.WriteFile(localFilePath, []byte("a"), 0666)
 	require.NoError(t, err)
 
 	defaultUserfileURLSchemeAndHost := url.URL{
 		Scheme: defaultUserfileScheme,
-		Host:   defaultQualifiedNamePrefix + security.RootUser,
+		Host:   defaultQualifiedNamePrefix + username.RootUser,
 	}
 
 	for tcNum, tc := range []struct {
@@ -780,14 +781,14 @@ func TestUsernameUserfileInteraction(t *testing.T) {
 
 	localFilePath := filepath.Join(dir, "test.csv")
 	fileContent := []byte("a")
-	err := ioutil.WriteFile(localFilePath, []byte("a"), 0666)
+	err := os.WriteFile(localFilePath, []byte("a"), 0666)
 	require.NoError(t, err)
 
 	rootURL, cleanup := sqlutils.PGUrl(t, c.ServingSQLAddr(), t.Name(),
-		url.User(security.RootUser))
+		url.User(username.RootUser))
 	defer cleanup()
 
-	conn := sqlConnCtx.MakeSQLConn(ioutil.Discard, ioutil.Discard, rootURL.String())
+	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, rootURL.String())
 	defer func() {
 		if err := conn.Close(); err != nil {
 			t.Fatal(err)
@@ -815,11 +816,11 @@ func TestUsernameUserfileInteraction(t *testing.T) {
 			},
 		} {
 			createUserQuery := fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD 'a'`, tc.username)
-			err = conn.Exec(createUserQuery, nil)
+			err = conn.Exec(ctx, createUserQuery)
 			require.NoError(t, err)
 
 			privsUserQuery := fmt.Sprintf(`GRANT CREATE ON DATABASE defaultdb TO "%s"`, tc.username)
-			err = conn.Exec(privsUserQuery, nil)
+			err = conn.Exec(ctx, privsUserQuery)
 			require.NoError(t, err)
 
 			userURL, cleanup2 := sqlutils.PGUrlWithOptionalClientCerts(t, c.ServingSQLAddr(), t.Name(),
@@ -830,7 +831,7 @@ func TestUsernameUserfileInteraction(t *testing.T) {
 				localFilePath, tc.name, userURL.String()))
 			require.NoError(t, err)
 
-			user, err := security.MakeSQLUsernameFromUserInput(tc.username, security.UsernameCreation)
+			user, err := username.MakeSQLUsernameFromUserInput(tc.username, username.PurposeCreation)
 			require.NoError(t, err)
 			uri := constructUserfileDestinationURI("", tc.name, user)
 			checkUserFileContent(ctx, t, c.ExecutorConfig(), user, uri, fileContent)

@@ -11,10 +11,16 @@
 package clisqlshell
 
 import (
+	"bufio"
+	"context"
+	"io"
 	"os"
 	"time"
 
 	democlusterapi "github.com/cockroachdb/cockroach/pkg/cli/democluster/api"
+	"github.com/cockroachdb/cockroach/pkg/sql/scanner"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 )
 
 // Context represents the external configuration of the interactive
@@ -36,6 +42,11 @@ type Context struct {
 	// `demo` command, if that is the command being run.
 	DemoCluster democlusterapi.DemoCluster
 
+	// DisableLineEditor, if set, causes the shell to use a dumb line editor
+	// (disable the interactive one), which simplifies testing by avoiding
+	// escape sequences in the output.
+	DisableLineEditor bool
+
 	// ParseURL is a custom URL parser.
 	//
 	// When left undefined, the code defaults to pgurl.Parse.
@@ -51,6 +62,14 @@ type internalContext struct {
 	// stdout and stderr are where messages and errors/warnings go.
 	stdout *os.File
 	stderr *os.File
+
+	// queryOutputFile is the output file configured via \o.
+	// This can be the same as stdout (\o without argument).
+	// Note: we use .queryOutput for query execution, which
+	// is buffered (via queryOutputBuf).
+	queryOutputFile *os.File
+	queryOutputBuf  *bufio.Writer
+	queryOutput     io.Writer
 
 	// quitAfterExecStmts tells the shell whether to quit
 	// after processing the execStmts.
@@ -71,4 +90,48 @@ type internalContext struct {
 
 	// current database name, if known. This is maintained on a best-effort basis.
 	dbName string
+
+	// displayPrompt indicates that the prompt should still be displayed,
+	// even when the line editor is disabled.
+	displayPrompt bool
+
+	// hook to run once, then clear, after running the next batch of statements.
+	afterRun func()
+
+	statementWrappers []statementWrapper
+
+	// state about the current query.
+	mu struct {
+		syncutil.Mutex
+		cancelFn func(ctx context.Context) error
+		doneCh   chan struct{}
+	}
+}
+
+// StatementWrapper allows custom client-side logic to be executed when a statement
+// matches a given pattern.
+// The cli will call Pattern.FindStringSubmatch on every statement before
+// executing it. If it returns non-nil, execution will stop and Wrapper will
+// be called with the statement and match data.
+type statementWrapper struct {
+	Pattern statementType
+	Wrapper func(ctx context.Context, statement string, c *cliState) error
+}
+
+// AddStatementWrapper adds a StatementWrapper to the specified context.
+func (c *internalContext) addStatementWrapper(w statementWrapper) {
+	c.statementWrappers = append(c.statementWrappers, w)
+}
+
+func (c *internalContext) maybeWrapStatement(
+	ctx context.Context, statement string, state *cliState,
+) (err error) {
+	var s scanner.Scanner
+	for _, sw := range c.statementWrappers {
+		s.Init(statement)
+		if sw.Pattern.matches(s) {
+			err = errors.CombineErrors(err, sw.Wrapper(ctx, statement, state))
+		}
+	}
+	return
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -38,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	pbtypes "github.com/gogo/protobuf/types"
 	"github.com/stretchr/testify/require"
@@ -48,7 +50,7 @@ import (
 func setupRouter(
 	t testing.TB,
 	st *cluster.Settings,
-	evalCtx *tree.EvalContext,
+	evalCtx *eval.Context,
 	diskMonitor *mon.BytesMonitor,
 	spec execinfrapb.OutputRouterSpec,
 	inputTypes []*types.T,
@@ -65,6 +67,7 @@ func setupRouter(
 			Settings: st,
 		},
 		EvalCtx:     evalCtx,
+		Mon:         evalCtx.TestingMon,
 		DiskMonitor: diskMonitor,
 	}
 	r.init(ctx, &flowCtx, inputTypes)
@@ -83,7 +86,7 @@ func TestRouters(t *testing.T) {
 	alloc := &tree.DatumAlloc{}
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
@@ -296,7 +299,7 @@ func TestConsumerStatus(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
@@ -452,7 +455,7 @@ func TestMetadataIsForwarded(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)
@@ -665,7 +668,7 @@ func TestRouterBlocks(t *testing.T) {
 			}
 			st := cluster.MakeTestingClusterSettings()
 			ctx := context.Background()
-			evalCtx := tree.MakeTestingEvalContext(st)
+			evalCtx := eval.MakeTestingEvalContext(st)
 			defer evalCtx.Stop(ctx)
 			diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 			defer diskMonitor.Stop(ctx)
@@ -674,6 +677,7 @@ func TestRouterBlocks(t *testing.T) {
 					Settings: st,
 				},
 				EvalCtx:     &evalCtx,
+				Mon:         evalCtx.TestingMon,
 				DiskMonitor: diskMonitor,
 			}
 			router.init(ctx, &flowCtx, colTypes)
@@ -754,7 +758,7 @@ func TestRouterDiskSpill(t *testing.T) {
 
 	// Enable stats recording.
 	tracer := tracing.NewTracer()
-	sp := tracer.StartSpan("root", tracing.WithRecording(tracing.RecordingVerbose))
+	sp := tracer.StartSpan("root", tracing.WithRecording(tracingpb.RecordingVerbose))
 	ctx := tracing.ContextWithSpan(context.Background(), sp)
 
 	st := cluster.MakeTestingClusterSettings()
@@ -780,10 +784,11 @@ func TestRouterDiskSpill(t *testing.T) {
 		math.MaxInt64,                /* noteworthy */
 		st,
 	)
-	evalCtx := tree.MakeTestingEvalContextWithMon(st, monitor)
+	evalCtx := eval.MakeTestingEvalContextWithMon(st, monitor)
 	defer evalCtx.Stop(ctx)
 	flowCtx := execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 		Cfg: &execinfra.ServerConfig{
 			Settings:    st,
 			TempStorage: tempEngine,
@@ -797,10 +802,10 @@ func TestRouterDiskSpill(t *testing.T) {
 	// memErrorWhenConsumingRows indicates whether we expect an OOM error to
 	// occur when we're consuming rows from the row channel. By default, it
 	// will occur because routerOutput derives a memory monitor for the row
-	// buffer from evalCtx.Mon which has a limit, and we're going to consume
-	// rows after the spilling has occurred (meaning that evalCtx.Mon reached
-	// its limit). In order for this to not happen we will create a separate
-	// memory account.
+	// buffer from evalCtx.TestingMon which has a limit, and we're going to
+	// consume rows after the spilling has occurred (meaning that
+	// evalCtx.TestingMon reached its limit). In order for this to not happen we
+	// will create a separate memory account.
 	for _, memErrorWhenConsumingRows := range []bool{false, true} {
 		var (
 			rowChan execinfra.RowChannel
@@ -1003,7 +1008,7 @@ func BenchmarkRouter(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.NewTestingEvalContext(st)
+	evalCtx := eval.NewTestingEvalContext(st)
 	defer evalCtx.Stop(context.Background())
 	diskMonitor := execinfra.NewTestDiskMonitor(ctx, st)
 	defer diskMonitor.Stop(ctx)

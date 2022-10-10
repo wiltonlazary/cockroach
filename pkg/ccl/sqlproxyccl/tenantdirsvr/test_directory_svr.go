@@ -1,4 +1,4 @@
-// Copyright 2021 The Cockroach Authors.
+// Copyright 2022 The Cockroach Authors.
 //
 // Licensed as a CockroachDB Enterprise file under the Cockroach Community
 // License (the "License"); you may not use this file except in compliance with
@@ -29,6 +29,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/logtags"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Make sure that TestDirectoryServer implements the DirectoryServer interface.
@@ -48,7 +50,7 @@ type Process struct {
 // is a possibility that between the two calls, the parent stopper completes a
 // stop and then the leak detection may find a leaked stopper.
 func NewSubStopper(parentStopper *stop.Stopper) *stop.Stopper {
-	mu := &syncutil.Mutex{}
+	var mu syncutil.Mutex
 	var subStopper *stop.Stopper
 	parentStopper.AddCloser(stop.CloserFn(func() {
 		mu.Lock()
@@ -104,7 +106,7 @@ func New(stopper *stop.Stopper, args ...string) (*TestDirectoryServer, error) {
 	dir.TenantStarterFunc = dir.startTenantLocked
 	dir.proc.processByAddrByTenantID = map[uint64]map[net.Addr]*Process{}
 	dir.listen.eventListeners = list.New()
-	stopper.AddCloser(stop.CloserFn(func() { dir.grpcServer.GracefulStop() }))
+	stopper.AddCloser(stop.CloserFn(dir.grpcServer.GracefulStop))
 	tenant.RegisterDirectoryServer(dir.grpcServer, dir)
 	return dir, nil
 }
@@ -128,6 +130,10 @@ func (s *TestDirectoryServer) Get(id roachpb.TenantID) (result map[net.Addr]*Pro
 	}
 	return
 }
+
+// serverShutdownErr is returned when TestDirectoryServer is no longer accepting
+// new requests.
+var serverShutdownErr = status.Error(codes.Unavailable, "server shutting down")
 
 // StartTenant will forcefully start a new tenant pod
 // instance. This may be useful to test the behavior when more
@@ -155,31 +161,6 @@ func (s *TestDirectoryServer) StartTenant(ctx context.Context, id roachpb.Tenant
 	}))
 
 	return nil
-}
-
-// SetFakeLoad artificially sets the load reported by a specific tenant pod. If
-// the id or addr is not found, a load update event is still generated.
-func (s *TestDirectoryServer) SetFakeLoad(id roachpb.TenantID, addr net.Addr, fakeLoad float32) {
-	s.proc.RLock()
-	defer s.proc.RUnlock()
-
-	// Only set FakeLoad if an entry exists.
-	if processes, ok := s.proc.processByAddrByTenantID[id.ToUint64()]; ok {
-		if process, ok := processes[addr]; ok {
-			process.FakeLoad = fakeLoad
-		}
-	}
-
-	s.listen.RLock()
-	defer s.listen.RUnlock()
-	s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
-		Pod: &tenant.Pod{
-			Addr:     addr.String(),
-			TenantID: id.ToUint64(),
-			Load:     fakeLoad,
-			State:    tenant.UNKNOWN,
-		},
-	})
 }
 
 // GetTenant returns tenant metadata for a given ID. Hard coded to return every
@@ -210,7 +191,7 @@ func (s *TestDirectoryServer) WatchPods(
 ) error {
 	select {
 	case <-s.stopper.ShouldQuiesce():
-		return context.Canceled
+		return serverShutdownErr
 	default:
 	}
 	// Make the channel with a small buffer to allow for a burst of notifications
@@ -260,9 +241,10 @@ func (s *TestDirectoryServer) Drain() {
 			defer s.listen.RUnlock()
 			s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
 				Pod: &tenant.Pod{
-					TenantID: tenantID,
-					Addr:     addr.String(),
-					State:    tenant.DRAINING,
+					TenantID:       tenantID,
+					Addr:           addr.String(),
+					State:          tenant.DRAINING,
+					StateTimestamp: timeutil.Now(),
 				},
 			})
 		}
@@ -335,10 +317,11 @@ func (s *TestDirectoryServer) listLocked(
 	resp := tenant.ListPodsResponse{}
 	for addr, proc := range processByAddr {
 		resp.Pods = append(resp.Pods, &tenant.Pod{
-			TenantID: req.TenantID,
-			Addr:     addr.String(),
-			State:    tenant.RUNNING,
-			Load:     proc.FakeLoad,
+			TenantID:       req.TenantID,
+			Addr:           addr.String(),
+			State:          tenant.RUNNING,
+			Load:           proc.FakeLoad,
+			StateTimestamp: timeutil.Now(),
 		})
 	}
 	return &resp, nil
@@ -356,10 +339,11 @@ func (s *TestDirectoryServer) registerInstanceLocked(tenantID uint64, process *P
 	defer s.listen.RUnlock()
 	s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
 		Pod: &tenant.Pod{
-			TenantID: tenantID,
-			Addr:     process.SQL.String(),
-			State:    tenant.RUNNING,
-			Load:     process.FakeLoad,
+			TenantID:       tenantID,
+			Addr:           process.SQL.String(),
+			State:          tenant.RUNNING,
+			Load:           process.FakeLoad,
+			StateTimestamp: timeutil.Now(),
 		},
 	})
 }
@@ -379,9 +363,10 @@ func (s *TestDirectoryServer) deregisterInstance(tenantID uint64, sql net.Addr) 
 		defer s.listen.RUnlock()
 		s.notifyEventListenersLocked(&tenant.WatchPodsResponse{
 			Pod: &tenant.Pod{
-				TenantID: tenantID,
-				Addr:     sql.String(),
-				State:    tenant.DELETING,
+				TenantID:       tenantID,
+				Addr:           sql.String(),
+				State:          tenant.DELETING,
+				StateTimestamp: timeutil.Now(),
 			},
 		})
 	}
@@ -465,9 +450,10 @@ func (s *TestDirectoryServer) startTenantLocked(
 	client := &http.Client{Transport: transport}
 	for {
 		time.Sleep(300 * time.Millisecond)
-		_, err := client.Get(fmt.Sprintf("https://%s/health", httpListener.Addr().String()))
+		resp, err := client.Get(fmt.Sprintf("https://%s/health", httpListener.Addr().String()))
 		waitTime := timeutil.Since(start)
 		if err == nil {
+			resp.Body.Close()
 			log.Infof(ctx, "tenant is healthy")
 			break
 		}

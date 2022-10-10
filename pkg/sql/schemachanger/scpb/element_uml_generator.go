@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
@@ -83,6 +82,5 @@ func run(out string) error {
 	// the end.
 	buf.Write(parentRelations.Bytes())
 	buf.WriteString("@enduml\n")
-	ioutil.WriteFile(out, buf.Bytes(), 0777)
-	return nil
+	return os.WriteFile(out, buf.Bytes(), 0777)
 }

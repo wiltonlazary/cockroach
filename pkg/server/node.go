@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
+	"github.com/cockroachdb/cockroach/pkg/server/tenantsettingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -43,16 +44,22 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -147,6 +154,12 @@ var (
 		10*time.Second,
 		settings.NonNegativeDurationWithMaximum(maxGraphiteInterval),
 	).WithPublic()
+	redactServerTracesForSecondaryTenants = settings.RegisterBoolSetting(
+		settings.SystemOnly,
+		"server.secondary_tenants.redact_trace.enabled",
+		"controls if server side traces are redacted for tenant operations",
+		true,
+	).WithPublic()
 )
 
 type nodeMetrics struct {
@@ -161,7 +174,9 @@ type nodeMetrics struct {
 
 func makeNodeMetrics(reg *metric.Registry, histogramWindow time.Duration) nodeMetrics {
 	nm := nodeMetrics{
-		Latency:    metric.NewLatency(metaExecLatency, histogramWindow),
+		Latency: metric.NewHistogram(
+			metaExecLatency, histogramWindow, metric.IOLatencyBuckets,
+		),
 		Success:    metric.NewCounter(metaExecSuccess),
 		Err:        metric.NewCounter(metaExecError),
 		DiskStalls: metric.NewCounter(metaDiskStalls),
@@ -206,7 +221,7 @@ type Node struct {
 	clusterID    *base.ClusterIDContainer // UUID for Cockroach cluster
 	Descriptor   roachpb.NodeDescriptor   // Node ID, network/physical topology
 	storeCfg     kvserver.StoreConfig     // Config to use and pass to stores
-	sqlExec      *sql.InternalExecutor    // For event logging
+	execCfg      *sql.ExecutorConfig      // For event logging
 	stores       *kvserver.Stores         // Access to node-local stores
 	metrics      nodeMetrics
 	recorder     *status.MetricsRecorder
@@ -220,15 +235,19 @@ type Node struct {
 
 	perReplicaServer kvserver.Server
 
-	admissionController kvserver.KVAdmissionController
-
 	tenantUsage multitenant.TenantUsageServer
+
+	tenantSettingsWatcher *tenantsettingswatcher.Watcher
 
 	spanConfigAccessor spanconfig.KVAccessor // powers the span configuration RPCs
 
 	// Turns `Node.writeNodeStatus` into a no-op. This is a hack to enable the
 	// COCKROACH_DEBUG_TS_IMPORT_FILE env var.
 	suppressNodeStatus syncutil.AtomicBool
+
+	diskStatsMap diskStatsMap
+
+	testingErrorEvent func(context.Context, *roachpb.BatchRequest, error)
 }
 
 var _ roachpb.InternalServer = &Node{}
@@ -324,7 +343,7 @@ func bootstrapCluster(
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
-				hlc.UnixNano(), storeKnobs,
+				timeutil.Now().UnixNano(), storeKnobs,
 			); err != nil {
 				return nil, err
 			}
@@ -336,9 +355,7 @@ func bootstrapCluster(
 
 // NewNode returns a new instance of Node.
 //
-// execCfg can be nil to help bootstrapping of a Server (the Node is created
-// before the ExecutorConfig is initialized). In that case, InitLogger() needs
-// to be called before the Node is used.
+// InitLogger() needs to be called before the Node is used.
 func NewNode(
 	cfg kvserver.StoreConfig,
 	recorder *status.MetricsRecorder,
@@ -346,38 +363,40 @@ func NewNode(
 	stopper *stop.Stopper,
 	txnMetrics kvcoord.TxnMetrics,
 	stores *kvserver.Stores,
-	execCfg *sql.ExecutorConfig,
 	clusterID *base.ClusterIDContainer,
 	kvAdmissionQ *admission.WorkQueue,
+	elasticCPUGrantCoord *admission.ElasticCPUGrantCoordinator,
 	storeGrantCoords *admission.StoreGrantCoordinators,
 	tenantUsage multitenant.TenantUsageServer,
+	tenantSettingsWatcher *tenantsettingswatcher.Watcher,
 	spanConfigAccessor spanconfig.KVAccessor,
 ) *Node {
-	var sqlExec *sql.InternalExecutor
-	if execCfg != nil {
-		sqlExec = execCfg.InternalExecutor
-	}
 	n := &Node{
-		storeCfg:            cfg,
-		stopper:             stopper,
-		recorder:            recorder,
-		metrics:             makeNodeMetrics(reg, cfg.HistogramWindowInterval),
-		stores:              stores,
-		txnMetrics:          txnMetrics,
-		sqlExec:             sqlExec,
-		clusterID:           clusterID,
-		admissionController: kvserver.MakeKVAdmissionController(kvAdmissionQ, storeGrantCoords),
-		tenantUsage:         tenantUsage,
-		spanConfigAccessor:  spanConfigAccessor,
+		storeCfg:              cfg,
+		stopper:               stopper,
+		recorder:              recorder,
+		metrics:               makeNodeMetrics(reg, cfg.HistogramWindowInterval),
+		stores:                stores,
+		txnMetrics:            txnMetrics,
+		execCfg:               nil, // filled in later by InitLogger()
+		clusterID:             clusterID,
+		tenantUsage:           tenantUsage,
+		tenantSettingsWatcher: tenantSettingsWatcher,
+		spanConfigAccessor:    spanConfigAccessor,
+		testingErrorEvent:     cfg.TestingKnobs.TestingResponseErrorEvent,
 	}
-	n.storeCfg.KVAdmissionController = n.admissionController
+	n.storeCfg.KVAdmissionController = kvserver.MakeKVAdmissionController(
+		kvAdmissionQ, elasticCPUGrantCoord.ElasticCPUWorkQueue, storeGrantCoords, cfg.Settings,
+	)
+	n.storeCfg.SchedulerLatencyListener = elasticCPUGrantCoord.SchedulerLatencyListener
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
 }
 
-// InitLogger needs to be called if a nil execCfg was passed to NewNode().
+// InitLogger connects the Node to the InternalExecutor to be used for event
+// logging.
 func (n *Node) InitLogger(execCfg *sql.ExecutorConfig) {
-	n.sqlExec = execCfg.InternalExecutor
+	n.execCfg = execCfg
 }
 
 // String implements fmt.Stringer.
@@ -399,19 +418,23 @@ func (n *Node) AnnotateCtxWithSpan(
 
 // start starts the node by registering the storage instance for the RPC
 // service "Node" and initializing stores for each specified engine.
-// Launches periodic store gossiping in a goroutine. A callback can
-// be optionally provided that will be invoked once this node's
-// NodeDescriptor is available, to help bootstrapping.
+// Launches periodic store gossiping in a goroutine.
+//
+// addr, sqlAddr, and httpAddr are used to populate the Address,
+// SQLAddress, and HTTPAddress fields respectively of the
+// NodeDescriptor. If sqlAddr is not provided or empty, it is assumed
+// that SQL connections are accepted at addr. Neither is ever assumed
+// to carry HTTP, only if httpAddr is non-null will this node accept
+// proxied traffic from other nodes.
 func (n *Node) start(
 	ctx context.Context,
-	addr, sqlAddr net.Addr,
+	addr, sqlAddr, httpAddr net.Addr,
 	state initState,
 	initialStart bool,
 	clusterName string,
 	attrs roachpb.Attributes,
 	locality roachpb.Locality,
 	localityAddress []roachpb.LocalityAddress,
-	nodeDescriptorCallback func(descriptor roachpb.NodeDescriptor),
 ) error {
 	n.initialStart = initialStart
 	n.startedAt = n.storeCfg.Clock.Now().WallTime
@@ -426,12 +449,7 @@ func (n *Node) start(
 		ServerVersion:   n.storeCfg.Settings.Version.BinaryVersion(),
 		BuildTag:        build.GetInfo().Tag,
 		StartedAt:       n.startedAt,
-	}
-	// Invoke any passed in nodeDescriptorCallback as soon as it's available, to
-	// ensure that other components (currently the DistSQLPlanner) are initialized
-	// before store startup continues.
-	if nodeDescriptorCallback != nil {
-		nodeDescriptorCallback(n.Descriptor)
+		HTTPAddress:     util.MakeUnresolvedAddr(httpAddr.Network(), httpAddr.String()),
 	}
 
 	// Gossip the node descriptor to make this node addressable by node ID.
@@ -512,10 +530,12 @@ func (n *Node) start(
 	}
 
 	n.startComputePeriodicMetrics(n.stopper, base.DefaultMetricsSampleInterval)
+	// Stores have been created, so can start providing tenant weights.
+	n.storeCfg.KVAdmissionController.SetTenantWeightProvider(n, n.stopper)
 
 	// Be careful about moving this line above where we start stores; store
-	// migrations rely on the fact that the cluster version has not been updated
-	// via Gossip (we have migrations that want to run only if the server starts
+	// upgrades rely on the fact that the cluster version has not been updated
+	// via Gossip (we have upgrades that want to run only if the server starts
 	// with a given cluster version, but not if the server starts with a lower
 	// one and gets bumped immediately, which would be possible if gossip got
 	// started earlier).
@@ -557,9 +577,9 @@ func (n *Node) IsDraining() bool {
 // to report work that needed to be done and which may or may not have
 // been done by the time this call returns. See the explanation in
 // pkg/server/drain.go for details.
-func (n *Node) SetDraining(drain bool, reporter func(int, redact.SafeString)) error {
+func (n *Node) SetDraining(drain bool, reporter func(int, redact.SafeString), verbose bool) error {
 	return n.stores.VisitStores(func(s *kvserver.Store) error {
-		s.SetDraining(drain, reporter)
+		s.SetDraining(drain, reporter, verbose)
 		return nil
 	})
 }
@@ -747,16 +767,133 @@ func (n *Node) computePeriodicMetrics(ctx context.Context, tick int) error {
 	})
 }
 
+// UpdateIOThreshold relays the supplied IOThreshold to the same method on the
+// designated Store.
+func (n *Node) UpdateIOThreshold(id roachpb.StoreID, threshold *admissionpb.IOThreshold) {
+	s, err := n.stores.GetStore(id)
+	if err != nil {
+		log.Errorf(n.AnnotateCtx(context.Background()), "%v", err)
+	}
+	s.UpdateIOThreshold(threshold)
+}
+
+// diskStatsMap encapsulates all the logic for populating DiskStats for
+// admission.StoreMetrics.
+type diskStatsMap struct {
+	provisionedRate   map[roachpb.StoreID]base.ProvisionedRateSpec
+	diskNameToStoreID map[string]roachpb.StoreID
+}
+
+func (dsm *diskStatsMap) tryPopulateAdmissionDiskStats(
+	ctx context.Context,
+	clusterProvisionedBandwidth int64,
+	diskStatsFunc func(context.Context) ([]status.DiskStats, error),
+) (stats map[roachpb.StoreID]admission.DiskStats, err error) {
+	if dsm.empty() {
+		return stats, nil
+	}
+	diskStats, err := diskStatsFunc(ctx)
+	if err != nil {
+		return stats, err
+	}
+	stats = make(map[roachpb.StoreID]admission.DiskStats)
+	for id, spec := range dsm.provisionedRate {
+		s := admission.DiskStats{ProvisionedBandwidth: clusterProvisionedBandwidth}
+		if spec.ProvisionedBandwidth > 0 {
+			s.ProvisionedBandwidth = spec.ProvisionedBandwidth
+		}
+		stats[id] = s
+	}
+	for i := range diskStats {
+		if id, ok := dsm.diskNameToStoreID[diskStats[i].Name]; ok {
+			s := stats[id]
+			s.BytesRead = uint64(diskStats[i].ReadBytes)
+			s.BytesWritten = uint64(diskStats[i].WriteBytes)
+			stats[id] = s
+		}
+	}
+	return stats, nil
+}
+
+func (dsm *diskStatsMap) empty() bool {
+	return len(dsm.provisionedRate) == 0
+}
+
+func (dsm *diskStatsMap) initDiskStatsMap(specs []base.StoreSpec, engines []storage.Engine) error {
+	*dsm = diskStatsMap{
+		provisionedRate:   make(map[roachpb.StoreID]base.ProvisionedRateSpec),
+		diskNameToStoreID: make(map[string]roachpb.StoreID),
+	}
+	for i := range engines {
+		id, err := kvserver.ReadStoreIdent(context.Background(), engines[i])
+		if err != nil {
+			return err
+		}
+		if len(specs[i].ProvisionedRateSpec.DiskName) > 0 {
+			dsm.provisionedRate[id.StoreID] = specs[i].ProvisionedRateSpec
+			dsm.diskNameToStoreID[specs[i].ProvisionedRateSpec.DiskName] = id.StoreID
+		}
+	}
+	return nil
+}
+
+func (n *Node) registerEnginesForDiskStatsMap(
+	specs []base.StoreSpec, engines []storage.Engine,
+) error {
+	return n.diskStatsMap.initDiskStatsMap(specs, engines)
+}
+
 // GetPebbleMetrics implements admission.PebbleMetricsProvider.
 func (n *Node) GetPebbleMetrics() []admission.StoreMetrics {
+	clusterProvisionedBandwidth := kvserver.ProvisionedBandwidthForAdmissionControl.Get(
+		&n.storeCfg.Settings.SV)
+	storeIDToDiskStats, err := n.diskStatsMap.tryPopulateAdmissionDiskStats(
+		context.Background(), clusterProvisionedBandwidth, status.GetDiskCounters)
+	if err != nil {
+		log.Warningf(context.Background(), "%v",
+			errors.Wrapf(err, "unable to populate disk stats"))
+	}
 	var metrics []admission.StoreMetrics
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
 		m := store.Engine().GetMetrics()
-		metrics = append(
-			metrics, admission.StoreMetrics{StoreID: int32(store.StoreID()), Metrics: m.Metrics})
+		im := store.Engine().GetInternalIntervalMetrics()
+		diskStats := admission.DiskStats{ProvisionedBandwidth: clusterProvisionedBandwidth}
+		if s, ok := storeIDToDiskStats[store.StoreID()]; ok {
+			diskStats = s
+		}
+		metrics = append(metrics, admission.StoreMetrics{
+			StoreID:                 int32(store.StoreID()),
+			Metrics:                 m.Metrics,
+			WriteStallCount:         m.WriteStallCount,
+			InternalIntervalMetrics: im,
+			DiskStats:               diskStats})
 		return nil
 	})
 	return metrics
+}
+
+// GetTenantWeights implements kvserver.TenantWeightProvider.
+func (n *Node) GetTenantWeights() kvserver.TenantWeights {
+	weights := kvserver.TenantWeights{
+		Node: make(map[uint64]uint32),
+	}
+	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
+		sw := make(map[uint64]uint32)
+		weights.Stores = append(weights.Stores, kvserver.TenantWeightsForStore{
+			StoreID: store.StoreID(),
+			Weights: sw,
+		})
+		store.VisitReplicas(func(r *kvserver.Replica) bool {
+			tid, valid := r.TenantID()
+			if valid {
+				weights.Node[tid.ToUint64()]++
+				sw[tid.ToUint64()]++
+			}
+			return true
+		})
+		return nil
+	})
+	return weights
 }
 
 func (n *Node) startGraphiteStatsExporter(st *cluster.Settings) {
@@ -839,7 +976,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration, must
 
 		if result := n.recorder.CheckHealth(ctx, *nodeStatus); len(result.Alerts) != 0 {
 			var numNodes int
-			if err := n.storeCfg.Gossip.IterateInfos(gossip.KeyNodeIDPrefix, func(k string, info gossip.Info) error {
+			if err := n.storeCfg.Gossip.IterateInfos(gossip.KeyNodeDescPrefix, func(k string, info gossip.Info) error {
 				numNodes++
 				return nil
 			}); err != nil {
@@ -871,7 +1008,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, alertTTL time.Duration, must
 // join" or "node restart" event. This query will retry until it succeeds or the
 // server stops.
 func (n *Node) recordJoinEvent(ctx context.Context) {
-	var event eventpb.EventPayload
+	var event logpb.EventPayload
 	var nodeDetails *eventpb.CommonNodeEventDetails
 	if !n.initialStart {
 		ev := &eventpb.NodeRestart{}
@@ -888,35 +1025,19 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 	nodeDetails.StartedAt = n.startedAt
 	nodeDetails.NodeID = int32(n.Descriptor.NodeID)
 
-	// Ensure that the event goes to log files even if LogRangeEvents is
+	// Ensure that the event goes to log files even if LogRangeAndNodeEvents is
 	// disabled (which means skip the system.eventlog _table_).
 	log.StructuredEvent(ctx, event)
 
-	if !n.storeCfg.LogRangeEvents {
+	if !n.storeCfg.LogRangeAndNodeEvents {
 		return
 	}
 
-	_ = n.stopper.RunAsyncTask(ctx, "record-join", func(bgCtx context.Context) {
-		ctx, span := n.AnnotateCtxWithSpan(bgCtx, "record-join-event")
-		defer span.Finish()
-		retryOpts := base.DefaultRetryOptions()
-		retryOpts.Closer = n.stopper.ShouldQuiesce()
-		for r := retry.Start(retryOpts); r.Next(); {
-			if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				return sql.InsertEventRecord(ctx, n.sqlExec,
-					txn,
-					int32(n.Descriptor.NodeID), /* reporting ID: the node where the event is logged */
-					sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* LogEventDestination: we already call log.StructuredEvent above */
-					int32(n.Descriptor.NodeID),                        /* target ID: the node that is joining (ourselves) */
-					event,
-				)
-			}); err != nil {
-				log.Warningf(ctx, "%s: unable to log event %v: %v", n, event, err)
-			} else {
-				return
-			}
-		}
-	})
+	// InsertEventRecord processes the event asynchronously.
+	sql.InsertEventRecords(ctx, n.execCfg,
+		sql.LogToSystemTable|sql.LogToDevChannelIfVerbose, /* not LogExternally: we already call log.StructuredEvent above */
+		event,
+	)
 }
 
 // If we receive a (proto-marshaled) roachpb.BatchRequest whose Requests contain
@@ -942,32 +1063,40 @@ func (n *Node) batchInternal(
 	}
 
 	var br *roachpb.BatchResponse
-	if err := n.stopper.RunTaskWithErr(ctx, "node.Node: batch", func(ctx context.Context) error {
-		var finishSpan func(context.Context, *roachpb.BatchResponse)
-		// Shadow ctx from the outer function. Written like this to pass the linter.
-		ctx, finishSpan = n.setupSpanForIncomingRPC(ctx, tenID, args)
-		// NB: wrapped to delay br evaluation to its value when returning.
-		defer func() { finishSpan(ctx, br) }()
-		if log.HasSpanOrEvent(ctx) {
-			log.Eventf(ctx, "node received request: %s", args.Summary())
-		}
+	var reqSp spanForRequest
+	ctx, reqSp = n.setupSpanForIncomingRPC(ctx, tenID, args)
+	// NB: wrapped to delay br evaluation to its value when returning.
+	defer func() { reqSp.finish(br) }()
+	if log.HasSpanOrEvent(ctx) {
+		log.Eventf(ctx, "node received request: %s", args.Summary())
+	}
 
-		tStart := timeutil.Now()
-		var pErr *roachpb.Error
-		br, pErr = n.stores.Send(ctx, *args)
-		if pErr != nil {
-			br = &roachpb.BatchResponse{}
-			log.VErrEventf(ctx, 3, "error from stores.Send: %s", pErr)
-		}
-		if br.Error != nil {
-			panic(roachpb.ErrorUnexpectedlySet(n.stores, br))
-		}
-		n.metrics.callComplete(timeutil.Since(tStart), pErr)
-		br.Error = pErr
-		return nil
-	}); err != nil {
+	tStart := timeutil.Now()
+	handle, err := n.storeCfg.KVAdmissionController.AdmitKVWork(ctx, tenID, args)
+	if err != nil {
 		return nil, err
 	}
+	if handle.ElasticCPUWorkHandle != nil {
+		ctx = admission.ContextWithElasticCPUWorkHandle(ctx, handle.ElasticCPUWorkHandle)
+	}
+
+	var writeBytes *kvserver.StoreWriteBytes
+	defer func() {
+		n.storeCfg.KVAdmissionController.AdmittedKVWorkDone(handle, writeBytes)
+		writeBytes.Release()
+	}()
+	var pErr *roachpb.Error
+	br, writeBytes, pErr = n.stores.SendWithWriteBytes(ctx, *args)
+	if pErr != nil {
+		br = &roachpb.BatchResponse{}
+		log.VErrEventf(ctx, 3, "error from stores.Send: %s", pErr)
+	}
+	if br.Error != nil {
+		panic(roachpb.ErrorUnexpectedlySet(n.stores, br))
+	}
+	n.metrics.callComplete(timeutil.Since(tStart), pErr)
+	br.Error = pErr
+
 	return br, nil
 }
 
@@ -985,7 +1114,6 @@ func (n *Node) incrementBatchCounters(ba *roachpb.BatchRequest) {
 func (n *Node) Batch(
 	ctx context.Context, args *roachpb.BatchRequest,
 ) (*roachpb.BatchResponse, error) {
-
 	n.incrementBatchCounters(args)
 
 	// NB: Node.Batch is called directly for "local" calls. We don't want to
@@ -1007,12 +1135,7 @@ func (n *Node) Batch(
 		args.GatewayNodeID = n.Descriptor.NodeID
 	}
 
-	handle, err := n.admissionController.AdmitKVWork(ctx, tenantID, args)
-	if err != nil {
-		return nil, err
-	}
 	br, err := n.batchInternal(ctx, tenantID, args)
-	n.admissionController.AdmittedKVWorkDone(handle)
 
 	// We always return errors via BatchResponse.Error so structure is
 	// preserved; plain errors are presumed to be from the RPC
@@ -1028,7 +1151,52 @@ func (n *Node) Batch(
 		}
 		br.Error = roachpb.NewError(err)
 	}
+	if buildutil.CrdbTestBuild && br.Error != nil && n.testingErrorEvent != nil {
+		n.testingErrorEvent(ctx, args, errors.DecodeError(ctx, br.Error.EncodedError))
+	}
 	return br, nil
+}
+
+// spanForRequest is the retval of setupSpanForIncomingRPC. It groups together a
+// few variables needed when finishing an RPC's span.
+//
+// finish() must be called when the span is done.
+type spanForRequest struct {
+	sp            *tracing.Span
+	needRecording bool
+	tenID         roachpb.TenantID
+	settings      *cluster.Settings
+}
+
+// finish finishes the span. If the span was recording and br is not nil, the
+// recording is written to br.CollectedSpans.
+func (sp *spanForRequest) finish(br *roachpb.BatchResponse) {
+	var rec tracingpb.Recording
+	// If we don't have a response, there's nothing to attach a trace to.
+	// Nothing more for us to do.
+	sp.needRecording = sp.needRecording && br != nil
+
+	if !sp.needRecording {
+		sp.sp.Finish()
+		return
+	}
+
+	rec = sp.sp.FinishAndGetConfiguredRecording()
+	if rec != nil {
+		// Decide if the trace for this RPC, if any, will need to be redacted. In
+		// general, responses sent to a tenant are redacted unless indicated
+		// otherwise by the cluster setting below.
+		//
+		// Even if the recording sent to a tenant is redacted (anything sensitive
+		// is stripped out of the verbose messages), structured payloads
+		// stay untouched.
+		needRedaction := sp.tenID != roachpb.SystemTenantID &&
+			redactServerTracesForSecondaryTenants.Get(&sp.settings.SV)
+		if needRedaction {
+			redactRecording(rec)
+		}
+		br.CollectedSpans = append(br.CollectedSpans, rec...)
+	}
 }
 
 // setupSpanForIncomingRPC takes a context and returns a derived context with a
@@ -1046,8 +1214,17 @@ func (n *Node) Batch(
 // be nil in case no response is to be returned to the rpc caller.
 func (n *Node) setupSpanForIncomingRPC(
 	ctx context.Context, tenID roachpb.TenantID, ba *roachpb.BatchRequest,
-) (context.Context, func(context.Context, *roachpb.BatchResponse)) {
-	tr := n.storeCfg.AmbientCtx.Tracer
+) (context.Context, spanForRequest) {
+	return setupSpanForIncomingRPC(ctx, tenID, ba, n.storeCfg.AmbientCtx.Tracer, n.storeCfg.Settings)
+}
+
+func setupSpanForIncomingRPC(
+	ctx context.Context,
+	tenID roachpb.TenantID,
+	ba *roachpb.BatchRequest,
+	tr *tracing.Tracer,
+	settings *cluster.Settings,
+) (context.Context, spanForRequest) {
 	var newSpan *tracing.Span
 	parentSpan := tracing.SpanFromContext(ctx)
 	localRequest := grpcutil.IsLocalRequestContext(ctx)
@@ -1057,66 +1234,41 @@ func (n *Node) setupSpanForIncomingRPC(
 	needRecordingCollection := !localRequest
 	if localRequest {
 		// This is a local request which circumvented gRPC. Start a span now.
-		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, tracing.BatchMethodName, tracing.WithServerSpanKind)
+		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, grpcinterceptor.BatchMethodName, tracing.WithServerSpanKind)
 	} else if parentSpan == nil {
+		// Non-local call. Tracing information comes from the request proto.
 		var remoteParent tracing.SpanMeta
 		if !ba.TraceInfo.Empty() {
-			remoteParent = tracing.SpanMetaFromProto(ba.TraceInfo)
+			ctx, newSpan = tr.StartSpanCtx(ctx, grpcinterceptor.BatchMethodName,
+				tracing.WithRemoteParentFromTraceInfo(ba.TraceInfo),
+				tracing.WithServerSpanKind)
 		} else {
 			// For backwards compatibility with 21.2, if tracing info was passed as
 			// gRPC metadata, we use it.
 			var err error
-			remoteParent, err = tracing.ExtractSpanMetaFromGRPCCtx(ctx, tr)
+			remoteParent, err = grpcinterceptor.ExtractSpanMetaFromGRPCCtx(ctx, tr)
 			if err != nil {
 				log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
 			}
+			ctx, newSpan = tr.StartSpanCtx(ctx, grpcinterceptor.BatchMethodName,
+				tracing.WithRemoteParentFromSpanMeta(remoteParent),
+				tracing.WithServerSpanKind)
 		}
-
-		ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
-			tracing.WithRemoteParent(remoteParent),
-			tracing.WithServerSpanKind)
 	} else {
 		// It's unexpected to find a span in the context for a non-local request.
 		// Let's create a span for the RPC anyway.
-		ctx, newSpan = tr.StartSpanCtx(ctx, tracing.BatchMethodName,
+		ctx, newSpan = tr.StartSpanCtx(ctx, grpcinterceptor.BatchMethodName,
 			tracing.WithParent(parentSpan),
 			tracing.WithServerSpanKind)
 	}
 
-	finishSpan := func(ctx context.Context, br *roachpb.BatchResponse) {
-		var rec tracing.Recording
-		// If we don't have a response, there's nothing to attach a trace to.
-		// Nothing more for us to do.
-		needRecordingCollection = needRecordingCollection && br != nil
-
-		if !needRecordingCollection {
-			newSpan.Finish()
-			return
-		}
-
-		rec = newSpan.FinishAndGetRecording(newSpan.RecordingType())
-		if rec != nil {
-			// Decide if the trace for this RPC, if any, will need to be redacted. It
-			// needs to be redacted if the response goes to a tenant. In case the request
-			// is local, then the trace might eventually go to a tenant (and tenID might
-			// be set), but it will go to the tenant only indirectly, through the response
-			// of a parent RPC. In that case, that parent RPC is responsible for the
-			// redaction.
-			//
-			// Tenants get a redacted recording, i.e. with anything
-			// sensitive stripped out of the verbose messages. However,
-			// structured payloads stay untouched.
-			needRedaction := tenID != roachpb.SystemTenantID
-			if needRedaction {
-				if err := redactRecordingForTenant(tenID, rec); err != nil {
-					log.Errorf(ctx, "error redacting trace recording: %s", err)
-					rec = nil
-				}
-			}
-			br.CollectedSpans = append(br.CollectedSpans, rec...)
-		}
+	newSpan.SetLazyTag("request", ba)
+	return ctx, spanForRequest{
+		needRecording: needRecordingCollection,
+		tenID:         tenID,
+		sp:            newSpan,
+		settings:      settings,
 	}
-	return ctx, finishSpan
 }
 
 // RangeLookup implements the roachpb.InternalServer interface.
@@ -1154,6 +1306,12 @@ func (n *Node) RangeLookup(
 func (n *Node) RangeFeed(
 	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
 ) error {
+	return n.singleRangeFeed(args, stream)
+}
+
+func (n *Node) singleRangeFeed(
+	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
+) error {
 	pErr := n.stores.RangeFeed(args, stream)
 	if pErr != nil {
 		var event roachpb.RangeFeedEvent
@@ -1163,6 +1321,83 @@ func (n *Node) RangeFeed(
 		return stream.Send(&event)
 	}
 	return nil
+}
+
+// setRangeIDEventSink annotates each response with range and stream IDs.
+// This is used by MuxRangeFeed.
+// TODO: This code can be removed in 22.2 once MuxRangeFeed is the default, and
+// the old style RangeFeed deprecated.
+type setRangeIDEventSink struct {
+	ctx      context.Context
+	rangeID  roachpb.RangeID
+	streamID int64
+	wrapped  *lockedMuxStream
+}
+
+func (s *setRangeIDEventSink) Context() context.Context {
+	return s.ctx
+}
+
+func (s *setRangeIDEventSink) Send(event *roachpb.RangeFeedEvent) error {
+	response := &roachpb.MuxRangeFeedEvent{
+		RangeFeedEvent: *event,
+		RangeID:        s.rangeID,
+		StreamID:       s.streamID,
+	}
+	return s.wrapped.Send(response)
+}
+
+var _ roachpb.RangeFeedEventSink = (*setRangeIDEventSink)(nil)
+
+// lockedMuxStream provides support for concurrent calls to Send.
+// The underlying MuxRangeFeedServer is not safe for concurrent calls to Send.
+type lockedMuxStream struct {
+	wrapped roachpb.Internal_MuxRangeFeedServer
+	sendMu  syncutil.Mutex
+}
+
+func (s *lockedMuxStream) Context() context.Context {
+	return s.wrapped.Context()
+}
+
+func (s *lockedMuxStream) Send(e *roachpb.MuxRangeFeedEvent) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.wrapped.Send(e)
+}
+
+// MuxRangeFeed implements the roachpb.InternalServer interface.
+func (n *Node) MuxRangeFeed(stream roachpb.Internal_MuxRangeFeedServer) error {
+	ctx, cancelFeeds := n.stopper.WithCancelOnQuiesce(stream.Context())
+	defer cancelFeeds()
+	rfGrp := ctxgroup.WithContext(ctx)
+
+	muxStream := &lockedMuxStream{wrapped: stream}
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			cancelFeeds()
+			return errors.CombineErrors(err, rfGrp.Wait())
+		}
+
+		rfGrp.GoCtx(func(ctx context.Context) error {
+			ctx = n.AnnotateCtx(ctx)
+			ctx = logtags.AddTag(ctx, "r", req.RangeID)
+			ctx = logtags.AddTag(ctx, "s", req.Replica.StoreID)
+			ctx, restore := pprofutil.SetProfilerLabelsFromCtxTags(ctx)
+			defer restore()
+			ctx, span := tracing.ForkSpan(ctx, "mux-rf")
+			defer span.Finish()
+
+			sink := setRangeIDEventSink{
+				ctx:      ctx,
+				rangeID:  req.RangeID,
+				streamID: req.StreamID,
+				wrapped:  muxStream,
+			}
+			return n.singleRangeFeed(req, &sink)
+		})
+	}
 }
 
 // ResetQuorum implements the roachpb.InternalServer interface.
@@ -1261,6 +1496,7 @@ func (n *Node) ResetQuorum(
 	if err := kvserver.SendEmptySnapshot(
 		ctx,
 		n.storeCfg.Settings,
+		n.storeCfg.Tracer(),
 		conn,
 		n.storeCfg.Clock.Now(),
 		desc,
@@ -1280,34 +1516,7 @@ func (n *Node) GossipSubscription(
 	ctx := n.storeCfg.AmbientCtx.AnnotateCtx(stream.Context())
 	ctxDone := ctx.Done()
 
-	stripContent := func(_ string, content roachpb.Value) (roachpb.Value, error) {
-		// Don't strip anything.
-		return content, nil
-	}
-	if _, ok := roachpb.TenantFromContext(ctx); ok {
-		// If this is a tenant connection, strip portions of the gossip infos.
-		stripContent = func(key string, content roachpb.Value) (roachpb.Value, error) {
-			switch key {
-			case gossip.KeySystemConfig:
-				// Strip the system config down to just those keys in the
-				// GossipSubscriptionSystemConfigMask, preventing cluster-wide
-				// or system tenant-specific information to leak.
-				var ents config.SystemConfigEntries
-				if err := content.GetProto(&ents); err != nil {
-					return roachpb.Value{}, errors.Wrap(err, "could not unmarshal system config")
-				}
-
-				var newContent roachpb.Value
-				newEnts := kvtenant.GossipSubscriptionSystemConfigMask.Apply(ents)
-				if err := newContent.SetProto(&newEnts); err != nil {
-					return roachpb.Value{}, errors.Wrap(err, "could not marshal system config")
-				}
-				return newContent, nil
-			default:
-				return content, nil
-			}
-		}
-	}
+	_, isSecondaryTenant := roachpb.TenantFromContext(ctx)
 
 	// Register a callback for each of the requested patterns. We don't want to
 	// block the gossip callback goroutine on a slow consumer, so we instead
@@ -1319,43 +1528,78 @@ func (n *Node) GossipSubscription(
 	entC := make(chan *roachpb.GossipSubscriptionEvent, 256)
 	entCClosed := false
 	var callbackMu syncutil.Mutex
-	const maxBlockDur = 1 * time.Millisecond
-	for _, pattern := range args.Patterns {
-		pattern := pattern
-		callback := func(key string, content roachpb.Value) {
-			callbackMu.Lock()
-			defer callbackMu.Unlock()
-			if entCClosed {
-				return
-			}
-			content, err := stripContent(key, content)
-			var event roachpb.GossipSubscriptionEvent
-			if err != nil {
-				event.Error = roachpb.NewError(err)
-			} else {
+	var systemConfigUpdateCh <-chan struct{}
+	for i := range args.Patterns {
+		pattern := args.Patterns[i] // copy for closure
+		switch pattern {
+		// Note that we need to support clients subscribing to the system config
+		// over this RPC even if the system config is no longer stored in gossip
+		// in the host cluster. To achieve this, we special-case the system config
+		// key and hook it up to the node's SystemConfigProvider. We need to
+		// support this because tenant clusters are upgraded *after* the system
+		// tenant of the host cluster. Tenant sql servers will still be expecting
+		// this information to drive GC TTLs for their GC jobs. It's worth noting
+		// that those zone configurations won't really map to reality, but that's
+		// okay, we just need to tell the pods something.
+		//
+		// TODO(ajwerner): Remove support for the system config key in the
+		// in 22.2, or leave it and make it a no-op.
+		case gossip.KeyDeprecatedSystemConfig:
+			var unregister func()
+			systemConfigUpdateCh, unregister = n.storeCfg.SystemConfigProvider.RegisterSystemConfigChannel()
+			defer unregister()
+		default:
+			callback := func(key string, content roachpb.Value) {
+				callbackMu.Lock()
+				defer callbackMu.Unlock()
+				if entCClosed {
+					return
+				}
+				var event roachpb.GossipSubscriptionEvent
 				event.Key = key
 				event.Content = content
 				event.PatternMatched = pattern
-			}
-			select {
-			case entC <- &event:
-			default:
+				const maxBlockDur = 1 * time.Millisecond
 				select {
 				case entC <- &event:
-				case <-time.After(maxBlockDur):
-					// entC blocking for too long. The consumer must not be
-					// keeping up. Terminate the subscription.
-					close(entC)
-					entCClosed = true
+				default:
+					select {
+					case entC <- &event:
+					case <-time.After(maxBlockDur):
+						// entC blocking for too long. The consumer must not be
+						// keeping up. Terminate the subscription.
+						close(entC)
+						entCClosed = true
+					}
 				}
 			}
+			unregister := n.storeCfg.Gossip.RegisterCallback(pattern, callback)
+			defer unregister()
 		}
-		unregister := n.storeCfg.Gossip.RegisterCallback(pattern, callback)
-		defer unregister()
 	}
-
+	handleSystemConfigUpdate := func() error {
+		cfg := n.storeCfg.SystemConfigProvider.GetSystemConfig()
+		ents := cfg.SystemConfigEntries
+		if isSecondaryTenant {
+			ents = kvtenant.GossipSubscriptionSystemConfigMask.Apply(ents)
+		}
+		var event roachpb.GossipSubscriptionEvent
+		var content roachpb.Value
+		if err := content.SetProto(&ents); err != nil {
+			event.Error = roachpb.NewError(errors.Wrap(err, "could not marshal system config"))
+		} else {
+			event.Key = gossip.KeyDeprecatedSystemConfig
+			event.Content = content
+			event.PatternMatched = gossip.KeyDeprecatedSystemConfig
+		}
+		return stream.Send(&event)
+	}
 	for {
 		select {
+		case <-systemConfigUpdateCh:
+			if err := handleSystemConfigUpdate(); err != nil {
+				return errors.Wrap(err, "handling system config update")
+			}
 		case e, ok := <-entC:
 			if !ok {
 				// The consumer was not keeping up with gossip updates, so its
@@ -1379,7 +1623,58 @@ func (n *Node) GossipSubscription(
 func (n *Node) TenantSettings(
 	args *roachpb.TenantSettingsRequest, stream roachpb.Internal_TenantSettingsServer,
 ) error {
-	return errors.AssertionFailedf("not implemented")
+	ctx := n.storeCfg.AmbientCtx.AnnotateCtx(stream.Context())
+	ctxDone := ctx.Done()
+
+	w := n.tenantSettingsWatcher
+	if err := w.WaitForStart(ctx); err != nil {
+		return stream.Send(&roachpb.TenantSettingsEvent{
+			Error: errors.EncodeError(ctx, err),
+		})
+	}
+
+	send := func(precedence roachpb.TenantSettingsPrecedence, overrides []roachpb.TenantSetting) error {
+		log.VInfof(ctx, 1, "sending precedence %d: %v", precedence, overrides)
+		return stream.Send(&roachpb.TenantSettingsEvent{
+			Precedence:  precedence,
+			Incremental: false,
+			Overrides:   overrides,
+		})
+	}
+
+	allOverrides, allCh := w.GetAllTenantOverrides()
+	if err := send(roachpb.AllTenantsOverrides, allOverrides); err != nil {
+		return err
+	}
+
+	tenantOverrides, tenantCh := w.GetTenantOverrides(args.TenantID)
+	if err := send(roachpb.SpecificTenantOverrides, tenantOverrides); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-allCh:
+			// All-tenant overrides have changed, send them again.
+			allOverrides, allCh = w.GetAllTenantOverrides()
+			if err := send(roachpb.AllTenantsOverrides, allOverrides); err != nil {
+				return err
+			}
+
+		case <-tenantCh:
+			// Tenant-specific overrides have changed, send them again.
+			tenantOverrides, tenantCh = w.GetTenantOverrides(args.TenantID)
+			if err := send(roachpb.SpecificTenantOverrides, tenantOverrides); err != nil {
+				return err
+			}
+
+		case <-ctxDone:
+			return ctx.Err()
+
+		case <-n.stopper.ShouldQuiesce():
+			return stop.ErrUnavailable
+		}
+	}
 }
 
 // Join implements the roachpb.InternalServer service. This is the
@@ -1412,7 +1707,7 @@ func (n *Node) Join(
 	// manually create a liveness record to maintain this same invariant.
 	//
 	// NB: This invariant will be required for when we introduce long running
-	// migrations. See https://github.com/cockroachdb/cockroach/pull/48843 for
+	// upgrades. See https://github.com/cockroachdb/cockroach/pull/48843 for
 	// details.
 	if err := n.storeCfg.NodeLiveness.CreateLivenessRecord(ctx, nodeID); err != nil {
 		return nil, err
@@ -1497,24 +1792,53 @@ func (emptyMetricStruct) MetricStruct() {}
 func (n *Node) GetSpanConfigs(
 	ctx context.Context, req *roachpb.GetSpanConfigsRequest,
 ) (*roachpb.GetSpanConfigsResponse, error) {
-	entries, err := n.spanConfigAccessor.GetSpanConfigEntriesFor(ctx, req.Spans)
+	targets, err := spanconfig.TargetsFromProtos(req.Targets)
+	if err != nil {
+		return nil, err
+	}
+	records, err := n.spanConfigAccessor.GetSpanConfigRecords(ctx, targets)
 	if err != nil {
 		return nil, err
 	}
 
-	return &roachpb.GetSpanConfigsResponse{SpanConfigEntries: entries}, nil
+	return &roachpb.GetSpanConfigsResponse{
+		SpanConfigEntries: spanconfig.RecordsToEntries(records),
+	}, nil
+}
+
+// GetAllSystemSpanConfigsThatApply implements the roachpb.InternalServer
+// interface.
+func (n *Node) GetAllSystemSpanConfigsThatApply(
+	ctx context.Context, req *roachpb.GetAllSystemSpanConfigsThatApplyRequest,
+) (*roachpb.GetAllSystemSpanConfigsThatApplyResponse, error) {
+	spanConfigs, err := n.spanConfigAccessor.GetAllSystemSpanConfigsThatApply(ctx, req.TenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &roachpb.GetAllSystemSpanConfigsThatApplyResponse{
+		SpanConfigs: spanConfigs,
+	}, nil
 }
 
 // UpdateSpanConfigs implements the roachpb.InternalServer interface.
 func (n *Node) UpdateSpanConfigs(
 	ctx context.Context, req *roachpb.UpdateSpanConfigsRequest,
 ) (*roachpb.UpdateSpanConfigsResponse, error) {
-	// TODO(irfansharif): We want to protect ourselves from tenants creating
-	// outlandishly large string buffers here and OOM-ing the host cluster. Is
-	// the maximum protobuf message size enough of a safeguard?
-	err := n.spanConfigAccessor.UpdateSpanConfigEntries(ctx, req.ToDelete, req.ToUpsert)
+	toUpsert, err := spanconfig.EntriesToRecords(req.ToUpsert)
 	if err != nil {
 		return nil, err
+	}
+	toDelete, err := spanconfig.TargetsFromProtos(req.ToDelete)
+	if err != nil {
+		return nil, err
+	}
+	if err := n.spanConfigAccessor.UpdateSpanConfigRecords(
+		ctx, toDelete, toUpsert, req.MinCommitTimestamp, req.MaxCommitTimestamp,
+	); err != nil {
+		return &roachpb.UpdateSpanConfigsResponse{
+			Error: errors.EncodeError(ctx, err),
+		}, nil
 	}
 	return &roachpb.UpdateSpanConfigsResponse{}, nil
 }

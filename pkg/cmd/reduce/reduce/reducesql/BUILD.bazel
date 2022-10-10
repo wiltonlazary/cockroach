@@ -1,3 +1,4 @@
+load("//build/bazelutil/unused_checker:unused.bzl", "get_x_data")
 load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
@@ -17,14 +18,17 @@ go_test(
     name = "reducesql_test",
     size = "small",
     srcs = ["reducesql_test.go"],
+    args = ["-test.timeout=55s"],
     data = glob(["testdata/**"]),
     deps = [
         ":reducesql",
         "//pkg/base",
         "//pkg/cmd/reduce/reduce",
-        "//pkg/security",
+        "//pkg/security/username",
         "//pkg/server",
         "//pkg/testutils/skip",
         "@com_github_jackc_pgx_v4//:pgx",
     ],
 )
+
+get_x_data(name = "get_x_data")

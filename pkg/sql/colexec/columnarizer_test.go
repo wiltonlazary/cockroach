@@ -21,7 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/memsize"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/distsqlutils"
@@ -44,14 +44,15 @@ func TestColumnarizerResetsInternalBatch(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	foundRows := 0
 	for {
@@ -74,12 +75,13 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	for _, tc := range []struct {
@@ -98,7 +100,7 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 			const errMsg = "artificial error"
 			rb := distsqlutils.NewRowBuffer([]*types.T{types.Int}, nil /* rows */, distsqlutils.RowBufferArgs{})
 			rb.Push(nil, &execinfrapb.ProducerMetadata{Err: errors.New(errMsg)})
-			c := NewBufferingColumnarizer(testAllocator, flowCtx, 0 /* processorID */, rb)
+			c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0 /* processorID */, rb)
 
 			c.Init(ctx)
 
@@ -109,7 +111,7 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 
 			if tc.consumerClosed {
 				// Closing the Columnarizer should call ConsumerClosed on the processor.
-				require.NoError(t, c.Close())
+				require.NoError(t, c.Close(ctx))
 				require.Equal(t, execinfra.ConsumerClosed, rb.ConsumerStatus, "unexpected consumer status %d", rb.ConsumerStatus)
 			} else {
 				// Calling DrainMeta from the vectorized execution engine should propagate to
@@ -126,7 +128,6 @@ func TestColumnarizerDrainsAndClosesInput(t *testing.T) {
 }
 
 func BenchmarkColumnarize(b *testing.B) {
-	defer log.Scope(b).Close(b)
 	types := []*types.T{types.Int, types.Int}
 	nRows := 10000
 	nCols := 2
@@ -135,16 +136,17 @@ func BenchmarkColumnarize(b *testing.B) {
 
 	ctx := context.Background()
 	st := cluster.MakeTestingClusterSettings()
-	evalCtx := tree.MakeTestingEvalContext(st)
+	evalCtx := eval.MakeTestingEvalContext(st)
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		Cfg:     &execinfra.ServerConfig{Settings: st},
 		EvalCtx: &evalCtx,
+		Mon:     evalCtx.TestingMon,
 	}
 
 	b.SetBytes(int64(nRows * nCols * int(memsize.Int64)))
 
-	c := NewBufferingColumnarizer(testAllocator, flowCtx, 0, input)
+	c := NewBufferingColumnarizerForTests(testAllocator, flowCtx, 0, input)
 	c.Init(ctx)
 	for i := 0; i < b.N; i++ {
 		foundRows := 0

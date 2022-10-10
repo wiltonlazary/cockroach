@@ -11,20 +11,22 @@
 package xform
 
 import (
+	"context"
 	"math"
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/distribution"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/ordering"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
-	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"golang.org/x/tools/container/intsets"
 )
 
@@ -37,11 +39,11 @@ import (
 // operators constitute the "cost model". A given cost model can be designed to
 // maximize any optimization goal, such as:
 //
-//   1. Max aggregate cluster throughput (txns/sec across cluster)
-//   2. Min transaction latency (time to commit txns)
-//   3. Min latency to first row (time to get first row of txns)
-//   4. Min memory usage
-//   5. Some weighted combination of #1 - #4
+//  1. Max aggregate cluster throughput (txns/sec across cluster)
+//  2. Min transaction latency (time to commit txns)
+//  3. Min latency to first row (time to get first row of txns)
+//  4. Min memory usage
+//  5. Some weighted combination of #1 - #4
 //
 // The cost model in this file targets #1 as the optimization goal. However,
 // note that #2 is implicitly important to that goal, since overall cluster
@@ -67,7 +69,8 @@ type Coster interface {
 // and index statistics that are propagated throughout the logical expression
 // tree.
 type coster struct {
-	evalCtx *tree.EvalContext
+	ctx     context.Context
+	evalCtx *eval.Context
 	mem     *memo.Memo
 
 	// locality gives the location of the current node as a set of user-defined
@@ -83,13 +86,21 @@ type coster struct {
 	// 0.5, and the estimated cost of an expression is c, the cost returned by
 	// ComputeCost will be in the range [c - 0.5 * c, c + 0.5 * c).
 	perturbation float64
+
+	// rng is used for deterministic perturbation.
+	rng *rand.Rand
 }
 
 var _ Coster = &coster{}
 
 // MakeDefaultCoster creates an instance of the default coster.
-func MakeDefaultCoster(mem *memo.Memo) Coster {
-	return &coster{mem: mem}
+func MakeDefaultCoster(ctx context.Context, evalCtx *eval.Context, mem *memo.Memo) Coster {
+	return &coster{
+		ctx:      ctx,
+		evalCtx:  evalCtx,
+		mem:      mem,
+		locality: evalCtx.Locality,
+	}
 }
 
 const (
@@ -153,6 +164,10 @@ const (
 	// stale.
 	largeMaxCardinalityScanCostPenalty = unboundedMaxCardinalityScanCostPenalty / 2
 
+	// LargeDistributeCost is the cost to use for Distribute operations when a
+	// session mode is set to error out on access of rows from remote regions.
+	LargeDistributeCost = hugeCost / 100
+
 	// preferLookupJoinFactor is a scale factor for the cost of a lookup join when
 	// we have a hint for preferring a lookup join.
 	preferLookupJoinFactor = 1e-6
@@ -181,7 +196,9 @@ const (
 // yet. Although function costs differ based on the overload (due to
 // arguments), here we are using the minimum from similar functions based on
 // postgres' pg_proc table. The following query can be used to generate this table:
-//   SELECT proname, min(procost) FROM pg_proc WHERE proname LIKE 'st\_%' AND procost > 1 GROUP BY proname ORDER BY proname
+//
+//	SELECT proname, min(procost) FROM pg_proc WHERE proname LIKE 'st\_%' AND procost > 1 GROUP BY proname ORDER BY proname
+//
 // TODO(mjibson): Add costs directly to overloads. When that is done, we should
 // also add a test that ensures those costs match postgres.
 var fnCost = map[string]memo.Cost{
@@ -439,14 +456,18 @@ var fnCost = map[string]memo.Cost{
 }
 
 // Init initializes a new coster structure with the given memo.
-func (c *coster) Init(evalCtx *tree.EvalContext, mem *memo.Memo, perturbation float64) {
+func (c *coster) Init(
+	ctx context.Context, evalCtx *eval.Context, mem *memo.Memo, perturbation float64, rng *rand.Rand,
+) {
 	// This initialization pattern ensures that fields are not unwittingly
 	// reused. Field reuse must be explicit.
 	*c = coster{
+		ctx:          ctx,
 		evalCtx:      evalCtx,
 		mem:          mem,
 		locality:     evalCtx.Locality,
 		perturbation: perturbation,
+		rng:          rng,
 	}
 }
 
@@ -548,14 +569,19 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 		// Optsteps uses MaxCost to suppress nodes in the memo. When a node with
 		// MaxCost is added to the memo, it can lead to an obscure crash with an
 		// unknown node. We'd rather detect this early.
-		panic(errors.AssertionFailedf("node %s with MaxCost added to the memo", log.Safe(candidate.Op())))
+		panic(errors.AssertionFailedf("node %s with MaxCost added to the memo", redact.Safe(candidate.Op())))
 	}
 
 	if c.perturbation != 0 {
 		// Don't perturb the cost if we are forcing an index.
 		if cost < hugeCost {
 			// Get a random value in the range [-1.0, 1.0)
-			multiplier := 2*rand.Float64() - 1
+			var multiplier float64
+			if c.rng == nil {
+				multiplier = 2*rand.Float64() - 1
+			} else {
+				multiplier = 2*c.rng.Float64() - 1
+			}
 
 			// If perturbation is p, and the estimated cost of an expression is c,
 			// the new cost is in the range [max(0, c - pc), c + pc). For example,
@@ -573,9 +599,9 @@ func (c *coster) ComputeCost(candidate memo.RelExpr, required *physical.Required
 
 func (c *coster) computeTopKCost(topk *memo.TopKExpr, required *physical.Required) memo.Cost {
 	rel := topk.Relational()
-	outputRowCount := rel.Stats.RowCount
+	outputRowCount := rel.Statistics().RowCount
 
-	inputRowCount := topk.Input.Relational().Stats.RowCount
+	inputRowCount := topk.Input.Relational().Statistics().RowCount
 	if !required.Ordering.Any() {
 		// When there is a partial ordering of the input rows' sort columns, we may
 		// be able to reduce the number of input rows needed to find the top K rows.
@@ -613,7 +639,7 @@ func (c *coster) computeSortCost(sort *memo.SortExpr, required *physical.Require
 	numPreorderedCols := len(sort.InputOrdering.Columns)
 
 	rel := sort.Relational()
-	stats := rel.Stats
+	stats := rel.Statistics()
 	numSegments := c.countSegments(sort)
 
 	// Start with a cost of storing each row; this takes the total number of
@@ -648,6 +674,14 @@ func (c *coster) computeSortCost(sort *memo.SortExpr, required *physical.Require
 func (c *coster) computeDistributeCost(
 	distribute *memo.DistributeExpr, required *physical.Required,
 ) memo.Cost {
+	if distribute.NoOpDistribution() {
+		// If the distribution will be elided, the cost is zero.
+		return memo.Cost(0)
+	}
+	if c.evalCtx != nil && c.evalCtx.SessionData().EnforceHomeRegion {
+		return LargeDistributeCost
+	}
+
 	// TODO(rytaft): Compute a real cost here. Currently we just add a tiny cost
 	// as a placeholder.
 	return cpuCostFactor
@@ -671,7 +705,7 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 		}
 	}
 
-	stats := scan.Relational().Stats
+	stats := scan.Relational().Statistics()
 	rowCount := stats.RowCount
 	if isUnfiltered && c.evalCtx != nil && c.evalCtx.SessionData().DisallowFullTableScans {
 		isLarge := !stats.Available || rowCount > c.evalCtx.SessionData().LargeFullScanRows
@@ -680,10 +714,9 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 		}
 	}
 
-	// Scanning an index with a few columns is faster than scanning an index with
-	// many columns. Ideally, we would want to use statistics about the size of
-	// each column. In lieu of that, use the number of columns.
-	perRowCost := c.rowScanCost(scan.Table, scan.Index, scan.Cols.Len())
+	// Add the IO cost of retrieving and the CPU cost of emitting the rows. The
+	// row cost depends on the size of the columns scanned.
+	perRowCost := c.rowScanCost(scan.Table, scan.Index, scan.Cols)
 
 	numSpans := 1
 	if scan.Constraint != nil {
@@ -755,16 +788,16 @@ func (c *coster) computeScanCost(scan *memo.ScanExpr, required *physical.Require
 
 func (c *coster) computeSelectCost(sel *memo.SelectExpr, required *physical.Required) memo.Cost {
 	// Typically the filter has to be evaluated on each input row.
-	inputRowCount := sel.Input.Relational().Stats.RowCount
+	inputRowCount := sel.Input.Relational().Statistics().RowCount
 
 	// If there is a LimitHint, n, it is expected that the filter will only be
 	// evaluated on the number of rows required to produce n rows.
 	if required.LimitHint != 0 {
-		selectivity := sel.Relational().Stats.Selectivity.AsFloat()
+		selectivity := sel.Relational().Statistics().Selectivity.AsFloat()
 		inputRowCount = math.Min(inputRowCount, required.LimitHint/selectivity)
 	}
 
-	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, util.FastIntMap{})
+	filterSetup, filterPerRow := c.computeFiltersCost(sel.Filters, util.FastIntSet{})
 	cost := memo.Cost(inputRowCount) * filterPerRow
 	cost += filterSetup
 	return cost
@@ -772,7 +805,7 @@ func (c *coster) computeSelectCost(sel *memo.SelectExpr, required *physical.Requ
 
 func (c *coster) computeProjectCost(prj *memo.ProjectExpr) memo.Cost {
 	// Each synthesized column causes an expression to be evaluated on each row.
-	rowCount := prj.Relational().Stats.RowCount
+	rowCount := prj.Relational().Statistics().RowCount
 	synthesizedColCount := len(prj.Projections)
 	cost := memo.Cost(rowCount) * memo.Cost(synthesizedColCount) * cpuCostFactor
 
@@ -783,21 +816,21 @@ func (c *coster) computeProjectCost(prj *memo.ProjectExpr) memo.Cost {
 
 func (c *coster) computeInvertedFilterCost(invFilter *memo.InvertedFilterExpr) memo.Cost {
 	// The filter has to be evaluated on each input row.
-	inputRowCount := invFilter.Input.Relational().Stats.RowCount
+	inputRowCount := invFilter.Input.Relational().Statistics().RowCount
 	cost := memo.Cost(inputRowCount) * cpuCostFactor
 	return cost
 }
 
 func (c *coster) computeValuesCost(values *memo.ValuesExpr) memo.Cost {
-	return memo.Cost(values.Relational().Stats.RowCount) * cpuCostFactor
+	return memo.Cost(values.Relational().Statistics().RowCount) * cpuCostFactor
 }
 
 func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	if join.Private().(*memo.JoinPrivate).Flags.Has(memo.DisallowHashJoinStoreRight) {
 		return hugeCost
 	}
-	leftRowCount := join.Child(0).(memo.RelExpr).Relational().Stats.RowCount
-	rightRowCount := join.Child(1).(memo.RelExpr).Relational().Stats.RowCount
+	leftRowCount := join.Child(0).(memo.RelExpr).Relational().Statistics().RowCount
+	rightRowCount := join.Child(1).(memo.RelExpr).Relational().Statistics().RowCount
 	if (join.Op() == opt.SemiJoinOp || join.Op() == opt.AntiJoinOp) && leftRowCount < rightRowCount {
 		// If we have a semi or an anti join, during the execbuilding we choose
 		// the relation with smaller cardinality to be on the right side, so we
@@ -819,25 +852,13 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	// pressure and the possibility of spilling to disk.
 	cost += c.rowBufferCost(rightRowCount)
 
-	// Compute filter cost. Fetch the equality columns so they can be
-	// ignored later.
+	// Compute filter cost. Fetch the indices of the filters that will be used in
+	// the join, since they will not add to the cost and should be skipped.
 	on := join.Child(2).(*memo.FiltersExpr)
-	leftEq, rightEq := memo.ExtractJoinEqualityColumns(
-		join.Child(0).(memo.RelExpr).Relational().OutputCols,
-		join.Child(1).(memo.RelExpr).Relational().OutputCols,
-		*on,
-	)
-	// Generate a quick way to lookup if two columns are join equality
-	// columns. We add in both directions because we don't know which way
-	// the equality filters will be defined.
-	eqMap := util.FastIntMap{}
-	for i := range leftEq {
-		left := int(leftEq[i])
-		right := int(rightEq[i])
-		eqMap.Set(left, right)
-		eqMap.Set(right, left)
-	}
-	filterSetup, filterPerRow := c.computeFiltersCost(*on, eqMap)
+	leftCols := join.Child(0).(memo.RelExpr).Relational().OutputCols
+	rightCols := join.Child(1).(memo.RelExpr).Relational().OutputCols
+	filtersToSkip := memo.ExtractJoinConditionFilterOrds(leftCols, rightCols, *on, false /* inequality */)
+	filterSetup, filterPerRow := c.computeFiltersCost(*on, filtersToSkip)
 	cost += filterSetup
 
 	// Add the CPU cost of emitting the rows.
@@ -845,7 +866,7 @@ func (c *coster) computeHashJoinCost(join memo.RelExpr) memo.Cost {
 	if !ok {
 		// This can happen as part of testing. In this case just return the number
 		// of rows.
-		rowsProcessed = join.Relational().Stats.RowCount
+		rowsProcessed = join.Relational().Statistics().RowCount
 	}
 	cost += memo.Cost(rowsProcessed) * filterPerRow
 
@@ -856,8 +877,8 @@ func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
 	if join.MergeJoinPrivate.Flags.Has(memo.DisallowMergeJoin) {
 		return hugeCost
 	}
-	leftRowCount := join.Left.Relational().Stats.RowCount
-	rightRowCount := join.Right.Relational().Stats.RowCount
+	leftRowCount := join.Left.Relational().Statistics().RowCount
+	rightRowCount := join.Right.Relational().Statistics().RowCount
 
 	if (join.Op() == opt.SemiJoinOp || join.Op() == opt.AntiJoinOp) && leftRowCount < rightRowCount {
 		// If we have a semi or an anti join, during the execbuilding we choose
@@ -874,7 +895,7 @@ func (c *coster) computeMergeJoinCost(join *memo.MergeJoinExpr) memo.Cost {
 	// smaller right side is preferred to the symmetric join.
 	cost := memo.Cost(0.9*leftRowCount+1.1*rightRowCount) * cpuCostFactor
 
-	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntSet{})
 	cost += filterSetup
 
 	// Add the CPU cost of emitting the rows.
@@ -911,7 +932,7 @@ func (c *coster) computeLookupJoinCost(
 	if join.LookupJoinPrivate.Flags.Has(memo.DisallowLookupJoinIntoRight) {
 		return hugeCost
 	}
-	return c.computeIndexLookupJoinCost(
+	cost := c.computeIndexLookupJoinCost(
 		join,
 		required,
 		join.LookupColsAreTableKey,
@@ -922,6 +943,18 @@ func (c *coster) computeLookupJoinCost(
 		join.Flags,
 		join.LocalityOptimized,
 	)
+	if c.evalCtx != nil && c.evalCtx.SessionData().EnforceHomeRegion {
+		provided := distribution.BuildLookupJoinLookupTableDistribution(c.ctx, c.evalCtx, join)
+		if provided.Any() || len(provided.Regions) != 1 {
+			cost += LargeDistributeCost
+		}
+		var localDist physical.Distribution
+		localDist.FromLocality(c.evalCtx.Locality)
+		if !localDist.Equals(provided) {
+			cost += LargeDistributeCost
+		}
+	}
+	return cost
 }
 
 func (c *coster) computeIndexLookupJoinCost(
@@ -936,7 +969,7 @@ func (c *coster) computeIndexLookupJoinCost(
 	localityOptimized bool,
 ) memo.Cost {
 	input := join.Child(0).(memo.RelExpr)
-	lookupCount := input.Relational().Stats.RowCount
+	lookupCount := input.Relational().Statistics().RowCount
 
 	// Take into account that the "internal" row count is higher, according to
 	// the selectivities of the conditions. In particular, we need to ignore
@@ -959,7 +992,7 @@ func (c *coster) computeIndexLookupJoinCost(
 	// expensive lookup join might have a lower cost if its limit hint estimates
 	// that most rows will not be needed.
 	if required.LimitHint != 0 && lookupCount > 0 {
-		outputRows := join.Relational().Stats.RowCount
+		outputRows := join.Relational().Statistics().RowCount
 		unlimitedLookupCount := lookupCount
 		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
 		// We scale the number of rows processed by the same factor (we are
@@ -968,35 +1001,34 @@ func (c *coster) computeIndexLookupJoinCost(
 		rowsProcessed = (rowsProcessed / unlimitedLookupCount) * lookupCount
 	}
 
-	// The rows in the (left) input are used to probe into the (right) table.
-	// Since the matching rows in the table may not all be in the same range, this
-	// counts as random I/O.
-	perLookupCost := memo.Cost(randIOCostFactor)
+	perLookupCost := indexLookupJoinPerLookupCost(join)
 	if !lookupColsAreTableKey {
 		// If the lookup columns don't form a key, execution will have to limit
 		// KV batches which prevents running requests to multiple nodes in parallel.
 		// An experiment on a 4 node cluster with a table with 100k rows split into
 		// 100 ranges showed that a "non-parallel" lookup join is about 5 times
 		// slower.
-		perLookupCost *= 5
+		// TODO(drewk): this no longer applies now that the streamer work is used.
+		perLookupCost += 4 * randIOCostFactor
 	}
 	if c.mem.Metadata().Table(table).IsVirtualTable() {
 		// It's expensive to perform a lookup join into a virtual table because
 		// we need to fetch the table descriptors on each lookup.
 		perLookupCost += virtualScanTableDescriptorFetchCost
 	}
-	perLookupCost += lookupExprCost(join)
 	cost := memo.Cost(lookupCount) * perLookupCost
 
-	filterSetup, filterPerRow := c.computeFiltersCost(on, util.FastIntMap{})
+	filterSetup, filterPerRow := c.computeFiltersCost(on, util.FastIntSet{})
 	cost += filterSetup
 
 	// Each lookup might retrieve many rows; add the IO cost of retrieving the
 	// rows (relevant when we expect many resulting rows per lookup) and the CPU
 	// cost of emitting the rows.
-	numLookupCols := cols.Difference(input.Relational().OutputCols).Len()
+	// TODO(harding): Add the cost of reading all columns in the lookup table when
+	// we cost rows by column size.
+	lookupCols := cols.Difference(input.Relational().OutputCols)
 	perRowCost := lookupJoinRetrieveRowCost + filterPerRow +
-		c.rowScanCost(table, index, numLookupCols)
+		c.rowScanCost(table, index, lookupCols)
 
 	cost += memo.Cost(rowsProcessed) * perRowCost
 
@@ -1022,7 +1054,7 @@ func (c *coster) computeInvertedJoinCost(
 	if join.InvertedJoinPrivate.Flags.Has(memo.DisallowInvertedJoinIntoRight) {
 		return hugeCost
 	}
-	lookupCount := join.Input.Relational().Stats.RowCount
+	lookupCount := join.Input.Relational().Statistics().RowCount
 
 	// Take into account that the "internal" row count is higher, according to
 	// the selectivities of the conditions. In particular, we need to ignore
@@ -1044,7 +1076,7 @@ func (c *coster) computeInvertedJoinCost(
 	// expensive lookup join might have a lower cost if its limit hint estimates
 	// that most rows will not be needed.
 	if required.LimitHint != 0 && lookupCount > 0 {
-		outputRows := join.Relational().Stats.RowCount
+		outputRows := join.Relational().Statistics().RowCount
 		unlimitedLookupCount := lookupCount
 		lookupCount = lookupJoinInputLimitHint(unlimitedLookupCount, outputRows, required.LimitHint)
 		// We scale the number of rows processed by the same factor (we are
@@ -1065,54 +1097,67 @@ func (c *coster) computeInvertedJoinCost(
 	perLookupCost *= 5
 	cost := memo.Cost(lookupCount) * perLookupCost
 
-	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntSet{})
 	cost += filterSetup
 
 	// Each lookup might retrieve many rows; add the IO cost of retrieving the
 	// rows (relevant when we expect many resulting rows per lookup) and the CPU
 	// cost of emitting the rows.
-	numLookupCols := join.Cols.Difference(join.Input.Relational().OutputCols).Len()
+	lookupCols := join.Cols.Difference(join.Input.Relational().OutputCols)
 	perRowCost := lookupJoinRetrieveRowCost + filterPerRow +
-		c.rowScanCost(join.Table, join.Index, numLookupCols)
+		c.rowScanCost(join.Table, join.Index, lookupCols)
 
 	cost += memo.Cost(rowsProcessed) * perRowCost
+
+	if c.evalCtx != nil && c.evalCtx.SessionData().EnforceHomeRegion {
+		provided := distribution.BuildInvertedJoinLookupTableDistribution(c.ctx, c.evalCtx, join)
+		if provided.Any() || len(provided.Regions) != 1 {
+			cost += LargeDistributeCost
+		}
+		var localDist physical.Distribution
+		localDist.FromLocality(c.evalCtx.Locality)
+		if !localDist.Equals(provided) {
+			cost += LargeDistributeCost
+		}
+	}
 	return cost
+}
+
+// computeExprCost calculates per-row cost of the expression.
+// It finds every embedded spatial function and add its cost.
+func (c *coster) computeExprCost(expr opt.Expr) memo.Cost {
+	perRowCost := memo.Cost(0)
+	if expr.Op() == opt.FunctionOp {
+		// We are ok with the zero value here for functions not in the map.
+		function := expr.(*memo.FunctionExpr)
+		perRowCost += fnCost[function.Name]
+	}
+	// recurse into the children of the current expression
+	for i := 0; i < expr.ChildCount(); i++ {
+		perRowCost += c.computeExprCost(expr.Child(i))
+	}
+	return perRowCost
 }
 
 // computeFiltersCost returns the setup and per-row cost of executing
 // a filter. Callers of this function should add setupCost and multiply
 // perRowCost by the number of rows expected to be filtered.
+//
+// filtersToSkip identifies the indices of filters that should be skipped,
+// because they do not add to the cost. This can happen when a condition still
+// exists in the filters even though it is handled by the join.
 func (c *coster) computeFiltersCost(
-	filters memo.FiltersExpr, eqMap util.FastIntMap,
+	filters memo.FiltersExpr, filtersToSkip util.FastIntSet,
 ) (setupCost, perRowCost memo.Cost) {
 	// Add a base perRowCost so that callers do not need to have their own
 	// base per-row cost.
 	perRowCost += cpuCostFactor
 	for i := range filters {
-		f := &filters[i]
-		switch f.Condition.Op() {
-		case opt.EqOp:
-			eq := f.Condition.(*memo.EqExpr)
-			leftVar, ok := eq.Left.(*memo.VariableExpr)
-			if !ok {
-				break
-			}
-			rightVar, ok := eq.Right.(*memo.VariableExpr)
-			if !ok {
-				break
-			}
-			if val, ok := eqMap.Get(int(leftVar.Col)); ok && val == int(rightVar.Col) {
-				// Equality filters on some joins are still in
-				// filters, while others have already removed
-				// them. They do not cost anything.
-				continue
-			}
-		case opt.FunctionOp:
-			function := f.Condition.(*memo.FunctionExpr)
-			// We are ok with the zero value here for functions not in the map.
-			perRowCost += fnCost[function.Name]
+		if filtersToSkip.Contains(i) {
+			continue
 		}
-
+		f := &filters[i]
+		perRowCost += c.computeExprCost(f.Condition)
 		// Add a constant "setup" cost per ON condition to account for the fact that
 		// the rowsProcessed estimate alone cannot effectively discriminate between
 		// plans when RowCount is too small.
@@ -1122,27 +1167,45 @@ func (c *coster) computeFiltersCost(
 }
 
 func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
-	rowCount := join.Relational().Stats.RowCount
+	rowCount := join.Relational().Statistics().RowCount
 
-	// Assume the upper bound on scan cost to be the sum of the cost of
-	// scanning the two constituent indexes. To determine how many columns
-	// are returned from each scan, intersect the output column set join.Cols
-	// with each side's IndexColumns. Columns present in both indexes are
-	// projected from the left side only.
+	// Assume the upper bound on scan cost to be the sum of the cost of scanning
+	// the two constituent indexes. To determine which columns are returned from
+	// each scan, intersect the output column set join.Cols with each side's
+	// IndexColumns. Columns present in both indexes are projected from the left
+	// side only.
 	md := c.mem.Metadata()
 	leftCols := md.TableMeta(join.LeftTable).IndexColumns(join.LeftIndex)
 	leftCols.IntersectionWith(join.Cols)
 	rightCols := md.TableMeta(join.RightTable).IndexColumns(join.RightIndex)
 	rightCols.IntersectionWith(join.Cols)
 	rightCols.DifferenceWith(leftCols)
-	scanCost := c.rowScanCost(join.LeftTable, join.LeftIndex, leftCols.Len())
-	scanCost += c.rowScanCost(join.RightTable, join.RightIndex, rightCols.Len())
+	scanCost := c.rowScanCost(join.LeftTable, join.LeftIndex, leftCols)
+	scanCost += c.rowScanCost(join.RightTable, join.RightIndex, rightCols)
 
-	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntMap{})
+	filterSetup, filterPerRow := c.computeFiltersCost(join.On, util.FastIntSet{})
+
+	// It is much more expensive to do a seek in zigzag join vs. lookup join
+	// because zigzag join starts a new scan for every seek via
+	// `Fetcher.StartScan`. Instead of using `seqIOCostFactor`, bump seek costs to
+	// be similar to lookup join, though more fine-tuning is needed.
+	// TODO(msirek): Refine zigzag join costs and try out changes to execution to
+	//               do a point lookup for a match in the other index before
+	//               starting a new scan. Lookup join and inverted join add a
+	//               cost of 5 * randIOCostFactor per row to account for not
+	//               running non-key lookups in parallel. This may be applicable
+	//               here too.
+	//               Explore dynamically detecting selection of a bad zigzag join
+	//               during execution and switching to merge join on-the-fly.
+	// Seek costs should be at least as expensive as lookup join.
+	// See `indexLookupJoinPerLookupCost` and `computeIndexLookupJoinCost`.
+	// Increased zigzag join costs mean that accurate selectivity estimation is
+	// needed to ensure this index access path can be picked.
+	seekCost := memo.Cost(randIOCostFactor + lookupJoinRetrieveRowCost)
 
 	// Double the cost of emitting rows as well as the cost of seeking rows,
 	// given two indexes will be accessed.
-	cost := memo.Cost(rowCount) * (2*(cpuCostFactor+seqIOCostFactor) + scanCost + filterPerRow)
+	cost := memo.Cost(rowCount) * (2*(cpuCostFactor+seekCost) + scanCost + filterPerRow)
 	cost += filterSetup
 
 	// Add a penalty if the cardinality exceeds the row count estimate. Adding a
@@ -1158,9 +1221,17 @@ func (c *coster) computeZigzagJoinCost(join *memo.ZigzagJoinExpr) memo.Cost {
 	return cost
 }
 
+// isStreamingSetOperator returns true if relation is a streaming set operator.
+func isStreamingSetOperator(relation memo.RelExpr) bool {
+	if opt.IsSetOp(relation) {
+		return !relation.Private().(*memo.SetPrivate).Ordering.Any()
+	}
+	return false
+}
+
 func (c *coster) computeSetCost(set memo.RelExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	outputRowCount := set.Relational().Stats.RowCount
+	outputRowCount := set.Relational().Statistics().RowCount
 	cost := memo.Cost(outputRowCount) * cpuCostFactor
 
 	// A set operation must process every row from both tables once. UnionAll and
@@ -1169,11 +1240,12 @@ func (c *coster) computeSetCost(set memo.RelExpr) memo.Cost {
 	//
 	// The exception is if this is a streaming set operation, in which case there
 	// is no need to build a hash table. We can detect that this is a streaming
-	// operation by checking whether the ordering is defined in the set private.
+	// operation by checking whether the ordering is defined in the set private
+	// (see isStreamingSetOperator).
 	if set.Op() != opt.UnionAllOp && set.Op() != opt.LocalityOptimizedSearchOp &&
-		set.Private().(*memo.SetPrivate).Ordering.Any() {
-		leftRowCount := set.Child(0).(memo.RelExpr).Relational().Stats.RowCount
-		rightRowCount := set.Child(1).(memo.RelExpr).Relational().Stats.RowCount
+		!isStreamingSetOperator(set) {
+		leftRowCount := set.Child(0).(memo.RelExpr).Relational().Statistics().RowCount
+		rightRowCount := set.Child(1).(memo.RelExpr).Relational().Statistics().RowCount
 		cost += memo.Cost(leftRowCount+rightRowCount) * cpuCostFactor
 
 		// Add a cost for buffering rows that takes into account increased memory
@@ -1198,7 +1270,6 @@ func (c *coster) computeSetCost(set memo.RelExpr) memo.Cost {
 			panic(errors.AssertionFailedf("unhandled operator %s", set.Op()))
 		}
 	}
-
 	return cost
 }
 
@@ -1209,7 +1280,7 @@ func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.R
 	cost := memo.Cost(cpuCostFactor)
 
 	// Add the CPU cost of emitting the rows.
-	outputRowCount := grouping.Relational().Stats.RowCount
+	outputRowCount := grouping.Relational().Statistics().RowCount
 	cost += memo.Cost(outputRowCount) * cpuCostFactor
 
 	private := grouping.Private().(*memo.GroupingPrivate)
@@ -1217,7 +1288,7 @@ func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.R
 	aggsCount := grouping.Child(1).ChildCount()
 
 	// Normally, a grouping expression must process each input row once.
-	inputRowCount := grouping.Child(0).(memo.RelExpr).Relational().Stats.RowCount
+	inputRowCount := grouping.Child(0).(memo.RelExpr).Relational().Statistics().RowCount
 
 	// If this is a streaming GroupBy with a limit hint, l, we only need to
 	// process enough input rows to output l rows.
@@ -1250,25 +1321,25 @@ func (c *coster) computeGroupingCost(grouping memo.RelExpr, required *physical.R
 
 func (c *coster) computeLimitCost(limit *memo.LimitExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(limit.Relational().Stats.RowCount) * cpuCostFactor
+	cost := memo.Cost(limit.Relational().Statistics().RowCount) * cpuCostFactor
 	return cost
 }
 
 func (c *coster) computeOffsetCost(offset *memo.OffsetExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(offset.Relational().Stats.RowCount) * cpuCostFactor
+	cost := memo.Cost(offset.Relational().Statistics().RowCount) * cpuCostFactor
 	return cost
 }
 
 func (c *coster) computeOrdinalityCost(ord *memo.OrdinalityExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(ord.Relational().Stats.RowCount) * cpuCostFactor
+	cost := memo.Cost(ord.Relational().Statistics().RowCount) * cpuCostFactor
 	return cost
 }
 
 func (c *coster) computeProjectSetCost(projectSet *memo.ProjectSetExpr) memo.Cost {
 	// Add the CPU cost of emitting the rows.
-	cost := memo.Cost(projectSet.Relational().Stats.RowCount) * cpuCostFactor
+	cost := memo.Cost(projectSet.Relational().Statistics().RowCount) * cpuCostFactor
 	return cost
 }
 
@@ -1282,7 +1353,7 @@ func getOrderingColStats(
 	if oc.Any() {
 		return nil
 	}
-	stats := expr.Relational().Stats
+	stats := expr.Relational().Statistics()
 	orderedCols := oc.ColSet()
 	orderedStats, ok := stats.ColStats.Lookup(orderedCols)
 	if !ok {
@@ -1331,10 +1402,10 @@ func (c *coster) rowCmpCost(numKeyCols int) memo.Cost {
 	return memo.Cost(cost)
 }
 
-// rowScanCost is the CPU cost to scan one row, which depends on the number of
-// columns in the index and (to a lesser extent) on the number of columns we are
+// rowScanCost is the CPU cost to scan one row, which depends on the average
+// size of the columns in the index and the average size of the columns we are
 // scanning.
-func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, numScannedCols int) memo.Cost {
+func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, scannedCols opt.ColSet) memo.Cost {
 	md := c.mem.Metadata()
 	tab := md.Table(tabID)
 	idx := tab.Index(idxOrd)
@@ -1362,22 +1433,47 @@ func (c *coster) rowScanCost(tabID opt.TableID, idxOrd int, numScannedCols int) 
 	// more data to scan. The number of columns we actually return also matters
 	// because that is the amount of data that we could potentially transfer over
 	// the network.
-	return memo.Cost(numCols+numScannedCols) * costFactor
+	if c.evalCtx != nil && c.evalCtx.SessionData().CostScansWithDefaultColSize {
+		numScannedCols := scannedCols.Len()
+		return memo.Cost(numCols+numScannedCols) * costFactor
+	}
+	var cost memo.Cost
+	for i := 0; i < idx.ColumnCount(); i++ {
+		colID := tabID.ColumnID(idx.Column(i).Ordinal())
+		isScannedCol := scannedCols.Contains(colID)
+		isSystemCol := idx.Column(i).Kind() == cat.System
+		if isSystemCol && !isScannedCol {
+			continue
+		}
+		avgSize := c.mem.RequestColAvgSize(tabID, colID)
+		// Scanned columns are double-counted due to the cost of transferring data
+		// over the network.
+		var networkCostFactor memo.Cost = 1
+		if isScannedCol && !isSystemCol {
+			networkCostFactor = 2
+		}
+		// Divide the column size by the default column size (4 bytes), so that by
+		// default the cost of plans involving tables that use the default AvgSize
+		// (e.g., if the stat is not available) is the same as if
+		// CostScansWithDefaultColSize were true.
+		cost += memo.Cost(float64(avgSize)/4) * costFactor * networkCostFactor
+	}
+	return cost
 }
 
 // rowBufferCost adds a cost for buffering rows according to a ramp function:
 //
-//                  cost
-//                 factor
+//	               cost
+//	              factor
 //
-//                    |               spillRowCount
-//   spillCostFactor _|                  ___________ _ _ _
-//                    |                 /
-//                    |                /
-//                    |               /
-//                0  _| _ _ _________/______________________    row
-//                    |                                        count
-//                         noSpillRowCount
+//	                 |               spillRowCount
+//	spillCostFactor _|                  ___________ _ _ _
+//	                 |                 /
+//	                 |                /
+//	                 |               /
+//	             0  _| _ _ _________/______________________    row
+//	                 |                                        count
+//	                      noSpillRowCount
 //
 // This function models the fact that operators that buffer rows become more
 // expensive the more rows they need to buffer, since eventually they will need
@@ -1425,42 +1521,42 @@ func (c *coster) largeCardinalityCostPenalty(
 // leaseholder preferences, with 0.0 indicating 0% and 1.0 indicating 100%. This
 // is the basic algorithm:
 //
-//   t = total # of locality tiers
+//	t = total # of locality tiers
 //
-//   Match each locality tier against the constraint set, and compute a value
-//   for each tier:
+//	Match each locality tier against the constraint set, and compute a value
+//	for each tier:
 //
-//      0 = key not present in constraint set or key matches prohibited
-//          constraint, but value doesn't match
-//     +1 = key matches required constraint, and value does match
-//     -1 = otherwise
+//	   0 = key not present in constraint set or key matches prohibited
+//	       constraint, but value doesn't match
+//	  +1 = key matches required constraint, and value does match
+//	  -1 = otherwise
 //
-//   m = length of longest locality prefix that ends in a +1 value and doesn't
-//       contain a -1 value.
+//	m = length of longest locality prefix that ends in a +1 value and doesn't
+//	    contain a -1 value.
 //
-//   Compute "m" for both the ReplicaConstraints constraints set, as well as for
-//   the LeasePreferences constraints set:
+//	Compute "m" for both the ReplicaConstraints constraints set, as well as for
+//	the LeasePreferences constraints set:
 //
-//     constraint-score = m / t
-//     lease-pref-score = m / t
+//	  constraint-score = m / t
+//	  lease-pref-score = m / t
 //
-//   if there are no lease preferences, then final-score = lease-pref-score
-//   else final-score = (constraint-score * 2 + lease-pref-score) / 3
+//	if there are no lease preferences, then final-score = lease-pref-score
+//	else final-score = (constraint-score * 2 + lease-pref-score) / 3
 //
 // Here are some scoring examples:
 //
-//   Locality = region=us,dc=east
-//   0.0 = []                     // No constraints to match
-//   0.0 = [+region=eu,+dc=uk]    // None of the tiers match
-//   0.0 = [+region=eu,+dc=east]  // 2nd tier matches, but 1st tier doesn't
-//   0.0 = [-region=us,+dc=east]  // 1st tier matches PROHIBITED constraint
-//   0.0 = [-region=eu]           // 1st tier PROHIBITED and non-matching
-//   0.5 = [+region=us]           // 1st tier matches
-//   0.5 = [+region=us,-dc=east]  // 1st tier matches, 2nd tier PROHIBITED
-//   0.5 = [+region=us,+dc=west]  // 1st tier matches, but 2nd tier doesn't
-//   1.0 = [+region=us,+dc=east]  // Both tiers match
-//   1.0 = [+dc=east]             // 2nd tier matches, no constraints for 1st
-//   1.0 = [+region=us,+dc=east,+rack=1,-ssd]  // Extra constraints ignored
+//	Locality = region=us,dc=east
+//	0.0 = []                     // No constraints to match
+//	0.0 = [+region=eu,+dc=uk]    // None of the tiers match
+//	0.0 = [+region=eu,+dc=east]  // 2nd tier matches, but 1st tier doesn't
+//	0.0 = [-region=us,+dc=east]  // 1st tier matches PROHIBITED constraint
+//	0.0 = [-region=eu]           // 1st tier PROHIBITED and non-matching
+//	0.5 = [+region=us]           // 1st tier matches
+//	0.5 = [+region=us,-dc=east]  // 1st tier matches, 2nd tier PROHIBITED
+//	0.5 = [+region=us,+dc=west]  // 1st tier matches, but 2nd tier doesn't
+//	1.0 = [+region=us,+dc=east]  // Both tiers match
+//	1.0 = [+dc=east]             // 2nd tier matches, no constraints for 1st
+//	1.0 = [+region=us,+dc=east,+rack=1,-ssd]  // Extra constraints ignored
 //
 // Note that constraints need not be specified in any particular order, so all
 // constraints are scanned when matching each locality tier. In cases where
@@ -1631,15 +1727,51 @@ func topKInputLimitHint(
 	return math.Min(inputRowCount, expectedRows)
 }
 
-// lookupExprCost accounts for the extra CPU cost of the lookupExpr.
-func lookupExprCost(join memo.RelExpr) memo.Cost {
-	lookupExpr, ok := join.(*memo.LookupJoinExpr)
-	if ok {
+// indexLookupJoinPerLookupCost accounts for the cost of performing lookups for
+// a single input row. It accounts for the random IOs incurred for each span
+// (multiple spans mean multiple IOs). It also accounts for the extra CPU cost
+// of the lookupExpr, if there is one.
+func indexLookupJoinPerLookupCost(join memo.RelExpr) memo.Cost {
+	// The rows in the (left) input are used to probe into the (right) table.
+	// Since the matching rows in the table may not all be in the same range,
+	// this counts as random I/O.
+	cost := memo.Cost(randIOCostFactor)
+	lookupJoin, ok := join.(*memo.LookupJoinExpr)
+	if ok && len(lookupJoin.LookupExpr) > 0 {
+		numSpans := 1
+		var getNumSpans func(opt.ScalarExpr)
+		getNumSpans = func(expr opt.ScalarExpr) {
+			// The lookup expression will have been validated by isCanonicalFilter in
+			// lookupjoin/constraint_builder.go to only contain a subset of possible
+			// filter condition types.
+			switch t := expr.(type) {
+			case *memo.RangeExpr:
+				getNumSpans(t.And)
+			case *memo.AndExpr:
+				getNumSpans(t.Left)
+				getNumSpans(t.Right)
+			case *memo.InExpr:
+				in := t.Right.(*memo.TupleExpr)
+				numSpans *= len(in.Elems)
+			default:
+				// Equalities and inequalities do not change the number of spans.
+			}
+		}
+		if numSpans == 0 {
+			panic(errors.AssertionFailedf("lookup expr has contradiction"))
+		}
+		for i := range lookupJoin.LookupExpr {
+			getNumSpans(lookupJoin.LookupExpr[i].Condition)
+		}
+		if numSpans > 1 {
+			// Account for the random IO incurred by looking up the extra spans.
+			cost += memo.Cost(randIOCostFactor * (numSpans - 1))
+		}
 		// 1.1 is a fudge factor that pushes some plans over the edge when choosing
 		// between a partial index vs full index plus lookup expr in the
 		// regional_by_row.
 		// TODO(treilly): do some empirical analysis and model this better
-		return cpuCostFactor * memo.Cost(len(lookupExpr.LookupExpr)) * 1.1
+		cost += cpuCostFactor * memo.Cost(len(lookupJoin.LookupExpr)) * 1.1
 	}
-	return 0
+	return cost
 }

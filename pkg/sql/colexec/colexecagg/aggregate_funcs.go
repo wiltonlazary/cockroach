@@ -11,6 +11,7 @@
 package colexecagg
 
 import (
+	"context"
 	"unsafe"
 
 	"github.com/cockroachdb/apd/v3"
@@ -19,7 +20,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexecop"
 	"github.com/cockroachdb/cockroach/pkg/sql/colmem"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execagg"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
@@ -217,6 +220,7 @@ const (
 
 // NewAggregateFuncsAlloc returns a new AggregateFuncsAlloc.
 func NewAggregateFuncsAlloc(
+	ctx context.Context,
 	args *NewAggregatorArgs,
 	aggregations []execinfrapb.AggregatorSpec_Aggregation,
 	allocSize int64,
@@ -378,12 +382,12 @@ func NewAggregateFuncsAlloc(
 			switch aggKind {
 			case HashAggKind:
 				funcAllocs[i] = newDefaultHashAggAlloc(
-					args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
+					ctx, args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
 					len(aggFn.ColIdx), args.ConstArguments[i], args.OutputTypes[i], allocSize,
 				)
 			case OrderedAggKind:
 				funcAllocs[i] = newDefaultOrderedAggAlloc(
-					args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
+					ctx, args.Allocator, args.Constructors[i], args.EvalCtx, inputArgsConverter,
 					len(aggFn.ColIdx), args.ConstArguments[i], args.OutputTypes[i], allocSize,
 				)
 			case WindowAggKind:
@@ -441,22 +445,23 @@ type aggAllocBase struct {
 //
 // evalCtx will not be mutated.
 func ProcessAggregations(
-	evalCtx *tree.EvalContext,
+	ctx context.Context,
+	evalCtx *eval.Context,
 	semaCtx *tree.SemaContext,
 	aggregations []execinfrapb.AggregatorSpec_Aggregation,
 	inputTypes []*types.T,
 ) (
-	constructors []execinfrapb.AggregateConstructor,
+	constructors []execagg.AggregateConstructor,
 	constArguments []tree.Datums,
 	outputTypes []*types.T,
 	err error,
 ) {
-	constructors = make([]execinfrapb.AggregateConstructor, len(aggregations))
+	constructors = make([]execagg.AggregateConstructor, len(aggregations))
 	constArguments = make([]tree.Datums, len(aggregations))
 	outputTypes = make([]*types.T, len(aggregations))
 	for i, aggFn := range aggregations {
-		constructors[i], constArguments[i], outputTypes[i], err = execinfrapb.GetAggregateConstructor(
-			evalCtx, semaCtx, &aggFn, inputTypes,
+		constructors[i], constArguments[i], outputTypes[i], err = execagg.GetAggregateConstructor(
+			ctx, evalCtx, semaCtx, &aggFn, inputTypes,
 		)
 		if err != nil {
 			return

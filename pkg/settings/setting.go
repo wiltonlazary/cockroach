@@ -10,10 +10,7 @@
 
 package settings
 
-import (
-	"context"
-	"strings"
-)
+import "context"
 
 // Setting is the interface exposing the metadata for a cluster setting.
 //
@@ -58,6 +55,14 @@ type NonMaskedSetting interface {
 	// the setting.
 	EncodedDefault() string
 
+	// DecodeToString returns the string representation of the provided
+	// encoded value.
+	// This is analogous to loading the setting from storage and
+	// then calling String() on it, however the setting is not modified.
+	// The string representation of the default value can be obtained
+	// by calling EncodedDefault() and then DecodeToString().
+	DecodeToString(encoded string) (repr string, err error)
+
 	// SetOnChange installs a callback to be called when a setting's value
 	// changes. `fn` should avoid doing long-running or blocking work as it is
 	// called on the goroutine which handles all settings updates.
@@ -76,19 +81,20 @@ type NonMaskedSetting interface {
 // SystemOnly.RegisterIntSetting().
 //
 // Guidelines for choosing a class:
-//  - Make sure to read the descriptions below carefully to understand the
-//    differences in semantics.
 //
-//  - If the setting controls a user-visible aspect of SQL, it should be a
-//    TenantWritable setting.
+//   - Make sure to read the descriptions below carefully to understand the
+//     differences in semantics.
 //
-//  - Control settings relevant to tenant-specific internal implementation
-//    should be TenantReadOnly.
+//   - If the setting controls a user-visible aspect of SQL, it should be a
+//     TenantWritable setting.
 //
-//  - When in doubt, the first choice to consider should be TenantReadOnly.
+//   - Control settings relevant to tenant-specific internal implementation
+//     should be TenantReadOnly.
 //
-//  - SystemOnly should be used with caution: even internal tenant code is
-//    disallowed from using these settings at all.
+//   - When in doubt, the first choice to consider should be TenantReadOnly.
+//
+//   - SystemOnly should be used with caution: even internal tenant code is
+//     disallowed from using these settings at all.
 type Class int8
 
 const (
@@ -128,10 +134,3 @@ const (
 	// In short: "Go ahead but be careful."
 	Public
 )
-
-// AdminOnly returns whether the setting can only be viewed and modified by
-// superusers. Otherwise, users with the MODIFYCLUSTERSETTING role privilege can
-// do so.
-func AdminOnly(name string) bool {
-	return !strings.HasPrefix(name, "sql.defaults.")
-}

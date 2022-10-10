@@ -28,27 +28,18 @@ import (
 // MergeQueueEnabled is a setting that controls whether the merge queue is
 // enabled.
 var MergeQueueEnabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.SystemOnly,
 	"kv.range_merge.queue_enabled",
 	"whether the automatic merge queue is enabled",
 	true,
 )
-
-// TxnCleanupThreshold is the threshold after which a transaction is
-// considered abandoned and fit for removal, as measured by the
-// maximum of its last heartbeat and timestamp. Abort spans for the
-// transaction are cleaned up at the same time.
-//
-// TODO(tschottdorf): need to enforce at all times that this is much
-// larger than the heartbeat interval used by the coordinator.
-const TxnCleanupThreshold = time.Hour
 
 // CmdIDKey is a Raft command id. This will be logged unredacted - keep it random.
 type CmdIDKey string
 
 // SafeFormat implements redact.SafeFormatter.
 func (s CmdIDKey) SafeFormat(sp redact.SafePrinter, verb rune) {
-	sp.Printf("%q", redact.SafeString(s))
+	sp.Printf("%x", redact.SafeString(s))
 }
 
 func (s CmdIDKey) String() string {
@@ -59,13 +50,14 @@ var _ redact.SafeFormatter = CmdIDKey("")
 
 // FilterArgs groups the arguments to a ReplicaCommandFilter.
 type FilterArgs struct {
-	Ctx   context.Context
-	CmdID CmdIDKey
-	Index int
-	Sid   roachpb.StoreID
-	Req   roachpb.Request
-	Hdr   roachpb.Header
-	Err   error // only used for TestingPostEvalFilter
+	Ctx     context.Context
+	CmdID   CmdIDKey
+	Index   int
+	Sid     roachpb.StoreID
+	Req     roachpb.Request
+	Hdr     roachpb.Header
+	Version roachpb.Version
+	Err     error // only used for TestingPostEvalFilter
 }
 
 // ProposalFilterArgs groups the arguments to ReplicaProposalFilter.
@@ -124,7 +116,7 @@ type ReplicaResponseFilter func(context.Context, roachpb.BatchRequest, *roachpb.
 // ReplicaRangefeedFilter is used in unit tests to modify the request, inject
 // responses, or return errors from rangefeeds.
 type ReplicaRangefeedFilter func(
-	args *roachpb.RangeFeedRequest, stream roachpb.Internal_RangeFeedServer,
+	args *roachpb.RangeFeedRequest, stream roachpb.RangeFeedEventSink,
 ) *roachpb.Error
 
 // ContainsKey returns whether this range contains the specified key.
@@ -222,3 +214,7 @@ var SplitByLoadMergeDelay = settings.RegisterDurationSetting(
 		return nil
 	},
 )
+
+// MaxCommandSizeDefault is the default for the kv.raft.command.max_size
+// cluster setting.
+const MaxCommandSizeDefault = 64 << 20

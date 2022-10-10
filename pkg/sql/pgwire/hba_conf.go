@@ -18,7 +18,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/hba"
@@ -66,6 +66,12 @@ import (
 // - A rule matches if the connecting client's IP address is included
 //   in the network address specified in the CIDR notation.
 //
+
+// chainOptions and requireClusterVersion will be used in an upcoming PR.
+// Referencing them temporarily to pass the "unused linter" warning.
+// See comment in https://github.com/cockroachdb/cockroach/pull/85777.
+var _ = chainOptions
+var _ = requireClusterVersion
 
 // serverHBAConfSetting is the name of the cluster setting that holds
 // the HBA configuration.
@@ -204,7 +210,7 @@ func ParseAndNormalize(val string) (*hba.Conf, error) {
 		return conf, err
 	}
 
-	if len(conf.Entries) == 0 || !conf.Entries[0].Equivalent(rootEntry) {
+	if len(conf.Entries) == 0 || !(conf.Entries[0].Equivalent(rootEntry) || conf.Entries[0].Equivalent(rootLocalEntry)) {
 		entries := make([]hba.Entry, 1, len(conf.Entries)+1)
 		entries[0] = rootEntry
 		entries = append(entries, conf.Entries...)
@@ -234,12 +240,35 @@ var insecureEntry = hba.Entry{
 	Method:   hba.String{Value: "--insecure"},
 }
 
+var sessionRevivalEntry = hba.Entry{
+	ConnType: hba.ConnHostAny,
+	User:     []hba.String{{Value: "all", Quoted: false}},
+	Address:  hba.AnyAddr{},
+	Method:   hba.String{Value: "session_revival_token"},
+}
+
+var jwtAuthEntry = hba.Entry{
+	ConnType: hba.ConnHostAny,
+	User:     []hba.String{{Value: "all", Quoted: false}},
+	Address:  hba.AnyAddr{},
+	Method:   hba.String{Value: "jwt_token"},
+}
+
 var rootEntry = hba.Entry{
 	ConnType: hba.ConnHostAny,
-	User:     []hba.String{{Value: security.RootUser, Quoted: false}},
+	User:     []hba.String{{Value: username.RootUser, Quoted: false}},
 	Address:  hba.AnyAddr{},
 	Method:   hba.String{Value: "cert-password"},
 	Input:    "host  all root all cert-password # CockroachDB mandatory rule",
+}
+
+var _, localhostCidrBytes, _ = net.ParseCIDR("127.0.0.1/32")
+var rootLocalEntry = hba.Entry{
+	ConnType: hba.ConnHostAny,
+	User:     []hba.String{{Value: username.RootUser, Quoted: false}},
+	Address:  localhostCidrBytes,
+	Method:   hba.String{Value: "cert-password"},
+	Input:    "host all root 127.0.0.1/32 cert-password # Alternative to the CockroachDB mandatory rule",
 }
 
 // DefaultHBAConfig is used when the stored HBA configuration string

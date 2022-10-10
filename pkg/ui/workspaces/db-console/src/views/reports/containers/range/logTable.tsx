@@ -19,9 +19,7 @@ import { Loading, util } from "@cockroachlabs/cluster-ui";
 
 interface LogTableProps {
   rangeID: Long;
-  log: CachedDataReducerState<
-    protos.cockroach.server.serverpb.RangeLogResponse
-  >;
+  log: CachedDataReducerState<protos.cockroach.server.serverpb.RangeLogResponse>;
 }
 
 function printLogEventType(
@@ -41,6 +39,9 @@ function printLogEventType(
       return "Split";
     case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType.merge:
       return "Merge";
+    case protos.cockroach.kv.kvserver.storagepb.RangeLogEventType
+      .unsafe_quorum_recovery:
+      return "Unsafe Quorum Recovery";
     default:
       return "Unknown";
   }
@@ -155,6 +156,7 @@ export default class LogTable extends React.Component<LogTableProps, {}> {
         <h2 className="base-heading">Range Log</h2>
         <Loading
           loading={!log || log.inFlight}
+          page={"log table"}
           error={log && log.lastError}
           render={this.renderContent}
         />

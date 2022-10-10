@@ -18,7 +18,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -37,7 +38,11 @@ import (
 func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	spanConfigStore := spanconfigstore.New(roachpb.TestingDefaultSpanConfig())
+	spanConfigStore := spanconfigstore.New(
+		roachpb.TestingDefaultSpanConfig(),
+		cluster.MakeTestingClusterSettings(),
+		nil,
+	)
 	mockSubscriber := newMockSpanConfigSubscriber(spanConfigStore)
 
 	ctx := context.Background()
@@ -47,6 +52,7 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 			Store: &kvserver.StoreTestingKnobs{
 				DisableMergeQueue: true,
 				DisableSplitQueue: true,
+				DisableGCQueue:    true,
 			},
 			SpanConfig: &spanconfig.TestingKnobs{
 				StoreKVSubscriberOverride: mockSubscriber,
@@ -57,7 +63,7 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	defer s.Stopper().Stop(context.Background())
 
 	_, err := s.InternalExecutor().(sqlutil.InternalExecutor).ExecEx(ctx, "inline-exec", nil,
-		sessiondata.InternalExecutorOverride{User: security.RootUserName()},
+		sessiondata.InternalExecutorOverride{User: username.RootUserName()},
 		`SET CLUSTER SETTING spanconfig.store.enabled = true`)
 	require.NoError(t, err)
 
@@ -69,14 +75,21 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 	span := repl.Desc().RSpan().AsRawSpanWithNoLocals()
 	conf := roachpb.SpanConfig{NumReplicas: 5, NumVoters: 3}
 
-	deleted, added := spanConfigStore.Apply(ctx, false /* dryrun */, spanconfig.Addition(span, conf))
+	add, err := spanconfig.Addition(spanconfig.MakeTargetFromSpan(span), conf)
+	require.NoError(t, err)
+	deleted, added := spanConfigStore.Apply(
+		ctx,
+		false, /* dryrun */
+		add,
+	)
 	require.Empty(t, deleted)
 	require.Len(t, added, 1)
-	require.True(t, added[0].Span.Equal(span))
-	require.True(t, added[0].Config.Equal(conf))
+	require.True(t, added[0].GetTarget().GetSpan().Equal(span))
+	addedCfg := added[0].GetConfig()
+	require.True(t, addedCfg.Equal(conf))
 
 	require.NotNil(t, mockSubscriber.callback)
-	mockSubscriber.callback(span) // invoke the callback
+	mockSubscriber.callback(ctx, span) // invoke the callback
 	testutils.SucceedsSoon(t, func() error {
 		repl := store.LookupReplica(keys.MustAddr(key))
 		gotConfig := repl.SpanConfig()
@@ -88,7 +101,7 @@ func TestSpanConfigUpdateAppliedToReplica(t *testing.T) {
 }
 
 type mockSpanConfigSubscriber struct {
-	callback func(config roachpb.Span)
+	callback func(ctx context.Context, config roachpb.Span)
 	spanconfig.Store
 }
 
@@ -114,10 +127,16 @@ func (m *mockSpanConfigSubscriber) GetSpanConfigForKey(
 	return m.Store.GetSpanConfigForKey(ctx, key)
 }
 
+func (m *mockSpanConfigSubscriber) GetProtectionTimestamps(
+	context.Context, roachpb.Span,
+) ([]hlc.Timestamp, hlc.Timestamp, error) {
+	panic("unimplemented")
+}
+
 func (m *mockSpanConfigSubscriber) LastUpdated() hlc.Timestamp {
 	panic("unimplemented")
 }
 
-func (m *mockSpanConfigSubscriber) Subscribe(callback func(roachpb.Span)) {
+func (m *mockSpanConfigSubscriber) Subscribe(callback func(context.Context, roachpb.Span)) {
 	m.callback = callback
 }

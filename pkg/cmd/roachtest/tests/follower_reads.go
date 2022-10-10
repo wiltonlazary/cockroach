@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -51,9 +52,9 @@ func registerFollowerReads(r registry.Registry) {
 			name = name + "/insufficient-quorum"
 		}
 		r.Add(registry.TestSpec{
-			Skip:  "https://github.com/cockroachdb/cockroach/issues/69817",
-			Name:  name,
-			Owner: registry.OwnerKV,
+			Name:            name,
+			Owner:           registry.OwnerKV,
+			RequiresLicense: true,
 			Cluster: r.MakeClusterSpec(
 				6, /* nodeCount */
 				spec.CPU(4),
@@ -91,14 +92,17 @@ func registerFollowerReads(r registry.Registry) {
 	}
 
 	r.Add(registry.TestSpec{
-		Skip:  "https://github.com/cockroachdb/cockroach/issues/69817",
-		Name:  "follower-reads/mixed-version/single-region",
-		Owner: registry.OwnerKV,
+		Name:            "follower-reads/mixed-version/single-region",
+		Owner:           registry.OwnerKV,
+		RequiresLicense: true,
 		Cluster: r.MakeClusterSpec(
 			3, /* nodeCount */
 			spec.CPU(2),
 		),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			if runtime.GOARCH == "arm64" {
+				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
+			}
 			runFollowerReadsMixedVersionSingleRegionTest(ctx, t, c, *t.BuildVersion())
 		},
 	})
@@ -141,24 +145,23 @@ type topologySpec struct {
 // runFollowerReadsTest is a basic litmus test that follower reads work.
 // The test does the following:
 //
-//  * Creates a multi-region database and table.
-//  * Configures the database's survival goals.
-//  * Configures the table's locality setting.
-//  * Installs a number of rows into that table.
-//  * Queries the data initially with a recent timestamp and expecting an
-//    error because the table does not exist in the past immediately following
-//    creation.
-//  * If using a REGIONAL table, waits until the required duration has elapsed
-//    such that the installed data can be read with a follower read issued using
-//    `follower_read_timestamp()`.
-//  * Performs a few select query against a single row on all of the nodes and
-//    then observes the counter metric for store-level follower reads ensuring
-//    that they occurred on at least two of the nodes. If using a REGIONAL table,
-//    these reads are stale through the use of `follower_read_timestamp()`.
-//  * Performs reads against the written data on all of the nodes at a steady
-//    rate for 20 seconds, ensure that the 90-%ile SQL latencies during that
-//    time are under 10ms which implies that no WAN RPCs occurred.
-//
+//   - Creates a multi-region database and table.
+//   - Configures the database's survival goals.
+//   - Configures the table's locality setting.
+//   - Installs a number of rows into that table.
+//   - Queries the data initially with a recent timestamp and expecting an
+//     error because the table does not exist in the past immediately following
+//     creation.
+//   - If using a REGIONAL table, waits until the required duration has elapsed
+//     such that the installed data can be read with a follower read issued using
+//     `follower_read_timestamp()`.
+//   - Performs a few select query against a single row on all of the nodes and
+//     then observes the counter metric for store-level follower reads ensuring
+//     that they occurred on at least two of the nodes. If using a REGIONAL table,
+//     these reads are stale through the use of `follower_read_timestamp()`.
+//   - Performs reads against the written data on all of the nodes at a steady
+//     rate for 20 seconds, ensure that the 90-%ile SQL latencies during that
+//     time are under 10ms which implies that no WAN RPCs occurred.
 func runFollowerReadsTest(
 	ctx context.Context,
 	t test.Test,
@@ -271,20 +274,24 @@ func runFollowerReadsTest(
 		t.Fatalf("failed to get follower read counts: %v", err)
 	}
 
-	// Perform reads on each node and ensure we get the expected value. Do so a
-	// few times on each follower to give caches time to warm up.
+	// Perform reads on each node and ensure we get the expected value. Do so for
+	// 15 seconds to give closed timestamps a chance to propagate and caches time
+	// to warm up.
 	t.L().Printf("warming up reads")
 	g, gCtx := errgroup.WithContext(ctx)
 	k, v := chooseKV()
+	until := timeutil.Now().Add(15 * time.Second)
 	for i := 1; i <= c.Spec().NodeCount; i++ {
 		fn := verifySelect(gCtx, i, k, v)
 		g.Go(func() error {
-			for j := 0; j < 100; j++ {
+			for {
+				if timeutil.Now().After(until) {
+					return nil
+				}
 				if err := fn(); err != nil {
 					return err
 				}
 			}
-			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -873,7 +880,8 @@ func runFollowerReadsMixedVersionSingleRegionTest(
 	// Start the cluster at the old version.
 	settings := install.MakeClusterSettings()
 	settings.Binary = uploadVersion(ctx, t, c, c.All(), predecessorVersion)
-	c.Start(ctx, t.L(), option.DefaultStartOpts(), settings, c.All())
+	startOpts := option.DefaultStartOpts()
+	c.Start(ctx, t.L(), startOpts, settings, c.All())
 	topology := topologySpec{multiRegion: false}
 	data := initFollowerReadsDB(ctx, t, c, topology)
 
@@ -881,7 +889,7 @@ func runFollowerReadsMixedVersionSingleRegionTest(
 	randNode := 1 + rand.Intn(c.Spec().NodeCount)
 	t.L().Printf("upgrading n%d to current version", randNode)
 	nodeToUpgrade := c.Node(randNode)
-	upgradeNodes(ctx, nodeToUpgrade, curVersion, t, c)
+	upgradeNodes(ctx, nodeToUpgrade, startOpts, curVersion, t, c)
 	runFollowerReadsTest(ctx, t, c, topologySpec{multiRegion: false}, exactStaleness, data)
 
 	// Upgrade the remaining nodes to the new version and run the test.
@@ -893,6 +901,6 @@ func runFollowerReadsMixedVersionSingleRegionTest(
 		remainingNodes = remainingNodes.Merge(c.Node(i + 1))
 	}
 	t.L().Printf("upgrading nodes %s to current version", remainingNodes)
-	upgradeNodes(ctx, remainingNodes, curVersion, t, c)
+	upgradeNodes(ctx, remainingNodes, startOpts, curVersion, t, c)
 	runFollowerReadsTest(ctx, t, c, topologySpec{multiRegion: false}, exactStaleness, data)
 }

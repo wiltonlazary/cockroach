@@ -8,7 +8,6 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-import assert from "assert";
 import { createMemoryHistory } from "history";
 import Long from "long";
 import { RouteComponentProps } from "react-router-dom";
@@ -26,7 +25,6 @@ import { AdminUIState, createAdminUIStore } from "src/redux/state";
 import { databaseNameAttr, tableNameAttr } from "src/util/constants";
 import * as fakeApi from "src/util/fakeApi";
 import { mapStateToProps, mapDispatchToProps } from "./redux";
-import moment from "moment";
 import { makeTimestamp } from "src/views/databases/utils";
 
 function fakeRouteComponentProps(
@@ -86,21 +84,21 @@ class TestDriver {
   ) {
     // Assert moments are equal if not in pre-loading state.
     if (compareTimestamps) {
-      this.properties().indexStats.lastReset.isSame(
+      expect(this.properties().indexStats.lastReset).toEqual(
         expected.indexStats.lastReset,
       );
     }
     delete this.properties().indexStats.lastReset;
     delete expected.indexStats.lastReset;
-    assert.deepStrictEqual(this.properties(), expected);
+    expect(this.properties()).toEqual(expected);
   }
 
   assertTableDetails(expected: DatabaseTablePageDataDetails) {
-    assert.deepStrictEqual(this.properties().details, expected);
+    expect(this.properties().details).toEqual(expected);
   }
 
   assertTableStats(expected: DatabaseTablePageDataStats) {
-    assert.deepStrictEqual(this.properties().stats, expected);
+    expect(this.properties().stats).toEqual(expected);
   }
 
   assertIndexStats(
@@ -109,22 +107,23 @@ class TestDriver {
   ) {
     // Assert moments are equal if not in pre-loading state.
     if (compareTimestamps) {
-      assert(
-        this.properties().indexStats.stats[0].lastUsed.isSame(
-          expected.stats[0].lastUsed,
-        ),
+      expect(expected.stats[0].lastUsed).toEqual(
+        this.properties().indexStats.stats[0].lastUsed,
       );
     }
     delete this.properties().indexStats.stats[0].lastUsed;
     delete expected.stats[0].lastUsed;
-    assert(this.properties().indexStats.lastReset.isSame(expected.lastReset));
+    expect(expected.lastReset).toEqual(this.properties().indexStats.lastReset);
     delete this.properties().indexStats.lastReset;
     delete expected.lastReset;
 
     // Assert objects without moments are equal.
-    assert.deepStrictEqual(this.properties().indexStats, expected);
+    expect(this.properties().indexStats).toEqual(expected);
   }
 
+  async refreshSettings() {
+    return this.actions.refreshSettings();
+  }
   async refreshTableDetails() {
     return this.actions.refreshTableDetails(this.database, this.table);
   }
@@ -138,10 +137,10 @@ class TestDriver {
   }
 }
 
-describe("Database Table Page", function() {
+describe("Database Table Page", function () {
   let driver: TestDriver;
 
-  beforeEach(function() {
+  beforeEach(function () {
     driver = new TestDriver(
       createAdminUIStore(createMemoryHistory()),
       "DATABASE",
@@ -149,11 +148,19 @@ describe("Database Table Page", function() {
     );
   });
 
-  afterEach(function() {
+  afterEach(function () {
     fakeApi.restore();
   });
 
-  it("starts in a pre-loading state", function() {
+  it("starts in a pre-loading state", async function () {
+    fakeApi.stubClusterSettings({
+      key_values: {
+        "sql.stats.automatic_collection.enabled": { value: "true" },
+      },
+    });
+
+    await driver.refreshSettings();
+
     driver.assertProperties(
       {
         databaseName: "DATABASE",
@@ -166,7 +173,12 @@ describe("Database Table Page", function() {
           replicaCount: 0,
           indexNames: [],
           grants: [],
+          statsLastUpdated: null,
+          livePercentage: 0,
+          liveBytes: 0,
+          totalBytes: 0,
         },
+        automaticStatsCollectionEnabled: true,
         stats: {
           loading: false,
           loaded: false,
@@ -178,14 +190,14 @@ describe("Database Table Page", function() {
           loading: false,
           loaded: false,
           stats: [],
-          lastReset: moment(),
+          lastReset: null,
         },
       },
       false,
     );
   });
 
-  it("loads table details", async function() {
+  it("loads table details", async function () {
     fakeApi.stubTableDetails("DATABASE", "TABLE", {
       grants: [
         { user: "admin", privileges: ["CREATE", "DROP"] },
@@ -200,6 +212,10 @@ describe("Database Table Page", function() {
       zone_config: {
         num_replicas: 5,
       },
+      stats_last_created_at: makeTimestamp("0001-01-01T00:00:00Z"),
+      data_total_bytes: new Long(456789),
+      data_live_bytes: new Long(12345),
+      data_live_percentage: 2.0,
     });
 
     await driver.refreshTableDetails();
@@ -215,10 +231,16 @@ describe("Database Table Page", function() {
         { user: "admin", privilege: "DROP" },
         { user: "public", privilege: "SELECT" },
       ],
+      statsLastUpdated: util.TimestampToMoment(
+        makeTimestamp("0001-01-01T00:00:00Z"),
+      ),
+      livePercentage: 2.0,
+      liveBytes: 12345,
+      totalBytes: 456789,
     });
   });
 
-  it("loads table stats", async function() {
+  it("loads table stats", async function () {
     fakeApi.stubTableStats("DATABASE", "TABLE", {
       range_count: new Long(4200),
       approximate_disk_bytes: new Long(44040192),
@@ -235,7 +257,7 @@ describe("Database Table Page", function() {
     });
   });
 
-  it("loads index stats", async function() {
+  it("loads index stats", async function () {
     fakeApi.stubIndexStats("DATABASE", "TABLE", {
       statistics: [
         {
@@ -256,8 +278,27 @@ describe("Database Table Page", function() {
           index_name: "jobs_status_created_idx",
           index_type: "secondary",
         },
+        {
+          statistics: {
+            key: {
+              table_id: 1,
+              index_id: 2,
+            },
+            stats: {
+              total_read_count: new Long(0),
+              last_read: makeTimestamp("0001-01-01T00:00:00Z"),
+              total_rows_read: new Long(0),
+              total_write_count: new Long(0),
+              last_write: makeTimestamp("0001-01-01T00:00:00Z"),
+              total_rows_written: new Long(0),
+            },
+          },
+          index_name: "index_no_reads_no_resets",
+          index_type: "secondary",
+          created_at: makeTimestamp("0001-01-01T00:00:00Z"),
+        },
       ],
-      last_reset: makeTimestamp("2021-11-12T20:18:22.167627Z"),
+      last_reset: makeTimestamp("0001-01-01T00:00:00Z"),
     });
 
     await driver.refreshIndexStats();
@@ -273,11 +314,19 @@ describe("Database Table Page", function() {
             makeTimestamp("2021-11-19T23:01:05.167627Z"),
           ),
           lastUsedType: "read",
+          indexRecommendations: [],
+        },
+        {
+          indexName: "index_no_reads_no_resets",
+          totalReads: 0,
+          lastUsed: util.TimestampToMoment(
+            makeTimestamp("0001-01-01T00:00:00Z"),
+          ),
+          lastUsedType: "created",
+          indexRecommendations: [],
         },
       ],
-      lastReset: util.TimestampToMoment(
-        makeTimestamp("2021-11-12T20:18:22.167627Z"),
-      ),
+      lastReset: util.TimestampToMoment(makeTimestamp("0001-01-01T00:00:00Z")),
     });
   });
 });

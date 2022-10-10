@@ -139,8 +139,10 @@ func TestInboxNextPanicDoesntLeakGoroutines(t *testing.T) {
 	m := &execinfrapb.ProducerMessage{}
 	m.Data.RawBytes = []byte("garbage")
 
+	// Simulate the client (outbox) that sends only a single piece of metadata.
 	go func() {
 		_ = rpcLayer.client.Send(m)
+		_ = rpcLayer.client.CloseSend()
 	}()
 
 	// inbox.Next should panic given that the deserializer will encounter garbage
@@ -149,6 +151,10 @@ func TestInboxNextPanicDoesntLeakGoroutines(t *testing.T) {
 		inbox.Init(context.Background())
 		inbox.Next()
 	})
+
+	// Upon catching the panic and converting it into an error, the caller
+	// transitions to draining.
+	inbox.DrainMeta()
 
 	// We require no error from the stream handler as nothing was canceled. The
 	// panic is bubbled up through the Next chain on the Inbox's host.
@@ -195,9 +201,9 @@ func TestInboxTimeout(t *testing.T) {
 // These goroutines race against each other and the
 // desired state is that everything is cleaned up at the end. Examples of
 // scenarios that are tested by this test include but are not limited to:
-//  - DrainMeta called before Next and before a stream arrives.
-//  - DrainMeta called with an active stream.
-//  - A forceful cancellation of Next but no call to DrainMeta.
+//   - DrainMeta called before Next and before a stream arrives.
+//   - DrainMeta called with an active stream.
+//   - A forceful cancellation of Next but no call to DrainMeta.
 func TestInboxShutdown(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -250,6 +256,10 @@ func TestInboxShutdown(t *testing.T) {
 				drainScenario = drainMetaNotCalled
 			}
 			for _, runRunWithStreamGoroutine := range []bool{false, true} {
+				// copy loop variables so they can be safelyreferenced in Go routines
+				cancel, runNextGoroutine, runRunWithStreamGoroutine :=
+					cancel, runNextGoroutine, runRunWithStreamGoroutine
+
 				if runNextGoroutine == false && runRunWithStreamGoroutine == true {
 					// This is sort of like a remote node connecting to the inbox, but the
 					// inbox will never be spawned. This is dealt with by another part of

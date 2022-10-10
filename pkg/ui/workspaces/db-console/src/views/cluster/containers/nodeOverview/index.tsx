@@ -24,7 +24,7 @@ import {
 } from "src/redux/nodes";
 import { AdminUIState } from "src/redux/state";
 import { nodeIDAttr } from "src/util/constants";
-import { Bytes, DATE_FORMAT, Percentage } from "src/util/format";
+import { Bytes, DATE_FORMAT_24_UTC, Percentage } from "src/util/format";
 import { INodeStatus, MetricConstants, StatusMetrics } from "src/util/proto";
 import { getMatchParamByName } from "src/util/query";
 import {
@@ -44,6 +44,8 @@ import {
   NodeUsedCapacityTooltip,
   NodeAvailableCapacityTooltip,
   NodeMaximumCapacityTooltip,
+  MVCCRangeKeyBytesTooltip,
+  MVCCRangeValueBytesTooltip,
 } from "./tooltips";
 import { TooltipProps } from "src/components/tooltip/tooltip";
 
@@ -189,6 +191,24 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
                 />
                 <TableRow
                   data={node}
+                  title="MVCC Range Key Bytes"
+                  valueFn={metrics =>
+                    Bytes(metrics[MetricConstants.rangeKeyBytes] || 0)
+                  }
+                  nodeName={nodesSummary.nodeDisplayNameByID[node.desc.node_id]}
+                  CellTooltip={MVCCRangeKeyBytesTooltip}
+                />
+                <TableRow
+                  data={node}
+                  title="MVCC Range Value Bytes"
+                  valueFn={metrics =>
+                    Bytes(metrics[MetricConstants.rangeValBytes] || 0)
+                  }
+                  nodeName={nodesSummary.nodeDisplayNameByID[node.desc.node_id]}
+                  CellTooltip={MVCCRangeValueBytesTooltip}
+                />
+                <TableRow
+                  data={node}
                   title="Intent Bytes"
                   valueFn={metrics =>
                     Bytes(metrics[MetricConstants.intentBytes])
@@ -286,7 +306,9 @@ export class NodeOverview extends React.Component<NodeOverviewProps, {}> {
               />
               <SummaryValue
                 title="Last Update"
-                value={util.LongToMoment(node.updated_at).format(DATE_FORMAT)}
+                value={util
+                  .LongToMoment(node.updated_at)
+                  .format(DATE_FORMAT_24_UTC)}
               />
               <SummaryValue title="Build" value={node.build_info.tag} />
               <SummaryValue

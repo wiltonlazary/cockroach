@@ -20,7 +20,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				emit(func(this *scpb.CheckConstraint) scop.Op {
+				emit(func(this *scpb.CheckConstraint) *scop.NotImplemented {
 					return notImplemented(this)
 				}),
 			),
@@ -28,8 +28,31 @@ func init() {
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				emit(func(this *scpb.CheckConstraint) scop.Op {
-					return notImplemented(this)
+				// TODO(postamar): remove revertibility constraint when possible
+				revertible(false),
+				emit(func(this *scpb.CheckConstraint) *scop.RemoveCheckConstraint {
+					return &scop.RemoveCheckConstraint{
+						TableID:      this.TableID,
+						ConstraintID: this.ConstraintID,
+					}
+				}),
+				emit(func(this *scpb.CheckConstraint) *scop.UpdateTableBackReferencesInTypes {
+					if len(this.UsesTypeIDs) == 0 {
+						return nil
+					}
+					return &scop.UpdateTableBackReferencesInTypes{
+						TypeIDs:               this.UsesTypeIDs,
+						BackReferencedTableID: this.TableID,
+					}
+				}),
+				emit(func(this *scpb.CheckConstraint) *scop.UpdateBackReferencesInSequences {
+					if len(this.UsesSequenceIDs) == 0 {
+						return nil
+					}
+					return &scop.UpdateBackReferencesInSequences{
+						SequenceIDs:           this.UsesSequenceIDs,
+						BackReferencedTableID: this.TableID,
+					}
 				}),
 			),
 		),

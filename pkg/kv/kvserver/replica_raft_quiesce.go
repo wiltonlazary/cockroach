@@ -14,6 +14,7 @@ import (
 	"context"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -87,7 +88,7 @@ func (r *Replica) maybeUnquiesceAndWakeLeaderLocked() bool {
 	r.store.unquiescedReplicas.Unlock()
 	r.maybeCampaignOnWakeLocked(ctx)
 	// Propose an empty command which will wake the leader.
-	data := encodeRaftCommand(raftVersionStandard, makeIDKey(), nil)
+	data := kvserverbase.EncodeRaftCommand(kvserverbase.RaftVersionStandard, makeIDKey(), nil)
 	_ = r.mu.internalRaftGroup.Propose(data)
 	return true
 }
@@ -113,7 +114,7 @@ func (r *Replica) canUnquiesceRLocked() bool {
 		// so it is important that they are cheap. Keeping them quiesced instead of
 		// letting them unquiesce and tick every 200ms indefinitely avoids a
 		// meaningful amount of periodic work for each uninitialized replica.
-		r.isInitializedRLocked() &&
+		r.IsInitialized() &&
 		// A replica's Raft group begins in a dormant state and is initialized
 		// lazily in response to any Raft traffic (see stepRaftGroup) or KV request
 		// traffic (see maybeInitializeRaftGroup). If it has yet to be initialized,
@@ -181,7 +182,7 @@ func (r *Replica) canUnquiesceRLocked() bool {
 func (r *Replica) maybeQuiesceRaftMuLockedReplicaMuLocked(
 	ctx context.Context, now hlc.ClockTimestamp, livenessMap liveness.IsLiveMap,
 ) bool {
-	status, lagging, ok := shouldReplicaQuiesce(ctx, r, now, livenessMap)
+	status, lagging, ok := shouldReplicaQuiesce(ctx, r, now, livenessMap, r.mu.pausedFollowers)
 	if !ok {
 		return false
 	}
@@ -192,7 +193,7 @@ type quiescer interface {
 	descRLocked() *roachpb.RangeDescriptor
 	raftStatusRLocked() *raft.Status
 	raftBasicStatusRLocked() raft.BasicStatus
-	raftLastIndexLocked() (uint64, error)
+	raftLastIndexRLocked() uint64
 	hasRaftReadyRLocked() bool
 	hasPendingProposalsRLocked() bool
 	hasPendingProposalQuotaRLocked() bool
@@ -266,7 +267,11 @@ func (s laggingReplicaSet) Less(i, j int) bool { return s[i].NodeID < s[j].NodeI
 //
 // NOTE: The last 3 conditions are fairly, but not completely, overlapping.
 func shouldReplicaQuiesce(
-	ctx context.Context, q quiescer, now hlc.ClockTimestamp, livenessMap liveness.IsLiveMap,
+	ctx context.Context,
+	q quiescer,
+	now hlc.ClockTimestamp,
+	livenessMap liveness.IsLiveMap,
+	pausedFollowers map[roachpb.ReplicaID]struct{},
 ) (*raft.Status, laggingReplicaSet, bool) {
 	if testingDisableQuiescence {
 		return nil, nil, false
@@ -299,6 +304,14 @@ func shouldReplicaQuiesce(
 		}
 		return nil, nil, false
 	}
+
+	if q.hasRaftReadyRLocked() {
+		if log.V(4) {
+			log.Infof(ctx, "not quiescing: raft ready")
+		}
+		return nil, nil, false
+	}
+
 	status := q.raftStatusRLocked()
 	if status == nil {
 		if log.V(4) {
@@ -336,17 +349,24 @@ func shouldReplicaQuiesce(
 		}
 		return nil, nil, false
 	}
-	lastIndex, err := q.raftLastIndexLocked()
-	if err != nil {
-		if log.V(4) {
-			log.Infof(ctx, "not quiescing: %v", err)
-		}
-		return nil, nil, false
-	}
+	lastIndex := q.raftLastIndexRLocked()
 	if status.Commit != lastIndex {
 		if log.V(4) {
 			log.Infof(ctx, "not quiescing: commit (%d) != lastIndex (%d)",
 				status.Commit, lastIndex)
+		}
+		return nil, nil, false
+	}
+
+	if len(pausedFollowers) > 0 {
+		// TODO(tbg): we should use a mechanism similar to livenessMap below (including a
+		// callback that unquiesces when paused followers unpause, since they will by
+		// definition be lagging). This was a little too much code churn at the time
+		// at which this comment was written.
+		//
+		// See: https://github.com/cockroachdb/cockroach/issues/84252
+		if log.V(4) {
+			log.Infof(ctx, "not quiescing: overloaded followers %v", pausedFollowers)
 		}
 		return nil, nil, false
 	}
@@ -389,22 +409,16 @@ func shouldReplicaQuiesce(
 		}
 		return nil, nil, false
 	}
-	if q.hasRaftReadyRLocked() {
-		if log.V(4) {
-			log.Infof(ctx, "not quiescing: raft ready")
-		}
-		return nil, nil, false
-	}
 	return status, lagging, true
 }
 
 func (r *Replica) quiesceAndNotifyRaftMuLockedReplicaMuLocked(
 	ctx context.Context, status *raft.Status, lagging laggingReplicaSet,
 ) bool {
-	fromReplica, fromErr := r.getReplicaDescriptorByIDRLocked(r.mu.replicaID, r.raftMu.lastToReplica)
+	fromReplica, fromErr := r.getReplicaDescriptorByIDRLocked(r.replicaID, r.raftMu.lastToReplica)
 	if fromErr != nil {
 		if log.V(4) {
-			log.Infof(ctx, "not quiescing: cannot find from replica (%d)", r.mu.replicaID)
+			log.Infof(ctx, "not quiescing: cannot find from replica (%d)", r.replicaID)
 		}
 		return false
 	}
@@ -412,7 +426,7 @@ func (r *Replica) quiesceAndNotifyRaftMuLockedReplicaMuLocked(
 	r.quiesceLocked(ctx, lagging)
 
 	for id, prog := range status.Progress {
-		if roachpb.ReplicaID(id) == r.mu.replicaID {
+		if roachpb.ReplicaID(id) == r.replicaID {
 			continue
 		}
 		toReplica, toErr := r.getReplicaDescriptorByIDRLocked(
@@ -443,7 +457,7 @@ func (r *Replica) quiesceAndNotifyRaftMuLockedReplicaMuLocked(
 			curLagging = nil
 		}
 		msg := raftpb.Message{
-			From:   uint64(r.mu.replicaID),
+			From:   uint64(r.replicaID),
 			To:     id,
 			Type:   raftpb.MsgHeartbeat,
 			Term:   status.Term,

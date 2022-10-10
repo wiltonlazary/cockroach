@@ -23,7 +23,8 @@ import (
 const (
 	offsetBoundSecs = 167*60*60 + 59*60
 	// PG supports UTC hour offsets in the range [-167, 167].
-	maxUTCHourOffset = 167
+	maxUTCHourOffset          = 167
+	maxUTCHourOffsetInSeconds = maxUTCHourOffset * 60 * 60
 )
 
 var timezoneOffsetRegex = regexp.MustCompile(`(?i)^(GMT|UTC)?([+-])?(\d{1,3}(:[0-5]?\d){0,2})$`)
@@ -69,6 +70,9 @@ func TimeZoneStringToLocation(
 ) (*time.Location, error) {
 	offset, _, parsed := ParseTimeZoneOffset(locStr, std)
 	if parsed {
+		if offset < -maxUTCHourOffsetInSeconds || offset > maxUTCHourOffsetInSeconds {
+			return nil, errors.New("UTC timezone offset is out of range.")
+		}
 		return TimeZoneOffsetToLocation(offset), nil
 	}
 
@@ -200,9 +204,10 @@ func timeZoneOffsetStringConversion(
 }
 
 // The timestamp must be of one of the following formats:
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func hoursMinutesSecondsToSeconds(timeString string) int {
 	var (
 		hoursString   = "0"
@@ -226,9 +231,10 @@ func hoursMinutesSecondsToSeconds(timeString string) int {
 }
 
 // secondsToHoursMinutesSeconds converts seconds to a timestamp of the format
-//   HH
-//   HH:MM
-//   HH:MM:SS
+//
+//	HH
+//	HH:MM
+//	HH:MM:SS
 func secondsToHoursMinutesSeconds(totalSeconds int) string {
 	secondsPerHour := 60 * 60
 	secondsPerMinute := 60
@@ -253,9 +259,10 @@ func secondsToHoursMinutesSeconds(totalSeconds int) string {
 // The minutes and seconds sections are only included in the precision is
 // necessary.
 // For example:
-//    11.00 -> 11
-//    11.5 -> 11:30
-//    11.51 -> 11:30:36
+//
+//	11.00 -> 11
+//	11.5 -> 11:30
+//	11.51 -> 11:30:36
 func floatToHoursMinutesSeconds(f float64) string {
 	hours := int(f)
 	remaining := f - float64(hours)

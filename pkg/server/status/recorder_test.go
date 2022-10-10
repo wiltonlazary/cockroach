@@ -12,7 +12,7 @@ package status
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"sort"
@@ -141,9 +141,9 @@ func TestMetricsRecorder(t *testing.T) {
 		desc:     storeDesc2,
 		registry: metric.NewRegistry(),
 	}
-	manual := hlc.NewManualClock(100)
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 100))
 	st := cluster.MakeTestingClusterSettings()
-	recorder := NewMetricsRecorder(hlc.NewClock(manual.UnixNano, time.Nanosecond), nil, nil, nil, st)
+	recorder := NewMetricsRecorder(hlc.NewClock(manual, time.Nanosecond), nil, nil, nil, st /* maxOffset */)
 	recorder.AddStore(store1)
 	recorder.AddStore(store2)
 	recorder.AddNode(reg1, nodeDesc, 50, "foo:26257", "foo:26258", "foo:5432")
@@ -152,7 +152,7 @@ func TestMetricsRecorder(t *testing.T) {
 	// as the test expects time to not advance too far which would age the actual
 	// data (e.g. in histogram's) unexpectedly.
 	defer metric.TestingSetNow(func() time.Time {
-		return timeutil.Unix(0, manual.UnixNano())
+		return manual.Now()
 	})()
 
 	// ========================================
@@ -201,13 +201,11 @@ func TestMetricsRecorder(t *testing.T) {
 		{"testGauge", "gauge", 20},
 		{"testGaugeFloat64", "floatgauge", 20},
 		{"testCounter", "counter", 5},
-		{"testHistogram", "histogram", 10},
-		{"testLatency", "latency", 10},
+		{"testHistogram", "histogram", 9},
 		{"testAggGauge", "agggauge", 4},
 		{"testAggCounter", "aggcounter", 7},
 
 		// Stats needed for store summaries.
-		{"ranges", "counter", 1},
 		{"replicas.leaders", "gauge", 1},
 		{"replicas.leaseholders", "gauge", 1},
 		{"ranges", "gauge", 1},
@@ -288,23 +286,14 @@ func TestMetricsRecorder(t *testing.T) {
 				c.Inc((data.val))
 				addExpected(reg.prefix, data.name, reg.source, 100, data.val, reg.isNode)
 			case "histogram":
-				h := metric.NewHistogram(metric.Metadata{Name: reg.prefix + data.name}, time.Second, 1000, 2)
+				h := metric.NewHistogram(metric.Metadata{Name: reg.prefix + data.name}, time.Second, []float64{1.0, 10.0, 100.0, 1000.0})
 				reg.reg.AddMetric(h)
 				h.RecordValue(data.val)
 				for _, q := range recordHistogramQuantiles {
-					addExpected(reg.prefix, data.name+q.suffix, reg.source, 100, data.val, reg.isNode)
+					addExpected(reg.prefix, data.name+q.suffix, reg.source, 100, 10, reg.isNode)
 				}
 				addExpected(reg.prefix, data.name+"-count", reg.source, 100, 1, reg.isNode)
-			case "latency":
-				l := metric.NewLatency(metric.Metadata{Name: reg.prefix + data.name}, time.Hour)
-				reg.reg.AddMetric(l)
-				l.RecordValue(data.val)
-				// Latency is simply three histograms (at different resolution
-				// time scales).
-				for _, q := range recordHistogramQuantiles {
-					addExpected(reg.prefix, data.name+q.suffix, reg.source, 100, data.val, reg.isNode)
-				}
-				addExpected(reg.prefix, data.name+"-count", reg.source, 100, 1, reg.isNode)
+				addExpected(reg.prefix, data.name+"-avg", reg.source, 100, 9, reg.isNode)
 			default:
 				t.Fatalf("unexpected: %+v", data)
 			}
@@ -388,7 +377,7 @@ func TestMetricsRecorder(t *testing.T) {
 			if _, err := recorder.MarshalJSON(); err != nil {
 				t.Error(err)
 			}
-			_ = recorder.PrintAsText(ioutil.Discard)
+			_ = recorder.PrintAsText(io.Discard)
 			_ = recorder.GetTimeSeriesData()
 			wg.Done()
 		}()

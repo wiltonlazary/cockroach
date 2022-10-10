@@ -22,12 +22,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descbuilder"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -71,8 +74,9 @@ type Reporter struct {
 	db        *kv.DB
 	liveness  *liveness.NodeLiveness
 	settings  *cluster.Settings
-	storePool *kvserver.StorePool
+	storePool *storepool.StorePool
 	executor  sqlutil.InternalExecutor
+	cfgs      config.SystemConfigProvider
 
 	frequencyMu struct {
 		syncutil.Mutex
@@ -85,10 +89,11 @@ type Reporter struct {
 func NewReporter(
 	db *kv.DB,
 	localStores *kvserver.Stores,
-	storePool *kvserver.StorePool,
+	storePool *storepool.StorePool,
 	st *cluster.Settings,
 	liveness *liveness.NodeLiveness,
 	executor sqlutil.InternalExecutor,
+	provider config.SystemConfigProvider,
 ) *Reporter {
 	r := Reporter{
 		db:          db,
@@ -97,6 +102,7 @@ func NewReporter(
 		settings:    st,
 		liveness:    liveness,
 		executor:    executor,
+		cfgs:        provider,
 	}
 	r.frequencyMu.changeCh = make(chan struct{})
 	return &r
@@ -123,9 +129,12 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 		stats.frequencyMu.interval = ReporterInterval.Get(&stats.settings.SV)
 	})
 	_ = stopper.RunAsyncTask(ctx, "stats-reporter", func(ctx context.Context) {
+		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
+		ctx, cancel := stopper.WithCancelOnQuiesce(ctx)
+		defer cancel()
+
 		var timer timeutil.Timer
 		defer timer.Stop()
-		ctx = logtags.AddTag(ctx, "replication-reporter", nil /* value */)
 
 		replStatsSaver := makeReplicationStatsReportSaver()
 		constraintsSaver := makeReplicationConstraintStatusReportSaver()
@@ -160,6 +169,8 @@ func (stats *Reporter) Start(ctx context.Context, stopper *stop.Stopper) {
 			case <-timerCh:
 				timer.Read = true
 			case <-changeCh:
+			case <-ctx.Done():
+				return
 			case <-stopper.ShouldQuiesce():
 				return
 			}
@@ -186,19 +197,15 @@ func (stats *Reporter) update(
 	}
 
 	allStores := stats.storePool.GetStores()
-	var getStoresFromGossip StoreResolver = func(
-		r *roachpb.RangeDescriptor,
-	) []roachpb.StoreDescriptor {
-		storeDescs := make([]roachpb.StoreDescriptor, len(r.Replicas().VoterDescriptors()))
+	var storesFromGossip StoreResolver = func(
+		id roachpb.StoreID,
+	) roachpb.StoreDescriptor {
 		// We'll return empty descriptors for stores that gossip doesn't have a
 		// descriptor for. These stores will be considered to satisfy all
 		// constraints.
 		// TODO(andrei): note down that some descriptors were missing from gossip
 		// somewhere in the report.
-		for i, repl := range r.Replicas().VoterDescriptors() {
-			storeDescs[i] = allStores[repl.StoreID]
-		}
-		return storeDescs
+		return allStores[id]
 	}
 
 	isLiveMap := stats.liveness.GetIsLiveMap()
@@ -216,10 +223,10 @@ func (stats *Reporter) update(
 
 	// Create the visitors that we're going to pass to visitRanges() below.
 	constraintConfVisitor := makeConstraintConformanceVisitor(
-		ctx, stats.latestConfig, getStoresFromGossip)
+		ctx, stats.latestConfig, storesFromGossip)
 	localityStatsVisitor := makeCriticalLocalitiesVisitor(
 		ctx, nodeLocalities, stats.latestConfig,
-		getStoresFromGossip, isNodeLive)
+		storesFromGossip, isNodeLive)
 	replicationStatsVisitor := makeReplicationStatsVisitor(ctx, stats.latestConfig, isNodeLive)
 
 	// Iterate through all the ranges.
@@ -279,7 +286,7 @@ func (stats *Reporter) meta1LeaseHolderStore(ctx context.Context) *kvserver.Stor
 }
 
 func (stats *Reporter) updateLatestConfig() {
-	stats.latestConfig = stats.meta1LeaseHolder.Gossip().GetSystemConfig()
+	stats.latestConfig = stats.cfgs.GetSystemConfig()
 }
 
 // nodeChecker checks whether a node is to be considered alive or not.
@@ -291,7 +298,7 @@ type nodeChecker func(nodeID roachpb.NodeID) bool
 type zoneResolver struct {
 	init bool
 	// curObjectID is the object (i.e. usually table) of the configured range.
-	curObjectID config.SystemTenantObjectID
+	curObjectID config.ObjectID
 	// curRootZone is the lowest zone convering the previously resolved range
 	// that's not a subzone.
 	// This is used to compute the subzone for a range.
@@ -313,9 +320,7 @@ func (c *zoneResolver) resolveRange(
 // setZone remembers the passed-in info as the reference for further
 // checkSameZone() calls.
 // Clients should generally use the higher-level updateZone().
-func (c *zoneResolver) setZone(
-	objectID config.SystemTenantObjectID, key ZoneKey, rootZone *zonepb.ZoneConfig,
-) {
+func (c *zoneResolver) setZone(objectID config.ObjectID, key ZoneKey, rootZone *zonepb.ZoneConfig) {
 	c.init = true
 	c.curObjectID = objectID
 	c.curRootZone = rootZone
@@ -327,7 +332,7 @@ func (c *zoneResolver) setZone(
 func (c *zoneResolver) updateZone(
 	ctx context.Context, rd *roachpb.RangeDescriptor, cfg *config.SystemConfig,
 ) (ZoneKey, error) {
-	objectID, _ := config.DecodeKeyIntoZoneIDAndSuffix(rd.StartKey)
+	objectID, _ := config.DecodeKeyIntoZoneIDAndSuffix(keys.SystemSQLCodec, rd.StartKey)
 	first := true
 	var zoneKey ZoneKey
 	var rootZone *zonepb.ZoneConfig
@@ -371,7 +376,7 @@ func (c *zoneResolver) checkSameZone(ctx context.Context, rng *roachpb.RangeDesc
 		return false
 	}
 
-	objectID, keySuffix := config.DecodeKeyIntoZoneIDAndSuffix(rng.StartKey)
+	objectID, keySuffix := config.DecodeKeyIntoZoneIDAndSuffix(keys.SystemSQLCodec, rng.StartKey)
 	if objectID != c.curObjectID {
 		return false
 	}
@@ -402,7 +407,7 @@ func visitZones(
 	opt visitOpt,
 	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) (bool, error) {
-	id, keySuffix := config.DecodeKeyIntoZoneIDAndSuffix(rng.StartKey)
+	id, keySuffix := config.DecodeKeyIntoZoneIDAndSuffix(keys.SystemSQLCodec, rng.StartKey)
 	zone, err := getZoneByID(id, cfg)
 	if err != nil {
 		return false, err
@@ -438,7 +443,7 @@ func visitZones(
 // corresponding to id. The zone corresponding to id itself is not visited.
 func visitAncestors(
 	ctx context.Context,
-	id config.SystemTenantObjectID,
+	id config.ObjectID,
 	cfg *config.SystemConfig,
 	visitor func(context.Context, *zonepb.ZoneConfig, ZoneKey) bool,
 ) (bool, error) {
@@ -453,23 +458,22 @@ func visitAncestors(
 
 	// TODO(ajwerner): Reconsider how this zone config picking apart happens. This
 	// isn't how we want to be retreiving table descriptors in general.
-	var desc descpb.Descriptor
-	if err := descVal.GetProto(&desc); err != nil {
+	b, err := descbuilder.FromSerializedValue(descVal)
+	if err != nil {
 		return false, err
 	}
-	tableDesc, _, _, _ := descpb.FromDescriptorWithMVCCTimestamp(&desc, descVal.Timestamp)
 	// If it's a database, the parent is the default zone.
-	if tableDesc == nil {
+	if b == nil || b.DescriptorType() != catalog.Table {
 		return visitDefaultZone(ctx, cfg, visitor), nil
 	}
-
+	tableDesc := b.BuildImmutable()
 	// If it's a table, the parent is a database.
-	zone, err := getZoneByID(config.SystemTenantObjectID(tableDesc.ParentID), cfg)
+	zone, err := getZoneByID(config.ObjectID(tableDesc.GetParentID()), cfg)
 	if err != nil {
 		return false, err
 	}
 	if zone != nil {
-		if visitor(ctx, zone, MakeZoneKey(config.SystemTenantObjectID(tableDesc.ParentID), NoSubzone)) {
+		if visitor(ctx, zone, MakeZoneKey(config.ObjectID(tableDesc.GetParentID()), NoSubzone)) {
 			return true, nil
 		}
 	}
@@ -493,9 +497,7 @@ func visitDefaultZone(
 }
 
 // getZoneByID returns a zone given its id. Inheritance does not apply.
-func getZoneByID(
-	id config.SystemTenantObjectID, cfg *config.SystemConfig,
-) (*zonepb.ZoneConfig, error) {
+func getZoneByID(id config.ObjectID, cfg *config.SystemConfig) (*zonepb.ZoneConfig, error) {
 	zoneVal := cfg.GetValue(config.MakeZoneKey(keys.SystemSQLCodec, descpb.ID(id)))
 	if zoneVal == nil {
 		return nil, nil
@@ -507,10 +509,10 @@ func getZoneByID(
 	return zone, nil
 }
 
-// StoreResolver is a function resolving a range to a store descriptor for each
-// of the replicas. Empty store descriptors are to be returned when there's no
-// information available for the store.
-type StoreResolver func(*roachpb.RangeDescriptor) []roachpb.StoreDescriptor
+// StoreResolver is a function resolving a store descriptor by its id. Empty
+// store descriptors are to be returned when there's no information available
+// for the store.
+type StoreResolver func(roachpb.StoreID) roachpb.StoreDescriptor
 
 // rangeVisitor abstracts the interface for range iteration implemented by all
 // report generators.
@@ -590,6 +592,11 @@ func visitRanges(
 		if rd.RangeID == 0 {
 			// We're done.
 			break
+		}
+
+		// Check for context cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
 		newKey, err := resolver.resolveRange(ctx, &rd, cfg)
@@ -793,7 +800,7 @@ func getReportGenerationTime(
 		ctx,
 		"get-previous-timestamp",
 		txn,
-		sessiondata.InternalExecutorOverride{User: security.NodeUserName()},
+		sessiondata.InternalExecutorOverride{User: username.NodeUserName()},
 		"select generated from system.reports_meta where id = $1",
 		rid,
 	)

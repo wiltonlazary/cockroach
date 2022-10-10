@@ -13,7 +13,9 @@ package descpb
 import (
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	types "github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,18 +32,21 @@ func (desc *IndexDescriptor) IsPartial() bool {
 // ExplicitColumnStartIdx returns the start index of any explicit columns.
 func (desc *IndexDescriptor) ExplicitColumnStartIdx() int {
 	start := int(desc.Partitioning.NumImplicitColumns)
-	// We do not currently handle implicit columns along with hash sharded indexes.
-	// Thus, safe to override this to 1.
+	// Currently, we only allow implicit partitioning on hash sharded index. When
+	// that happens, the shard column always comes after implicit partition
+	// columns.
 	if desc.IsSharded() {
-		start = 1
+		start++
 	}
 	return start
 }
 
-// FillColumns sets the column names and directions in desc.
+// FillColumns sets the column names and directions in desc. Note that it does
+// no validation with regards to the existence of the listed columns. It also
+// delegates filling in any IDs until later.
 func (desc *IndexDescriptor) FillColumns(elems tree.IndexElemList) error {
 	desc.KeyColumnNames = make([]string, 0, len(elems))
-	desc.KeyColumnDirections = make([]IndexDescriptor_Direction, 0, len(elems))
+	desc.KeyColumnDirections = make([]catpb.IndexColumn_Direction, 0, len(elems))
 	for _, c := range elems {
 		if c.Expr != nil {
 			return errors.AssertionFailedf("index elem expression should have been replaced with a column")
@@ -49,14 +54,24 @@ func (desc *IndexDescriptor) FillColumns(elems tree.IndexElemList) error {
 		desc.KeyColumnNames = append(desc.KeyColumnNames, string(c.Column))
 		switch c.Direction {
 		case tree.Ascending, tree.DefaultDirection:
-			desc.KeyColumnDirections = append(desc.KeyColumnDirections, IndexDescriptor_ASC)
+			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catpb.IndexColumn_ASC)
 		case tree.Descending:
-			desc.KeyColumnDirections = append(desc.KeyColumnDirections, IndexDescriptor_DESC)
+			desc.KeyColumnDirections = append(desc.KeyColumnDirections, catpb.IndexColumn_DESC)
 		default:
 			return fmt.Errorf("invalid direction %s for column %s", c.Direction, c.Column)
 		}
 	}
 	return nil
+}
+
+// IsHelpfulOriginIndex returns whether the index may be a helpful index for
+// performing foreign key checks and cascades for a foreign key with the given
+// origin columns. Given the originColIDs for foreign key constraint, the index
+// could be useful for FK check if the first column covered by the index is
+// present in FK constraint columns.
+func (desc *IndexDescriptor) IsHelpfulOriginIndex(originColIDs ColumnIDs) bool {
+	isHelpfulOriginIndex := len(desc.KeyColumnIDs) > 0 && originColIDs.Contains(desc.KeyColumnIDs[0])
+	return !desc.IsPartial() && isHelpfulOriginIndex
 }
 
 // IsValidOriginIndex returns whether the index can serve as an origin index for a foreign
@@ -79,13 +94,21 @@ func (desc *IndexDescriptor) explicitColumnIDsWithoutShardColumn() ColumnIDs {
 	return colIDs
 }
 
+// implicitColumnIDs returns the implicit column ids of the index.
+func (desc *IndexDescriptor) implicitColumnIDs() ColumnIDs {
+	return desc.KeyColumnIDs[:desc.Partitioning.NumImplicitColumns]
+}
+
 // IsValidReferencedUniqueConstraint  is part of the UniqueConstraint interface.
 // It returns whether the index can serve as a referenced index for a foreign
 // key constraint with the provided set of referencedColumnIDs.
 func (desc *IndexDescriptor) IsValidReferencedUniqueConstraint(referencedColIDs ColumnIDs) bool {
+	explicitColumnIDs := desc.explicitColumnIDsWithoutShardColumn()
+	allColumnIDs := append(explicitColumnIDs, desc.implicitColumnIDs()...)
 	return desc.Unique &&
 		!desc.IsPartial() &&
-		desc.explicitColumnIDsWithoutShardColumn().PermutationOf(referencedColIDs)
+		(explicitColumnIDs.PermutationOf(referencedColIDs) ||
+			allColumnIDs.PermutationOf(referencedColIDs))
 }
 
 // GetName is part of the UniqueConstraint interface.
@@ -111,4 +134,15 @@ func (desc *IndexDescriptor) InvertedColumnName() string {
 		panic(errors.AssertionFailedf("index is not inverted"))
 	}
 	return desc.KeyColumnNames[len(desc.KeyColumnNames)-1]
+}
+
+// InvertedColumnKeyType returns the type of the data element that is encoded
+// as the inverted index key. This is currently always EncodedKey.
+//
+// Panics if the index is not inverted.
+func (desc *IndexDescriptor) InvertedColumnKeyType() *types.T {
+	if desc.Type != IndexDescriptor_INVERTED {
+		panic(errors.AssertionFailedf("index is not inverted"))
+	}
+	return types.EncodedKey
 }

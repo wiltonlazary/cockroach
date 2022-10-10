@@ -175,7 +175,7 @@ func (b *SpillingBuffer) AppendTuples(
 	if b.diskQueue == nil {
 		if b.fdSemaphore != nil {
 			if err = b.fdSemaphore.Acquire(ctx, numSpillingBufferFDs); err != nil {
-				colexecerror.InternalError(err)
+				colexecerror.ExpectedError(err)
 			}
 		}
 		if b.diskQueue, err = colcontainer.NewRewindableDiskQueue(
@@ -275,7 +275,7 @@ func (b *SpillingBuffer) GetVecWithTuple(
 			// it, then account for the current one.
 			b.unlimitedAllocator.ReleaseMemory(b.lastDequeuedBatchMemUsage)
 			b.lastDequeuedBatchMemUsage = colmem.GetBatchMemSize(b.dequeueScratch)
-			b.unlimitedAllocator.AdjustMemoryUsage(b.lastDequeuedBatchMemUsage)
+			b.unlimitedAllocator.AdjustMemoryUsageAfterAllocation(b.lastDequeuedBatchMemUsage)
 			return b.dequeueScratch.ColVec(colIdx), rowIdx, b.dequeueScratch.Length()
 		}
 		// The requested tuple must be located further into the disk queue.
@@ -313,7 +313,7 @@ func (b *SpillingBuffer) Close(ctx context.Context) {
 	if b.closed {
 		return
 	}
-	b.unlimitedAllocator.ReleaseMemory(b.unlimitedAllocator.Used())
+	b.unlimitedAllocator.ReleaseAll()
 	b.closeSpillingQueue(ctx)
 
 	// Release all references so they can be garbage collected.

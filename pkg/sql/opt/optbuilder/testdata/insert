@@ -344,6 +344,13 @@ project
       │    ├── d_comp:13 => d:4
       │    ├── "?column?":9 => e:5
       │    └── rowid_default:12 => rowid:6
+      ├── return-mapping:
+      │    ├── "?column?":9 => a:1
+      │    ├── b_default:10 => b:2
+      │    ├── c_default:11 => c:3
+      │    ├── d_comp:13 => d:4
+      │    ├── "?column?":9 => e:5
+      │    └── rowid_default:12 => rowid:6
       └── project
            ├── columns: d_comp:13 "?column?":9!null b_default:10 c_default:11!null rowid_default:12
            ├── project
@@ -370,6 +377,13 @@ project
  ├── insert abcde [as=foo]
  │    ├── columns: a:1!null b:2 c:3!null d:4 e:5!null rowid:6!null
  │    ├── insert-mapping:
+ │    │    ├── "?column?":9 => a:1
+ │    │    ├── b_default:10 => b:2
+ │    │    ├── c_default:11 => c:3
+ │    │    ├── d_comp:13 => d:4
+ │    │    ├── "?column?":9 => e:5
+ │    │    └── rowid_default:12 => rowid:6
+ │    ├── return-mapping:
  │    │    ├── "?column?":9 => a:1
  │    │    ├── b_default:10 => b:2
  │    │    ├── c_default:11 => c:3
@@ -407,6 +421,13 @@ with &1
  │    └── insert abcde
  │         ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3!null abcde.d:4 abcde.e:5!null rowid:6!null
  │         ├── insert-mapping:
+ │         │    ├── column1:9 => abcde.a:1
+ │         │    ├── b_default:10 => abcde.b:2
+ │         │    ├── c_default:11 => abcde.c:3
+ │         │    ├── d_comp:13 => abcde.d:4
+ │         │    ├── column1:9 => abcde.e:5
+ │         │    └── rowid_default:12 => rowid:6
+ │         ├── return-mapping:
  │         │    ├── column1:9 => abcde.a:1
  │         │    ├── b_default:10 => abcde.b:2
  │         │    ├── c_default:11 => abcde.c:3
@@ -556,6 +577,13 @@ with &1
  │         │    ├── d_comp:13 => abcde.d:4
  │         │    ├── column1:9 => abcde.e:5
  │         │    └── rowid_default:12 => rowid:6
+ │         ├── return-mapping:
+ │         │    ├── column1:9 => abcde.a:1
+ │         │    ├── b_default:10 => abcde.b:2
+ │         │    ├── c_default:11 => abcde.c:3
+ │         │    ├── d_comp:13 => abcde.d:4
+ │         │    ├── column1:9 => abcde.e:5
+ │         │    └── rowid_default:12 => rowid:6
  │         └── project
  │              ├── columns: d_comp:13 column1:9!null b_default:10 c_default:11!null rowid_default:12
  │              ├── project
@@ -686,6 +714,13 @@ project
       │    ├── d_comp:13 => d:4
       │    ├── column1:9 => e:5
       │    └── column2:10 => rowid:6
+      ├── return-mapping:
+      │    ├── column1:9 => a:1
+      │    ├── b_default:11 => b:2
+      │    ├── c_default:12 => c:3
+      │    ├── d_comp:13 => d:4
+      │    ├── column1:9 => e:5
+      │    └── column2:10 => rowid:6
       └── project
            ├── columns: d_comp:13 column1:9!null column2:10!null b_default:11 c_default:12!null
            ├── project
@@ -708,6 +743,13 @@ RETURNING *, rowid
 insert abcde
  ├── columns: a:1!null b:2 c:3!null d:4 e:5!null rowid:6!null
  ├── insert-mapping:
+ │    ├── column3:11 => a:1
+ │    ├── column2:10 => b:2
+ │    ├── column1:9 => c:3
+ │    ├── d_comp:13 => d:4
+ │    ├── column3:11 => e:5
+ │    └── column4:12 => rowid:6
+ ├── return-mapping:
  │    ├── column3:11 => a:1
  │    ├── column2:10 => b:2
  │    ├── column1:9 => c:3
@@ -827,6 +869,13 @@ project
       │    ├── d_comp:17 => d:4
       │    ├── y:10 => e:5
       │    └── rowid_default:16 => rowid:6
+      ├── return-mapping:
+      │    ├── y:10 => a:1
+      │    ├── x:14 => b:2
+      │    ├── c_default:15 => c:3
+      │    ├── d_comp:17 => d:4
+      │    ├── y:10 => e:5
+      │    └── rowid_default:16 => rowid:6
       └── project
            ├── columns: d_comp:17!null y:10 x:14!null c_default:15!null rowid_default:16
            ├── project
@@ -850,6 +899,13 @@ INSERT INTO abcde (rowid, a) VALUES (1, 2) RETURNING *, rowid
 insert abcde
  ├── columns: a:1!null b:2 c:3!null d:4 e:5!null rowid:6!null
  ├── insert-mapping:
+ │    ├── column2:10 => a:1
+ │    ├── b_default:11 => b:2
+ │    ├── c_default:12 => c:3
+ │    ├── d_comp:13 => d:4
+ │    ├── column2:10 => e:5
+ │    └── column1:9 => rowid:6
+ ├── return-mapping:
  │    ├── column2:10 => a:1
  │    ├── b_default:11 => b:2
  │    ├── c_default:12 => c:3
@@ -880,6 +936,13 @@ with &1
  │    └── insert abcde
  │         ├── columns: abcde.a:1!null abcde.b:2 abcde.c:3!null abcde.d:4 abcde.e:5 rowid:6!null
  │         ├── insert-mapping:
+ │         │    ├── "?column?":14 => abcde.a:1
+ │         │    ├── y:10 => abcde.b:2
+ │         │    ├── c_default:15 => abcde.c:3
+ │         │    ├── d_comp:17 => abcde.d:4
+ │         │    ├── "?column?":14 => abcde.e:5
+ │         │    └── rowid_default:16 => rowid:6
+ │         ├── return-mapping:
  │         │    ├── "?column?":14 => abcde.a:1
  │         │    ├── y:10 => abcde.b:2
  │         │    ├── c_default:15 => abcde.c:3
@@ -1085,6 +1148,9 @@ insert mutation
  │    ├── column2:9 => n:2
  │    ├── o_default:10 => o:3
  │    └── p_comp:11 => p:4
+ ├── return-mapping:
+ │    ├── column1:8 => m:1
+ │    └── column2:9 => n:2
  ├── check columns: check1:12
  └── project
       ├── columns: check1:12!null column1:8!null column2:9!null o_default:10!null p_comp:11!null
@@ -1221,7 +1287,7 @@ insert decimals
       │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:12]
       │    │    │              └── c_default:11
       │    │    └── projections
-      │    │         └── a_cast:9::DECIMAL + c_cast:12::DECIMAL [as=d_comp:13]
+      │    │         └── a_cast:9 + c_cast:12 [as=d_comp:13]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:14]
       │              └── d_comp:13
@@ -1266,7 +1332,7 @@ insert decimals
       │    │    │         └── assignment-cast: DECIMAL(10,1) [as=c_cast:12]
       │    │    │              └── c_default:11
       │    │    └── projections
-      │    │         └── a_cast:9::DECIMAL + c_cast:12::DECIMAL [as=d_comp:13]
+      │    │         └── a_cast:9 + c_cast:12 [as=d_comp:13]
       │    └── projections
       │         └── assignment-cast: DECIMAL(10,1) [as=d_cast:14]
       │              └── d_comp:13
@@ -1333,52 +1399,65 @@ exec-ddl
 CREATE TABLE assn_cast_default (
     k INT PRIMARY KEY,
     i2 INT2 DEFAULT 10::INT,
+    i3 INT DEFAULT 1.0::FLOAT,
     c1 CHAR DEFAULT 'foo',
     c2 CHAR DEFAULT 'bar'::TEXT,
     d1 DECIMAL(10, 0) DEFAULT 1.23,
     d2 DECIMAL(10, 0) DEFAULT 4.56::DECIMAL(10, 2),
+    b BOOL DEFAULT 1.0::FLOAT,
     s TEXT DEFAULT NULL
 )
 ----
 
 build
-INSERT INTO assn_cast_default (k) VALUES (1)
+INSERT INTO assn_cast_default (k, b) VALUES (1, true)
 ----
 insert assn_cast_default
  ├── columns: <none>
  ├── insert-mapping:
- │    ├── column1:10 => k:1
- │    ├── i2_cast:17 => i2:2
- │    ├── c1_cast:18 => c1:3
- │    ├── c2_cast:19 => c2:4
- │    ├── d1_cast:20 => d1:5
- │    ├── d2_cast:21 => d2:6
- │    └── s_default:16 => s:7
+ │    ├── column1:12 => k:1
+ │    ├── i2_cast:21 => i2:2
+ │    ├── i3_cast:22 => i3:3
+ │    ├── c1_cast:23 => c1:4
+ │    ├── c2_cast:24 => c2:5
+ │    ├── d1_cast:25 => d1:6
+ │    ├── d2_cast:26 => d2:7
+ │    ├── column2:13 => b:8
+ │    └── s_default:20 => s:9
  └── project
-      ├── columns: i2_cast:17!null c1_cast:18!null c2_cast:19!null d1_cast:20!null d2_cast:21!null column1:10!null s_default:16
+      ├── columns: i2_cast:21!null i3_cast:22!null c1_cast:23!null c2_cast:24!null d1_cast:25!null d2_cast:26!null column1:12!null column2:13!null s_default:20
       ├── project
-      │    ├── columns: i2_default:11!null c1_default:12!null c2_default:13!null d1_default:14!null d2_default:15!null s_default:16 column1:10!null
+      │    ├── columns: i2_default:14!null i3_default:15!null c1_default:16!null c2_default:17!null d1_default:18!null d2_default:19!null s_default:20 column1:12!null column2:13!null
       │    ├── values
-      │    │    ├── columns: column1:10!null
-      │    │    └── (1,)
+      │    │    ├── columns: column1:12!null column2:13!null
+      │    │    └── (1, true)
       │    └── projections
-      │         ├── 10 [as=i2_default:11]
-      │         ├── 'foo' [as=c1_default:12]
-      │         ├── 'bar' [as=c2_default:13]
-      │         ├── 1.23 [as=d1_default:14]
-      │         ├── 4.56::DECIMAL(10,2) [as=d2_default:15]
-      │         └── NULL::STRING [as=s_default:16]
+      │         ├── 10 [as=i2_default:14]
+      │         ├── 1.0 [as=i3_default:15]
+      │         ├── 'foo' [as=c1_default:16]
+      │         ├── 'bar' [as=c2_default:17]
+      │         ├── 1.23 [as=d1_default:18]
+      │         ├── 4.56::DECIMAL(10,2) [as=d2_default:19]
+      │         └── NULL::STRING [as=s_default:20]
       └── projections
-           ├── assignment-cast: INT2 [as=i2_cast:17]
-           │    └── i2_default:11
-           ├── assignment-cast: CHAR [as=c1_cast:18]
-           │    └── c1_default:12
-           ├── assignment-cast: CHAR [as=c2_cast:19]
-           │    └── c2_default:13
-           ├── assignment-cast: DECIMAL(10) [as=d1_cast:20]
-           │    └── d1_default:14
-           └── assignment-cast: DECIMAL(10) [as=d2_cast:21]
-                └── d2_default:15
+           ├── assignment-cast: INT2 [as=i2_cast:21]
+           │    └── i2_default:14
+           ├── assignment-cast: INT8 [as=i3_cast:22]
+           │    └── i3_default:15
+           ├── assignment-cast: CHAR [as=c1_cast:23]
+           │    └── c1_default:16
+           ├── assignment-cast: CHAR [as=c2_cast:24]
+           │    └── c2_default:17
+           ├── assignment-cast: DECIMAL(10) [as=d1_cast:25]
+           │    └── d1_default:18
+           └── assignment-cast: DECIMAL(10) [as=d2_cast:26]
+                └── d2_default:19
+
+# This fails because the cast from FLOAT to BOOL is not a valid assignment cast.
+build
+INSERT INTO assn_cast_default (k) VALUES (1)
+----
+error (42804): value type float doesn't match type bool of column "b"
 
 exec-ddl
 CREATE TABLE assn_cast_comp (
@@ -1419,7 +1498,7 @@ insert assn_cast_comp
       │    │              └── column4:13
       │    └── projections
       │         ├── column2:11 + 10 [as=i_comp_comp:15]
-      │         └── d_cast:14::DECIMAL + 2.5 [as=d_comp_comp:16]
+      │         └── d_cast:14 + 2.5 [as=d_comp_comp:16]
       └── projections
            ├── assignment-cast: INT2 [as=i_comp_cast:17]
            │    └── i_comp_comp:15

@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scbuild"
@@ -46,47 +47,32 @@ import (
 func TestPlanDataDriven(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer utilccl.TestingEnableEnterprise()()
 	ctx := context.Background()
 
 	datadriven.Walk(t, testutils.TestDataPath(t), func(t *testing.T, path string) {
-		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+			DisableDefaultTestTenant: true,
+		})
 		defer s.Stopper().Stop(ctx)
 
 		tdb := sqlutils.MakeSQLRunner(sqlDB)
 		run := func(t *testing.T, d *datadriven.TestData) string {
 			switch d.Cmd {
-			case "create-view", "create-sequence", "create-table", "create-type", "create-database", "create-schema", "create-index":
+			case "setup":
 				stmts, err := parser.Parse(d.Input)
 				require.NoError(t, err)
-				require.Len(t, stmts, 1)
-				tableName := ""
-				switch node := stmts[0].AST.(type) {
-				case *tree.CreateTable:
-					tableName = node.Table.String()
-				case *tree.CreateSequence:
-					tableName = node.Name.String()
-				case *tree.CreateView:
-					tableName = node.Name.String()
-				case *tree.CreateType:
-					tableName = ""
-				case *tree.CreateDatabase:
-					tableName = ""
-				case *tree.CreateSchema:
-					tableName = ""
-				case *tree.CreateIndex:
-					tableName = ""
-				default:
-					t.Fatal("not a CREATE TABLE/SEQUENCE/VIEW statement")
-				}
-				tdb.Exec(t, d.Input)
-
-				if len(tableName) > 0 {
-					var tableID descpb.ID
-					tdb.QueryRow(t, `SELECT $1::regclass::int`, tableName).Scan(&tableID)
-					if tableID == 0 {
-						t.Fatalf("failed to read ID of new table %s", tableName)
+				for _, stmt := range stmts {
+					tableName := sctestutils.TableNameFromStmt(stmt)
+					tdb.Exec(t, stmt.SQL)
+					if len(tableName) > 0 {
+						var tableID descpb.ID
+						tdb.QueryRow(t, `SELECT $1::regclass::int`, tableName).Scan(&tableID)
+						if tableID == 0 {
+							t.Fatalf("failed to read ID of new table %s", tableName)
+						}
+						t.Logf("created relation with id %d", tableID)
 					}
-					t.Logf("created relation with id %d", tableID)
 				}
 				return ""
 			case "ops", "deps":
@@ -101,6 +87,7 @@ func TestPlanDataDriven(t *testing.T) {
 					}
 
 					plan = sctestutils.MakePlan(t, state, scop.EarliestPhase)
+					sctestutils.TruncateJobOps(&plan)
 					validatePlan(t, &plan)
 				})
 
@@ -134,7 +121,7 @@ func TestPlanDataDriven(t *testing.T) {
 // an arbitrary stage in the existing plan: the results should be the same as in
 // the original plan, minus the stages prior to the selected stage.
 // This guarantees the idempotency of the planning scheme, which is a useful
-// property to have. For instance it guarantees that the output of EXPLAIN (DDL)
+// property to have. For instance, it guarantees that the output of EXPLAIN (DDL)
 // represents the plan that actually gets executed in the various execution
 // phases.
 func validatePlan(t *testing.T, plan *scplan.Plan) {
@@ -155,6 +142,7 @@ func validatePlan(t *testing.T, plan *scplan.Plan) {
 			Current:     stage.Before,
 		}
 		truncatedPlan := sctestutils.MakePlan(t, cs, stage.Phase)
+		sctestutils.TruncateJobOps(&truncatedPlan)
 		a := marshalOps(t, plan.TargetState, truncatedPlan.Stages)
 		require.Equalf(t, e, a, "plan mismatch when re-planning %d stage(s) later", i)
 	}
@@ -185,7 +173,11 @@ func marshalDeps(t *testing.T, plan *scplan.Plan) string {
 			fmt.Fprintf(&deps, "  to:   [%s, %s]\n",
 				screl.ElementString(de.To().Element()), de.To().CurrentStatus)
 			fmt.Fprintf(&deps, "  kind: %s\n", de.Kind())
-			fmt.Fprintf(&deps, "  rule: %s\n", de.Name())
+			if rn := de.RuleNames(); len(rn) == 1 {
+				fmt.Fprintf(&deps, "  rule: %s\n", rn)
+			} else {
+				fmt.Fprintf(&deps, "  rules: %s\n", rn)
+			}
 			sortedDeps = append(sortedDeps, deps.String())
 			return nil
 		})
@@ -233,6 +225,11 @@ func marshalOps(t *testing.T, ts scpb.TargetState, stages []scstage.Stage) strin
 		sb.WriteString("  ops:\n")
 		stageOps := ""
 		for _, op := range ops {
+			if setJobStateOp, ok := op.(*scop.SetJobStateOnDescriptor); ok {
+				clone := *setJobStateOp
+				clone.State = scpb.DescriptorState{}
+				op = &clone
+			}
 			opMap, err := scgraphviz.ToMap(op)
 			require.NoError(t, err)
 			data, err := yaml.Marshal(opMap)

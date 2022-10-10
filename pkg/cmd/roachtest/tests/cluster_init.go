@@ -14,7 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/stretchr/testify/require"
 )
 
 func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -153,7 +154,7 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 				}
 				defer resp.Body.Close()
 				if resp.StatusCode != tc.expectedStatus {
-					bodyBytes, _ := ioutil.ReadAll(resp.Body)
+					bodyBytes, _ := io.ReadAll(resp.Body)
 					t.Fatalf("unexpected response code %d (expected %d) hitting %s endpoint: %v",
 						resp.StatusCode, tc.expectedStatus, tc.endpoint, string(bodyBytes))
 				}
@@ -166,7 +167,8 @@ func runClusterInit(ctx context.Context, t test.Test, c cluster.Cluster) {
 			fmt.Sprintf(`./cockroach init --insecure --port={pgport:%d}`, initNode))
 
 		// This will only succeed if 3 nodes joined the cluster.
-		WaitFor3XReplication(t, dbs[0])
+		err = WaitFor3XReplication(ctx, t, dbs[0])
+		require.NoError(t, err)
 
 		execCLI := func(runNode int, extraArgs ...string) (string, error) {
 			args := []string{"./cockroach"}

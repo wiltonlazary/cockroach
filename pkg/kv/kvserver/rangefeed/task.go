@@ -37,7 +37,6 @@ type runnable interface {
 // the Processor was started and hooked up to a stream of logical operations.
 // The Processor can initialize its resolvedTimestamp once the scan completes
 // because it knows it is now tracking all intents in its key range.
-//
 type initResolvedTSScan struct {
 	p  *Processor
 	is IntentScanner
@@ -55,7 +54,7 @@ func (s *initResolvedTSScan) Run(ctx context.Context) {
 		s.p.StopWithErr(roachpb.NewError(err))
 	} else {
 		// Inform the processor that its resolved timestamp can be initialized.
-		s.p.setResolvedTSInitialized()
+		s.p.setResolvedTSInitialized(ctx)
 	}
 }
 
@@ -65,7 +64,7 @@ func (s *initResolvedTSScan) iterateAndConsume(ctx context.Context) error {
 	return s.is.ConsumeIntents(ctx, startKey, endKey, func(op enginepb.MVCCWriteIntentOp) bool {
 		var ops [1]enginepb.MVCCLogicalOp
 		ops[0].SetValue(&op)
-		return s.p.sendEvent(event{ops: ops[:]}, 0 /* timeout */)
+		return s.p.sendEvent(ctx, event{ops: ops[:]}, 0)
 	})
 }
 
@@ -89,8 +88,8 @@ type IntentScanner interface {
 //
 // EngineIterator Contract:
 //
-//  - The EngineIterator must have an UpperBound set.
-//  - The range must be using separated intents.
+//   - The EngineIterator must have an UpperBound set.
+//   - The range must be using separated intents.
 type SeparatedIntentScanner struct {
 	iter storage.EngineIterator
 }
@@ -151,12 +150,11 @@ func (s *SeparatedIntentScanner) Close() { s.iter.Close() }
 //
 // MVCCIterator Contract:
 //
-//   The provided MVCCIterator must observe all intents in the Processor's keyspan.
-//   An important implication of this is that if the iterator is a
-//   TimeBoundIterator, its MinTimestamp cannot be above the keyspan's largest
-//   known resolved timestamp, if one has ever been recorded. If one has never
-//   been recorded, the TimeBoundIterator cannot have any lower bound.
-//
+//	The provided MVCCIterator must observe all intents in the Processor's keyspan.
+//	An important implication of this is that if the iterator is a
+//	TimeBoundIterator, its MinTimestamp cannot be above the keyspan's largest
+//	known resolved timestamp, if one has ever been recorded. If one has never
+//	been recorded, the TimeBoundIterator cannot have any lower bound.
 type LegacyIntentScanner struct {
 	iter storage.SimpleMVCCIterator
 }
@@ -225,20 +223,20 @@ type TxnPusher interface {
 // txnPushAttempt pushes all old transactions that have unresolved intents on
 // the range which are blocking the resolved timestamp from moving forward. It
 // does so in two steps.
-// 1. it pushes all old transactions to the current timestamp and gathers
-//    up the transactions' authoritative transaction records.
-// 2. for each transaction that is pushed, it checks the transaction's current
-//    status and reacts accordingly:
-//    - PENDING:   inform the Processor that the transaction's timestamp has
-//                 increased so that the transaction's intents no longer need
-//                 to block the resolved timestamp. Even though the intents
-//                 may still be at an older timestamp, we know that they can't
-//                 commit at that timestamp.
-//    - COMMITTED: launch async processes to resolve the transaction's intents
-//                 so they will be resolved sometime soon and unblock the
-//                 resolved timestamp.
-//    - ABORTED:   inform the Processor to stop caring about the transaction.
-//                 It will never commit and its intents can be safely ignored.
+//  1. it pushes all old transactions to the current timestamp and gathers
+//     up the transactions' authoritative transaction records.
+//  2. for each transaction that is pushed, it checks the transaction's current
+//     status and reacts accordingly:
+//     - PENDING:   inform the Processor that the transaction's timestamp has
+//     increased so that the transaction's intents no longer need
+//     to block the resolved timestamp. Even though the intents
+//     may still be at an older timestamp, we know that they can't
+//     commit at that timestamp.
+//     - COMMITTED: launch async processes to resolve the transaction's intents
+//     so they will be resolved sometime soon and unblock the
+//     resolved timestamp.
+//     - ABORTED:   inform the Processor to stop caring about the transaction.
+//     It will never commit and its intents can be safely ignored.
 type txnPushAttempt struct {
 	p     *Processor
 	txns  []enginepb.TxnMeta
@@ -343,7 +341,7 @@ func (a *txnPushAttempt) pushOldTxns(ctx context.Context) error {
 	}
 
 	// Inform the processor of all logical ops.
-	a.p.sendEvent(event{ops: ops}, 0 /* timeout */)
+	a.p.sendEvent(ctx, event{ops: ops}, 0)
 
 	// Resolve intents, if necessary.
 	return a.p.TxnPusher.ResolveIntents(ctx, intentsToCleanup)

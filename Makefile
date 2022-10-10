@@ -130,7 +130,7 @@ SUBTESTS :=
 LINTTIMEOUT := 30m
 
 ## Test timeout to use for regular tests.
-TESTTIMEOUT := 45m
+TESTTIMEOUT := 60m
 
 ## Test timeout to use for race tests.
 RACETIMEOUT := 45m
@@ -175,6 +175,17 @@ bindir       := $(prefix)/bin
 # We always want to build from the vendor directory.
 # Avoid reusing GOFLAGS as that is overwritten by various release processes.
 GOMODVENDORFLAGS := -mod=vendor
+
+# Color support.
+red = $(shell { tput setaf 1 || tput AF 1; } 2>/dev/null)
+yellow = $(shell { tput setaf 3 || tput AF 3; } 2>/dev/null)
+cyan = $(shell { tput setaf 6 || tput AF 6; } 2>/dev/null)
+term-reset = $(shell { tput sgr0 || tput me; } 2>/dev/null)
+$(call make-lazy,yellow)
+$(call make-lazy,cyan)
+$(call make-lazy,term-reset)
+
+$(info $(red)[WARNING] Makefile is deprecated and will be removed shortly.$(term-reset))
 
 ifeq "$(findstring -j,$(shell ps -o args= $$PPID))" ""
 ifdef NCPUS
@@ -305,14 +316,6 @@ MAKE_TERMERR ?= $(shell [[ -t 2 ]] && echo true)
 # This is how you get a literal space into a Makefile.
 space := $(eval) $(eval)
 
-# Color support.
-yellow = $(shell { tput setaf 3 || tput AF 3; } 2>/dev/null)
-cyan = $(shell { tput setaf 6 || tput AF 6; } 2>/dev/null)
-term-reset = $(shell { tput sgr0 || tput me; } 2>/dev/null)
-$(call make-lazy,yellow)
-$(call make-lazy,cyan)
-$(call make-lazy,term-reset)
-
 # Warn maintainers for if ccache is not found.
 ifeq (, $(shell which ccache))
 $(info $(yellow)Warning: 'ccache' not found, consider installing it for faster builds$(term-reset))
@@ -355,6 +358,10 @@ $(GITHOOKSDIR)/%: githooks/%
 	@ln -s ../../$(basename $<) $(dir $@)
 endif
 
+ESLINT_PLUGIN_CRDB := pkg/ui/workspaces/eslint-plugin-crdb/dist/index.js
+.SECONDARY: $(ESLINT_PLUGIN_CRDB)
+$(ESLINT_PLUGIN_CRDB): $(shell find pkg/ui/workspaces/eslint-plugin-crdb/src -type f | grep -v '\.spec') pkg/ui/yarn.installed
+	$(NODE_RUN) -C pkg/ui/workspaces/eslint-plugin-crdb yarn build
 
 CLUSTER_UI_JS := pkg/ui/cluster-ui/dist/main.js
 
@@ -369,9 +376,6 @@ pkg/ui/yarn.installed: pkg/ui/package.json pkg/ui/yarn.lock | bin/.submodules-in
 	@# Also some linux distributions (that are used as development env) don't support some of
 	@# optional dependencies (i.e. cypress) so it is important to make these deps optional.
 	$(NODE_RUN) -C pkg/ui yarn install --ignore-optional --offline
-	@# We remove this broken dependency again in pkg/ui/webpack.config.js.
-	@# See the comment there for details.
-	rm -rf pkg/ui/node_modules/@types/node
 	touch $@
 
 vendor/modules.txt: | bin/.submodules-initialized
@@ -549,6 +553,9 @@ native-tag := $(subst -,_,$(TARGET_TRIPLE))$(if $(use-stdmalloc),_stdmalloc)
 # encounters a given native tag or when the build signature changes (see
 # build/defs.mk.sig). These tags are unset when building with the Go toolchain
 # directly, so these files are only compiled when building with Make.
+#
+# NB: If you update the zcgo_flags.go generation below, make sure to make the
+# corresponding changes to `dev generate cgo`.
 CGO_PKGS := \
 	pkg/cli \
 	pkg/cli/clisqlshell \
@@ -614,12 +621,18 @@ $(JEMALLOC_DIR)/Makefile: $(C_DEPS_DIR)/jemalloc-rebuild $(JEMALLOC_SRC_DIR)/con
 	mkdir -p $(JEMALLOC_DIR)
 	@# NOTE: If you change the configure flags below, bump the version in
 	@# $(C_DEPS_DIR)/jemalloc-rebuild. See above for rationale.
-	cd $(JEMALLOC_DIR) && $(JEMALLOC_SRC_DIR)/configure $(xconfigure-flags) --enable-prof
+	@# NOTE: we disable MADV_FREE; see https://github.com/cockroachdb/cockroach/issues/83790
+	export je_cv_madv_free="no" && cd $(JEMALLOC_DIR) && $(JEMALLOC_SRC_DIR)/configure $(xconfigure-flags) --enable-prof
+	JEMALLOC_MADV_FREE_ENABLED=$$(grep -E "^je_cv_madv_free=no$$" $(JEMALLOC_DIR)/config.log | awk -F'=' '{print $$2}'); \
+	if [[ "$$JEMALLOC_MADV_FREE_ENABLED" != "no" ]]; then \
+		echo "NOTE: using MADV_FREE with jemalloc can lead to surprising results; see https://github.com/cockroachdb/cockroach/issues/83790"; \
+		exit 1; \
+	fi
 
 $(KRB5_SRC_DIR)/src/configure.in: | bin/.submodules-initialized
 
 $(KRB5_SRC_DIR)/src/configure: $(KRB5_SRC_DIR)/src/configure.in
-	cd $(KRB5_SRC_DIR)/src && autoreconf
+	cd $(KRB5_SRC_DIR)/src && autoreconf -Wno-obsolete
 
 $(KRB5_DIR)/Makefile: $(C_DEPS_DIR)/krb5-rebuild $(KRB5_SRC_DIR)/src/configure
 	rm -rf $(KRB5_DIR)
@@ -782,8 +795,8 @@ SQLPARSER_TARGETS = \
 
 PROTOBUF_TARGETS := bin/.go_protobuf_sources bin/.gw_protobuf_sources
 
-SWAGGER_TARGETS := \
-  docs/generated/swagger/spec.json
+SWAGGER_TARGETS :=
+  #docs/generated/swagger/spec.json
 
 DOCGEN_TARGETS := \
 	bin/.docgen_bnfs \
@@ -796,12 +809,8 @@ DOCGEN_TARGETS := \
 	docs/generated/eventlog.md
 
 GENERATED_TARGETS = \
-  pkg/cmd/roachtest/prometheus/mock_generated.go \
-  pkg/cmd/roachtest/tests/drt_generated.go \
-  pkg/kv/kvclient/rangefeed/mocks_generated.go \
   pkg/roachprod/vm/aws/embedded.go \
-  pkg/security/securitytest/embedded.go \
-  pkg/security/certmgr/mocks_generated.go
+  pkg/security/securitytest/embedded.go
 
 EXECGEN_TARGETS = \
   pkg/col/coldata/vec.eg.go \
@@ -811,8 +820,8 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/hash_aggregator.eg.go \
   pkg/sql/colexec/is_null_ops.eg.go \
   pkg/sql/colexec/ordered_synchronizer.eg.go \
-  pkg/sql/colexec/quicksort.eg.go \
-  pkg/sql/colexec/rowstovec.eg.go \
+  pkg/sql/colexec/pdqsort.eg.go \
+  pkg/sql/colexec/rowtovec.eg.go \
   pkg/sql/colexec/select_in.eg.go \
   pkg/sql/colexec/sort.eg.go \
   pkg/sql/colexec/sorttopk.eg.go \
@@ -866,15 +875,15 @@ EXECGEN_TARGETS = \
   pkg/sql/colexec/colexecjoin/mergejoiner_rightanti.eg.go \
   pkg/sql/colexec/colexecjoin/mergejoiner_rightouter.eg.go \
   pkg/sql/colexec/colexecjoin/mergejoiner_rightsemi.eg.go \
-  pkg/sql/colexec/colexecproj/default_cmp_proj_ops.eg.go \
-  pkg/sql/colexec/colexecproj/proj_const_left_ops.eg.go \
-  pkg/sql/colexec/colexecproj/proj_const_right_ops.eg.go \
-  pkg/sql/colexec/colexecproj/proj_like_ops.eg.go \
+  pkg/sql/colexec/colexecproj/default_cmp_proj_op.eg.go \
   pkg/sql/colexec/colexecproj/proj_non_const_ops.eg.go \
+  pkg/sql/colexec/colexecprojconst/default_cmp_proj_const_op.eg.go \
+  pkg/sql/colexec/colexecprojconst/proj_const_left_ops.eg.go \
+  pkg/sql/colexec/colexecprojconst/proj_const_right_ops.eg.go \
+  pkg/sql/colexec/colexecprojconst/proj_like_ops.eg.go \
   pkg/sql/colexec/colexecsel/default_cmp_sel_ops.eg.go \
   pkg/sql/colexec/colexecsel/selection_ops.eg.go \
   pkg/sql/colexec/colexecsel/sel_like_ops.eg.go \
-  pkg/sql/colexec/colexecspan/span_assembler.eg.go \
   pkg/sql/colexec/colexecspan/span_encoder.eg.go \
   pkg/sql/colexec/colexecwindow/first_value.eg.go \
   pkg/sql/colexec/colexecwindow/lag.eg.go \
@@ -935,7 +944,8 @@ go-targets-ccl := \
 	stress stressrace \
 	roachprod-stress roachprod-stressrace \
 	generate \
-	lint lintshort
+	lint lintshort \
+	instrument instrumentshort
 
 go-targets := $(go-targets-ccl) $(COCKROACHOSS) $(COCKROACHSHORT) $(COCKROACHSQL)
 
@@ -979,7 +989,7 @@ $(go-targets): override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.rev=$(shell cat .buildinfo/rev)" \
 	-X "github.com/cockroachdb/cockroach/pkg/build.cgoTargetTriple=$(TARGET_TRIPLE)" \
 	$(if $(BUILDCHANNEL),-X "github.com/cockroachdb/cockroach/pkg/build.channel=$(BUILDCHANNEL)") \
-	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
+	$(if $(BUILD_TAGGED_RELEASE),-X "github.com/cockroachdb/cockroach/pkg/util/log/logcrash.crashReportEnv=$(if $(BUILDINFO_TAG),$(BUILDINFO_TAG),$(shell cat .buildinfo/tag))")
 
 # The build.utcTime format must remain in sync with TimeFormat in
 # pkg/build/info.go. It is not installed in tests or in `buildshort` to avoid
@@ -987,13 +997,11 @@ $(go-targets): override LINKFLAGS += \
 $(COCKROACH) $(COCKROACHOSS) go-install: override LINKFLAGS += \
 	-X "github.com/cockroachdb/cockroach/pkg/build.utcTime=$(shell date -u '+%Y/%m/%d %H:%M:%S')"
 
-settings-doc-gen = $(if $(filter buildshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
+docs/generated/settings/settings.html: $(COCKROACHSHORT)
+	@$(COCKROACHSHORT) gen settings-list --format=rawhtml > $@
 
-docs/generated/settings/settings.html: $(settings-doc-gen)
-	@$(settings-doc-gen) gen settings-list --format=rawhtml > $@
-
-docs/generated/settings/settings-for-tenants.txt:  $(settings-doc-gen)
-	@$(settings-doc-gen) gen settings-list --without-system-only > $@
+docs/generated/settings/settings-for-tenants.txt: $(COCKROACHSHORT)
+	@$(COCKROACHSHORT) gen settings-list --without-system-only > $@
 
 SETTINGS_DOC_PAGES := docs/generated/settings/settings.html docs/generated/settings/settings-for-tenants.txt
 
@@ -1003,6 +1011,7 @@ SETTINGS_DOC_PAGES := docs/generated/settings/settings.html docs/generated/setti
 # normal and race test builds.
 .PHONY: go-install
 $(COCKROACH) $(COCKROACHOSS) $(COCKROACHSHORT) $(COCKROACHSQL) go-install:
+	 $(info $(yellow)[WARNING] Use `dev build $(subst ./pkg/cmd/,,$(BUILDTARGET))` instead.$(term-reset))
 	 $(xgo) $(build-mode) -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
 
 # The build targets, in addition to producing a Cockroach binary, silently
@@ -1075,16 +1084,78 @@ bench benchshort: TESTTIMEOUT := $(BENCHTIMEOUT)
 # that longer running benchmarks can skip themselves.
 benchshort: override TESTFLAGS += -benchtime=1ns -short
 
+# ANTITHESIS INSTRUMENTATION
+# NB: This currently requires the Antithesis Go Instrumentation Package to be
+# installed (default path at /opt/antithesis), and libvoidstar.so symlinked
+# into /usr/lib prior to instrumenting and building.
+# TODO(sarkesian): remove requirement to symlink libvoidstar.so
+ANTITHESIS ?= /opt/antithesis
+INSTRUMENTOR_BIN ?= $(ANTITHESIS)/bin/goinstrumentor
+INSTRUMENTOR_EXCLUDE_VENDOR ?=
+instrumentation-deps = $(if $(filter instrumentshort,$(MAKECMDGOALS)),$(COCKROACHSHORT),$(COCKROACH))
+
+## Output path for instrumented code and symbols when running instrumented builds, e.g. "$HOME/tmp". Must be outside the repository.
+INSTRUMENTATION_TMP :=
+
+.PHONY: instrument
+instrument: ## Build the CockroachDB binary using Antithesis instrumentation.
+
+.PHONY: instrumentshort
+instrumentshort: ## Build the CockroachDB binary using Antithesis instrumentation, without the admin UI.
+
+.PHONY: instrumentation-prereqs
+instrumentation-prereqs:
+ifeq (, $(shell which $(INSTRUMENTOR_BIN)))
+	$(error $(INSTRUMENTOR_BIN) not found, please install Antithesis Instrumentor)
+endif
+ifeq (, $(wildcard /usr/lib/libvoidstar.so))
+	$(error /usr/lib/libvoidstar.so not found, please install Antithesis Instrumentor)
+endif
+ifndef INSTRUMENTATION_TMP
+	$(error INSTRUMENTATION_TMP must be defined with `make $@`)
+endif
+
+.instrumentor_exclusions.tmp:
+	@echo "regenerating $@"
+	VENDOR_EXCLUDE_ALL=$(INSTRUMENTOR_EXCLUDE_VENDOR) ./build/instrumentation/gen_exclusions.sh > $@
+
+.PHONY: instrumentcode
+instrumentcode: instrumentation-prereqs $(instrumentation-deps) .instrumentor_exclusions.tmp
+	rm -rf $(INSTRUMENTATION_TMP)
+	mkdir -p $(INSTRUMENTATION_TMP)
+	$(INSTRUMENTOR_BIN) -exclude .instrumentor_exclusions.tmp -stderrthreshold=WARNING \
+		-antithesis $(ANTITHESIS)/instrumentation/go/wrappers . $(INSTRUMENTATION_TMP)
+
+instrument instrumentshort: instrumentation-prereqs instrumentcode
+	./build/instrumentation/vendor_antithesis.sh $(INSTRUMENTATION_TMP)
+	cd $(INSTRUMENTATION_TMP)/customer && \
+		$(xgo) $(build-mode) -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(BUILDTARGET)
+	cp $(INSTRUMENTATION_TMP)/customer/$@ ./$@
+	ln -sf $@ cockroach-instrumented
+
+.PHONY: cleaninstrument
+cleaninstrument: ## Clean up instrumentation artifacts and instrumented code.
+cleaninstrument:
+ifdef INSTRUMENTATION_TMP
+	rm -rf $(INSTRUMENTATION_TMP)
+endif
+	rm -f .instrumentor_exclusions.tmp
+	for f in instrument*; do if [ -f "$$f" ]; then rm "$$f"; fi; done
+	rm -f cockroach-instrumented
+
 .PHONY: check test testshort testrace testdeadlock testlogic testbaselogic testccllogic testoptlogic bench benchshort
 test: ## Run tests.
 check test testshort testrace testdeadlock bench benchshort:
+	$(info $(yellow)[WARNING] Use `dev $(if $(BENCHES),bench,test)$(if $(GORACE), --race) $(subst ./,,$(PKG))$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(BENCHES), --filter $(BENCHES))$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))$(if $(TESTFLAGS), --test-args "$(TESTFLAGS)")` instead.$(term-reset))
 	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" $(if $(BENCHES),-bench "$(BENCHES)") -timeout $(TESTTIMEOUT) $(PKG) $(TESTFLAGS)
 
 .PHONY: stress stressrace
 stress: ## Run tests under stress.
+	$(info $(yellow)[WARNING] Use `dev test --stress $(subst ./,,$(PKG))$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(TESTFLAGS), --test-args "$(TESTFLAGS)")$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))` instead.$(term-reset))
+	COCKROACH_STRESS=true $(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 stressrace: ## Run tests under stress with the race detector enabled.
-stress stressrace:
-	$(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
+	$(info $(yellow)[WARNING] Use `dev test --stress --race $(subst ./,,$(PKG))$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(TESTFLAGS), --test-args "$(TESTFLAGS)")$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))` instead.$(term-reset))
+	COCKROACH_STRESS=true $(xgo) test $(GOTESTFLAGS) $(GOFLAGS) $(GOMODVENDORFLAGS) -exec 'stress $(STRESSFLAGS)' -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -run "$(TESTS)" -timeout 0 $(PKG) $(filter-out -v,$(TESTFLAGS)) -v -args -test.timeout $(TESTTIMEOUT)
 
 .PHONY: roachprod-stress roachprod-stressrace
 roachprod-stress roachprod-stressrace: bin/roachprod-stress
@@ -1099,31 +1170,18 @@ roachprod-stress roachprod-stressrace: bin/roachprod-stress
 	bin/roachprod-stress $(CLUSTER) $(patsubst github.com/cockroachdb/cockroach/%,./%,$(PKG)) $(STRESSFLAGS) -- \
 	  -test.run "$(TESTS)" $(filter-out -v,$(TESTFLAGS)) -test.v -test.timeout $(TESTTIMEOUT); \
 
-testlogic: testbaselogic testoptlogic testccllogic
+testlogic: testbaselogic testoptlogic testsqlitelogic testccllogic testsqliteccllogic
 
-testbaselogic: ## Run SQL Logic Tests.
-testbaselogic: bin/logictest
+logic-test-selector := $(if $(FILES),$(subst /,,$(subst -,_,$(subst .,_,$(FILES)))),.*)/$(SUBTESTS)
+testbaselogic: TESTS := TestLogic_$(logic-test-selector)
+testsqlitelogic: TESTS := TestLogic_$(logic-test-selector)
+testccllogic: TESTS := Test(CCL|Tenant)Logic_$(logic-test-selector)
+testsqliteccllogic: TESTS := TestTenantLogic_$(logic-test-selector)
+testoptlogic: TESTS := TestExecBuild_$(logic-test-selector)
 
-testccllogic: ## Run SQL CCL Logic Tests.
-testccllogic: bin/logictestccl
-
-testoptlogic: ## Run SQL Logic Tests from opt package.
-testoptlogic: bin/logictestopt
-
-logic-test-selector := $(if $(TESTCONFIG),^$(TESTCONFIG)$$)/$(if $(FILES),^$(subst $(space),$$|^,$(FILES))$$)/$(SUBTESTS)
-testbaselogic: TESTS := TestLogic/$(logic-test-selector)
-testccllogic: TESTS := TestCCLLogic/$(logic-test-selector)
-testoptlogic: TESTS := TestExecBuild/$(logic-test-selector)
-
-# Note: we specify -config here in addition to the filter on TESTS
-# above. This is because if we only restrict in TESTS, this will
-# merely cause Go to skip the sub-tests that match the pattern. It
-# does not prevent loading and initializing every default config in
-# turn (including setting up the test clusters, etc.). By specifying
-# -config, the extra initialization overhead is averted.
-testbaselogic testccllogic testoptlogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql) $(if $(TESTCONFIG),-config $(TESTCONFIG))
-testbaselogic testccllogic testoptlogic:
-	cd $($(<F)-package) && $(<F) -test.run "$(TESTS)" -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
+testbaselogic testccllogic testoptlogic testsqlitelogic testsqliteccllogic: TESTFLAGS := -test.v $(if $(FILES),-show-sql)
+testbaselogic testccllogic testoptlogic testsqlitelogic testsqliteccllogic:
+	$(xgo) test $($@-package)/tests/$(if $(TESTCONFIG),$(TESTCONFIG),...) -test.run "$(TESTS)" -test.timeout $(TESTTIMEOUT) $(TESTFLAGS)
 
 testraceslow: override GOFLAGS += -race
 testraceslow: TESTTIMEOUT := $(RACETIMEOUT)
@@ -1137,11 +1195,13 @@ testslow testraceslow:
 acceptance: TESTTIMEOUT := $(ACCEPTANCETIMEOUT)
 acceptance: export TESTTIMEOUT := $(TESTTIMEOUT)
 acceptance: ## Run acceptance tests.
+	$(info $(yellow)[WARNING] Use `dev acceptance $(subst ./,,$(PKG))$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))$(if $(TESTFLAGS), --test-args "$(TESTFLAGS)")` instead.$(term-reset))
 	+@pkg/acceptance/run.sh
 
 .PHONY: compose
 compose: export TESTTIMEOUT := $(TESTTIMEOUT)
 compose: ## Run compose tests.
+	$(info $(yellow)[WARNING] Use `dev compose` instead.$(term-reset))
 	+@pkg/compose/run.sh
 
 .PHONY: dupl
@@ -1159,6 +1219,7 @@ dupl: bin/.bootstrap
 .PHONY: generate
 generate: ## Regenerate generated code.
 generate: protobuf $(DOCGEN_TARGETS) $(OPTGEN_TARGETS) $(LOG_TARGETS) $(SQLPARSER_TARGETS) $(SETTINGS_DOC_PAGES) $(SWAGGER_TARGETS) bin/langgen bin/terraformgen
+	$(info $(yellow)[WARNING] Use `dev generate` instead.$(term-reset))
 	$(GO) generate $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' $(PKG)
 	$(MAKE) execgen
 
@@ -1168,6 +1229,7 @@ lint lintshort: TESTTIMEOUT := $(LINTTIMEOUT)
 lint: override TAGS += lint
 lint: ## Run all style checkers and linters.
 lint: bin/returncheck bin/roachvet bin/optfmt
+	$(info $(yellow)[WARNING] Use `dev lint$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))` instead.$(term-reset))
 	@if [ -t 1 ]; then echo '$(yellow)NOTE: `make lint` is very slow! Perhaps `make lintshort`?$(term-reset)'; fi
 	@# Run 'go build -i' to ensure we have compiled object files available for all
 	@# packages. In Go 1.10, only 'go vet' recompiles on demand. For details:
@@ -1179,11 +1241,13 @@ lint: bin/returncheck bin/roachvet bin/optfmt
 lintshort: override TAGS += lint
 lintshort: ## Run a fast subset of the style checkers and linters.
 lintshort: bin/roachvet bin/optfmt
+	$(info $(yellow)[WARNING] Use `dev lint --short$(if $(filter . -,$(TESTS)),, --filter $(TESTS))$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))` instead.$(term-reset))
 	$(xgo) test $(GOTESTFLAGS) ./pkg/testutils/lint -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -short -timeout $(TESTTIMEOUT) -run 'TestLint/$(TESTS)'
 
 .PHONY: protobuf
 protobuf: $(PROTOBUF_TARGETS)
 protobuf: ## Regenerate generated code for protobuf definitions.
+	$(info $(yellow)[WARNING] Use `dev generate protobuf` instead.$(term-reset))
 
 # pre-push locally runs most of the checks CI will run. Notably, it doesn't run
 # the acceptance tests.
@@ -1273,11 +1337,11 @@ GW_TS_PROTOS := ./pkg/ts/tspb/timeseries.proto
 GW_PROTOS  := $(GW_SERVER_PROTOS) $(GW_TS_PROTOS)
 GW_SOURCES := $(GW_PROTOS:%.proto=%.pb.gw.go)
 
-GO_PROTOS := $(sort $(shell $(FIND_RELEVANT) -type f -name '*.proto' -print))
+GO_PROTOS := $(sort $(shell $(FIND_RELEVANT) -type f -name '*.proto' \( -path './pkg/build/bazel/bes/*' -prune -o -print \) ))
 GO_SOURCES := $(GO_PROTOS:%.proto=%.pb.go)
 
-PBJS := $(NODE_RUN) pkg/ui/node_modules/.bin/pbjs
-PBTS := $(NODE_RUN) pkg/ui/node_modules/.bin/pbts
+PBJS := $(NODE_RUN) pkg/ui/workspaces/db-console/src/js/node_modules/.bin/pbjs
+PBTS := $(NODE_RUN) pkg/ui/workspaces/db-console/src/js/node_modules/.bin/pbts
 
 # Unlike the protobuf compiler for Go and C++, the protobuf compiler for
 # JavaScript only needs the entrypoint protobufs to be listed. It automatically
@@ -1357,65 +1421,36 @@ ui-topo: pkg/ui/yarn.installed
 	pkg/ui/workspaces/db-console/scripts/topo.js
 
 .PHONY: ui-lint
-ui-lint: pkg/ui/yarn.installed $(UI_PROTOS_OSS) $(UI_PROTOS_CCL)
+ui-lint: pkg/ui/yarn.installed $(ESLINT_PLUGIN_CRDB) $(UI_PROTOS_OSS) $(UI_PROTOS_CCL) $(CLUSTER_UI_JS)
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(STYLINT) -c .stylintrc styl
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(TSC)
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console yarn lint
 	@if $(NODE_RUN) -C pkg/ui/workspaces/db-console yarn list | grep phantomjs; then echo ^ forbidden UI dependency >&2; exit 1; fi
 	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn --cwd pkg/ui/workspaces/cluster-ui lint
 
-# DLLs are Webpack bundles, not Windows shared libraries. See "DLLs for speedy
-# builds" in the UI README for details.
-UI_CCL_DLLS := pkg/ui/workspaces/db-console/dist/protos.ccl.dll.js pkg/ui/workspaces/db-console/dist/vendor.oss.dll.js
-UI_CCL_MANIFESTS := pkg/ui/workspaces/db-console/protos.ccl.manifest.json pkg/ui/workspaces/db-console/vendor.oss.manifest.json
-UI_OSS_DLLS := $(subst .ccl,.oss,$(UI_CCL_DLLS))
-UI_OSS_MANIFESTS := $(subst .ccl,.oss,$(UI_CCL_MANIFESTS))
-
-# (Ab)use pattern rules to teach Make that this one Webpack command produces two
-# files. Normally, Make would run the recipe twice if dist/FOO.js and
-# FOO-manifest.js were both out-of-date. [0]
-#
-# XXX: Ideally we'd scope the dependency on $(UI_PROTOS*) to the appropriate
-# protos DLLs, but Make v3.81 has a bug that causes the dependency to be ignored
-# [1]. We're stuck with this workaround until Apple decides to update the
-# version of Make they ship with macOS or we require a newer version of Make.
-# Such a requirement would need to be strictly enforced, as the way this fails
-# is extremely subtle and doesn't present until the web UI is loaded in the
-# browser.
-#
-# [0]: https://stackoverflow.com/a/3077254/1122351
-# [1]: http://savannah.gnu.org/bugs/?19108
-.SECONDARY: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS)
-
-pkg/ui/workspaces/db-console/dist/%.oss.dll.js pkg/ui/workspaces/db-console/%.oss.manifest.json: pkg/ui/workspaces/db-console/webpack.%.js pkg/ui/yarn.installed $(CLUSTER_UI_JS) $(UI_PROTOS_OSS)
-	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) -p --config webpack.$*.js --env.dist=oss
-
-pkg/ui/workspaces/db-console/dist/%.ccl.dll.js pkg/ui/workspaces/db-console/%.ccl.manifest.json: pkg/ui/workspaces/db-console/webpack.%.js pkg/ui/yarn.installed $(CLUSTER_UI_JS) $(UI_PROTOS_CCL)
-	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) -p --config webpack.$*.js --env.dist=ccl
-
 .PHONY: ui-test
-ui-test: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
-	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start
+ui-test: $(UI_PROTOS_OSS) $(UI_PROTOS_CCL) $(CLUSTER_UI_JS)
+	$(info $(yellow)[WARNING]: Use `dev ui test` instead.$(term-reset))
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console yarn test
 	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn ci
 
 .PHONY: ui-test-watch
-ui-test-watch: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS)
+ui-test-watch: $(UI_PROTOS_OSS) $(UI_PROTOS_CCL) $(CLUSTER_UI_JS)
+	$(info $(yellow)[WARNING]: Use `dev ui test --watch` instead.$(term-reset))
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start --no-single-run --auto-watch & \
 	$(NODE_RUN) -C pkg/ui/workspaces/cluster-ui yarn test
 
 .PHONY: ui-test-debug
-ui-test-debug: $(UI_DLLS) $(UI_MANIFESTS)
+ui-test-debug: $(UI_PROTOS_OSS) $(UI_PROTOS_CCL) $(CLUSTER_UI_JS)
 	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(KARMA) start --browsers Chrome --no-single-run --debug --auto-watch
 
 .SECONDARY: pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
-pkg/ui/assets.ccl.installed: $(UI_CCL_DLLS) $(UI_CCL_MANIFESTS) $(UI_JS_CCL) $(shell find pkg/ui/workspaces/db-console/ccl -type f)
-pkg/ui/assets.oss.installed: $(UI_OSS_DLLS) $(UI_OSS_MANIFESTS) $(UI_JS_OSS)
-pkg/ui/assets.%.installed: pkg/ui/workspaces/db-console/webpack.app.js $(shell find pkg/ui/workspaces/db-console/src pkg/ui/workspaces/db-console/styl -type f) | bin/.bootstrap
+pkg/ui/assets.ccl.installed: $(UI_PROTOS_CCL) $(shell find pkg/ui/workspaces/db-console/ccl -type f)
+pkg/ui/assets.oss.installed: $(UI_PROTOS_OSS)
+pkg/ui/assets.%.installed: pkg/ui/workspaces/db-console/webpack.config.js $(CLUSTER_UI_JS) $(shell find pkg/ui/workspaces/db-console/src pkg/ui/workspaces/db-console/styl -type f) | bin/.bootstrap
 	find pkg/ui/dist$*/assets -mindepth 1 -not -name .gitkeep -delete
-	for dll in $(shell find pkg/ui/workspaces/db-console/dist -name '*.dll.js' -type f); do \
-		echo $$dll | sed -E "s/.oss.dll.js|.ccl.dll.js/.dll.js/" | sed -E "s|^.*\/|pkg/ui/dist$*/assets/|" | xargs -I{} cp $$dll {};\
-	done
-	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) --config webpack.app.js --env.dist=$*
+	export NODE_OPTIONS=--max-old-space-size=5000
+	$(NODE_RUN) -C pkg/ui/workspaces/db-console $(WEBPACK) --config webpack.config.js --env.dist=$*
 	touch $@
 
 pkg/ui/yarn.opt.installed:
@@ -1429,46 +1464,41 @@ ui-watch-secure: export TARGET ?= https://localhost:8080/
 .PHONY: ui-watch
 ui-watch: export TARGET ?= http://localhost:8080
 ui-watch ui-watch-secure: PORT := 3000
-ui-watch ui-watch-secure: $(UI_CCL_DLLS) pkg/ui/yarn.opt.installed
+ui-watch ui-watch-secure: $(UI_PROTOS_OSS) $(UI_PROTOS_CCL) pkg/ui/yarn.opt.installed
   # TODO (koorosh): running two webpack dev servers doesn't provide best performance and polling changes.
   # it has to be considered to use something like `parallel-webpack` lib.
   #
   # `node-run.sh` wrapper is removed because this command is supposed to be run in dev environment (not in docker of CI)
   # so it is safe to run yarn commands directly to preserve formatting and colors for outputs
+	$(info $(yellow)[WARNING] Use `dev ui watch [--secure]` instead$(term-reset))
 	yarn --cwd pkg/ui/workspaces/cluster-ui build:watch & \
-	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.app.js --env.dist=ccl --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
+	yarn --cwd pkg/ui/workspaces/db-console webpack-dev-server --config webpack.config.js --env.dist=ccl --env.WEBPACK_SERVE --port $(PORT) --mode "development" $(WEBPACK_DEV_SERVER_FLAGS)
 
 .PHONY: ui-clean
 ui-clean: ## Remove build artifacts.
+	$(info $(yellow)[WARNING] Use `dev ui clean` instead.$(term-reset))
 	find pkg/ui/distccl/assets pkg/ui/distoss/assets -mindepth 1 -not -name .gitkeep -delete
 	rm -rf pkg/ui/assets.ccl.installed pkg/ui/assets.oss.installed
-	rm -rf pkg/ui/dist_vendor/*
 	rm -f $(UI_PROTOS_CCL) $(UI_PROTOS_OSS)
-	rm -f pkg/ui/workspaces/db-console/*manifest.json
 	rm -rf pkg/ui/workspaces/cluster-ui/dist
 
 .PHONY: ui-maintainer-clean
 ui-maintainer-clean: ## Like clean, but also remove installed dependencies
 ui-maintainer-clean: ui-clean
-	rm -rf pkg/ui/node_modules pkg/ui/workspaces/db-console/node_modules pkg/ui/yarn.installed pkg/ui/workspaces/cluster-ui/node_modules
-
-pkg/cmd/roachtest/prometheus/mock_generated.go: bin/.bootstrap pkg/cmd/roachtest/prometheus/prometheus.go
-	(cd pkg/cmd/roachtest/prometheus && $(GO) generate)
-
-pkg/cmd/roachtest/tests/drt_generated.go: bin/.bootstrap pkg/cmd/roachtest/tests/drt.go
-	(cd pkg/cmd/roachtest/tests && $(GO) generate)
-
-pkg/kv/kvclient/rangefeed/mocks_generated.go: bin/.bootstrap pkg/kv/kvclient/rangefeed/rangefeed.go
-	(cd pkg/kv/kvclient/rangefeed && $(GO) generate)
+	$(info $(yellow)[WARNING] Use `dev ui clean --all` instead.$(term-reset))
+	rm -rf pkg/ui/node_modules \
+		pkg/ui/workspaces/db-console/node_modules \
+		pkg/ui/yarn.installed \
+		pkg/ui/workspaces/cluster-ui/node_modules \
+		pkg/ui/workspaces/db-console/src/js/node_modules \
+		pkg/ui/workspaces/e2e-tests/node_modules \
+		pkg/ui/workspaces/eslint-plugin-crdb/node_modules
 
 pkg/roachprod/vm/aws/embedded.go: bin/.bootstrap pkg/roachprod/vm/aws/config.json pkg/roachprod/vm/aws/old.json bin/terraformgen
 	(cd pkg/roachprod/vm/aws && $(GO) generate)
 
 pkg/security/securitytest/embedded.go: bin/.bootstrap $(shell find pkg/security/securitytest/test_certs -type f -not -name README.md -not -name regenerate.sh)
 	(cd pkg/security/securitytest && $(GO) generate)
-
-pkg/security/certmgr/mocks_generated.go: bin/.bootstrap pkg/security/certmgr/cert.go
-	(cd pkg/security/certmgr && $(GO) generate)
 
 .SECONDARY: pkg/sql/parser/gen/sql.go.tmp
 pkg/sql/parser/gen/sql.go.tmp: pkg/sql/parser/gen/sql-gen.y bin/.bootstrap
@@ -1590,37 +1620,51 @@ docs/generated/redact_safe.md:
 #### WARNING ####
 # You must keep this list in sync with the list in `pkg/util/log/eventpb/PROTOS.bzl`.
 # Order matters!!
-EVENTLOG_PROTOS = \
-	pkg/util/log/eventpb/events.proto \
-	pkg/util/log/eventpb/debug_events.proto \
-	pkg/util/log/eventpb/ddl_events.proto \
-	pkg/util/log/eventpb/misc_sql_events.proto \
-	pkg/util/log/eventpb/privilege_events.proto \
-	pkg/util/log/eventpb/role_events.proto \
-	pkg/util/log/eventpb/zone_events.proto \
-	pkg/util/log/eventpb/session_events.proto \
-	pkg/util/log/eventpb/sql_audit_events.proto \
-	pkg/util/log/eventpb/cluster_events.proto \
-	pkg/util/log/eventpb/job_events.proto \
-	pkg/util/log/eventpb/health_events.proto \
-	pkg/util/log/eventpb/telemetry.proto
+EVENTPB_PROTOS = \
+  pkg/util/log/eventpb/events.proto \
+  pkg/util/log/eventpb/debug_events.proto \
+  pkg/util/log/eventpb/zone_events.proto \
+  pkg/util/log/eventpb/ddl_events.proto \
+  pkg/util/log/eventpb/misc_sql_events.proto \
+  pkg/util/log/eventpb/privilege_events.proto \
+  pkg/util/log/eventpb/role_events.proto \
+  pkg/util/log/eventpb/session_events.proto \
+  pkg/util/log/eventpb/sql_audit_events.proto \
+  pkg/util/log/eventpb/cluster_events.proto \
+  pkg/util/log/eventpb/job_events.proto \
+  pkg/util/log/eventpb/health_events.proto \
+  pkg/util/log/eventpb/storage_events.proto \
+  pkg/util/log/eventpb/telemetry.proto
+
+EVENTLOG_PROTOS = pkg/util/log/logpb/event.proto $(EVENTPB_PROTOS)
+
+EVENTPBGEN_PKG = pkg/util/log/eventpb/eventpbgen
 
 LOGSINKDOC_DEP = pkg/util/log/logconfig/config.go
+
+$(EVENTPBGEN_PKG)/log_channels_generated.go: pkg/util/log/logpb/log.proto
+	awk -f $(EVENTPBGEN_PKG)/extract_log_channels.awk <$< >$@
+
+$(EVENTPBGEN_PKG): $(EVENTPBGEN_PKG)/*.go $(EVENTPBGEN_PKG)/log_channels_generated.go
 
 docs/generated/logsinks.md: pkg/util/log/logconfig/gen.go $(LOGSINKDOC_DEP) | bin/.bootstrap
 	$(GO) run $(GOMODVENDORFLAGS) $< <$(LOGSINKDOC_DEP) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-docs/generated/eventlog.md: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOMODVENDORFLAGS) $< eventlog.md $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+docs/generated/eventlog.md: $(EVENTPBGEN_PKG) $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOMODVENDORFLAGS) ./$< eventlog.md $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-pkg/util/log/eventpb/eventlog_channels_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOMODVENDORFLAGS) $< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+pkg/util/log/eventpb/eventlog_channels_generated.go: $(EVENTPBGEN_PKG) $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOMODVENDORFLAGS) ./$< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
-pkg/util/log/eventpb/json_encode_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOMODVENDORFLAGS) $< json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+pkg/util/log/eventpb/json_encode_generated.go: $(EVENTPBGEN_PKG) pkg/util/log/eventpb $(EVENTPB_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOMODVENDORFLAGS) ./$< --excluded-events CommonEventDetails json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/logpb/json_encode_generated.go: $(EVENTPBGEN_PKG) pkg/util/log/logpb/event.proto | bin/.go_protobuf_sources
+	$(GO) run $(GOMODVENDORFLAGS) ./$< --package logpb json_encode_go pkg/util/log/logpb/event.proto >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
 docs/generated/logging.md: pkg/util/log/gen/main.go pkg/util/log/logpb/log.proto | bin/.bootstrap
@@ -1644,7 +1688,8 @@ pkg/util/log/log_channels_generated.go: pkg/util/log/gen/main.go pkg/util/log/lo
 .PHONY: execgen
 execgen: ## Regenerate generated code for the vectorized execution engine.
 execgen: $(EXECGEN_TARGETS) bin/execgen
-	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && ./bin/execgen -fmt=false $$i > $$i; done
+	$(info $(yellow)[WARNING] Use `dev generate execgen` instead.$(term-reset))
+	for i in $(EXECGEN_TARGETS); do echo EXECGEN $$i && COCKROACH_INTERNAL_DISABLE_METAMORPHIC_TESTING=true ./bin/execgen -fmt=false $$i > $$i; done
 	goimports -w $(EXECGEN_TARGETS)
 
 # Add a catch-all rule for any non-existent execgen generated
@@ -1710,7 +1755,7 @@ cleanshort:
 
 .PHONY: clean
 clean: ## Like cleanshort, but also includes C++ artifacts, Bazel artifacts, and the go build cache.
-clean: cleanshort clean-c-deps
+clean: cleanshort clean-c-deps cleaninstrument
 	rm -rf build/defs.mk*
 	-$(GO) clean $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -i -cache github.com/cockroachdb/cockroach...
 	$(FIND_RELEVANT) -type f -name 'zcgo_flags*.go' -exec rm {} +
@@ -1738,7 +1783,6 @@ bins = \
   bin/cockroach-oss \
   bin/cockroach-short \
   bin/cockroach-sql \
-  bin/compile-builds \
   bin/docgen \
   bin/execgen \
   bin/fuzz \
@@ -1781,9 +1825,11 @@ execgen-package = ./pkg/sql/colexec/execgen/cmd/execgen
 langgen-package = ./pkg/sql/opt/optgen/cmd/langgen
 optfmt-package = ./pkg/sql/opt/optgen/cmd/optfmt
 optgen-package = ./pkg/sql/opt/optgen/cmd/optgen
-logictest-package = ./pkg/sql/logictest
-logictestccl-package = ./pkg/ccl/logictestccl
-logictestopt-package = ./pkg/sql/opt/exec/execbuilder
+testbaselogic-package = ./pkg/sql/logictest
+testsqlitelogic-package = ./pkg/sql/sqlitelogictest
+testccllogic-package = ./pkg/ccl/logictestccl
+testsqliteccllogic-package = ./pkg/ccl/sqlitelogictestccl
+testoptlogic-package = ./pkg/sql/opt/exec/execbuilder
 terraformgen-package = ./pkg/roachprod/vm/aws/terraformgen
 logictest-bins := bin/logictest bin/logictestopt bin/logictestccl
 
@@ -1820,6 +1866,7 @@ $(xbins): bin/%: bin/%.d | bin/prereqs bin/.submodules-initialized
 	$(xgo) build -v $(GOFLAGS) $(GOMODVENDORFLAGS) -tags '$(TAGS)' -ldflags '$(LINKFLAGS)' -o $@ $(if $($*-package),$($*-package),./pkg/cmd/$*)
 
 $(testbins): bin/%: bin/%.d | bin/prereqs $(SUBMODULES_TARGET)
+	$(info $(yellow)[WARNING] Use `dev test $(subst ./,,$($*-package)) $(if $(TESTS), --filter $(TESTS))$(if $(findstring 60m,$(TESTTIMEOUT)),, --timeout $(TESTTIMEOUT))$(if $(TESTFLAGS), --test-args "$(TESTFLAGS)")` instead.$(term-reset))
 	@echo go test -c $($*-package)
 	$(PREREQS) -bin-name=$* -test $($*-package) > $@.d.tmp
 	mv -f $@.d.tmp $@.d
@@ -1838,6 +1885,7 @@ fuzz: bin/fuzz
 # `./dev generate bazel`.)
 .PHONY: bazel-generate
 bazel-generate:
+	$(info $(yellow)[WARNING] Use `dev generate bazel` instead.$(term-reset))
 	@echo 'Generating DEPS.bzl and BUILD files using gazelle'
 	./build/bazelutil/bazel-generate.sh
 
@@ -1890,8 +1938,3 @@ build/variables.mk: Makefile build/archive/contents/Makefile pkg/ui/Makefile bui
 include build/variables.mk
 $(foreach v,$(filter-out $(strip $(VALID_VARS)),$(.VARIABLES)),\
 	$(if $(findstring command line,$(origin $v)),$(error Variable '$v' is not recognized by this Makefile)))
-
-# Cypress e2e tests
-.PHONY: db-console-e2e-test
-db-console-e2e-test: pkg/ui/yarn.opt.installed
-	cd pkg/ui/workspaces/db-console && yarn cypress:run

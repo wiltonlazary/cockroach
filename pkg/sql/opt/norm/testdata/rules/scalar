@@ -18,6 +18,17 @@ exec-ddl
 CREATE TABLE c (c CHAR PRIMARY KEY)
 ----
 
+exec-ddl
+CREATE TABLE b
+(
+    k INT PRIMARY KEY,
+    j JSONB,
+    i INT,
+    s STRING,
+    arr STRING[]
+)
+----
+
 # --------------------------------------------------
 # CommuteVar
 # --------------------------------------------------
@@ -1162,16 +1173,16 @@ SELECT k FROM e WHERE i IS NOT DISTINCT FROM NULL::FLOAT
 ----
 project
  ├── columns: k:1(int!null)
- ├── stats: [rows=10.0000001]
- ├── cost: 24.5400001
+ ├── stats: [rows=10]
+ ├── cost: 24.5400002
  ├── key: (1)
  ├── prune: (1)
  ├── interesting orderings: (+1)
  └── scan t.public.e@e_i_idx
       ├── columns: t.public.e.k:1(int!null) t.public.e.i:2(int)
       ├── constraint: /2/1: [/NULL - /NULL]
-      ├── stats: [rows=10.0000001, distinct(2)=1, null(2)=10]
-      ├── cost: 24.4200001
+      ├── stats: [rows=10, distinct(2)=1, null(2)=10]
+      ├── cost: 24.4200002
       ├── key: (1)
       ├── fd: ()-->(2)
       ├── prune: (1)
@@ -1294,16 +1305,16 @@ project
 
 # Working in concert with other norm rules
 opt
-SELECT k FROM e WHERE d - '1w'::INTERVAL > '2018-07-01'::DATE
+SELECT k FROM e WHERE i - 10 > 100
 ----
 project
  ├── columns: k:1!null
  ├── key: (1)
- └── scan e@e_d_idx
-      ├── columns: k:1!null d:5!null
-      ├── constraint: /5/1: [/'2018-07-09' - ]
+ └── scan e@e_i_idx
+      ├── columns: k:1!null i:2!null
+      ├── constraint: /2/1: [/111 - ]
       ├── key: (1)
-      └── fd: (1)-->(5)
+      └── fd: (1)-->(2)
 
 # --------------------------------------------------
 # InlineAnyValuesSingleCol
@@ -1476,6 +1487,28 @@ select
  │    └── key: (1)
  └── filters
       └── k:1 > ANY () [outer=(1)]
+
+# DTuples should be converted to TupleExprs. This allows constraints to be built
+# for the resulting IN expression because the constraint builder requires
+# TupleExprs on the RHS of IN expressions.
+norm expect=SimplifyAnyScalarArray
+SELECT k FROM a WHERE (k, s) = ANY(ARRAY[(1, 'foo'), (2, 'bar')])
+----
+project
+ ├── columns: k:1!null
+ ├── cardinality: [0 - 2]
+ ├── key: (1)
+ └── select
+      ├── columns: k:1!null s:4!null
+      ├── cardinality: [0 - 2]
+      ├── key: (1)
+      ├── fd: (1)-->(4)
+      ├── scan a
+      │    ├── columns: k:1!null s:4
+      │    ├── key: (1)
+      │    └── fd: (1)-->(4)
+      └── filters
+           └── (k:1, s:4) IN ((1, 'foo'), (2, 'bar')) [outer=(1,4), constraints=(/1/4: [/1/'foo' - /1/'foo'] [/2/'bar' - /2/'bar']; /4: [/'bar' - /'bar'] [/'foo' - /'foo']; tight)]
 
 # --------------------------------------------------
 # SimplifyEqualsAnyTuple + SimplifyAnyScalarArray
@@ -2108,3 +2141,92 @@ project
  │    └── columns: geom1:2 geom2:3
  └── projections
       └── NOT st_intersects(geom1:2, geom2:3) [as="?column?":8, outer=(2,3), immutable]
+
+# --------------------------------------------------
+# ConvertJSONSubscriptToFetchValue
+# --------------------------------------------------
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j['c'] FROM b WHERE j['a'] = '"b"'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── (b.j:2->'a') = '"b"' [outer=(2), immutable]
+ └── projections
+      └── b.j:2->'c' [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j['a']['b'] FROM b WHERE j['c'] = '1'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── (b.j:2->'c') = '1' [outer=(2), immutable]
+ └── projections
+      └── (b.j:2->'a')->'b' [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j[0] FROM b WHERE j[0][1] = '1'
+----
+project
+ ├── columns: j:8
+ ├── immutable
+ ├── select
+ │    ├── columns: b.j:2
+ │    ├── immutable
+ │    ├── scan b
+ │    │    └── columns: b.j:2
+ │    └── filters
+ │         └── ((b.j:2->0)->1) = '1' [outer=(2), immutable]
+ └── projections
+      └── b.j:2->0 [as=j:8, outer=(2), immutable]
+
+norm expect=ConvertJSONSubscriptToFetchValue
+SELECT j[i], j[s] FROM b
+----
+project
+ ├── columns: j:8 j:9
+ ├── immutable
+ ├── scan b
+ │    └── columns: b.j:2 i:3 s:4
+ └── projections
+      ├── b.j:2->i:3 [as=j:8, outer=(2,3), immutable]
+      └── b.j:2->s:4 [as=j:9, outer=(2,4), immutable]
+
+norm expect-not=ConvertJSONSubscriptToFetchValue
+SELECT arr[1] FROM b WHERE arr[2] = 'a'
+----
+project
+ ├── columns: arr:8
+ ├── select
+ │    ├── columns: b.arr:5
+ │    ├── scan b
+ │    │    └── columns: b.arr:5
+ │    └── filters
+ │         └── b.arr:5[2] = 'a' [outer=(5)]
+ └── projections
+      └── b.arr:5[1] [as=arr:8, outer=(5)]
+
+norm expect-not=ConvertJSONSubscriptToFetchValue
+SELECT arr[1], arr[2] FROM b;
+----
+project
+ ├── columns: arr:8 arr:9
+ ├── scan b
+ │    └── columns: b.arr:5
+ └── projections
+      ├── b.arr:5[1] [as=arr:8, outer=(5)]
+      └── b.arr:5[2] [as=arr:9, outer=(5)]

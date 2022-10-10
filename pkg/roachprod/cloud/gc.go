@@ -15,7 +15,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -262,7 +261,7 @@ func shouldSend(channel string, status *status) (bool, error) {
 		return true, err
 	}
 	hashPath := os.ExpandEnv(filepath.Join(hashDir, "notification-"+channel))
-	fileBytes, err := ioutil.ReadFile(hashPath)
+	fileBytes, err := os.ReadFile(hashPath)
 	if err != nil && !oserror.IsNotExist(err) {
 		return true, err
 	}
@@ -273,7 +272,7 @@ func shouldSend(channel string, status *status) (bool, error) {
 		return false, nil
 	}
 
-	return true, ioutil.WriteFile(hashPath, []byte(newHash), 0644)
+	return true, os.WriteFile(hashPath, []byte(newHash), 0644)
 }
 
 // GCClusters checks all cluster to see if they should be deleted. It only
@@ -312,11 +311,7 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 		}
 	}
 
-	// Send out notification to #roachprod-status.
 	client := makeSlackClient()
-	channel, _ := findChannel(client, "roachprod-status", "")
-	postStatus(l, client, channel, dryrun, &s, badVMs)
-
 	// Send out user notifications if any of the user's clusters are expired or
 	// will be destroyed.
 	for user, status := range users {
@@ -330,6 +325,7 @@ func GCClusters(l *logger.Logger, cloud *Cloud, dryrun bool) error {
 		}
 	}
 
+	channel, _ := findChannel(client, "roachprod-status", "")
 	if !dryrun {
 		if len(badVMs) > 0 {
 			// Destroy bad VMs.

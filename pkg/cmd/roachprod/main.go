@@ -416,8 +416,8 @@ The --sig flag will pass a signal to kill to allow us finer control over how we
 shutdown cockroach. The --wait flag causes stop to loop waiting for all
 processes with the right ROACHPROD environment variable to exit. Note that stop
 will wait forever if you specify --wait with a non-terminating signal (e.g.
-SIGHUP). --wait defaults to true for signal 9 (SIGKILL) and false for all other
-signals.
+SIGHUP), unless you also configure --max-wait.
+--wait defaults to true for signal 9 (SIGKILL) and false for all other signals.
 ` + tagHelp + `
 `,
 	Args: cobra.ExactArgs(1),
@@ -426,7 +426,7 @@ signals.
 		if sig == 9 /* SIGKILL */ && !cmd.Flags().Changed("wait") {
 			wait = true
 		}
-		stopOpts := roachprod.StopOpts{Wait: wait, ProcessTag: tag, Sig: sig}
+		stopOpts := roachprod.StopOpts{Wait: wait, MaxWait: maxWait, ProcessTag: tag, Sig: sig}
 		return roachprod.Stop(context.Background(), roachprodLibraryLogger, args[0], stopOpts)
 	}),
 }
@@ -505,7 +505,20 @@ The "status" command outputs the binary and PID for the specified nodes:
 `,
 	Args: cobra.ExactArgs(1),
 	Run: wrap(func(cmd *cobra.Command, args []string) error {
-		return roachprod.Status(context.Background(), roachprodLibraryLogger, args[0], tag)
+		statuses, err := roachprod.Status(context.Background(), roachprodLibraryLogger, args[0], tag)
+		if err != nil {
+			return err
+		}
+		for _, status := range statuses {
+			if status.Err != nil {
+				roachprodLibraryLogger.Printf("  %2d: %s %s\n", status.NodeID, status.Err.Error())
+			} else if !status.Running {
+				roachprodLibraryLogger.Printf("  %2d: not running\n", status.NodeID)
+			} else {
+				roachprodLibraryLogger.Printf("  %2d: %s %s\n", status.NodeID, status.Version, status.Pid)
+			}
+		}
+		return nil
 	}),
 }
 
@@ -885,6 +898,55 @@ var getProvidersCmd = &cobra.Command{
 	},
 }
 
+var grafanaStartCmd = &cobra.Command{
+	Use:   `grafana-start <cluster>`,
+	Short: `spins up a prometheus and grafana instance on the last node in the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StartGrafana(context.Background(), roachprodLibraryLogger, args[0],
+			grafanaConfig, nil)
+	}),
+}
+
+var grafanaStopCmd = &cobra.Command{
+	Use:   `grafana-stop <cluster>`,
+	Short: `spins down prometheus and grafana instances on the last node in the cluster`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		return roachprod.StopGrafana(context.Background(), roachprodLibraryLogger, args[0], "")
+	}),
+}
+
+var grafanaDumpCmd = &cobra.Command{
+	Use:   `grafana-dump <cluster>`,
+	Short: `dump prometheus data to the specified directory`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		if grafanaDumpDir == "" {
+			return errors.New("--dump-dir unspecified")
+		}
+		return roachprod.PrometheusSnapshot(context.Background(), roachprodLibraryLogger, args[0], grafanaDumpDir)
+	}),
+}
+
+var grafanaURLCmd = &cobra.Command{
+	Use:   `grafanaurl <cluster>`,
+	Short: `returns a url to the grafana dashboard`,
+	Args:  cobra.ExactArgs(1),
+	Run: wrap(func(cmd *cobra.Command, args []string) error {
+		urls, err := roachprod.GrafanaURL(context.Background(), roachprodLibraryLogger, args[0],
+			grafanaurlOpen)
+		if err != nil {
+			return err
+		}
+		for _, url := range urls {
+			fmt.Println(url)
+		}
+		fmt.Println("username: admin; pwd: admin")
+		return nil
+	}),
+}
+
 func main() {
 	loggerCfg := logger.Config{Stdout: os.Stdout, Stderr: os.Stderr}
 	var loggerError error
@@ -935,6 +997,10 @@ func main() {
 		cachedHostsCmd,
 		versionCmd,
 		getProvidersCmd,
+		grafanaStartCmd,
+		grafanaStopCmd,
+		grafanaDumpCmd,
+		grafanaURLCmd,
 	)
 	setBashCompletionFunction()
 

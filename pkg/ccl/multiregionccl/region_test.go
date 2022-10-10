@@ -30,13 +30,14 @@ import (
 // TestConcurrentAddDropRegions tests all combinations of add/drop as if they
 // were executed by two concurrent sessions. The general sketch of the test is
 // as follows:
-// - First operation is executed and blocks before the enum members are promoted.
-// - The second operation starts once the first operation has reached the type
-//   schema changer. It continues to completion. It may succeed/fail depending
-//   on the specific test setup.
-// - The first operation is resumed and allowed to complete. We expect it to
-//   succeed.
-// - Verify database regions are as expected.
+//   - First operation is executed and blocks before the enum members are promoted.
+//   - The second operation starts once the first operation has reached the type
+//     schema changer. It continues to completion. It may succeed/fail depending
+//     on the specific test setup.
+//   - The first operation is resumed and allowed to complete. We expect it to
+//     succeed.
+//   - Verify database regions are as expected.
+//
 // Operations act on a multi-region database that contains a REGIONAL BY ROW
 // table, so as to exercise the repartitioning semantics.
 func TestConcurrentAddDropRegions(t *testing.T) {
@@ -149,12 +150,12 @@ CREATE DATABASE db WITH PRIMARY REGION "us-east1" REGIONS "us-east2", "us-east3"
 CREATE TABLE db.rbr () LOCALITY REGIONAL BY ROW`)
 			require.NoError(t, err)
 
-			go func() {
-				if _, err := sqlDB.Exec(tc.firstOp); err != nil {
+			go func(firstOp string) {
+				if _, err := sqlDB.Exec(firstOp); err != nil {
 					t.Error(err)
 				}
 				close(firstOpFinished)
-			}()
+			}(tc.firstOp)
 
 			// Wait for the first operation to reach the type schema changer.
 			<-firstOpStarted
@@ -288,12 +289,12 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 `)
 				require.NoError(t, err)
 
-				go func() {
+				go func(cmd string, shouldSucceed bool) {
 					defer func() {
 						close(typeChangeFinished)
 					}()
-					_, err := sqlDB.Exec(regionAlterCmd.cmd)
-					if regionAlterCmd.shouldSucceed {
+					_, err := sqlDB.Exec(cmd)
+					if shouldSucceed {
 						if err != nil {
 							t.Errorf("expected success, got %v", err)
 						}
@@ -302,7 +303,7 @@ CREATE TABLE db.rbr(k INT PRIMARY KEY, v INT NOT NULL) LOCALITY REGIONAL BY ROW;
 							t.Errorf("expected error boom, found %v", err)
 						}
 					}
-				}()
+				}(regionAlterCmd.cmd, regionAlterCmd.shouldSucceed)
 
 				<-typeChangeStarted
 
@@ -401,18 +402,18 @@ ALTER TABLE db.public.global CONFIGURE ZONE USING
 
 			_, err := sqlDB.Exec(`
 CREATE DATABASE db PRIMARY REGION "us-east1" REGIONS "us-east2";
-CREATE TABLE db.global () LOCALITY GLOBAL;
-SET CLUSTER SETTING sql.defaults.multiregion_placement_policy.enabled = true;`)
+CREATE TABLE db.global () LOCALITY GLOBAL;`)
 			require.NoError(t, err)
-
-			go func() {
+			_, err = sqlDB.Exec(`SET CLUSTER SETTING sql.defaults.multiregion_placement_policy.enabled = true;`)
+			require.NoError(t, err)
+			go func(regionOp string) {
 				defer func() {
 					close(regionOpFinished)
 				}()
 
-				_, err := sqlDB.Exec(tc.regionOp)
+				_, err := sqlDB.Exec(regionOp)
 				require.NoError(t, err)
-			}()
+			}(tc.regionOp)
 
 			<-regionOpStarted
 			_, err = sqlDB.Exec(tc.placementOp)
@@ -883,15 +884,15 @@ INSERT INTO db.rbr VALUES (1,1),(2,2),(3,3);
 `)
 				require.NoError(t, err)
 
-				go func() {
+				go func(cmd string) {
 					defer func() {
 						close(typeChangeFinished)
 					}()
-					_, err := sqlDBBackup.Exec(regionAlterCmd.cmd)
+					_, err := sqlDBBackup.Exec(cmd)
 					if err != nil {
-						t.Errorf("expected success, got %v when executing %s", err, regionAlterCmd.cmd)
+						t.Errorf("expected success, got %v when executing %s", err, cmd)
 					}
-				}()
+				}(regionAlterCmd.cmd)
 
 				<-typeChangeStarted
 

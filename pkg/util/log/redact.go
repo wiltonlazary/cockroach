@@ -138,11 +138,6 @@ func maybeRedactEntry(payload entryPayload, editor redactEditor) (res entryPaylo
 	return res
 }
 
-// Safe constructs a SafeFormatter / SafeMessager.
-// This is obsolete. Use redact.Safe directly.
-// TODO(knz): Remove this.
-var Safe = redact.Safe
-
 func init() {
 	// We consider booleans and numeric values to be always safe for
 	// reporting. A log call can opt out by using redact.Unsafe() around
@@ -204,4 +199,38 @@ func TestingSetRedactable(redactableLogs bool) (cleanup func()) {
 			debugLog.sinkInfos[i].editor = e
 		}
 	}
+}
+
+// SafeOperational is a transparent wrapper around `redact.Safe` that
+// acts as documentation for *why* the object is being marked as safe.
+// In this case, the intent is to label this piece of information as
+// "operational" data which is helpful for telemetry and operator
+// actions. Typically, this includes schema structure and information
+// about internals that is *not* user data or derived from user data.
+func SafeOperational(s interface{}) redact.SafeValue {
+	return redact.Safe(s)
+}
+
+// SafeManaged marks the provided argument as safe from a redaction
+// perspective in cases where the node is being run as part of a managed
+// service. This is indicated via the `COCKROACH_REDACTION_POLICY_MANAGED`
+// environment variable.
+//
+// Certain types of data is normally considered "sensitive" from a
+// redaction perspective when logged from on-premises deployments, such
+// as CLI arguments and HTTP addresses. However, when running in a
+// managed service, such as CockroachCloud, this information is already
+// known to the operators and does not need to be treated as sensitive.
+//
+// NB: If the argument itself implements the redact.SafeFormatter interface,
+// then we delegate to its implementation in either case.
+//
+// NB: This approach is lightweight, but is not sustainable to build on top of.
+// We should be looking for more holistic approaches to conditional redaction.
+// See https://github.com/cockroachdb/cockroach/issues/87038 for details.
+func SafeManaged(a interface{}) interface{} {
+	if !logging.hasManagedRedactionPolicy() {
+		return a
+	}
+	return redact.Safe(a)
 }

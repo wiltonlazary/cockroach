@@ -29,7 +29,29 @@ const withData: IndexDetailsPageProps = {
     totalReads: 0,
     lastRead: moment("2021-10-21T22:00:00Z"),
     lastReset: moment("2021-12-02T07:12:00Z"),
+    indexRecommendations: [
+      {
+        type: "DROP_UNUSED",
+        reason:
+          "This index has not been used and can be removed for better write performance.",
+      },
+    ],
   },
+  breadcrumbItems: [
+    { link: "/databases", name: "Databases" },
+    {
+      link: `/databases/story_db`,
+      name: "Tables",
+    },
+    {
+      link: `/database/story_db/$public/story_table`,
+      name: `Table: story_table`,
+    },
+    {
+      link: `/database/story_db/public/story_table/story_index`,
+      name: `Index: story_index`,
+    },
+  ],
   refreshIndexStats: () => {},
   resetIndexUsageStats: () => {},
   refreshNodes: () => {},

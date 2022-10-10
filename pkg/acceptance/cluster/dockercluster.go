@@ -18,7 +18,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -31,6 +30,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/security"
+	"github.com/cockroachdb/cockroach/pkg/security/certnames"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/logflags"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -127,6 +128,7 @@ type DockerCluster struct {
 	stopper              *stop.Stopper
 	monitorCtx           context.Context
 	monitorCtxCancelFunc func()
+	monitorDone          chan struct{}
 	clusterID            string
 	networkID            string
 	networkName          string
@@ -162,7 +164,7 @@ func CreateDocker(
 	clusterIDS := clusterID.Short()
 
 	if volumesDir == "" {
-		volumesDir, err = ioutil.TempDir("", fmt.Sprintf("cockroach-acceptance-%s", clusterIDS))
+		volumesDir, err = os.MkdirTemp("", fmt.Sprintf("cockroach-acceptance-%s", clusterIDS))
 		maybePanic(err)
 	} else {
 		volumesDir = filepath.Join(volumesDir, clusterIDS)
@@ -189,7 +191,7 @@ func CreateDocker(
 
 func (l *DockerCluster) expectEvent(c *Container, msgs ...string) {
 	for index, ctr := range l.Nodes {
-		if c.id != ctr.id {
+		if ctr.Container == nil || c.id != ctr.id {
 			continue
 		}
 		for _, status := range msgs {
@@ -235,7 +237,7 @@ func (l *DockerCluster) OneShot(
 	if err := l.oneshot.Start(ctx); err != nil {
 		return err
 	}
-	return l.oneshot.Wait(ctx, container.WaitConditionNextExit)
+	return l.oneshot.WaitUntilNotRunning(ctx)
 }
 
 // stopOnPanic is invoked as a deferred function in Start in order to attempt
@@ -372,7 +374,7 @@ func (l *DockerCluster) initCluster(ctx context.Context) {
 	// and it'll get in the way of future runs.
 	l.vols = c
 	maybePanic(c.Start(ctx))
-	maybePanic(c.Wait(ctx, container.WaitConditionNextExit))
+	maybePanic(c.WaitUntilNotRunning(ctx))
 }
 
 // cockroachEntryPoint returns the value to be used as
@@ -450,7 +452,7 @@ func (l *DockerCluster) createNodeCerts() {
 	}
 	maybePanic(security.CreateNodePair(
 		certsDir,
-		filepath.Join(certsDir, security.EmbeddedCAKey),
+		filepath.Join(certsDir, certnames.EmbeddedCAKey),
 		keyLen, 48*time.Hour, true /* overwrite */, nodes))
 }
 
@@ -542,6 +544,7 @@ func (l *DockerCluster) processEvent(ctx context.Context, event events.Message) 
 	// If there's currently a oneshot container, ignore any die messages from
 	// it because those are expected.
 	if l.oneshot != nil && event.ID == l.oneshot.id && event.Status == eventDie {
+		log.Infof(ctx, "Docker event was: the oneshot container terminated")
 		return true
 	}
 
@@ -583,7 +586,9 @@ func (l *DockerCluster) processEvent(ctx context.Context, event events.Message) 
 	return false
 }
 
-func (l *DockerCluster) monitor(ctx context.Context) {
+func (l *DockerCluster) monitor(ctx context.Context, monitorDone chan struct{}) {
+	defer close(monitorDone)
+
 	if log.V(1) {
 		log.Infof(ctx, "events monitor starts")
 		defer log.Infof(ctx, "events monitor exits")
@@ -601,6 +606,9 @@ func (l *DockerCluster) monitor(ctx context.Context) {
 		})
 		for {
 			select {
+			case <-l.monitorCtx.Done():
+				log.Infof(ctx, "monitor shutting down")
+				return false
 			case err := <-errq:
 				log.Infof(ctx, "event stream done, resetting...: %s", err)
 				// Sometimes we get a random string-wrapped EOF error back.
@@ -638,7 +646,8 @@ func (l *DockerCluster) Start(ctx context.Context) {
 
 	log.Infof(ctx, "starting %d nodes", len(l.Nodes))
 	l.monitorCtx, l.monitorCtxCancelFunc = context.WithCancel(context.Background())
-	go l.monitor(ctx)
+	l.monitorDone = make(chan struct{})
+	go l.monitor(ctx, l.monitorDone)
 	var wg sync.WaitGroup
 	wg.Add(len(l.Nodes))
 	for _, node := range l.Nodes {
@@ -659,7 +668,6 @@ func (l *DockerCluster) Start(ctx context.Context) {
 // the cluster (restart, kill, ...). In the event of a mismatch, the passed
 // Tester receives a fatal error.
 func (l *DockerCluster) Assert(ctx context.Context, t testing.TB) {
-	const almostZero = 50 * time.Millisecond
 	filter := func(ch chan Event, wait time.Duration) *Event {
 		select {
 		case act := <-ch:
@@ -671,17 +679,28 @@ func (l *DockerCluster) Assert(ctx context.Context, t testing.TB) {
 
 	var events []Event
 	for {
+		// The expected event channel is buffered and should contain
+		// all expected events already.
+		const almostZero = 15 * time.Millisecond
 		exp := filter(l.expectedEvents, almostZero)
 		if exp == nil {
 			break
 		}
-		act := filter(l.events, 15*time.Second)
+		t.Logf("expecting event: %v", exp)
+		// l.events is connected to the docker controller and may
+		// receive events more slowly.
+		const waitForDockerEvent = 15 * time.Second
+		act := filter(l.events, waitForDockerEvent)
+		t.Logf("got event: %v", act)
 		if act == nil || *exp != *act {
 			t.Fatalf("expected event %v, got %v (after %v)", exp, act, events)
 		}
 		events = append(events, *exp)
 	}
-	if cur := filter(l.events, almostZero); cur != nil {
+	// At the end, we leave docker a bit more time to report a final event,
+	// if any.
+	const waitForLastDockerEvent = 1 * time.Second
+	if cur := filter(l.events, waitForLastDockerEvent); cur != nil {
 		t.Fatalf("unexpected extra event %v (after %v)", cur, events)
 	}
 	if log.V(2) {
@@ -711,13 +730,9 @@ func (l *DockerCluster) stop(ctx context.Context) {
 	if l.monitorCtxCancelFunc != nil {
 		l.monitorCtxCancelFunc()
 		l.monitorCtxCancelFunc = nil
+		<-l.monitorDone
 	}
 
-	if l.vols != nil {
-		maybePanic(l.vols.Kill(ctx))
-		maybePanic(l.vols.Remove(ctx))
-		l.vols = nil
-	}
 	for i, n := range l.Nodes {
 		if n.Container == nil {
 			continue
@@ -740,8 +755,14 @@ func (l *DockerCluster) stop(ctx context.Context) {
 			log.Infof(ctx, "~~~ node %d CRASHED ~~~~", i)
 		}
 		maybePanic(n.Remove(ctx))
+		n.Container = nil
 	}
-	l.Nodes = nil
+
+	if l.vols != nil {
+		maybePanic(l.vols.Kill(ctx))
+		maybePanic(l.vols.Remove(ctx))
+		l.vols = nil
+	}
 
 	if l.networkID != "" {
 		maybePanic(
@@ -768,12 +789,12 @@ func (l *DockerCluster) InternalIP(ctx context.Context, i int) net.IP {
 
 // PGUrl returns a URL string for the given node postgres server.
 func (l *DockerCluster) PGUrl(ctx context.Context, i int) string {
-	certUser := security.RootUser
+	certUser := username.RootUser
 	options := url.Values{}
 	options.Add("sslmode", "verify-full")
-	options.Add("sslcert", filepath.Join(certsDir, security.EmbeddedRootCert))
-	options.Add("sslkey", filepath.Join(certsDir, security.EmbeddedRootKey))
-	options.Add("sslrootcert", filepath.Join(certsDir, security.EmbeddedCACert))
+	options.Add("sslcert", filepath.Join(certsDir, certnames.EmbeddedRootCert))
+	options.Add("sslkey", filepath.Join(certsDir, certnames.EmbeddedRootKey))
+	options.Add("sslrootcert", filepath.Join(certsDir, certnames.EmbeddedCACert))
 	pgURL := url.URL{
 		Scheme:   "postgres",
 		User:     url.User(certUser),
@@ -869,13 +890,14 @@ func (l *DockerCluster) ExecCLI(ctx context.Context, i int, cmd []string) (strin
 // Cleanup removes the cluster's volumes directory, optionally preserving the
 // logs directory.
 func (l *DockerCluster) Cleanup(ctx context.Context, preserveLogs bool) {
-	volumes, err := ioutil.ReadDir(l.volumesDir)
+	volumes, err := os.ReadDir(l.volumesDir)
 	if err != nil {
 		log.Warningf(ctx, "%v", err)
 		return
 	}
 	for _, v := range volumes {
 		if preserveLogs && v.Name() == "logs" {
+			log.Infof(ctx, "preserving log directory: %s", l.volumesDir)
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(l.volumesDir, v.Name())); err != nil {

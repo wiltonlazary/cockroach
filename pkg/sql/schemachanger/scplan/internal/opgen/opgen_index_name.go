@@ -22,8 +22,7 @@ func init() {
 		toPublic(
 			scpb.Status_ABSENT,
 			to(scpb.Status_PUBLIC,
-				minPhase(scop.PreCommitPhase),
-				emit(func(this *scpb.IndexName) scop.Op {
+				emit(func(this *scpb.IndexName) *scop.SetIndexName {
 					return &scop.SetIndexName{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
@@ -32,11 +31,11 @@ func init() {
 				}),
 			),
 		),
+		toTransientAbsentLikePublic(),
 		toAbsent(
 			scpb.Status_PUBLIC,
 			to(scpb.Status_ABSENT,
-				minPhase(scop.PreCommitPhase),
-				emit(func(this *scpb.IndexName) scop.Op {
+				emit(func(this *scpb.IndexName) *scop.SetIndexName {
 					return &scop.SetIndexName{
 						TableID: this.TableID,
 						IndexID: this.IndexID,
